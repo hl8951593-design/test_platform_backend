@@ -37,3 +37,9 @@ def decode_access_token(token: str) -> dict[str, Any]:
         raise jwt.InvalidTokenError("token 类型无效")
     return payload
 
+
+def decode_refresh_token(token: str) -> dict[str, Any]:
+    payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+    if payload.get("type") != "refresh":
+        raise jwt.InvalidTokenError("token type invalid")
+    return payload

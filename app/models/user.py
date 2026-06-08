@@ -17,8 +17,8 @@ class User(Base):
     phone: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False, comment="手机号")
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False, comment="邮箱")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, comment="是否启用")
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, comment="是否管理员")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
     )
-

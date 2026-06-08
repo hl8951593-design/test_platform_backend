@@ -1,6 +1,6 @@
 """create users table
 
-Revision ID: 0001_create_users_table
+Revision ID: 0001_users
 Revises:
 Create Date: 2026-05-31
 """
@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from alembic import op
 import sqlalchemy as sa
 
-revision: str = "0001_create_users_table"
+revision: str = "0001_users"
 down_revision: str | Sequence[str] | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
@@ -43,4 +43,3 @@ def downgrade() -> None:
     op.drop_index("ix_users_account", table_name="users")
     op.drop_index("ix_users_id", table_name="users")
     op.drop_table("users")
-

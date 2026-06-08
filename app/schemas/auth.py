@@ -14,3 +14,6 @@ class LoginRequest(BaseModel):
     account: str = Field(min_length=3, max_length=64, description="账号")
     password: str = Field(min_length=6, max_length=128, description="密码")
 
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(min_length=1, description="刷新令牌")

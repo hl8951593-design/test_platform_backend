@@ -44,3 +44,11 @@ class UserRepository:
         self.db.refresh(user)
         return user
 
+    def set_admin(self, *, user_id: int, is_admin: bool) -> User | None:
+        user = self.get_by_id(user_id)
+        if user is None:
+            return None
+        user.is_admin = is_admin
+        self.db.commit()
+        self.db.refresh(user)
+        return user

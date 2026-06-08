@@ -11,6 +11,7 @@ class UserRead(BaseModel):
     phone: str
     email: EmailStr
     is_active: bool
+    is_admin: bool
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -21,4 +22,3 @@ class TokenRead(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     user: UserRead
-

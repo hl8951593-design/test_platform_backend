@@ -1,10 +1,17 @@
 from fastapi import HTTPException, status
+from jwt import InvalidTokenError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.security import create_access_token, create_refresh_token, hash_password, verify_password
+from app.core.security import (
+    create_access_token,
+    create_refresh_token,
+    decode_refresh_token,
+    hash_password,
+    verify_password,
+)
 from app.repositories.user_repository import UserRepository
-from app.schemas.auth import LoginRequest, RegisterRequest
+from app.schemas.auth import LoginRequest, RefreshTokenRequest, RegisterRequest
 from app.schemas.user import TokenRead, UserRead
 
 
@@ -60,3 +67,28 @@ class UserService:
             user=UserRead.model_validate(user),
         )
 
+    def refresh_token(self, payload: RefreshTokenRequest) -> TokenRead:
+        credentials_exception = HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="刷新令牌无效",
+        )
+        try:
+            token_payload = decode_refresh_token(payload.refresh_token)
+            user_id = token_payload.get("sub")
+            if user_id is None:
+                raise credentials_exception
+            user_id_int = int(user_id)
+        except (InvalidTokenError, ValueError) as exc:
+            raise credentials_exception from exc
+
+        user = self.repository.get_by_id(user_id_int)
+        if user is None:
+            raise credentials_exception
+        if not user.is_active:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="用户已被禁用")
+
+        return TokenRead(
+            access_token=create_access_token(user.id),
+            refresh_token=create_refresh_token(user.id),
+            user=UserRead.model_validate(user),
+        )

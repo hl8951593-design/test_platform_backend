@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_db
 from app.core.response import success
-from app.schemas.auth import LoginRequest, RegisterRequest
+from app.schemas.auth import LoginRequest, RefreshTokenRequest, RegisterRequest
 from app.services.user_service import UserService
 
 router = APIRouter()
@@ -20,3 +20,8 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     token_data = UserService(db).login(payload)
     return success(data=token_data, message="登录成功")
 
+
+@router.post("/refresh", summary="刷新访问令牌")
+def refresh_token(payload: RefreshTokenRequest, db: Session = Depends(get_db)):
+    token_data = UserService(db).refresh_token(payload)
+    return success(data=token_data, message="令牌刷新成功")

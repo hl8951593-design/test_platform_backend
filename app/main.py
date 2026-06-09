@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1.api import api_router
 from app.core.config import settings
 from app.services.websocket_debug_session_service import debug_session_manager
+from app.services.test_plan_scheduler import test_plan_scheduler
 
 
 def create_app() -> FastAPI:
@@ -21,6 +22,8 @@ def create_app() -> FastAPI:
     )
     application.include_router(api_router, prefix=settings.API_V1_PREFIX)
     application.router.add_event_handler("shutdown", debug_session_manager.close_all)
+    application.router.add_event_handler("startup", test_plan_scheduler.start)
+    application.router.add_event_handler("shutdown", test_plan_scheduler.stop)
 
     @application.get("/")
     async def root():

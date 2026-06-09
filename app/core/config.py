@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
     DEEPSEEK_MODEL: str = "deepseek-v4-flash"
     DEEPSEEK_TIMEOUT_SECONDS: float = 60.0
+    TEST_PLAN_SCHEDULER_ENABLED: bool = True
+    TEST_PLAN_SCHEDULER_INTERVAL_SECONDS: int = 30
+    TEST_PLAN_DEFAULT_TIMEZONE: str = "Asia/Shanghai"
     BACKEND_CORS_ORIGINS: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",

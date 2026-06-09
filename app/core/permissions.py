@@ -14,8 +14,16 @@ class ProjectPermission(StrEnum):
     MANAGE_CASE = "case:manage"
     VIEW_FLOW = "flow:view"
     MANAGE_FLOW = "flow:manage"
+    VIEW_SCENARIO = "scenario:view"
+    MANAGE_SCENARIO = "scenario:manage"
     EXECUTE_TEST = "test:execute"
     VIEW_REPORT = "report:view"
+    VIEW_PLAN = "plan:view"
+    CREATE_PLAN = "plan:create"
+    UPDATE_PLAN = "plan:update"
+    DELETE_PLAN = "plan:delete"
+    RUN_PLAN = "plan:run"
+    DELETE_PLAN_HISTORY = "plan:history:delete"
 
 
 PROJECT_CREATOR_PERMISSIONS = frozenset(permission.value for permission in ProjectPermission)

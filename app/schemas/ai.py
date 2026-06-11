@@ -119,6 +119,24 @@ class AIWebSocketTestCaseExpandRequest(BaseModel):
     include_assertions: bool = True
 
 
+class AIBrowserCaptureGenerateRequest(BaseModel):
+    generate_count: int = Field(default=5, ge=1, le=10)
+    include_assertions: bool = True
+    extra_requirements: str | None = None
+
+
+class AIBrowserCaptureBatchGenerateRequest(AIBrowserCaptureGenerateRequest):
+    entry_ids: list[int] = Field(min_length=1, max_length=50)
+
+
+class AIBrowserCaptureRelationsRequest(BaseModel):
+    entry_ids: list[int] | None = Field(default=None, max_length=100)
+
+
+class AIBrowserCaptureScenarioRequest(AIBrowserCaptureRelationsRequest):
+    name: str | None = Field(default=None, max_length=128)
+
+
 class AIGeneratedWebSocketTestCaseResponse(BaseModel):
     project_id: int
     environment_id: int

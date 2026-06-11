@@ -19,6 +19,8 @@ from app.models.websocket_test_case import WebSocketTestCase, WebSocketTestCaseE
 from app.models.visual_flow import VisualFlow, VisualFlowExecution, VisualFlowNodeExecution, VisualFlowVersion
 
 __all__ = [
+    "BrowserCapture",
+    "BrowserCaptureEntry",
     "Project",
     "ProjectEnvironment",
     "ProjectEnvironmentVariable",
@@ -44,3 +46,4 @@ __all__ = [
     "VisualFlowExecution",
     "VisualFlowNodeExecution",
 ]
+from app.models.browser_capture import BrowserCapture, BrowserCaptureEntry

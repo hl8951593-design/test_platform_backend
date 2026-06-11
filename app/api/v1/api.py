@@ -1,8 +1,9 @@
 from fastapi import APIRouter
 
-from app.api.v1.routers import ai, auth, environment_configs, projects, scenarios, test_cases, test_plans, users, visual_flows, websocket_test_cases
+from app.api.v1.routers import ai, auth, browser_captures, environment_configs, projects, scenarios, test_cases, test_plans, users, visual_flows, websocket_test_cases
 
 api_router = APIRouter()
+api_router.include_router(browser_captures.router, prefix="/browser-captures", tags=["Browser captures"])
 api_router.include_router(visual_flows.router, prefix="/flows", tags=["Visual flows"])
 api_router.include_router(websocket_test_cases.router, prefix="/websocket-test-cases", tags=["WebSocket test cases"])
 api_router.include_router(ai.router, prefix="/ai", tags=["AI"])

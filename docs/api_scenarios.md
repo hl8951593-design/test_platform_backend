@@ -1,26 +1,26 @@
 # 场景组合接口
 
-场景组合负责把 HTTP/WebSocket 基础测试用例编排为有序业务场景。测试计划只能绑定场景，
-不会直接绑定基础用例。
+场景将 HTTP/WebSocket 基础用例、等待和条件步骤编排为可版本化的业务流程。基础路径为
+`/api/v1`，接口使用 Bearer Token，成功响应统一为 `{code, message, data}`。
 
 ## 接口
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| GET/POST | `/api/v1/scenarios?project_id={id}` | 查询、创建场景 |
-| GET/PUT/DELETE | `/api/v1/scenarios/{scenario_id}?project_id={id}` | 详情、更新、删除 |
-| POST | `/api/v1/scenarios/{scenario_id}/execute?project_id={id}` | 执行场景 |
-| GET | `/api/v1/scenario-runs?project_id={id}&scenario_id={id}` | 查询场景运行历史 |
-| GET | `/api/v1/scenario-runs/{run_id}?project_id={id}` | 查询步骤执行详情 |
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| GET/POST | `/scenarios?project_id={id}` | `scenario:view` / `scenario:manage` | 分页查询、创建场景 |
+| GET/PUT/DELETE | `/scenarios/{scenario_id}?project_id={id}` | `scenario:view` / `scenario:manage` | 详情、更新、软删除 |
+| POST | `/scenarios/{scenario_id}/execute?project_id={id}` | `test:execute` | 同步执行场景 |
+| GET | `/scenario-runs?project_id={id}&scenario_id={id}` | `scenario:view` | 最近 200 条运行 |
+| GET | `/scenario-runs/{run_id}?project_id={id}` | `scenario:view` | 运行和步骤详情 |
 
-## 场景定义
+请求字段同时接受 snake_case 和文档注明的 camelCase 别名；响应统一使用 snake_case。
+列表响应结构为 `{items, total, page, page_size}`，`page_size` 最大为 200。
 
-后端兼容前端 `configText`、`variablesText`、`referenceId`、`continueOnFailure` 和
-`environmentId` 字段，并在保存时解析 JSON 字符串。
+## 场景定义与版本
 
 ```json
 {
-  "name": "登录下单场景",
+  "name": "登录下单",
   "environmentId": 1,
   "tags": ["P0"],
   "steps": [
@@ -33,15 +33,6 @@
       "path": "/login",
       "configText": "{}",
       "continueOnFailure": false
-    },
-    {
-      "id": "STEP-2",
-      "kind": "delay",
-      "name": "等待",
-      "method": "",
-      "path": "",
-      "configText": "{\"delayMs\": 1000}",
-      "continueOnFailure": false
     }
   ],
   "datasets": [
@@ -49,17 +40,17 @@
       "id": "DATA-1",
       "name": "普通用户",
       "enabled": true,
-      "variablesText": "{\"username\": \"tester\"}"
+      "variablesText": "{\"username\":\"tester\"}"
     }
   ]
 }
 ```
 
-保存时会校验环境和引用用例均属于当前项目。更新必须携带当前 `version`。
-每个场景版本会保存完整基础用例快照；基础用例后续被编辑时，旧场景版本仍保持原执行定义。
-对外场景详情只返回展示字段，不暴露完整用例快照。
+更新请求必须携带当前 `version`。版本冲突返回 HTTP `409` 和 `current_version`。
+每次更新生成不可变的 `test_scenario_versions` 记录。场景版本保存基础用例执行快照，
+后续修改基础用例不会改变旧版本。
 
-## 数据驱动执行
+## 数据集选择
 
 执行请求：
 
@@ -71,44 +62,45 @@
 }
 ```
 
-每个选中或启用数据集生成一条独立运行记录。若没有启用数据集，则使用第一条数据集；
-完全没有数据集时使用空变量。
+规则是确定的：
 
-执行流程：
+- 未传 `datasetIds`：执行全部 `enabled=true` 的数据集。
+- 传入非空数组：只执行指定数据集，允许显式选择已停用数据集。
+- 传入空数组：不执行任何数据集，返回空运行列表。
+- 场景完全没有数据集且未传 `datasetIds`：以空变量执行一次。
+- 指定不存在的数据集：返回 HTTP `400`。
+
+## 环境与幂等
+
+执行环境必须属于当前项目且未删除。没有传执行环境时使用场景绑定环境。
+
+幂等键作用域为当前项目，当前实现不自动过期。每个数据集派生独立键。同一键和相同请求返回
+原运行；同一键对应不同场景版本、环境、数据集或计划运行时返回 HTTP `409`。
+
+## 状态与审计
+
+场景运行状态包括 `running`、`passed`、`failed`、`timeout`。步骤还可能为 `skipped`。
+关联链如下：
 
 ```text
-读取不可变场景版本
-→ 合并数据集变量
-→ 按步骤顺序执行
-→ 保存真实 HTTP/WebSocket 执行记录
-→ 保存步骤输出和变量快照
-→ 失败且 continueOnFailure=false 时将后续步骤标记为 skipped
+test_plan_runs
+  -> test_scenario_runs.plan_run_id
+     -> test_case_executions.scenario_run_id
+     -> websocket_test_case_executions.scenario_run_id
 ```
 
-配置中支持变量模板，例如 `{{username}}`、`{{step_1.body.token}}`。条件步骤使用受限表达式：
+场景快照和变量快照对敏感字段进行掩码。场景版本中的 Authorization、Cookie、Token、
+Password、Secret、API Key 等字段使用 `SNAPSHOT_ENCRYPTION_KEY` 加密保存；未配置时使用
+`JWT_SECRET_KEY` 派生密钥。生产环境必须配置独立且稳定的加密密钥。
+
+## 错误响应
+
+HTTP 和参数校验错误统一返回：
 
 ```json
-{"expression": "variables[\"enabled\"] == True"}
+{
+  "code": 409,
+  "message": "幂等键已用于不同的场景执行请求",
+  "data": "幂等键已用于不同的场景执行请求"
+}
 ```
-
-## 数据关系
-
-```text
-test_scenarios
-→ test_scenario_versions       不可变步骤和数据集定义
-→ test_scenario_runs           每个数据集的一次运行
-→ step_results.execution_id    关联 HTTP/WebSocket 原始执行记录
-
-test_plans
-→ test_plan_scenarios
-→ test_scenarios
-```
-
-测试计划绑定时记录 `scenario_version_at_bind`，定时运行始终执行绑定版本。需要使用场景新版本时，
-应重新保存测试计划。被有效测试计划引用的场景不能删除。
-
-## 权限
-
-- `scenario:view`：查看场景和运行历史。
-- `scenario:manage`：创建、编辑和删除场景。
-- `test:execute`：执行场景。

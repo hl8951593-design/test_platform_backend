@@ -1,9 +1,10 @@
 from datetime import datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from app.models.project import ProjectEnvironment, ProjectEnvironmentVariable
+from app.core.sensitive_data import reveal_secret_text
 from app.models.test_case import TestCase
 from app.models.visual_flow import VisualFlow, VisualFlowExecution, VisualFlowNodeExecution, VisualFlowVersion
 from app.models.websocket_test_case import WebSocketTestCase
@@ -110,6 +111,22 @@ class VisualFlowRepository:
         self.db.refresh(version)
         return version
 
+    def delete_flow(self, *, flow: VisualFlow) -> None:
+        version_ids = list(self.db.scalars(
+            select(VisualFlowVersion.id).where(VisualFlowVersion.flow_id == flow.id)
+        ).all())
+        self.db.execute(
+            update(VisualFlowExecution)
+            .where(VisualFlowExecution.flow_id == flow.id)
+            .values(flow_id=None, flow_version_id=None)
+        )
+        if version_ids:
+            self.db.execute(
+                delete(VisualFlowVersion).where(VisualFlowVersion.id.in_(version_ids))
+            )
+        self.db.delete(flow)
+        self.db.commit()
+
     def get_environment(self, *, project_id: int, environment_id: int) -> ProjectEnvironment | None:
         return self.db.scalar(
             select(ProjectEnvironment).where(
@@ -123,7 +140,10 @@ class VisualFlowRepository:
         statement = select(ProjectEnvironmentVariable).where(
             ProjectEnvironmentVariable.environment_id == environment_id
         )
-        return {item.name: item.value for item in self.db.scalars(statement).all()}
+        return {
+            item.name: reveal_secret_text(item.value) if item.is_secret else item.value
+            for item in self.db.scalars(statement).all()
+        }
 
     def get_http_case(self, *, project_id: int, case_id: int) -> TestCase | None:
         return self.db.scalar(select(TestCase).where(TestCase.id == case_id, TestCase.project_id == project_id))

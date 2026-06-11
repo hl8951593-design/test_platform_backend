@@ -2,7 +2,9 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.project import ProjectEnvironment, ProjectEnvironmentVariable
+from app.core.sensitive_data import reveal_secret_text
 from app.models.test_case import TestCase, TestCaseEnvironment, TestCaseExecution
+from app.models.visual_flow import VisualFlow, VisualFlowVersion
 
 
 class TestCaseRepository:
@@ -107,6 +109,46 @@ class TestCaseRepository:
         updated_test_case = self.get_by_id(project_id=test_case.project_id, test_case_id=test_case.id)
         return updated_test_case or test_case
 
+    def delete(self, test_case: TestCase) -> None:
+        self.db.execute(
+            update(TestCaseExecution)
+            .where(TestCaseExecution.test_case_id == test_case.id)
+            .values(test_case_id=None)
+        )
+        self.db.execute(
+            delete(TestCaseEnvironment).where(TestCaseEnvironment.test_case_id == test_case.id)
+        )
+        self.db.delete(test_case)
+        self.db.commit()
+
+    def referencing_flow_names(self, *, project_id: int, test_case_id: int) -> list[str]:
+        rows = self.db.execute(
+            select(VisualFlow.name, VisualFlowVersion.definition)
+            .join(VisualFlowVersion, VisualFlowVersion.flow_id == VisualFlow.id)
+            .where(
+                VisualFlow.project_id == project_id,
+                VisualFlow.status != "archived",
+            )
+        ).all()
+        return sorted({
+            name for name, definition in rows
+            if self._definition_references_case(
+                definition, kind="api_case", test_case_id=test_case_id
+            )
+        })
+
+    @staticmethod
+    def _definition_references_case(definition: dict, *, kind: str, test_case_id: int) -> bool:
+        if not isinstance(definition, dict):
+            return False
+        for node in definition.get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            reference_id = node.get("reference_id", node.get("referenceId"))
+            if node.get("kind") == kind and str(reference_id) == str(test_case_id):
+                return True
+        return False
+
     def _replace_environment_links(
         self,
         *,
@@ -138,7 +180,10 @@ class TestCaseRepository:
         statement = select(ProjectEnvironmentVariable).where(
             ProjectEnvironmentVariable.environment_id == environment_id
         )
-        return {variable.name: variable.value for variable in self.db.scalars(statement).all()}
+        return {
+            variable.name: reveal_secret_text(variable.value) if variable.is_secret else variable.value
+            for variable in self.db.scalars(statement).all()
+        }
 
     def create_execution(
         self,
@@ -146,6 +191,7 @@ class TestCaseRepository:
         project_id: int,
         test_case_id: int | None,
         environment_id: int | None,
+        scenario_run_id: int | None,
         executed_by_id: int,
         status: str,
         request_snapshot: dict,
@@ -158,6 +204,7 @@ class TestCaseRepository:
             project_id=project_id,
             test_case_id=test_case_id,
             environment_id=environment_id,
+            scenario_run_id=scenario_run_id,
             executed_by_id=executed_by_id,
             status=status,
             request_snapshot=request_snapshot,

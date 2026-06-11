@@ -102,6 +102,7 @@ class TestPlanRun(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     trigger: Mapped[str] = mapped_column(String(32), nullable=False)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     plan_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
     target_results: Mapped[list] = mapped_column(JSON, nullable=False)
     target_count: Mapped[int] = mapped_column(default=0, nullable=False)
@@ -109,9 +110,34 @@ class TestPlanRun(Base):
     failed_count: Mapped[int] = mapped_column(default=0, nullable=False)
     operator_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     operator = relationship("User")
+
+
+class TestPlanWebhookEvent(Base):
+    __tablename__ = "test_plan_webhook_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "event", "idempotency_key",
+            name="uq_test_plan_webhook_event_idempotency",
+        ),
+        Index("ix_test_plan_webhook_events_project_received", "project_id", "received_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
+    event: Mapped[str] = mapped_column(String(128), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    body_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    run_ids: Mapped[list] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

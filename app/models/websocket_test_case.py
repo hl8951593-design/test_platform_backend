@@ -65,6 +65,7 @@ class WebSocketTestCaseExecution(Base):
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
     websocket_test_case_id: Mapped[int | None] = mapped_column(ForeignKey("websocket_test_cases.id"), index=True, nullable=True)
     environment_id: Mapped[int | None] = mapped_column(ForeignKey("project_environments.id"), nullable=True)
+    scenario_run_id: Mapped[int | None] = mapped_column(ForeignKey("test_scenario_runs.id"), index=True, nullable=True)
     executed_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     session_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)

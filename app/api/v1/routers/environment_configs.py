@@ -96,15 +96,12 @@ def delete_environment_config(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    environment = ProjectService(db).delete_environment(
+    ProjectService(db).delete_environment(
         project_id=project_id,
         environment_id=environment_id,
         current_user=current_user,
     )
-    return success(
-        data=ProjectEnvironmentDetailRead.model_validate(environment),
-        message="环境配置删除成功",
-    )
+    return success(message="环境配置删除成功")
 
 
 @router.get("/{environment_id}/variables", summary="查询环境配置变量")

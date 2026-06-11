@@ -73,8 +73,8 @@ def delete_project(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    project = ProjectService(db).delete(project_id, current_user)
-    return success(data=ProjectRead.model_validate(project), message="项目删除成功")
+    ProjectService(db).delete(project_id, current_user)
+    return success(message="项目删除成功")
 
 
 @router.post("/{project_id}/members", status_code=status.HTTP_201_CREATED, summary="添加普通测试人员权限")
@@ -142,12 +142,12 @@ def delete_project_environment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    environment = ProjectService(db).delete_environment(
+    ProjectService(db).delete_environment(
         project_id=project_id,
         environment_id=environment_id,
         current_user=current_user,
     )
-    return success(data=ProjectEnvironmentRead.model_validate(environment), message="项目环境删除成功")
+    return success(message="项目环境删除成功")
 
 
 @router.get("/{project_id}/environments/{environment_id}/variables", summary="查询项目环境变量")

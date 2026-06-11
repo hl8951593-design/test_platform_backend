@@ -6,11 +6,17 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.permissions import ProjectPermission
+from app.core.sensitive_data import (
+    decrypt_sensitive,
+    encrypt_sensitive,
+    mask_sensitive,
+    request_fingerprint,
+)
 from app.models.project import ProjectEnvironment
 from app.models.scenario import TestScenario, TestScenarioRun, TestScenarioVersion
 from app.models.test_case import TestCase
@@ -29,15 +35,23 @@ class ScenarioService:
         self.db = db
         self.permission_service = PermissionService(db)
 
-    def list_scenarios(self, *, project_id: int, current_user: User, keyword: str | None) -> list[dict[str, Any]]:
+    def list_scenarios(self, *, project_id: int, current_user: User, keyword: str | None,
+                       page: int, page_size: int) -> dict[str, Any]:
         self._require_view(current_user, project_id)
         filters = [TestScenario.project_id == project_id, TestScenario.is_deleted.is_(False)]
         if keyword:
             filters.append(or_(TestScenario.name.contains(keyword), TestScenario.description.contains(keyword)))
+        total = self.db.scalar(select(func.count()).select_from(TestScenario).where(*filters)) or 0
         scenarios = list(self.db.scalars(
             select(TestScenario).where(*filters).order_by(TestScenario.updated_at.desc(), TestScenario.id.desc())
+            .offset((page - 1) * page_size).limit(page_size)
         ).all())
-        return [self._detail(item) for item in scenarios]
+        return {
+            "items": [self._detail(item) for item in scenarios],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
 
     def get_scenario(self, *, project_id: int, scenario_id: int, current_user: User) -> dict[str, Any]:
         self._require_view(current_user, project_id)
@@ -96,42 +110,66 @@ class ScenarioService:
         ) or 0
         if referenced:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="场景已被测试计划引用，不能删除")
-        suffix = f"__deleted_{scenario.id}_{int(datetime.utcnow().timestamp())}"
-        scenario.name = f"{scenario.name[:128 - len(suffix)]}{suffix}"
-        scenario.is_deleted = True
+        version_ids = list(self.db.scalars(
+            select(TestScenarioVersion.id).where(
+                TestScenarioVersion.scenario_id == scenario.id
+            )
+        ).all())
+        self.db.execute(
+            update(TestScenarioRun)
+            .where(TestScenarioRun.scenario_id == scenario.id)
+            .values(scenario_id=None, scenario_version_id=None)
+        )
+        if version_ids:
+            self.db.execute(
+                delete(TestScenarioVersion).where(TestScenarioVersion.id.in_(version_ids))
+            )
+        self.db.delete(scenario)
         self.db.commit()
 
     def execute_scenario(self, *, project_id: int, scenario_id: int, environment_id: int | None,
                          dataset_ids: list[str] | None, idempotency_key: str | None, current_user: User,
-                         trigger_type: str = "manual", scenario_version: int | None = None) -> list[TestScenarioRun]:
+                         trigger_type: str = "manual", scenario_version: int | None = None,
+                         plan_run_id: int | None = None, deadline: datetime | None = None) -> list[TestScenarioRun]:
         self.permission_service.require_project_permission(current_user, project_id, ProjectPermission.EXECUTE_TEST.value)
         scenario = self._get_scenario(project_id, scenario_id)
         version = self._get_version(scenario, scenario_version)
-        definition = copy.deepcopy(version.definition)
+        definition = decrypt_sensitive(copy.deepcopy(version.definition))
         selected_environment_id = environment_id or scenario.environment_id
         self._get_environment(project_id, selected_environment_id)
-        datasets = [item for item in definition.get("datasets", []) if item.get("enabled", True)]
+        all_datasets = definition.get("datasets", [])
+        datasets = [item for item in all_datasets if item.get("enabled", True)]
         if dataset_ids is not None:
             requested = set(dataset_ids)
-            datasets = [item for item in definition.get("datasets", []) if item["id"] in requested]
+            datasets = [item for item in all_datasets if item["id"] in requested]
             if {item["id"] for item in datasets} != requested:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="数据集不存在")
-        if not datasets:
-            datasets = definition.get("datasets", [])[:1] or [{"id": None, "name": None, "variables": {}}]
+        elif not all_datasets:
+            datasets = [{"id": None, "name": None, "variables": {}}]
 
         runs = []
         for dataset in datasets:
             key = f"{idempotency_key}:{dataset['id']}" if idempotency_key and dataset["id"] else idempotency_key
-            existing = self._idempotent(project_id, key)
+            fingerprint = request_fingerprint({
+                "scenario_id": scenario.id,
+                "scenario_version": version.version,
+                "environment_id": selected_environment_id,
+                "dataset_id": dataset.get("id"),
+                "plan_run_id": plan_run_id,
+            })
+            existing = self._idempotent(project_id, key, fingerprint)
             if existing:
                 runs.append(existing)
                 continue
             runs.append(self._execute_dataset(
                 scenario=scenario, version=version, definition=definition, environment_id=selected_environment_id,
-                dataset=dataset, idempotency_key=key, current_user=current_user, trigger_type=trigger_type,
+                dataset=dataset, idempotency_key=key, request_hash=fingerprint,
+                current_user=current_user, trigger_type=trigger_type, plan_run_id=plan_run_id,
+                deadline=deadline,
             ))
-        scenario.last_run_at = datetime.utcnow()
-        self.db.commit()
+        if runs:
+            scenario.last_run_at = datetime.utcnow()
+            self.db.commit()
         return runs
 
     def list_runs(self, *, project_id: int, scenario_id: int | None, current_user: User) -> list[TestScenarioRun]:
@@ -154,15 +192,18 @@ class ScenarioService:
         return run
 
     def _execute_dataset(self, *, scenario: TestScenario, version: TestScenarioVersion, definition: dict,
-                         environment_id: int, dataset: dict, idempotency_key: str | None, current_user: User,
-                         trigger_type: str) -> TestScenarioRun:
+                         environment_id: int, dataset: dict, idempotency_key: str | None, request_hash: str,
+                         current_user: User, trigger_type: str, plan_run_id: int | None,
+                         deadline: datetime | None) -> TestScenarioRun:
         started_at = datetime.utcnow()
         variables = copy.deepcopy(dataset.get("variables") or {})
         run = TestScenarioRun(
-            scenario_id=scenario.id, scenario_version_id=version.id, project_id=scenario.project_id,
+            scenario_id=scenario.id, scenario_version_id=version.id, plan_run_id=plan_run_id,
+            project_id=scenario.project_id,
             environment_id=environment_id, dataset_id=dataset.get("id"), dataset_name=dataset.get("name"),
             status="running", trigger_type=trigger_type, idempotency_key=idempotency_key,
-            scenario_snapshot=copy.deepcopy(definition), variables_snapshot=copy.deepcopy(variables),
+            request_hash=request_hash, scenario_snapshot=mask_sensitive(definition),
+            variables_snapshot=mask_sensitive(variables),
             step_results=[], triggered_by_id=current_user.id, started_at=started_at,
         )
         self.db.add(run)
@@ -170,7 +211,7 @@ class ScenarioService:
             self.db.commit()
         except IntegrityError:
             self.db.rollback()
-            existing = self._idempotent(scenario.project_id, idempotency_key)
+            existing = self._idempotent(scenario.project_id, idempotency_key, request_hash)
             if existing:
                 return existing
             raise
@@ -179,12 +220,17 @@ class ScenarioService:
         results = []
         stop = False
         for index, step in enumerate(definition["steps"], start=1):
+            if deadline is not None and datetime.utcnow() >= deadline:
+                results.append(self._timeout_result(step, index))
+                stop = True
+                continue
             if stop:
                 results.append(self._skipped_result(step, index))
                 continue
             result = self._execute_step(
                 project_id=scenario.project_id, environment_id=environment_id, step=step,
                 step_index=index, variables=variables, previous_results=results, current_user=current_user,
+                scenario_run_id=run.id, deadline=deadline,
             )
             results.append(result)
             if result["status"] != "passed" and not step.get("continue_on_failure", False):
@@ -192,8 +238,12 @@ class ScenarioService:
 
         finished_at = datetime.utcnow()
         run.step_results = results
-        run.variables_snapshot = variables
-        run.status = "failed" if any(item["status"] == "failed" for item in results) else "passed"
+        run.variables_snapshot = mask_sensitive(variables)
+        run.status = (
+            "timeout" if any(item["status"] == "timeout" for item in results)
+            else "failed" if any(item["status"] == "failed" for item in results)
+            else "passed"
+        )
         run.finished_at = finished_at
         run.duration_ms = int((finished_at - started_at).total_seconds() * 1000)
         self.db.commit()
@@ -201,16 +251,23 @@ class ScenarioService:
         return run
 
     def _execute_step(self, *, project_id: int, environment_id: int, step: dict, step_index: int,
-                      variables: dict[str, Any], previous_results: list[dict], current_user: User) -> dict[str, Any]:
+                      variables: dict[str, Any], previous_results: list[dict], current_user: User,
+                      scenario_run_id: int, deadline: datetime | None) -> dict[str, Any]:
         started_at = datetime.utcnow()
         execution_id = None
         error_message = None
         status_value = "passed"
         output = None
         try:
+            remaining = (deadline - datetime.utcnow()).total_seconds() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("Scenario execution deadline exceeded")
             config = self._render(step.get("config") or {}, variables)
             if step["kind"] == "delay":
-                time.sleep(config.get("delayMs", config.get("delay_ms", 0)) / 1000)
+                delay_seconds = config.get("delayMs", config.get("delay_ms", 0)) / 1000
+                if remaining is not None and delay_seconds > remaining:
+                    raise TimeoutError("Scenario execution deadline exceeded")
+                time.sleep(delay_seconds)
             elif step["kind"] == "condition":
                 passed = self._evaluate_condition(str(config["expression"]), variables, previous_results)
                 output = {"result": passed}
@@ -223,8 +280,15 @@ class ScenarioService:
                 data.update(config)
                 data["environment_id"] = environment_id
                 payload = TestCaseRequestConfig.model_validate(self._render(data, variables))
+                existing_case_id = self.db.scalar(
+                    select(TestCase.id).where(
+                        TestCase.project_id == project_id,
+                        TestCase.id == step["reference_id"],
+                    )
+                )
                 execution = TestCaseService(self.db)._execute(  # noqa: SLF001
-                    project_id=project_id, test_case_id=step["reference_id"], payload=payload, current_user=current_user
+                    project_id=project_id, test_case_id=existing_case_id, payload=payload,
+                    current_user=current_user, scenario_run_id=scenario_run_id, timeout_seconds=remaining,
                 )
                 execution_id, status_value = execution.id, execution.status
                 output = execution.response_snapshot
@@ -235,20 +299,27 @@ class ScenarioService:
                 data.update(config)
                 data["environment_id"] = environment_id
                 payload = WebSocketTestCaseConfig.model_validate(self._render(data, variables))
+                existing_case_id = self.db.scalar(
+                    select(WebSocketTestCase.id).where(
+                        WebSocketTestCase.project_id == project_id,
+                        WebSocketTestCase.id == step["reference_id"],
+                    )
+                )
                 execution = WebSocketTestCaseService(self.db)._execute(  # noqa: SLF001
-                    project_id, step["reference_id"], payload, current_user
+                    project_id, existing_case_id, payload, current_user,
+                    scenario_run_id=scenario_run_id, timeout_seconds=remaining,
                 )
                 execution_id, status_value = execution.id, execution.status
                 output = execution.response_snapshot
                 error_message = execution.error_message
         except Exception as exc:  # noqa: BLE001
             self.db.rollback()
-            status_value = "failed"
+            status_value = "timeout" if isinstance(exc, TimeoutError) else "failed"
             error_message = str(exc)
         finished_at = datetime.utcnow()
         result = {
             "step_id": step["id"], "step_index": step_index, "kind": step["kind"], "name": step["name"],
-            "status": "passed" if status_value == "passed" else "failed", "execution_id": execution_id,
+            "status": status_value if status_value in {"passed", "timeout"} else "failed",
             "output": output, "error_message": error_message, "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(), "duration_ms": int((finished_at - started_at).total_seconds() * 1000),
         }
@@ -274,19 +345,20 @@ class ScenarioService:
                 step.update({"name": asset.name, "method": asset.method if item.kind == "api_case" else "WS", "path": asset.path})
                 step["case_snapshot"] = self._case_snapshot(asset, websocket=item.kind == "websocket_case")
             steps.append(step)
-        return {"steps": steps, "datasets": [item.model_dump() for item in payload.datasets]}
+        return encrypt_sensitive({"steps": steps, "datasets": [item.model_dump() for item in payload.datasets]})
 
     def _detail(self, scenario: TestScenario) -> dict[str, Any]:
         version = self._get_version(scenario)
+        definition = decrypt_sensitive(version.definition)
         public_steps = []
-        for item in version.definition["steps"]:
+        for item in definition["steps"]:
             step = copy.deepcopy(item)
             step.pop("case_snapshot", None)
             public_steps.append(step)
         return {
             "id": scenario.id, "project_id": scenario.project_id, "environment_id": scenario.environment_id,
             "current_version": scenario.current_version, "name": scenario.name, "description": scenario.description,
-            "tags": scenario.tags, "steps": public_steps, "datasets": version.definition["datasets"],
+            "tags": scenario.tags, "steps": public_steps, "datasets": mask_sensitive(definition["datasets"]),
             "created_at": scenario.created_at, "updated_at": scenario.updated_at, "last_run_at": scenario.last_run_at,
         }
 
@@ -330,12 +402,15 @@ class ScenarioService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="执行环境不存在或不属于当前项目")
         return item
 
-    def _idempotent(self, project_id: int, key: str | None) -> TestScenarioRun | None:
+    def _idempotent(self, project_id: int, key: str | None, request_hash: str) -> TestScenarioRun | None:
         if not key:
             return None
-        return self.db.scalar(select(TestScenarioRun).where(
+        existing = self.db.scalar(select(TestScenarioRun).where(
             TestScenarioRun.project_id == project_id, TestScenarioRun.idempotency_key == key
         ))
+        if existing is not None and existing.request_hash and existing.request_hash != request_hash:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="幂等键已用于不同的场景执行请求")
+        return existing
 
     def _render(self, value: Any, variables: dict[str, Any]) -> Any:
         if isinstance(value, str):
@@ -383,6 +458,13 @@ class ScenarioService:
         now = datetime.utcnow().isoformat()
         return {"step_id": step["id"], "step_index": index, "kind": step["kind"], "name": step["name"],
                 "status": "skipped", "execution_id": None, "output": None, "error_message": None,
+                "started_at": now, "finished_at": now, "duration_ms": 0}
+
+    def _timeout_result(self, step: dict, index: int) -> dict:
+        now = datetime.utcnow().isoformat()
+        return {"step_id": step["id"], "step_index": index, "kind": step["kind"], "name": step["name"],
+                "status": "timeout", "execution_id": None, "output": None,
+                "error_message": "Scenario execution deadline exceeded",
                 "started_at": now, "finished_at": now, "duration_ms": 0}
 
     def _commit_unique(self) -> None:

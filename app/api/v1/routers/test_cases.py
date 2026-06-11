@@ -59,6 +59,21 @@ def update_test_case(
     return success(data=TestCaseRead.model_validate(test_case), message="测试用例更新成功")
 
 
+@router.delete("/{test_case_id}", summary="删除测试用例")
+def delete_test_case(
+    project_id: int,
+    test_case_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    TestCaseService(db).delete_case(
+        project_id=project_id,
+        test_case_id=test_case_id,
+        current_user=current_user,
+    )
+    return success(message="测试用例删除成功")
+
+
 @router.post("/{test_case_id}/execute", summary="执行已保存测试用例")
 def execute_saved_test_case(
     project_id: int,

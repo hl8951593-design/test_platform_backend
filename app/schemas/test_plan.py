@@ -14,6 +14,7 @@ class TestPlanTargetRequest(BaseModel):
     reference_id: int
     kind: TargetKind
     sort_order: int = Field(ge=1)
+    scenario_version: int | None = Field(default=None, ge=1)
 
 
 class TestPlanTargetRead(TestPlanTargetRequest):
@@ -21,7 +22,6 @@ class TestPlanTargetRead(TestPlanTargetRequest):
     name: str
     method: str | None = None
     path: str | None = None
-    scenario_version: int | None = None
 
 
 class TestPlanPayload(BaseModel):
@@ -132,5 +132,6 @@ class TestPlanRunRead(BaseModel):
     target_count: int
     passed_count: int
     failed_count: int
+    error_message: str | None = None
     operator: dict
     target_results: list[dict] | None = None

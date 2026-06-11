@@ -34,6 +34,21 @@ def update_flow(project_id: int, flow_id: int, payload: FlowUpdateRequest, db: S
     return success(data=item, message="Flow updated")
 
 
+@router.delete("/{flow_id}")
+def delete_flow(
+    project_id: int,
+    flow_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    VisualFlowService(db).delete_flow(
+        project_id=project_id,
+        flow_id=flow_id,
+        current_user=current_user,
+    )
+    return success(message="Flow deleted")
+
+
 def _execution_response(execution, flow_version, node_executions):
     return FlowExecutionRead(
         execution_id=execution.id, flow_id=execution.flow_id, flow_version=flow_version,

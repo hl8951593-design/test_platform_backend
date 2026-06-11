@@ -79,6 +79,7 @@ class TestCaseExecution(Base):
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
     test_case_id: Mapped[int | None] = mapped_column(ForeignKey("test_cases.id"), index=True, nullable=True)
     environment_id: Mapped[int | None] = mapped_column(ForeignKey("project_environments.id"), nullable=True)
+    scenario_run_id: Mapped[int | None] = mapped_column(ForeignKey("test_scenario_runs.id"), index=True, nullable=True)
     executed_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, comment="执行人")
     status: Mapped[str] = mapped_column(String(32), nullable=False, comment="执行状态")
     request_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False, comment="请求快照")

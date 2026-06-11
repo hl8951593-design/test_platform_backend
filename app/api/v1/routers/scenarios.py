@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user, get_db
@@ -18,10 +18,17 @@ run_router = APIRouter()
 
 
 @router.get("", summary="查询项目场景列表")
-def list_scenarios(project_id: int, keyword: str | None = None, db: Session = Depends(get_db),
+def list_scenarios(project_id: int, keyword: str | None = None,
+                   page: int = Query(default=1, ge=1),
+                   page_size: int = Query(default=20, ge=1, le=200),
+                   db: Session = Depends(get_db),
                    current_user: User = Depends(get_current_user)):
-    items = ScenarioService(db).list_scenarios(project_id=project_id, current_user=current_user, keyword=keyword)
-    return success(data=[ScenarioRead.model_validate(item) for item in items])
+    result = ScenarioService(db).list_scenarios(
+        project_id=project_id, current_user=current_user, keyword=keyword,
+        page=page, page_size=page_size,
+    )
+    result["items"] = [ScenarioRead.model_validate(item) for item in result["items"]]
+    return success(data=result)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, summary="创建场景")

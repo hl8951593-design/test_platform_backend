@@ -10,6 +10,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.permissions import ProjectPermission
+from app.core.variable_renderer import render_variables
 from app.models.user import User
 from app.models.visual_flow import VisualFlow, VisualFlowExecution, VisualFlowVersion
 from app.repositories.visual_flow_repository import VisualFlowRepository
@@ -118,6 +119,11 @@ class VisualFlowService:
         if version is None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Flow version conflict")
         return self._detail(flow, stored)
+
+    def delete_flow(self, *, project_id: int, flow_id: int, current_user: User) -> None:
+        self._require(current_user, project_id, ProjectPermission.MANAGE_FLOW.value)
+        flow = self._get_flow(project_id, flow_id)
+        self.repository.delete_flow(flow=flow)
 
     def execute_saved(
         self,
@@ -728,18 +734,7 @@ class VisualFlowService:
             current[parts[-1]] = value
 
     def _render_variables(self, value: Any, variables: dict[str, Any]) -> Any:
-        if isinstance(value, str):
-            if value.startswith("{{") and value.endswith("}}") and value[2:-2] in variables:
-                return variables[value[2:-2]]
-            result = value
-            for key, item in variables.items():
-                result = result.replace("{{" + key + "}}", str(item))
-            return result
-        if isinstance(value, dict):
-            return {key: self._render_variables(item, variables) for key, item in value.items()}
-        if isinstance(value, list):
-            return [self._render_variables(item, variables) for item in value]
-        return value
+        return render_variables(value, variables)
 
     def _prepare_definition(self, definition: FlowDefinition, *, project_id: int) -> FlowDefinition:
         data = definition.model_dump(by_alias=True, mode="python", exclude={"id", "project_id", "updated_at"})

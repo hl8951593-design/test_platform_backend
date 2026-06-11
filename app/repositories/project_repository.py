@@ -8,7 +8,28 @@ from app.models.project import (
     ProjectMember,
     ProjectMemberPermission,
 )
+from app.models.scenario import TestScenario, TestScenarioRun, TestScenarioVersion
 from app.models.test_case import TestCase, TestCaseEnvironment
+from app.models.test_case import TestCaseExecution
+from app.models.test_plan import (
+    TestPlan,
+    TestPlanEnvironment,
+    TestPlanRun,
+    TestPlanScenario,
+    TestPlanWebhookEvent,
+)
+from app.models.visual_flow import (
+    VisualFlow,
+    VisualFlowExecution,
+    VisualFlowNodeExecution,
+    VisualFlowVersion,
+)
+from app.models.websocket_test_case import (
+    WebSocketTestCase,
+    WebSocketTestCaseEnvironment,
+    WebSocketTestCaseExecution,
+)
+from app.core.sensitive_data import protect_secret_text, reveal_secret_text
 
 
 class ProjectRepository:
@@ -47,11 +68,88 @@ class ProjectRepository:
         self.db.refresh(project)
         return project
 
-    def soft_delete(self, project: Project) -> Project:
-        project.is_deleted = True
+    def delete_project(self, project: Project) -> None:
+        project_id = project.id
+        flow_ids = list(self.db.scalars(
+            select(VisualFlow.id).where(VisualFlow.project_id == project_id)
+        ).all())
+        flow_execution_ids = list(self.db.scalars(
+            select(VisualFlowExecution.id).where(VisualFlowExecution.project_id == project_id)
+        ).all())
+        scenario_ids = list(self.db.scalars(
+            select(TestScenario.id).where(TestScenario.project_id == project_id)
+        ).all())
+        environment_ids = list(self.db.scalars(
+            select(ProjectEnvironment.id).where(ProjectEnvironment.project_id == project_id)
+        ).all())
+        member_ids = list(self.db.scalars(
+            select(ProjectMember.id).where(ProjectMember.project_id == project_id)
+        ).all())
+
+        if flow_execution_ids:
+            self.db.execute(
+                delete(VisualFlowNodeExecution).where(
+                    VisualFlowNodeExecution.execution_id.in_(flow_execution_ids)
+                )
+            )
+        self.db.execute(delete(VisualFlowExecution).where(VisualFlowExecution.project_id == project_id))
+        if flow_ids:
+            self.db.execute(delete(VisualFlowVersion).where(VisualFlowVersion.flow_id.in_(flow_ids)))
+        self.db.execute(delete(VisualFlow).where(VisualFlow.project_id == project_id))
+
+        self.db.execute(delete(TestCaseExecution).where(TestCaseExecution.project_id == project_id))
+        self.db.execute(
+            delete(WebSocketTestCaseExecution).where(
+                WebSocketTestCaseExecution.project_id == project_id
+            )
+        )
+        self.db.execute(delete(TestScenarioRun).where(TestScenarioRun.project_id == project_id))
+        self.db.execute(delete(TestPlanRun).where(TestPlanRun.project_id == project_id))
+        self.db.execute(
+            delete(TestPlanWebhookEvent).where(TestPlanWebhookEvent.project_id == project_id)
+        )
+        self.db.execute(delete(TestPlanScenario).where(TestPlanScenario.project_id == project_id))
+        self.db.execute(
+            delete(TestPlanEnvironment).where(TestPlanEnvironment.project_id == project_id)
+        )
+        self.db.execute(delete(TestPlan).where(TestPlan.project_id == project_id))
+
+        if scenario_ids:
+            self.db.execute(
+                delete(TestScenarioVersion).where(
+                    TestScenarioVersion.scenario_id.in_(scenario_ids)
+                )
+            )
+        self.db.execute(delete(TestScenario).where(TestScenario.project_id == project_id))
+        self.db.execute(delete(TestCaseEnvironment).where(TestCaseEnvironment.project_id == project_id))
+        self.db.execute(
+            delete(WebSocketTestCaseEnvironment).where(
+                WebSocketTestCaseEnvironment.project_id == project_id
+            )
+        )
+        self.db.execute(delete(TestCase).where(TestCase.project_id == project_id))
+        self.db.execute(
+            delete(WebSocketTestCase).where(WebSocketTestCase.project_id == project_id)
+        )
+
+        if environment_ids:
+            self.db.execute(
+                delete(ProjectEnvironmentVariable).where(
+                    ProjectEnvironmentVariable.environment_id.in_(environment_ids)
+                )
+            )
+        self.db.execute(
+            delete(ProjectEnvironment).where(ProjectEnvironment.project_id == project_id)
+        )
+        if member_ids:
+            self.db.execute(
+                delete(ProjectMemberPermission).where(
+                    ProjectMemberPermission.member_id.in_(member_ids)
+                )
+            )
+        self.db.execute(delete(ProjectMember).where(ProjectMember.project_id == project_id))
+        self.db.delete(project)
         self.db.commit()
-        self.db.refresh(project)
-        return project
 
     def get_member(self, *, project_id: int, user_id: int) -> ProjectMember | None:
         statement = select(ProjectMember).where(
@@ -156,6 +254,7 @@ class ProjectRepository:
         is_default: bool,
         created_by_id: int,
     ) -> ProjectEnvironment:
+        self._purge_deleted_environment_name(project_id=project_id, name=name)
         environment = ProjectEnvironment(
             project_id=project_id,
             name=name,
@@ -190,12 +289,82 @@ class ProjectRepository:
         self.db.refresh(environment)
         return environment
 
-    def soft_delete_environment(self, environment: ProjectEnvironment) -> ProjectEnvironment:
-        environment.is_deleted = True
-        environment.is_default = False
+    def delete_environment(self, environment: ProjectEnvironment) -> None:
+        environment_id = environment.id
+        plans = list(self.db.scalars(
+            select(TestPlan)
+            .join(TestPlanEnvironment, TestPlanEnvironment.plan_id == TestPlan.id)
+            .where(TestPlanEnvironment.environment_id == environment_id)
+        ).all())
+        for plan in plans:
+            plan.environment_ids = [
+                item for item in plan.environment_ids if item != environment_id
+            ]
+
+        self.db.execute(
+            update(TestCase)
+            .where(TestCase.environment_id == environment_id)
+            .values(environment_id=None)
+        )
+        self.db.execute(
+            update(WebSocketTestCase)
+            .where(WebSocketTestCase.environment_id == environment_id)
+            .values(environment_id=None)
+        )
+        self.db.execute(
+            update(TestCaseExecution)
+            .where(TestCaseExecution.environment_id == environment_id)
+            .values(environment_id=None)
+        )
+        self.db.execute(
+            update(WebSocketTestCaseExecution)
+            .where(WebSocketTestCaseExecution.environment_id == environment_id)
+            .values(environment_id=None)
+        )
+        self.db.execute(
+            update(TestPlanRun)
+            .where(TestPlanRun.environment_id == environment_id)
+            .values(environment_id=None)
+        )
+        self.db.execute(
+            update(VisualFlowExecution)
+            .where(VisualFlowExecution.environment_id == environment_id)
+            .values(environment_id=None)
+        )
+        self.db.execute(
+            delete(TestCaseEnvironment).where(
+                TestCaseEnvironment.environment_id == environment_id
+            )
+        )
+        self.db.execute(
+            delete(WebSocketTestCaseEnvironment).where(
+                WebSocketTestCaseEnvironment.environment_id == environment_id
+            )
+        )
+        self.db.execute(
+            delete(TestPlanEnvironment).where(
+                TestPlanEnvironment.environment_id == environment_id
+            )
+        )
+        self.db.execute(
+            delete(ProjectEnvironmentVariable).where(
+                ProjectEnvironmentVariable.environment_id == environment_id
+            )
+        )
+        self.db.delete(environment)
         self.db.commit()
-        self.db.refresh(environment)
-        return environment
+
+    def _purge_deleted_environment_name(self, *, project_id: int, name: str) -> None:
+        environment = self.db.scalar(
+            select(ProjectEnvironment).where(
+                ProjectEnvironment.project_id == project_id,
+                ProjectEnvironment.name == name,
+                ProjectEnvironment.is_deleted.is_(True),
+            )
+        )
+        if environment is None:
+            return
+        self.delete_environment(environment)
 
     def clear_default_environment(self, *, project_id: int) -> None:
         self.db.execute(
@@ -213,6 +382,13 @@ class ProjectRepository:
             ProjectEnvironmentVariable.environment_id == environment_id
         ).order_by(ProjectEnvironmentVariable.id.desc())
         return list(self.db.scalars(statement).all())
+
+    def get_environment_variable_values(self, *, environment_id: int) -> dict[str, str]:
+        variables = self.list_environment_variables(environment_id=environment_id)
+        return {
+            variable.name: reveal_secret_text(variable.value) if variable.is_secret else variable.value
+            for variable in variables
+        }
 
     def count_test_cases_by_environment(self, *, environment_id: int) -> int:
         statement = select(func.count()).select_from(TestCaseEnvironment).where(
@@ -276,12 +452,12 @@ class ProjectRepository:
             variable = ProjectEnvironmentVariable(
                 environment_id=environment_id,
                 name=name,
-                value=value,
+                value=protect_secret_text(value) if is_secret else value,
                 is_secret=is_secret,
             )
             self.db.add(variable)
         else:
-            variable.value = value
+            variable.value = protect_secret_text(value) if is_secret else value
             variable.is_secret = is_secret
         self.db.commit()
         self.db.refresh(variable)

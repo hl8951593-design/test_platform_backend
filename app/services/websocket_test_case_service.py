@@ -1,6 +1,5 @@
 import json
 import time
-from string import Template
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -9,6 +8,8 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.permissions import ProjectPermission
+from app.core.sensitive_data import mask_sensitive
+from app.core.variable_renderer import render_variables
 from app.models.user import User
 from app.models.websocket_test_case import WebSocketTestCase, WebSocketTestCaseExecution
 from app.repositories.websocket_test_case_repository import WebSocketTestCaseRepository
@@ -46,6 +47,23 @@ class WebSocketTestCaseService:
         self._apply_payload(test_case, payload, environment_id)
         return self.repository.save(test_case=test_case, environment_ids=environment_ids)
 
+    def delete_case(self, *, project_id: int, test_case_id: int, current_user: User) -> None:
+        self._require(current_user, project_id, ProjectPermission.MANAGE_CASE.value)
+        test_case = self._get_case(project_id, test_case_id)
+        flow_names = self.repository.referencing_flow_names(
+            project_id=project_id,
+            test_case_id=test_case_id,
+        )
+        if flow_names:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "WebSocket 测试用例已被可视化流程引用，不能删除",
+                    "flows": flow_names,
+                },
+            )
+        self.repository.delete(test_case)
+
     def execute_saved_case(self, *, project_id: int, test_case_id: int, environment_id: int | None, current_user: User) -> WebSocketTestCaseExecution:
         self._require(current_user, project_id, ProjectPermission.EXECUTE_TEST.value)
         return self._execute_saved(project_id, test_case_id, environment_id, current_user)
@@ -69,7 +87,15 @@ class WebSocketTestCaseService:
         )
         return self._execute(project_id, test_case_id, payload, current_user)
 
-    def _execute(self, project_id: int, test_case_id: int | None, payload: WebSocketTestCaseConfig, current_user: User):
+    def _execute(
+        self,
+        project_id: int,
+        test_case_id: int | None,
+        payload: WebSocketTestCaseConfig,
+        current_user: User,
+        scenario_run_id: int | None = None,
+        timeout_seconds: float | None = None,
+    ):
         environment, variables = self._load_environment_context(project_id, payload.environment_id)
         snapshot = self._build_session_snapshot(payload, environment.base_url if environment else None, variables)
         started_at = time.perf_counter()
@@ -78,7 +104,7 @@ class WebSocketTestCaseService:
         error_message = None
         status_value = "passed"
         try:
-            response_snapshot = self._run_session(snapshot)
+            response_snapshot = self._run_session(snapshot, timeout_seconds=timeout_seconds)
             assertion_results = self._run_assertions(payload.assertions, response_snapshot)
             if any(not result["passed"] for result in assertion_results):
                 status_value = "failed"
@@ -88,21 +114,24 @@ class WebSocketTestCaseService:
             error_message = str(exc)
         return self.repository.create_execution(
             project_id=project_id, websocket_test_case_id=test_case_id, environment_id=payload.environment_id,
-            executed_by_id=current_user.id, status=status_value, session_snapshot=snapshot,
+            scenario_run_id=scenario_run_id, executed_by_id=current_user.id, status=status_value,
+            session_snapshot=mask_sensitive(snapshot),
             response_snapshot=response_snapshot, assertion_results=assertion_results, error_message=error_message,
             duration_ms=int((time.perf_counter() - started_at) * 1000),
         )
 
-    def _run_session(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+    def _run_session(self, snapshot: dict[str, Any], *, timeout_seconds: float | None = None) -> dict[str, Any]:
         headers = [f"{key}: {value}" for key, value in snapshot["headers"].items()]
         connection = websocket.create_connection(
             snapshot["url"], header=headers, subprotocols=snapshot["subprotocols"] or None,
-            timeout=snapshot["connect_timeout_ms"] / 1000,
+            timeout=max(min(snapshot["connect_timeout_ms"] / 1000, timeout_seconds or float("inf")), 0.1),
         )
         sent: list[dict[str, Any]] = []
         received: list[dict[str, Any]] = []
         try:
-            connection.settimeout(snapshot["receive_timeout_ms"] / 1000)
+            connection.settimeout(
+                max(min(snapshot["receive_timeout_ms"] / 1000, timeout_seconds or float("inf")), 0.1)
+            )
             for message in snapshot["messages"]:
                 data = json.dumps(message["data"], ensure_ascii=False) if message["type"] == "json" else str(message["data"])
                 connection.send(data)
@@ -198,13 +227,7 @@ class WebSocketTestCaseService:
         self.permission_service.require_project_permission(user, project_id, permission)
 
     def _render(self, value, variables):
-        if isinstance(value, str):
-            return Template(value.replace("{{", "${").replace("}}", "}")).safe_substitute(variables)
-        if isinstance(value, dict):
-            return {key: self._render(item, variables) for key, item in value.items()}
-        if isinstance(value, list):
-            return [self._render(item, variables) for item in value]
-        return value
+        return render_variables(value, variables)
 
     def _safe_json(self, value):
         try:

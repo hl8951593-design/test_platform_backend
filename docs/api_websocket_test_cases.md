@@ -19,9 +19,12 @@ WebSocket 测试用例与 HTTP 测试用例完全独立：使用 `/api/v1/websoc
 | GET | `/websocket-test-cases?project_id={project_id}` | `case:view` | 查询用例 |
 | POST | `/websocket-test-cases?project_id={project_id}` | `case:manage` | 新增用例 |
 | PUT | `/websocket-test-cases/{id}?project_id={project_id}` | `case:manage` | 更新用例 |
+| DELETE | `/websocket-test-cases/{id}?project_id={project_id}` | `case:manage` | 删除用例 |
 | POST | `/websocket-test-cases/{id}/execute?project_id={project_id}` | `test:execute` | 执行已保存用例 |
 | POST | `/websocket-test-cases/execute-unsaved?project_id={project_id}` | `test:execute` | 执行未保存用例 |
 | POST | `/websocket-test-cases/batch-execute?project_id={project_id}` | `test:execute` | 按顺序批量执行 |
+
+删除时保留历史执行记录并将 `websocket_test_case_id` 置空。已保存的场景版本仍按完整快照执行；如果可视化流程版本仍引用该用例，接口返回 `409 Conflict`，并在 `detail.flows` 中返回流程名称。
 
 ## 配置示例
 

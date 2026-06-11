@@ -1,8 +1,11 @@
 from fastapi import HTTPException, status
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.permissions import NORMAL_TESTER_GRANTABLE_PERMISSIONS, ProjectPermission
 from app.models.project import Project, ProjectEnvironment
+from app.models.scenario import TestScenario, TestScenarioRun
 from app.models.user import User
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.user_repository import UserRepository
@@ -51,9 +54,9 @@ class ProjectService:
             description=payload.description,
         )
 
-    def delete(self, project_id: int, current_user: User) -> Project:
+    def delete(self, project_id: int, current_user: User) -> None:
         project = self.permission_service.require_project_creator_or_admin(current_user, project_id)
-        return self.project_repository.soft_delete(project)
+        self.project_repository.delete_project(project)
 
     def grant_normal_tester_permissions(
         self,
@@ -146,14 +149,21 @@ class ProjectService:
             project_id,
             ProjectPermission.MANAGE_ENVIRONMENT.value,
         )
-        return self.project_repository.create_environment(
-            project_id=project_id,
-            name=payload.name,
-            base_url=payload.base_url,
-            description=payload.description,
-            is_default=payload.is_default,
-            created_by_id=current_user.id,
-        )
+        try:
+            return self.project_repository.create_environment(
+                project_id=project_id,
+                name=payload.name,
+                base_url=payload.base_url,
+                description=payload.description,
+                is_default=payload.is_default,
+                created_by_id=current_user.id,
+            )
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="同一项目下环境名称不能重复",
+            ) from exc
 
     def update_environment(
         self,
@@ -174,15 +184,22 @@ class ProjectService:
         )
         if environment is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="环境不存在")
-        return self.project_repository.update_environment(
-            environment=environment,
-            name=payload.name,
-            base_url=payload.base_url,
-            description=payload.description,
-            is_default=payload.is_default,
-        )
+        try:
+            return self.project_repository.update_environment(
+                environment=environment,
+                name=payload.name,
+                base_url=payload.base_url,
+                description=payload.description,
+                is_default=payload.is_default,
+            )
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="同一项目下环境名称不能重复",
+            ) from exc
 
-    def delete_environment(self, *, project_id: int, environment_id: int, current_user: User) -> ProjectEnvironment:
+    def delete_environment(self, *, project_id: int, environment_id: int, current_user: User) -> None:
         self.permission_service.require_project_permission(
             current_user,
             project_id,
@@ -194,7 +211,22 @@ class ProjectService:
         )
         if environment is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="环境不存在")
-        return self.project_repository.soft_delete_environment(environment)
+        scenario_count = self.db.scalar(
+            select(func.count())
+            .select_from(TestScenario)
+            .where(TestScenario.environment_id == environment_id)
+        ) or 0
+        run_count = self.db.scalar(
+            select(func.count())
+            .select_from(TestScenarioRun)
+            .where(TestScenarioRun.environment_id == environment_id)
+        ) or 0
+        if scenario_count or run_count:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="环境仍被场景或场景执行记录使用，不能删除",
+            )
+        self.project_repository.delete_environment(environment)
 
     def list_environment_test_cases(
         self,
@@ -263,7 +295,19 @@ class ProjectService:
         environment = self.project_repository.get_environment(project_id=project_id, environment_id=environment_id)
         if environment is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="环境不存在")
-        return self.project_repository.list_environment_variables(environment_id=environment_id)
+        variables = self.project_repository.list_environment_variables(environment_id=environment_id)
+        return [
+            {
+                "id": variable.id,
+                "environment_id": variable.environment_id,
+                "name": variable.name,
+                "value": "***" if variable.is_secret else variable.value,
+                "is_secret": variable.is_secret,
+                "created_at": variable.created_at,
+                "updated_at": variable.updated_at,
+            }
+            for variable in variables
+        ]
 
     def upsert_environment_variable(
         self,
@@ -281,12 +325,21 @@ class ProjectService:
         environment = self.project_repository.get_environment(project_id=project_id, environment_id=environment_id)
         if environment is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="环境不存在")
-        return self.project_repository.upsert_environment_variable(
+        variable = self.project_repository.upsert_environment_variable(
             environment_id=environment_id,
             name=payload.name,
             value=payload.value,
             is_secret=payload.is_secret,
         )
+        return {
+            "id": variable.id,
+            "environment_id": variable.environment_id,
+            "name": variable.name,
+            "value": "***" if variable.is_secret else variable.value,
+            "is_secret": variable.is_secret,
+            "created_at": variable.created_at,
+            "updated_at": variable.updated_at,
+        }
 
     def delete_environment_variable(
         self,
@@ -314,6 +367,9 @@ class ProjectService:
 
     def _build_environment_detail(self, environment: ProjectEnvironment) -> ProjectEnvironmentDetailRead:
         detail = ProjectEnvironmentDetailRead.model_validate(environment)
+        for variable in detail.variables:
+            if variable.is_secret:
+                variable.value = "***"
         detail.test_case_count = self.project_repository.count_test_cases_by_environment(
             environment_id=environment.id,
         )

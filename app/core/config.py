@@ -27,6 +27,16 @@ class Settings(BaseSettings):
     TEST_PLAN_SCHEDULER_ENABLED: bool = True
     TEST_PLAN_SCHEDULER_INTERVAL_SECONDS: int = 30
     TEST_PLAN_DEFAULT_TIMEZONE: str = "Asia/Shanghai"
+    TEST_PLAN_RUN_STALE_SECONDS: int = 3600
+    TEST_PLAN_WEBHOOK_SECRET: str = ""
+    TEST_PLAN_WEBHOOK_MAX_AGE_SECONDS: int = 300
+    SNAPSHOT_ENCRYPTION_KEY: str = ""
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = ""
+    SMTP_USE_TLS: bool = True
     BACKEND_CORS_ORIGINS: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",

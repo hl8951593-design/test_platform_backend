@@ -1,7 +1,6 @@
 import json
 import uuid
 import time
-from string import Template
 from typing import Any
 from urllib.parse import urlencode
 
@@ -10,6 +9,8 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.permissions import ProjectPermission
+from app.core.sensitive_data import mask_sensitive
+from app.core.variable_renderer import render_variables
 from app.models.test_case import TestCase, TestCaseExecution
 from app.models.user import User
 from app.repositories.test_case_repository import TestCaseRepository
@@ -92,6 +93,27 @@ class TestCaseService:
             assertions=[item.model_dump() for item in payload.assertions],
             extractors=[item.model_dump() for item in payload.extractors],
         )
+
+    def delete_case(self, *, project_id: int, test_case_id: int, current_user: User) -> None:
+        self.permission_service.require_project_permission(
+            current_user,
+            project_id,
+            ProjectPermission.MANAGE_CASE.value,
+        )
+        test_case = self._get_case_or_404(project_id=project_id, test_case_id=test_case_id)
+        flow_names = self.repository.referencing_flow_names(
+            project_id=project_id,
+            test_case_id=test_case_id,
+        )
+        if flow_names:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "测试用例已被可视化流程引用，不能删除",
+                    "flows": flow_names,
+                },
+            )
+        self.repository.delete(test_case)
 
     def execute_saved_case(
         self,
@@ -186,6 +208,8 @@ class TestCaseService:
         test_case_id: int | None,
         payload: TestCaseRequestConfig | UnsavedTestCaseExecuteRequest,
         current_user: User,
+        scenario_run_id: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> TestCaseExecution:
         environment, variables = self._load_environment_context(
             project_id=project_id,
@@ -200,7 +224,7 @@ class TestCaseService:
         status_value = "passed"
 
         try:
-            response_snapshot = self._send_request(request_snapshot)
+            response_snapshot = self._send_request(request_snapshot, timeout_seconds=timeout_seconds)
             assertion_results = self._run_assertions(payload.assertions, response_snapshot)
             if any(not result["passed"] for result in assertion_results):
                 status_value = "failed"
@@ -214,9 +238,10 @@ class TestCaseService:
             project_id=project_id,
             test_case_id=test_case_id,
             environment_id=payload.environment_id,
+            scenario_run_id=scenario_run_id,
             executed_by_id=current_user.id,
             status=status_value,
-            request_snapshot=request_snapshot,
+            request_snapshot=mask_sensitive(request_snapshot),
             response_snapshot=response_snapshot,
             assertion_results=assertion_results,
             error_message=error_message,
@@ -288,13 +313,7 @@ class TestCaseService:
         }
 
     def _render_value(self, value: Any, variables: dict[str, str]) -> Any:
-        if isinstance(value, str):
-            return Template(value.replace("{{", "${").replace("}}", "}")).safe_substitute(variables)
-        if isinstance(value, dict):
-            return {key: self._render_value(item, variables) for key, item in value.items()}
-        if isinstance(value, list):
-            return [self._render_value(item, variables) for item in value]
-        return value
+        return render_variables(value, variables)
 
     def _send_request_legacy(self, request_snapshot: dict[str, Any]) -> dict[str, Any]:
         return self._send_request(request_snapshot)
@@ -326,7 +345,9 @@ class TestCaseService:
         except URLError as exc:
             raise RuntimeError(f"请求失败: {exc.reason}") from exc
 
-    def _send_request(self, request_snapshot: dict[str, Any]) -> dict[str, Any]:
+    def _send_request(
+        self, request_snapshot: dict[str, Any], *, timeout_seconds: float | None = None
+    ) -> dict[str, Any]:
         body = request_snapshot["body"]
         data = None
         headers = dict(request_snapshot["headers"] or {})
@@ -342,7 +363,7 @@ class TestCaseService:
                 request_snapshot["url"],
                 content=data,
                 headers=headers,
-                timeout=20,
+                timeout=max(min(timeout_seconds or 20, 20), 0.1),
                 follow_redirects=True,
             )
         except httpx.RequestError as exc:

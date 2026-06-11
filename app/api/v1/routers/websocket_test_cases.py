@@ -113,6 +113,21 @@ def update_case(project_id: int, test_case_id: int, payload: WebSocketTestCaseUp
     return success(data=WebSocketTestCaseRead.model_validate(case))
 
 
+@router.delete("/{test_case_id}", summary="删除 WebSocket 测试用例")
+def delete_case(
+    project_id: int,
+    test_case_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    WebSocketTestCaseService(db).delete_case(
+        project_id=project_id,
+        test_case_id=test_case_id,
+        current_user=current_user,
+    )
+    return success(message="WebSocket 测试用例删除成功")
+
+
 @router.post("/{test_case_id}/execute")
 def execute_saved_case(project_id: int, test_case_id: int, environment_id: int | None = Query(default=None), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     execution = WebSocketTestCaseService(db).execute_saved_case(project_id=project_id, test_case_id=test_case_id, environment_id=environment_id, current_user=current_user)

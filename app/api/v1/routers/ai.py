@@ -10,6 +10,7 @@ from app.schemas.ai import (
     AIBrowserCaptureGenerateRequest,
     AIBrowserCaptureRelationsRequest,
     AIBrowserCaptureScenarioRequest,
+    AIExecutionDiagnoseRequest,
     AITestCaseExpandRequest,
     AITestCaseGenerateRequest,
     AIWebSocketTestCaseExpandRequest,
@@ -62,6 +63,17 @@ def generate_browser_capture_scenario(
         project_id=project_id, capture_id=capture_id, payload=payload, current_user=current_user
     )
     return success(data=result, message="场景草稿生成完成")
+
+
+@router.post("/executions/diagnose", summary="AI 诊断接口执行结果")
+def diagnose_execution(
+    project_id: int, payload: AIExecutionDiagnoseRequest,
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    result = AIBrowserCaptureService(db).diagnose_execution(
+        project_id=project_id, payload=payload, current_user=current_user
+    )
+    return success(data=result, message="AI 执行诊断完成")
 
 
 @router.get("/provider", summary="查询 AI 数据源配置")

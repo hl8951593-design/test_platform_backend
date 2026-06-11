@@ -4,24 +4,31 @@ from typing import Any
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.permissions import ProjectPermission
 from app.models.user import User
 from app.schemas.ai import (
+    AIChatMessage,
+    AIChatRequest,
     AIBrowserCaptureBatchGenerateRequest,
     AIBrowserCaptureGenerateRequest,
     AIBrowserCaptureRelationsRequest,
     AIBrowserCaptureScenarioRequest,
+    AIExecutionDiagnoseRequest,
     AITestCaseGenerateRequest,
     AIWebSocketTestCaseGenerateRequest,
 )
+from app.services.ai_service import AIService
 from app.services.ai_test_case_service import AITestCaseService
 from app.services.ai_websocket_test_case_service import AIWebSocketTestCaseService
 from app.services.browser_capture_service import BrowserCaptureService
+from app.services.permission_service import PermissionService
 
 
 class AIBrowserCaptureService:
     def __init__(self, db: Session):
         self.db = db
         self.capture_service = BrowserCaptureService(db)
+        self.permission_service = PermissionService(db)
 
     def generate_cases(self, *, project_id: int, capture_id: int, entry_id: int, payload: AIBrowserCaptureGenerateRequest, current_user: User):
         entry = self.capture_service.get_entry(project_id=project_id, capture_id=capture_id, entry_id=entry_id, current_user=current_user, manage=True)
@@ -86,7 +93,9 @@ class AIBrowserCaptureService:
                     if not self._relation_candidate(response_path, response_value):
                         continue
                     for request_path, request_value in request_values.items():
-                        if response_value == request_value:
+                        if response_value == request_value and self._paths_compatible(
+                            response_path, request_path, response_value
+                        ):
                             variable = self._variable_name(response_path)
                             relations.append({
                                 "producer_entry_id": producer.id,
@@ -97,7 +106,7 @@ class AIBrowserCaptureService:
                                 "request_path": request_path,
                                 "variable": variable,
                                 "replacement": "{{" + variable + "}}",
-                                "confidence": 0.95,
+                                "confidence": 0.95 if isinstance(response_value, str) else 0.8,
                             })
         return {
             "capture_id": capture_id,
@@ -138,6 +147,32 @@ class AIBrowserCaptureService:
             "warnings": analysis["warnings"],
         }
 
+    def diagnose_execution(self, *, project_id: int, payload: AIExecutionDiagnoseRequest, current_user: User):
+        self.permission_service.require_project_permission(
+            current_user, project_id, ProjectPermission.EXECUTE_TEST.value
+        )
+        response = AIService().chat(AIChatRequest(
+            messages=[
+                AIChatMessage(role="system", content=(
+                    "你是接口自动化测试失败诊断助手。只输出合法 JSON，包含 summary、probable_causes、"
+                    "evidence、suggestions、risk_level。不要编造未提供的日志、字段或业务规则。"
+                )),
+                AIChatMessage(role="user", content=json.dumps({
+                    "protocol": payload.protocol,
+                    "draft": payload.draft_data,
+                    "execution": payload.execution_data,
+                }, ensure_ascii=False, indent=2)),
+            ],
+            thinking="disabled", temperature=0.1, max_tokens=2500, response_format="json",
+        ))
+        try:
+            result = json.loads(response.content)
+        except json.JSONDecodeError:
+            result = {"summary": response.content, "probable_causes": [], "evidence": [], "suggestions": [],
+                      "risk_level": "unknown"}
+        result["model"] = response.model
+        return result
+
     def _selected_entries(self, *, project_id: int, capture_id: int, entry_ids: list[int] | None,
                           current_user: User):
         entries = list(reversed(self.capture_service.list_entries(
@@ -167,8 +202,14 @@ class AIBrowserCaptureService:
     def _relation_candidate(self, path: str, value: Any) -> bool:
         key = path.rsplit(".", 1)[-1].lower()
         return key not in {"status", "status_code", "code", "message", "success"} and (
-            isinstance(value, str) and len(value) >= 6 or isinstance(value, int) and value > 0
+            isinstance(value, str) and len(value) >= 6
+            or isinstance(value, int) and not isinstance(value, bool) and value > 0
         )
+
+    def _paths_compatible(self, response_path: str, request_path: str, value: Any) -> bool:
+        if isinstance(value, str):
+            return True
+        return response_path.rsplit(".", 1)[-1].lower() == request_path.rsplit(".", 1)[-1].lower()
 
     def _variable_name(self, path: str) -> str:
         raw = path.rsplit(".", 1)[-1].replace("-", "_")

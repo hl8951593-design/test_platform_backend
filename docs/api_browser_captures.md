@@ -24,6 +24,6 @@ Chrome 插件使用浏览器采集接口保存一次操作过程中捕获的 HTT
 | `POST` | `/api/v1/ai/browser-captures/{capture_id}/entries/{entry_id}/generate-cases?project_id={id}` | 根据结构化草稿生成用例 |
 | `POST` | `/api/v1/ai/browser-captures/{capture_id}/generate-cases?project_id={id}` | 为选中草稿批量生成用例建议 |
 | `POST` | `/api/v1/ai/browser-captures/{capture_id}/analyze-relations?project_id={id}` | 分析响应字段与后续请求字段依赖 |
-| `POST` | `/api/v1/ai/browser-captures/{capture_id}/generate-scenario?project_id={id}` | 生成有序场景草稿与变量替换建议 |
+| `POST` | `/api/v1/ai/browser-captures/{capture_id}/generate-scenario?project_id={id}` | 生成有序场景草稿与跨步骤响应引用建议 |
 
 查看批次和草稿需要 `case:view`，创建、同步、更新与 AI 生成需要 `case:manage`。

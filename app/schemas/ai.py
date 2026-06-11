@@ -137,6 +137,12 @@ class AIBrowserCaptureScenarioRequest(AIBrowserCaptureRelationsRequest):
     name: str | None = Field(default=None, max_length=128)
 
 
+class AIExecutionDiagnoseRequest(BaseModel):
+    protocol: Literal["http", "websocket"]
+    draft_data: dict[str, Any]
+    execution_data: dict[str, Any]
+
+
 class AIGeneratedWebSocketTestCaseResponse(BaseModel):
     project_id: int
     environment_id: int

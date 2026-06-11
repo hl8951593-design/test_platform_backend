@@ -17,6 +17,7 @@ from app.schemas.ai import (
     AIBrowserCaptureGenerateRequest,
     AIBrowserCaptureRelationsRequest,
     AIBrowserCaptureScenarioRequest,
+    AIExecutionDiagnoseRequest,
 )
 from app.schemas.browser_capture import BrowserCaptureCreateRequest, BrowserCaptureEntryBatchRequest, BrowserCaptureEntryPayload, BrowserCaptureEntryUpdateRequest
 from app.services.ai_browser_capture_service import AIBrowserCaptureService
@@ -84,6 +85,16 @@ def main() -> None:
         )
         assert len(scenario["steps"]) == 2
         assert len(scenario["relations"]) == 1
+        diagnosis_response = SimpleNamespace(content='{"summary":"鉴权失败","probable_causes":["token 失效"],"evidence":[],"suggestions":[],"risk_level":"medium"}', model="mock-ai")
+        with patch("app.services.ai_browser_capture_service.AIService.chat", return_value=diagnosis_response):
+            diagnosis = AIBrowserCaptureService(db).diagnose_execution(
+                project_id=project.id,
+                payload=AIExecutionDiagnoseRequest(protocol="http", draft_data={"path": "/orders"},
+                                                   execution_data={"status": "failed"}),
+                current_user=user,
+            )
+        assert diagnosis["summary"] == "鉴权失败"
+        assert diagnosis["model"] == "mock-ai"
         print("browser-capture-service-ok")
 
 

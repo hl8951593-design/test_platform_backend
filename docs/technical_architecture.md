@@ -1,5 +1,7 @@
 # 自动化测试平台后端技术架构文档
 
+文档入口、权威范围和维护要求见 [文档索引与维护规范](README.md)。
+
 开发过程中的模块关系、业务逻辑、数据权限和用户权限记录见 [开发过程技术文档](development_technical_notes.md)。
 
 项目权限底座接口见 [项目权限接口文档](api_project_permissions.md)。
@@ -7,6 +9,13 @@
 测试用例接口见 [测试用例接口文档](api_test_cases.md)。
 
 WebSocket 测试用例接口见 [WebSocket 测试用例接口技术文档](api_websocket_test_cases.md)。
+
+场景组合与实时事件接口见 [场景组合接口文档](api_scenarios.md)。
+
+缺陷跟踪接口见 [缺陷跟踪接口文档](api_defects.md)。
+
+场景从触发到 dataset record、步骤、变量和事件持久化的完整关系见
+[场景组合执行流程图谱](scenario_execution_graph.md)。
 
 ## 1. 项目定位
 
@@ -20,15 +29,16 @@ WebSocket 测试用例接口见 [WebSocket 测试用例接口技术文档](api_w
 | --- | --- | --- |
 | Web 框架 | FastAPI | 提供 REST API，支持 OpenAPI 文档和类型校验 |
 | ASGI 服务 | Uvicorn | 本地开发和服务启动 |
-| 数据库 | MySQL | 保存用户、项目、接口、用例、流程、执行记录和报告 |
+| 数据库 | MySQL | 保存用户、项目、接口、用例、流程、缺陷、执行记录和报告 |
 | ORM | SQLAlchemy 2.x | 负责数据库模型和查询 |
 | 数据库迁移 | Alembic | 管理表结构版本演进 |
 | 数据校验 | Pydantic v2 | 定义请求和响应数据结构 |
 | 认证 | JWT | 支持前后端分离认证 |
 | 密码加密 | passlib[bcrypt] | 用户密码哈希存储 |
 | 缓存/临时状态 | Redis | 保存 token 状态、任务状态、临时变量和限流数据 |
-| HTTP 执行引擎 | requests | 执行接口测试步骤 |
-| 异步任务 | Celery + Redis | 后期用于异步执行测试流程和定时任务 |
+| HTTP 执行引擎 | httpx | 执行接口测试步骤 |
+| 异步任务 | FastAPI BackgroundTasks（当前）/ 独立 Worker（演进目标） | 当前场景手工执行在响应后继续运行；生产可靠性阶段迁移到独立 Worker |
+| 实时事件 | SSE + MySQL 持久化事件表 | 支持鉴权请求头、Last-Event-ID 重放、心跳和终态关闭 |
 | 测试报告 | 自研 | 基于执行记录生成平台内置报告 |
 | 配置管理 | pydantic-settings + .env | 管理环境配置 |
 | 日志 | Python logging 或 loguru | 记录系统日志和执行日志 |
@@ -75,7 +85,7 @@ app/
 
 ### 3.1 API 层
 
-API 层负责对外提供 HTTP 接口，包括用户认证、项目管理、环境管理、接口管理、用例管理、流程管理、执行管理和报告查询。
+API 层负责对外提供 HTTP 接口，包括用户认证、项目管理、环境管理、接口管理、用例管理、流程管理、缺陷跟踪、执行管理和报告查询。
 
 API 层只做参数接收、权限校验和响应封装，不直接写复杂业务逻辑。
 
@@ -208,37 +218,161 @@ Redis 可用于：
 
 ### 4.6 测试执行
 
-接口流程执行不依赖 pytest，直接使用 requests 作为 HTTP 执行引擎。
+接口流程执行不依赖 pytest，直接使用 httpx 作为 HTTP 执行引擎。
 
-推荐执行链路：
+当前场景手工执行链路：
 
 ```text
 前端点击执行
--> FastAPI 创建执行任务
--> MySQL 写入执行记录
--> Redis 写入任务状态
--> Celery Worker 获取任务
--> Runner 使用 requests 执行流程
--> 每一步结果写入 MySQL
--> Redis 更新实时状态
--> 前端轮询或 WebSocket 查看进度
+-> FastAPI 校验权限、场景版本、环境和数据集
+-> MySQL 写入 test_scenario_executions
+-> 每个已选择数据集的每条 enabled record 写入 test_scenario_runs 和 run_queued
+-> API 返回 HTTP 202、execution_id、run_id 和订阅地址
+-> FastAPI BackgroundTasks 使用独立 Session 执行已有 run
+-> 步骤执行继续复用原变量渲染、用例执行、断言和提取逻辑
+-> 每个状态边界先写 test_scenario_run_events，再由 SSE 读取
+-> 前端通过 Last-Event-ID 重连，必要时用 run detail 恢复快照
 ```
 
-执行入口不直接运行长流程。API 先创建持久化 `pending` 运行并返回 HTTP 202，再由后台执行器领取。
-当前版本使用数据库状态机和应用内执行线程；任务在领取前已经持久化，进程重启后可恢复。
-生产环境可将同一领取与执行边界迁移到 Celery Worker，无需改变 API 和运行状态模型。
+执行入口不直接等待长场景。API 先创建持久化 `queued` 运行并返回 HTTP 202，再由
+应用内后台任务继续执行。当前实现保证任务 ID、运行快照和事件在响应前落库，但尚未提供
+进程重启后的自动领取和恢复，因此不能把 `BackgroundTasks` 视为可靠任务队列。
+
+生产环境可将“读取 queued execution 并执行 run”的边界迁移到 Celery、RQ 或专用 Worker，
+无需改变现有 API、运行状态和 SSE 事件协议。迁移时必须增加原子 claim、租约、Worker 心跳、
+重复投递幂等和孤儿任务恢复。
+
+### 4.7 场景实时事件模型
+
+```text
+test_scenario_executions
+  1 -> N test_scenario_runs
+         1 -> N test_scenario_run_events
+```
+
+- execution 表示一次用户点击或一次幂等执行请求。
+- run 表示一个数据集 record 的一次运行，是详情快照和最终结果的权威来源。
+- event 表示 run 内不可变的有序状态变化，`run_id + sequence` 唯一。
+- 事件必须先提交数据库，再允许 SSE 客户端读取。
+- SSE 采用至少一次读取语义，客户端以 `run_id + sequence` 去重。
+- 心跳也持久化并占用 sequence，保证所有带 ID 的消息都可以重放。
+- 完整请求和响应正文不进入 SSE，只保存在执行详情及关联用例执行记录中。
+
+运行状态机：
+
+```text
+queued -> running -> passed | failed | timeout | cancelled
+```
+
+步骤状态机：
+
+```text
+pending -> running -> passed | failed | timeout | skipped | cancelled
+```
+
+执行期间 `test_scenario_runs` 维护 `current_step_id`、`current_step_index`、
+`last_event_sequence` 和渐进式 `step_results`，用于页面刷新或事件流中断后的快照恢复。
+
+### 4.8 数据驱动请求解析
+
+场景数据集使用 `records` 表示独立测试输入。未指定数据集时选择所有启用数据集；显式指定
+数据集时保留原有选择语义。每个选中数据集只展开其 `enabled=true` 的 record，每条 record
+创建一个独立 run。没有 `records` 的历史数据集在读取时归一化为一条兼容 record。
+
+每个步骤按以下顺序构建最终请求：
+
+```text
+读取不可变场景版本和步骤请求快照
+-> 深拷贝当前步骤请求
+-> 应用当前 record 对该步骤的 request_overrides
+-> 解析数据集变量、环境变量和上游步骤绑定
+-> 按协议 Schema 校验最终请求
+-> 执行并保存已解析请求快照
+```
+
+覆盖项优先于保存的请求快照，但模板解析发生在覆盖之后，因此覆盖值可以继续使用
+`{{variable}}`。HTTP 步骤支持 `path`、`headers`、`query_params` 和嵌套 JSON `body`；
+WebSocket 步骤支持 `path` 和 `headers`。覆盖只作用于当前 run 的请求副本，不修改场景版本。
+
+核心资源列表统一使用 `{items,total,page,page_size}` 分页结构。HTTP 和 WebSocket 用例支持
+关键字与环境筛选；可视化 Flow 支持关键字与状态筛选。列表查询在 Repository 层完成 count、
+filter、offset 和 limit，Service 负责权限和响应组装。
+
+### 4.9 统一错误边界
+
+应用级异常处理器统一覆盖业务 HTTP 异常、请求校验、框架 404 和未处理异常：
+
+```text
+Router / Dependency / Service 抛出异常
+-> StarletteHTTPException 保留状态码和结构化 detail
+-> RequestValidationError 返回 422 字段定位数组
+-> 未处理异常记录服务端堆栈和 request_id
+-> 客户端统一接收 {code,message,data}
+```
+
+500 响应不泄露内部异常，使用 `X-Request-ID` 关联服务日志。公共 `ErrorResponse` Schema 和
+常见状态码已注册到 OpenAPI。详细契约见 [统一错误响应文档](api_errors.md)。
+
+### 4.10 步骤内部重试
+
+HTTP 和 WebSocket 的自动重试位于协议执行器内部，而不是场景步骤结果路由层。单个步骤可
+经历多个 attempt，但场景外层只接收最终成功或最终失败。
+
+```text
+发送请求或建立会话
+-> 分类网络错误、超时、HTTP 状态
+-> 必要时指数退避 + Full Jitter
+-> 执行断言
+-> 轮询断言必要时重试
+-> 断言全部通过后提取变量
+-> 返回步骤最终结果
+```
+
+HTTP 默认重试网络错误、超时、408、429、500、502、503、504；普通 4xx 不自动重试，
+429 优先尊重 `Retry-After`。POST/PATCH 等非幂等方法默认禁止自动重试。WebSocket 每次
+attempt 都重新建立连接并重放消息序列。所有 attempt 写入执行记录，失败 attempt 不修改变量。
+
+### 4.11 统一执行记录查询
+
+执行中心采用只读聚合层，不建立新的执行总表，也不改变四类执行器的持久化职责：
+
+```text
+GET /execution-records
+-> ExecutionRecordService 校验 report:view
+-> ExecutionRecordRepository
+-> UNION ALL(
+     test_case_executions,
+     websocket_test_case_executions,
+     test_scenario_runs,
+     visual_flow_executions
+   )
+-> 公共筛选、计数、排序和分页
+```
+
+公共摘要统一执行类型、资源、项目、环境、触发人、状态、耗时、时间和错误信息。详情按
+`execution_type + execution_id` 回查原始表，HTTP/WebSocket 保留请求或会话、响应、断言和
+attempt 历史；场景保留 dataset record、变量、步骤结果和持久化事件；Flow 保留上下文和节点
+执行明细。该边界使报告和趋势统计复用统一读取模型，同时避免复制历史数据或影响现有执行链路。
+
+被删除资源通过外连接返回历史记录，资源名称允许为 `null`。统一执行记录是报告域能力，使用
+`report:view`，不要求调用方同时具备四类资源查看权限。
 
 ## 5. 自研测试报告设计
 
 测试报告基于执行过程中的结构化数据生成，不依赖 Allure。
 
-建议报告分层：
+当前首版不建立独立报告表，而是使用测试计划运行和 Flow 执行的不可变快照生成只读报告：
 
 ```text
-test_plan_run        # 一次测试计划或测试流程执行
-test_case_run        # 某个用例的一次执行
-test_step_run        # 某个接口步骤的一次执行
-test_assertion_run   # 某条断言的一次执行结果
+GET /reports
+-> TestReportService 校验 report:view
+-> TestReportRepository 聚合 test_plan_runs + visual_flow_executions
+-> 返回报告历史摘要
+
+GET /reports/{source_type}/{source_id}
+-> plan: target_results + test_scenario_runs + step_results
+-> flow: context_snapshot + visual_flow_node_executions
+-> 生成统一 summary、来源专属 metrics 和 items
 ```
 
 ### 5.1 报告核心指标
@@ -263,6 +397,9 @@ test_assertion_run   # 某条断言的一次执行结果
 - 失败断言数
 - 失败原因摘要
 
+计划报告区分目标级计数和 dataset record 场景运行级计数。Flow 报告按节点统计通过、失败、
+跳过和通过率。运行尚未完成时，结束时间和耗时允许为空。
+
 ### 5.2 步骤执行明细
 
 每个步骤建议记录：
@@ -280,7 +417,21 @@ test_assertion_run   # 某条断言的一次执行结果
 - 提取变量结果
 - 错误信息
 
-### 5.3 数据存储注意事项
+### 5.3 HTML 导出
+
+HTML 导出与结构化报告使用同一读取模型，不再次查询或复制执行数据。导出内容包括摘要、
+指标卡片和可展开的完整明细，使用 `Content-Disposition: attachment` 下载。所有运行名称、
+节点标识和 JSON 明细在写入 HTML 前必须转义，防止执行数据形成脚本注入。
+
+当前不持久化导出文件；每次下载即时生成。PDF 和长期归档仍属于后续阶段。
+
+### 5.4 历史趋势
+
+趋势接口在数据库内合并测试计划运行和 Flow 执行，按开始日期分组，统计执行次数、通过、
+失败、其他状态、通过率和平均耗时。默认窗口 30 天，最大 366 天，可按来源类型和环境过滤。
+趋势粒度是一次报告来源运行，不是计划目标、dataset record 或 Flow 节点。
+
+### 5.5 数据存储注意事项
 
 请求和响应数据可能很大，也可能包含敏感信息。
 
@@ -290,7 +441,7 @@ test_assertion_run   # 某条断言的一次执行结果
 - 对 token、password、secret 等字段脱敏
 - 执行日志和报告设置保留周期
 - 重要报告允许归档
-- 报告摘要和报告明细分表存储
+- 当即时聚合无法满足数据量和归档要求时，再引入报告摘要与明细表
 
 ## 6. Redis 使用规划
 
@@ -454,7 +605,7 @@ MySQL 用于保存平台核心业务数据。
 - 失败处理策略
 - 流程执行记录
 
-### 第四阶段：自研报告
+### 第四阶段：自研报告（基础能力已实现）
 
 - 执行摘要
 - 步骤明细
@@ -462,14 +613,15 @@ MySQL 用于保存平台核心业务数据。
 - 失败原因
 - 历史报告查询
 - 报告趋势统计
+- HTML 离线导出
 
 ### 第五阶段：任务系统
 
-- Celery 接入
-- 异步执行
+- 场景异步执行与持久化 SSE（已完成基础版本）
+- 独立 Worker、任务 claim 和重启恢复
 - 定时执行
 - 批量执行
-- 实时进度
+- 实时进度协议扩展到可视化 Flow
 - 执行取消
 
 ### 第六阶段：平台增强
@@ -483,16 +635,19 @@ MySQL 用于保存平台核心业务数据。
 
 ## 10. 当前结论
 
-当前项目处于 FastAPI 初始化阶段，后续推荐围绕以下主线演进：
+当前项目已完成认证、项目权限、环境、HTTP/WebSocket 用例、场景组合、测试计划、
+浏览器采集、场景实时执行、统一执行记录、报告查询、HTML 导出和按日趋势等核心能力。
+后续主线为执行可靠性、前端联调以及报告归档和 PDF 扩展：
 
 ```text
 FastAPI API 服务
 -> MySQL 业务数据
 -> JWT 用户认证
--> Redis 缓存和任务状态
--> requests 自研接口执行器
--> 自研测试报告
--> Celery 异步执行
+-> httpx 自研接口执行器
+-> MySQL 持久化运行快照与 SSE 事件
+-> 跨协议统一执行记录读取模型
+-> 独立 Worker 和可靠任务领取
+-> 自研测试报告与趋势读取模型
 ```
 
 这套架构更适合建设一个真正的平台型后端，而不是简单调用第三方测试框架。它的前期建设成本略高，但对可视化编排、执行历史、报告分析、权限管理和后续扩展更友好。

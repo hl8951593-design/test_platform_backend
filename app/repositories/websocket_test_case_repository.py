@@ -1,4 +1,4 @@
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.project import ProjectEnvironment, ProjectEnvironmentVariable
@@ -11,11 +11,45 @@ class WebSocketTestCaseRepository:
     def __init__(self, db: Session):
         self.db = db
 
-    def list_by_project(self, *, project_id: int) -> list[WebSocketTestCase]:
-        statement = select(WebSocketTestCase).options(selectinload(WebSocketTestCase.environment_links)).where(
-            WebSocketTestCase.project_id == project_id
-        ).order_by(WebSocketTestCase.id.desc())
-        return list(self.db.scalars(statement).all())
+    def list_by_project(
+        self,
+        *,
+        project_id: int,
+        keyword: str | None,
+        environment_id: int | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[WebSocketTestCase], int]:
+        conditions = [WebSocketTestCase.project_id == project_id]
+        if keyword:
+            pattern = f"%{keyword.strip()}%"
+            conditions.append(
+                or_(
+                    WebSocketTestCase.name.ilike(pattern),
+                    WebSocketTestCase.description.ilike(pattern),
+                )
+            )
+        if environment_id is not None:
+            conditions.append(
+                or_(
+                    WebSocketTestCase.environment_id == environment_id,
+                    WebSocketTestCase.environment_links.any(
+                        WebSocketTestCaseEnvironment.environment_id == environment_id
+                    ),
+                )
+            )
+        total = self.db.scalar(
+            select(func.count(WebSocketTestCase.id)).where(*conditions)
+        ) or 0
+        statement = (
+            select(WebSocketTestCase)
+            .options(selectinload(WebSocketTestCase.environment_links))
+            .where(*conditions)
+            .order_by(WebSocketTestCase.updated_at.desc(), WebSocketTestCase.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        return list(self.db.scalars(statement).all()), int(total)
 
     def get_by_id(self, *, project_id: int, test_case_id: int) -> WebSocketTestCase | None:
         statement = select(WebSocketTestCase).options(selectinload(WebSocketTestCase.environment_links)).where(

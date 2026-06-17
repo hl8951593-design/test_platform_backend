@@ -137,6 +137,8 @@ Content-Type: application/json
     "project:view",
     "api:view",
     "case:view",
+    "defect:view",
+    "defect:create",
     "test:execute",
     "report:view"
   ]

@@ -13,6 +13,13 @@ The visual flow module persists versioned DAG definitions and executes HTTP, Web
 | POST | `/api/v1/flows/{flow_id}/execute?project_id={project_id}` | `test:execute` |
 | POST | `/api/v1/flows/execute-unsaved?project_id={project_id}` | `test:execute` |
 
+Flow 列表支持 `keyword`、`status`、`page` 和 `page_size`：
+
+- `keyword` 按名称或描述模糊匹配。
+- 不传 `status` 时排除 `archived`；传入时精确匹配该状态。
+- `page` 默认 1，`page_size` 默认 20、最大 200。
+- 响应 `data` 为 `{items,total,page,page_size}`，每个 item 包含 `status` 和 `node_count`。
+
 `execute-unsaved` accepts either a complete `FlowDefinition` or `{ "definition": FlowDefinition }`.
 Execution endpoints accept an optional `environment_id` query parameter and `Idempotency-Key` header.
 

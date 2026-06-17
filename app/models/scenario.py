@@ -44,6 +44,28 @@ class TestScenarioVersion(Base):
     scenario = relationship("TestScenario", back_populates="versions")
 
 
+class TestScenarioExecution(Base):
+    __tablename__ = "test_scenario_executions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "idempotency_key", name="uq_scenario_executions_project_idempotency"),
+        Index("ix_scenario_executions_project_created", "project_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    scenario_id: Mapped[int | None] = mapped_column(ForeignKey("test_scenarios.id"), index=True, nullable=True)
+    scenario_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("test_scenario_versions.id"), nullable=True
+    )
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    triggered_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class TestScenarioRun(Base):
     __tablename__ = "test_scenario_runs"
     __table_args__ = (
@@ -52,6 +74,9 @@ class TestScenarioRun(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    execution_id: Mapped[str | None] = mapped_column(
+        ForeignKey("test_scenario_executions.id"), index=True, nullable=True
+    )
     scenario_id: Mapped[int | None] = mapped_column(ForeignKey("test_scenarios.id"), index=True, nullable=True)
     scenario_version_id: Mapped[int | None] = mapped_column(ForeignKey("test_scenario_versions.id"), nullable=True)
     plan_run_id: Mapped[int | None] = mapped_column(ForeignKey("test_plan_runs.id"), index=True, nullable=True)
@@ -59,6 +84,8 @@ class TestScenarioRun(Base):
     environment_id: Mapped[int] = mapped_column(ForeignKey("project_environments.id"), nullable=False)
     dataset_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     dataset_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    record_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    record_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     trigger_type: Mapped[str] = mapped_column(String(32), default="manual", nullable=False)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -66,6 +93,9 @@ class TestScenarioRun(Base):
     scenario_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
     variables_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
     step_results: Mapped[list] = mapped_column(JSON, nullable=False)
+    current_step_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    current_step_index: Mapped[int | None] = mapped_column(nullable=True)
+    last_event_sequence: Mapped[int] = mapped_column(default=0, nullable=False)
     triggered_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -73,3 +103,20 @@ class TestScenarioRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     triggered_by = relationship("User")
+
+
+class TestScenarioRunEvent(Base):
+    __tablename__ = "test_scenario_run_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="uq_scenario_run_events_run_sequence"),
+        Index("ix_scenario_run_events_run_sequence", "run_id", "sequence"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("test_scenario_runs.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(nullable=False)
+    event: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

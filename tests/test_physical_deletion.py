@@ -7,10 +7,18 @@ from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import sessionmaker
 
 import app.models  # noqa: F401
+from app.core.permissions import ProjectPermission
 from app.db.base import Base
+from app.models.defect import Defect
 from app.models.project import Project, ProjectEnvironment, ProjectEnvironmentVariable
-from app.models.scenario import TestScenario, TestScenarioRun, TestScenarioVersion
-from app.models.test_case import TestCase
+from app.models.scenario import (
+    TestScenario,
+    TestScenarioExecution,
+    TestScenarioRun,
+    TestScenarioRunEvent,
+    TestScenarioVersion,
+)
+from app.models.test_case import TestCase, TestCaseExecution
 from app.models.test_plan import TestPlan, TestPlanEnvironment, TestPlanRun
 from app.models.user import User
 from app.models.visual_flow import (
@@ -19,6 +27,7 @@ from app.models.visual_flow import (
     VisualFlowNodeExecution,
     VisualFlowVersion,
 )
+from app.models.websocket_test_case import WebSocketTestCaseExecution
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.visual_flow_repository import VisualFlowRepository
 from app.services.scenario_service import ScenarioService
@@ -222,19 +231,30 @@ class PhysicalDeletionTests(unittest.TestCase):
             created_by_id=self.user.id,
         )
         self.db.add(test_case)
+        defect = Defect(
+            project_id=self.project.id,
+            title="Defect",
+            bug_type="functional",
+            urgency="high",
+            status="new",
+            content_html="<p>detail</p>",
+            reporter_id=self.user.id,
+        )
+        self.db.add(defect)
         self.db.add(ProjectEnvironmentVariable(
             environment_id=environment_id,
             name="token",
             value="value",
         ))
         self.db.commit()
-        project_id, test_case_id = self.project.id, test_case.id
+        project_id, test_case_id, defect_id = self.project.id, test_case.id, defect.id
 
         ProjectRepository(self.db).delete_project(self.project)
 
         self.assertIsNone(self.db.get(Project, project_id))
         self.assertIsNone(self.db.get(ProjectEnvironment, environment_id))
         self.assertIsNone(self.db.get(TestCase, test_case_id))
+        self.assertIsNone(self.db.get(Defect, defect_id))
 
     def test_plan_run_delete_physically_removes_history(self):
         run = TestPlanRun(
@@ -276,6 +296,85 @@ class PhysicalDeletionTests(unittest.TestCase):
 
         self.assertIsNone(self.db.get(TestPlanRun, run_id))
         self.assertIsNone(self.db.get(TestScenarioRun, scenario_run_id).plan_run_id)
+
+    def test_scenario_run_delete_removes_events_and_detaches_case_executions(self):
+        execution = TestScenarioExecution(
+            id="scenario-execution",
+            project_id=self.project.id,
+            status="passed",
+            request_hash="hash",
+            triggered_by_id=self.user.id,
+        )
+        self.db.add(execution)
+        self.db.flush()
+        run = TestScenarioRun(
+            execution_id=execution.id,
+            project_id=self.project.id,
+            environment_id=self.environment.id,
+            status="passed",
+            scenario_snapshot={},
+            variables_snapshot={},
+            step_results=[],
+            triggered_by_id=self.user.id,
+            started_at=datetime.utcnow(),
+        )
+        self.db.add(run)
+        self.db.flush()
+        event_item = TestScenarioRunEvent(
+            run_id=run.id,
+            sequence=1,
+            event="run_completed",
+            payload={"status": "passed"},
+            occurred_at=datetime.utcnow(),
+        )
+        case_execution = TestCaseExecution(
+            project_id=self.project.id,
+            environment_id=self.environment.id,
+            scenario_run_id=run.id,
+            executed_by_id=self.user.id,
+            status="passed",
+            request_snapshot={},
+        )
+        websocket_execution = WebSocketTestCaseExecution(
+            project_id=self.project.id,
+            environment_id=self.environment.id,
+            scenario_run_id=run.id,
+            executed_by_id=self.user.id,
+            status="passed",
+            session_snapshot={},
+        )
+        self.db.add_all([event_item, case_execution, websocket_execution])
+        self.db.commit()
+        execution_id = execution.id
+        run_id = run.id
+        event_id = event_item.id
+        case_execution_id = case_execution.id
+        websocket_execution_id = websocket_execution.id
+        service = ScenarioService(self.db)
+        service.permission_service.require_project_permission = MagicMock()
+
+        service.delete_run(
+            project_id=self.project.id,
+            run_id=run_id,
+            current_user=self.user,
+        )
+
+        self.assertIsNone(self.db.get(TestScenarioRun, run_id))
+        self.assertIsNone(self.db.get(TestScenarioRunEvent, event_id))
+        self.assertIsNone(self.db.get(TestScenarioExecution, execution_id))
+        self.assertIsNone(
+            self.db.get(TestCaseExecution, case_execution_id).scenario_run_id
+        )
+        self.assertIsNone(
+            self.db.get(
+                WebSocketTestCaseExecution, websocket_execution_id
+            ).scenario_run_id
+        )
+        service.permission_service.require_project_permission.assert_called_once_with(
+            self.user,
+            self.project.id,
+            ProjectPermission.MANAGE_SCENARIO.value,
+        )
 
 
 if __name__ == "__main__":

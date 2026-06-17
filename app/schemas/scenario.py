@@ -2,7 +2,15 @@ import json
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 
 class ScenarioStepRequest(BaseModel):
@@ -50,6 +58,31 @@ class ScenarioStepRequest(BaseModel):
         return self
 
 
+class ScenarioRequestOverride(BaseModel):
+    step_id: str = Field(
+        min_length=1,
+        max_length=128,
+        validation_alias=AliasChoices("step_id", "stepId"),
+    )
+    target: str = Field(min_length=1, max_length=32)
+    path: str = Field(default="", max_length=512)
+    value: Any
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ScenarioDatasetRecordRequest(BaseModel):
+    id: str | None = Field(default=None, max_length=128)
+    name: str | None = Field(default=None, max_length=128)
+    enabled: bool = True
+    request_overrides: list[ScenarioRequestOverride] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("request_overrides", "requestOverrides"),
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class ScenarioDatasetRequest(BaseModel):
     id: str = Field(min_length=1, max_length=128)
     name: str = Field(min_length=1, max_length=128)
@@ -57,8 +90,64 @@ class ScenarioDatasetRequest(BaseModel):
     variables: dict[str, Any] = Field(
         default_factory=dict, validation_alias=AliasChoices("variables", "variables_text", "variablesText")
     )
+    records: list[ScenarioDatasetRecordRequest] = Field(default_factory=list)
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_records(cls, value):
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if data.get("records"):
+            data.pop("request_overrides", None)
+            data.pop("requestOverrides", None)
+            return data
+
+        dataset_id = str(data.get("id") or "DATA")
+        dataset_name = str(data.get("name") or "Record")
+        raw_overrides = data.pop(
+            "request_overrides", data.pop("requestOverrides", [])
+        ) or []
+        record_count = max(
+            1,
+            max(
+                (
+                    len(item.get("values"))
+                    for item in raw_overrides
+                    if isinstance(item, dict)
+                    and isinstance(item.get("values"), list)
+                ),
+                default=1,
+            ),
+        )
+        records = []
+        for index in range(record_count):
+            overrides = []
+            for raw_override in raw_overrides:
+                if not isinstance(raw_override, dict):
+                    overrides.append(raw_override)
+                    continue
+                override = dict(raw_override)
+                values = override.pop("values", None)
+                if isinstance(values, list):
+                    if index >= len(values):
+                        continue
+                    override["value"] = values[index]
+                overrides.append(override)
+            records.append({
+                "id": f"{dataset_id}-RECORD-{index + 1}",
+                "name": (
+                    dataset_name
+                    if record_count == 1
+                    else f"{dataset_name} #{index + 1}"
+                ),
+                "enabled": True,
+                "request_overrides": overrides,
+            })
+        data["records"] = records
+        return data
 
     @field_validator("variables", mode="before")
     @classmethod
@@ -130,17 +219,48 @@ class ScenarioRead(BaseModel):
 
 class ScenarioRunRead(BaseModel):
     id: int
+    execution_id: str | None = None
     scenario_id: int | None
     project_id: int
     environment_id: int
     dataset_id: str | None
     dataset_name: str | None
+    record_id: str | None = None
+    record_name: str | None = None
     status: str
     trigger_type: str
     variables_snapshot: dict
     step_results: list[dict]
+    current_step_id: str | None = None
+    current_step_index: int | None = None
+    last_event_sequence: int = 0
     started_at: datetime
     finished_at: datetime | None
     duration_ms: int | None
+    created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class ScenarioRunQueuedRead(BaseModel):
+    run_id: int
+    dataset_id: str | None
+    dataset_name: str | None
+    record_id: str | None = None
+    record_name: str | None = None
+    status: str
+    events_url: str
+    detail_url: str
+
+
+class ScenarioExecutionQueuedRead(BaseModel):
+    execution_id: str
+    scenario_id: int
+    scenario_version: int
+    status: str
+    created_at: datetime
+    runs: list[ScenarioRunQueuedRead]
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, value: datetime) -> str:
+        return value.isoformat(timespec="milliseconds") + "Z"

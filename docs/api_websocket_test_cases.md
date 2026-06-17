@@ -16,7 +16,7 @@ WebSocket 测试用例与 HTTP 测试用例完全独立：使用 `/api/v1/websoc
 
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
-| GET | `/websocket-test-cases?project_id={project_id}` | `case:view` | 查询用例 |
+| GET | `/websocket-test-cases?project_id={project_id}` | `case:view` | 分页查询用例 |
 | POST | `/websocket-test-cases?project_id={project_id}` | `case:manage` | 新增用例 |
 | PUT | `/websocket-test-cases/{id}?project_id={project_id}` | `case:manage` | 更新用例 |
 | DELETE | `/websocket-test-cases/{id}?project_id={project_id}` | `case:manage` | 删除用例 |
@@ -25,6 +25,15 @@ WebSocket 测试用例与 HTTP 测试用例完全独立：使用 `/api/v1/websoc
 | POST | `/websocket-test-cases/batch-execute?project_id={project_id}` | `test:execute` | 按顺序批量执行 |
 
 删除时保留历史执行记录并将 `websocket_test_case_id` 置空。已保存的场景版本仍按完整快照执行；如果可视化流程版本仍引用该用例，接口返回 `409 Conflict`，并在 `detail.flows` 中返回流程名称。
+
+列表支持：
+
+- `keyword`：按名称或描述模糊匹配。
+- `environment_id`：匹配默认环境或多环境关联。
+- `page`：默认 1。
+- `page_size`：默认 20，最大 200。
+
+响应 `data` 为 `{items,total,page,page_size}`。
 
 ## 配置示例
 
@@ -47,7 +56,16 @@ WebSocket 测试用例与 HTTP 测试用例完全独立：使用 `/api/v1/websoc
   ],
   "extractors": [
     {"name": "connection_id", "message_index": 0, "path": "connection_id"}
-  ]
+  ],
+  "retry_policy": {
+    "enabled": true,
+    "max_attempts": 3,
+    "base_delay_ms": 500,
+    "max_delay_ms": 10000,
+    "jitter": "full",
+    "retry_network_errors": true,
+    "retry_timeouts": true
+  }
 }
 ```
 
@@ -69,13 +87,27 @@ WebSocket 测试用例与 HTTP 测试用例完全独立：使用 `/api/v1/websoc
 
 `message_index` 从 `0` 开始，JSON 路径使用点分格式。提取器会从指定响应消息的 JSON 路径读取值，供后续批量用例使用。
 
+## 步骤级重试
+
+WebSocket 自动化用例支持步骤内部重试。每个 attempt 会重新建立连接、重新发送完整消息序列、
+重新接收消息并执行断言，因此有副作用的消息必须由被测系统提供业务幂等保护。
+
+- 连接和接收超时按 `retry_timeouts` 重试。
+- WebSocket 网络/协议异常按 `retry_network_errors` 重试。
+- 断言默认不重试；失败断言设置 `retry_on_failure=true` 后可用于轮询消息场景。
+- 退避使用指数上限和 Full Jitter。
+- 只有最终断言全部通过后才执行变量提取。
+- 默认不启用，旧用例仍只执行一次。
+
 ## 执行结果
 
 执行状态为 `passed`、`failed` 或 `error`。独立执行记录包含：
 
 - `session_snapshot`：连接 URL、headers、subprotocols、发送消息和超时配置
 - `response_snapshot`：发送消息、接收消息及协商后的 subprotocol
-- `assertion_results`、`error_message`、`duration_ms`
+- `assertion_results`、`attempt_history`、`error_message`、`duration_ms`
+
+`retry_policy` 和 `attempt_history` 由迁移 `0017_add_step_retry_policies.py` 引入。
 
 ## 实现位置
 

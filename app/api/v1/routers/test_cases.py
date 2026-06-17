@@ -20,11 +20,25 @@ router = APIRouter()
 @router.get("", summary="查询项目测试用例列表")
 def list_test_cases(
     project_id: int,
+    keyword: str | None = None,
+    environment_id: int | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    cases = TestCaseService(db).list_cases(project_id=project_id, current_user=current_user)
-    return success(data=[TestCaseRead.model_validate(item) for item in cases])
+    result = TestCaseService(db).list_cases(
+        project_id=project_id,
+        current_user=current_user,
+        keyword=keyword,
+        environment_id=environment_id,
+        page=page,
+        page_size=page_size,
+    )
+    result["items"] = [
+        TestCaseRead.model_validate(item) for item in result["items"]
+    ]
+    return success(data=result)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, summary="新增测试用例")

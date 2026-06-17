@@ -26,11 +26,12 @@ _MISSING = object()
 _TARGET_ROOTS = {"pathParams", "query", "headers", "body", "variables", "messages"}
 _HTTP_CASE_OVERRIDE_FIELDS = {
     "method", "path", "headers", "query_params", "body_type",
-    "body", "assertions", "extractors",
+    "body", "assertions", "extractors", "retry_policy",
 }
 _WEBSOCKET_CASE_OVERRIDE_FIELDS = {
     "path", "headers", "subprotocols", "messages", "receive_count",
     "connect_timeout_ms", "receive_timeout_ms", "assertions", "extractors",
+    "retry_policy",
 }
 _CASE_OVERRIDE_ALIASES = {
     "query": "query_params",
@@ -39,6 +40,7 @@ _CASE_OVERRIDE_ALIASES = {
     "receiveCount": "receive_count",
     "connectTimeoutMs": "connect_timeout_ms",
     "receiveTimeoutMs": "receive_timeout_ms",
+    "retryPolicy": "retry_policy",
 }
 
 
@@ -56,22 +58,44 @@ class VisualFlowService:
         self.repository = VisualFlowRepository(db)
         self.permission_service = PermissionService(db)
 
-    def list_flows(self, *, project_id: int, current_user: User) -> list[dict[str, Any]]:
+    def list_flows(
+        self,
+        *,
+        project_id: int,
+        current_user: User,
+        keyword: str | None,
+        flow_status: str | None,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
         self._require(current_user, project_id, ProjectPermission.VIEW_FLOW.value)
         result = []
-        for flow in self.repository.list_by_project(project_id):
+        flows, total = self.repository.list_by_project(
+            project_id=project_id,
+            keyword=keyword,
+            flow_status=flow_status,
+            page=page,
+            page_size=page_size,
+        )
+        for flow in flows:
             version = self.repository.get_version(flow_id=flow.id, version=flow.current_version)
             result.append(
                 {
                     "id": flow.id,
                     "name": flow.name,
                     "description": flow.description,
+                    "status": flow.status,
                     "node_count": len((version.definition if version else {}).get("nodes", [])),
                     "current_version": flow.current_version,
                     "updated_at": flow.updated_at,
                 }
             )
-        return result
+        return {
+            "items": result,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
 
     def get_flow(self, *, project_id: int, flow_id: int, current_user: User) -> dict[str, Any]:
         self._require(current_user, project_id, ProjectPermission.VIEW_FLOW.value)
@@ -368,6 +392,7 @@ class VisualFlowService:
             "body": copy.deepcopy(case.body),
             "assertions": copy.deepcopy(case.assertions or []),
             "extractors": copy.deepcopy(case.extractors or []),
+            "retry_policy": copy.deepcopy(getattr(case, "retry_policy", None) or {}),
         }
 
     def _websocket_case_data(self, case, *, environment_id: int | None) -> dict[str, Any]:
@@ -382,6 +407,7 @@ class VisualFlowService:
             "receive_timeout_ms": case.receive_timeout_ms,
             "assertions": copy.deepcopy(case.assertions or []),
             "extractors": copy.deepcopy(case.extractors or []),
+            "retry_policy": copy.deepcopy(getattr(case, "retry_policy", None) or {}),
         }
 
     def _apply_bindings(self, data: dict, node: FlowNode, outputs: dict, *, websocket: bool) -> None:
@@ -767,6 +793,7 @@ class VisualFlowService:
                     "kind": node.kind, "referenceId": case.id, "method": case.method, "path": case.path,
                     "headers": case.headers, "queryParams": case.query_params, "bodyType": case.body_type,
                     "body": case.body, "assertions": case.assertions, "extractors": case.extractors,
+                    "retryPolicy": getattr(case, "retry_policy", None),
                 }
             elif node.kind == "websocket_case":
                 case = self.repository.get_websocket_case(project_id=project_id, case_id=int(node.reference_id))
@@ -775,6 +802,7 @@ class VisualFlowService:
                     "subprotocols": case.subprotocols, "messages": case.messages, "receiveCount": case.receive_count,
                     "connectTimeoutMs": case.connect_timeout_ms, "receiveTimeoutMs": case.receive_timeout_ms,
                     "assertions": case.assertions, "extractors": case.extractors,
+                    "retryPolicy": getattr(case, "retry_policy", None),
                 }
         return result
 

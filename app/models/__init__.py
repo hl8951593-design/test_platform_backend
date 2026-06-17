@@ -1,3 +1,4 @@
+from app.models.defect import Defect
 from app.models.project import (
     Project,
     ProjectEnvironment,
@@ -5,7 +6,13 @@ from app.models.project import (
     ProjectMember,
     ProjectMemberPermission,
 )
-from app.models.scenario import TestScenario, TestScenarioRun, TestScenarioVersion
+from app.models.scenario import (
+    TestScenario,
+    TestScenarioExecution,
+    TestScenarioRun,
+    TestScenarioRunEvent,
+    TestScenarioVersion,
+)
 from app.models.test_case import TestCase, TestCaseEnvironment, TestCaseExecution
 from app.models.test_plan import (
     TestPlan,
@@ -21,14 +28,17 @@ from app.models.visual_flow import VisualFlow, VisualFlowExecution, VisualFlowNo
 __all__ = [
     "BrowserCapture",
     "BrowserCaptureEntry",
+    "Defect",
     "Project",
     "ProjectEnvironment",
     "ProjectEnvironmentVariable",
     "ProjectMember",
     "ProjectMemberPermission",
     "TestScenario",
+    "TestScenarioExecution",
     "TestScenarioVersion",
     "TestScenarioRun",
+    "TestScenarioRunEvent",
     "TestCase",
     "TestCaseEnvironment",
     "TestCaseExecution",

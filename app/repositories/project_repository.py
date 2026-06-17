@@ -8,7 +8,14 @@ from app.models.project import (
     ProjectMember,
     ProjectMemberPermission,
 )
-from app.models.scenario import TestScenario, TestScenarioRun, TestScenarioVersion
+from app.models.defect import Defect
+from app.models.scenario import (
+    TestScenario,
+    TestScenarioExecution,
+    TestScenarioRun,
+    TestScenarioRunEvent,
+    TestScenarioVersion,
+)
 from app.models.test_case import TestCase, TestCaseEnvironment
 from app.models.test_case import TestCaseExecution
 from app.models.test_plan import (
@@ -103,7 +110,21 @@ class ProjectRepository:
                 WebSocketTestCaseExecution.project_id == project_id
             )
         )
+        scenario_run_ids = list(self.db.scalars(
+            select(TestScenarioRun.id).where(TestScenarioRun.project_id == project_id)
+        ).all())
+        if scenario_run_ids:
+            self.db.execute(
+                delete(TestScenarioRunEvent).where(
+                    TestScenarioRunEvent.run_id.in_(scenario_run_ids)
+                )
+            )
         self.db.execute(delete(TestScenarioRun).where(TestScenarioRun.project_id == project_id))
+        self.db.execute(
+            delete(TestScenarioExecution).where(
+                TestScenarioExecution.project_id == project_id
+            )
+        )
         self.db.execute(delete(TestPlanRun).where(TestPlanRun.project_id == project_id))
         self.db.execute(
             delete(TestPlanWebhookEvent).where(TestPlanWebhookEvent.project_id == project_id)
@@ -131,6 +152,7 @@ class ProjectRepository:
         self.db.execute(
             delete(WebSocketTestCase).where(WebSocketTestCase.project_id == project_id)
         )
+        self.db.execute(delete(Defect).where(Defect.project_id == project_id))
 
         if environment_ids:
             self.db.execute(

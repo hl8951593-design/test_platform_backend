@@ -96,9 +96,27 @@ def close_debug_session(
 
 
 @router.get("")
-def list_cases(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    cases = WebSocketTestCaseService(db).list_cases(project_id=project_id, current_user=current_user)
-    return success(data=[WebSocketTestCaseRead.model_validate(item) for item in cases])
+def list_cases(
+    project_id: int,
+    keyword: str | None = None,
+    environment_id: int | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = WebSocketTestCaseService(db).list_cases(
+        project_id=project_id,
+        current_user=current_user,
+        keyword=keyword,
+        environment_id=environment_id,
+        page=page,
+        page_size=page_size,
+    )
+    result["items"] = [
+        WebSocketTestCaseRead.model_validate(item) for item in result["items"]
+    ]
+    return success(data=result)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

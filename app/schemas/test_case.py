@@ -3,6 +3,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.retry import RetryPolicyConfig
+
 
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 BodyType = Literal["none", "json", "form_urlencoded", "multipart", "raw_text", "raw_json"]
@@ -12,6 +14,10 @@ class AssertionConfig(BaseModel):
     type: Literal["status_code", "body_contains", "json_equals"]
     expected: Any
     path: str | None = Field(default=None, description="json_equals 使用的点分路径，例如 data.id")
+    retry_on_failure: bool = Field(
+        default=False,
+        description="断言失败时是否允许按 retry_policy 轮询重试",
+    )
 
 
 class ExtractorConfig(BaseModel):
@@ -30,6 +36,7 @@ class TestCaseRequestConfig(BaseModel):
     body: dict[str, Any] | list[Any] | str | None = None
     assertions: list[AssertionConfig] = Field(default_factory=list)
     extractors: list[ExtractorConfig] = Field(default_factory=list)
+    retry_policy: RetryPolicyConfig = Field(default_factory=RetryPolicyConfig)
 
 
 class TestCaseCreateRequest(TestCaseRequestConfig):
@@ -65,6 +72,7 @@ class TestCaseRead(BaseModel):
     body: dict[str, Any] | list[Any] | str | None
     assertions: list[dict[str, Any]] | None
     extractors: list[dict[str, Any]] | None
+    retry_policy: dict[str, Any] | None
     created_by_id: int
     last_executed_at: datetime | None
     last_execution_status: str | None
@@ -84,6 +92,7 @@ class TestCaseExecutionRead(BaseModel):
     request_snapshot: dict[str, Any]
     response_snapshot: dict[str, Any] | None
     assertion_results: list[dict[str, Any]] | None
+    attempt_history: list[dict[str, Any]] | None
     error_message: str | None
     duration_ms: int | None
     created_at: datetime

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.models.project import ProjectEnvironment, ProjectEnvironmentVariable
@@ -14,13 +14,39 @@ class VisualFlowRepository:
     def __init__(self, db: Session):
         self.db = db
 
-    def list_by_project(self, project_id: int) -> list[VisualFlow]:
+    def list_by_project(
+        self,
+        *,
+        project_id: int,
+        keyword: str | None,
+        flow_status: str | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[VisualFlow], int]:
+        conditions = [VisualFlow.project_id == project_id]
+        if flow_status:
+            conditions.append(VisualFlow.status == flow_status)
+        else:
+            conditions.append(VisualFlow.status != "archived")
+        if keyword:
+            pattern = f"%{keyword.strip()}%"
+            conditions.append(
+                or_(
+                    VisualFlow.name.ilike(pattern),
+                    VisualFlow.description.ilike(pattern),
+                )
+            )
+        total = self.db.scalar(
+            select(func.count(VisualFlow.id)).where(*conditions)
+        ) or 0
         statement = (
             select(VisualFlow)
-            .where(VisualFlow.project_id == project_id, VisualFlow.status != "archived")
+            .where(*conditions)
             .order_by(VisualFlow.updated_at.desc(), VisualFlow.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
         )
-        return list(self.db.scalars(statement).all())
+        return list(self.db.scalars(statement).all()), int(total)
 
     def get_flow(self, *, project_id: int, flow_id: int) -> VisualFlow | None:
         return self.db.scalar(

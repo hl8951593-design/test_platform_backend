@@ -1,4 +1,5 @@
 import json
+import copy
 import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -13,6 +14,8 @@ from app.core.variable_renderer import render_variables
 from app.models.user import User
 from app.models.websocket_test_case import WebSocketTestCase, WebSocketTestCaseExecution
 from app.repositories.websocket_test_case_repository import WebSocketTestCaseRepository
+from app.runner.assertion_engine import json_values_equal
+from app.runner.retry import failed_assertions_are_retryable, retry_delay_seconds
 from app.schemas.websocket_test_case import (
     UnsavedWebSocketTestCaseExecuteRequest,
     WebSocketBatchExecuteRequest,
@@ -29,9 +32,30 @@ class WebSocketTestCaseService:
         self.permission_service = PermissionService(db)
         self._environment_context_cache: dict[int, tuple[Any, dict[str, str]]] = {}
 
-    def list_cases(self, *, project_id: int, current_user: User) -> list[WebSocketTestCase]:
+    def list_cases(
+        self,
+        *,
+        project_id: int,
+        current_user: User,
+        keyword: str | None,
+        environment_id: int | None,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
         self._require(current_user, project_id, ProjectPermission.VIEW_CASE.value)
-        return self.repository.list_by_project(project_id=project_id)
+        items, total = self.repository.list_by_project(
+            project_id=project_id,
+            keyword=keyword,
+            environment_id=environment_id,
+            page=page,
+            page_size=page_size,
+        )
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
 
     def create_case(self, *, project_id: int, payload: WebSocketTestCaseCreateRequest, current_user: User) -> WebSocketTestCase:
         self._require(current_user, project_id, ProjectPermission.MANAGE_CASE.value)
@@ -84,6 +108,7 @@ class WebSocketTestCaseService:
             messages=case.messages or [], receive_count=case.receive_count,
             connect_timeout_ms=case.connect_timeout_ms, receive_timeout_ms=case.receive_timeout_ms,
             assertions=case.assertions or [], extractors=case.extractors or [],
+            retry_policy=case.retry_policy or {},
         )
         return self._execute(project_id, test_case_id, payload, current_user)
 
@@ -101,22 +126,112 @@ class WebSocketTestCaseService:
         started_at = time.perf_counter()
         response_snapshot = None
         assertion_results = None
+        attempt_history: list[dict[str, Any]] = []
         error_message = None
         status_value = "passed"
-        try:
-            response_snapshot = self._run_session(snapshot, timeout_seconds=timeout_seconds)
-            assertion_results = self._run_assertions(payload.assertions, response_snapshot)
-            if any(not result["passed"] for result in assertion_results):
-                status_value = "failed"
-            self._run_extractors(payload.extractors, response_snapshot, variables)
-        except Exception as exc:  # noqa: BLE001
-            status_value = "error"
-            error_message = str(exc)
+        policy = payload.retry_policy
+        execution_deadline = (
+            time.monotonic() + timeout_seconds
+            if timeout_seconds is not None
+            else None
+        )
+
+        for attempt in range(1, policy.attempts + 1):
+            attempt_started = time.perf_counter()
+            attempt_detail: dict[str, Any] = {
+                "attempt": attempt,
+                "status": "running",
+                "retry_reason": None,
+                "wait_ms": 0,
+            }
+            response_snapshot = None
+            assertion_results = None
+            retry_reason: str | None = None
+            try:
+                remaining = (
+                    execution_deadline - time.monotonic()
+                    if execution_deadline is not None
+                    else timeout_seconds
+                )
+                if remaining is not None and remaining <= 0:
+                    raise websocket.WebSocketTimeoutException(
+                        "Scenario execution deadline exceeded"
+                    )
+                response_snapshot = self._run_session(
+                    snapshot, timeout_seconds=remaining
+                )
+                assertion_results = self._run_assertions(
+                    payload.assertions, response_snapshot
+                )
+                attempt_detail["assertion_results"] = copy.deepcopy(
+                    assertion_results
+                )
+                if any(not result["passed"] for result in assertion_results):
+                    status_value = "failed"
+                    error_message = "Assertion failed"
+                    if (
+                        policy.enabled
+                        and failed_assertions_are_retryable(assertion_results)
+                    ):
+                        retry_reason = "polling_assertion_failed"
+                else:
+                    self._run_extractors(
+                        payload.extractors, response_snapshot, variables
+                    )
+                    status_value = "passed"
+                    error_message = None
+            except (websocket.WebSocketTimeoutException, TimeoutError) as exc:
+                status_value = "error"
+                error_message = str(exc)
+                if policy.enabled and policy.retry_timeouts:
+                    retry_reason = "timeout"
+            except (websocket.WebSocketException, OSError) as exc:
+                status_value = "error"
+                error_message = str(exc)
+                if policy.enabled and policy.retry_network_errors:
+                    retry_reason = "network_error"
+            except Exception as exc:  # noqa: BLE001
+                status_value = "error"
+                error_message = str(exc)
+
+            can_retry = retry_reason is not None and attempt < policy.attempts
+            attempt_detail["status"] = (
+                "retrying"
+                if can_retry
+                else "passed"
+                if status_value == "passed"
+                else "failed"
+            )
+            attempt_detail["retry_reason"] = retry_reason
+            attempt_detail["error_message"] = error_message
+            attempt_detail["duration_ms"] = int(
+                (time.perf_counter() - attempt_started) * 1000
+            )
+            if can_retry:
+                wait_seconds = retry_delay_seconds(policy, attempt=attempt)
+                if (
+                    execution_deadline is not None
+                    and time.monotonic() + wait_seconds >= execution_deadline
+                ):
+                    attempt_detail["status"] = "failed"
+                    attempt_detail["retry_reason"] = "deadline_exceeded"
+                    error_message = "Scenario execution deadline exceeded"
+                    status_value = "error"
+                    attempt_history.append(attempt_detail)
+                    break
+                attempt_detail["wait_ms"] = int(wait_seconds * 1000)
+                attempt_history.append(attempt_detail)
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+                continue
+            attempt_history.append(attempt_detail)
+            break
         return self.repository.create_execution(
             project_id=project_id, websocket_test_case_id=test_case_id, environment_id=payload.environment_id,
             scenario_run_id=scenario_run_id, executed_by_id=current_user.id, status=status_value,
             session_snapshot=mask_sensitive(snapshot),
-            response_snapshot=response_snapshot, assertion_results=assertion_results, error_message=error_message,
+            response_snapshot=response_snapshot, assertion_results=assertion_results,
+            attempt_history=attempt_history, error_message=error_message,
             duration_ms=int((time.perf_counter() - started_at) * 1000),
         )
 
@@ -176,7 +291,11 @@ class WebSocketTestCaseService:
             elif item["message_index"] < len(messages):
                 message = messages[item["message_index"]]
                 actual = message["data"] if item["type"] == "message_contains" else self._get_json_path(message["json"], item.get("path"))
-            passed = str(item["expected"]) in str(actual) if item["type"] == "message_contains" else actual == item["expected"]
+            passed = (
+                str(item["expected"]) in str(actual)
+                if item["type"] == "message_contains"
+                else json_values_equal(actual, item["expected"])
+            )
             results.append({"assertion": item, "actual": actual, "passed": passed})
         return results
 
@@ -222,6 +341,7 @@ class WebSocketTestCaseService:
         test_case.messages = [item.model_dump() for item in payload.messages]
         test_case.assertions = [item.model_dump() for item in payload.assertions]
         test_case.extractors = [item.model_dump() for item in payload.extractors]
+        test_case.retry_policy = payload.retry_policy.model_dump()
 
     def _require(self, user, project_id, permission):
         self.permission_service.require_project_permission(user, project_id, permission)

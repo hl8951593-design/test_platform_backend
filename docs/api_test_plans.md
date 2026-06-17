@@ -56,6 +56,16 @@
 - 显式传入：切换到指定的现存版本。
 - 修改名称、通知、Cron 等非目标字段不会自动升级场景版本。
 
+### 场景数据集与 record
+
+测试计划执行目标时使用绑定的不可变 Scenario 版本。每个被选中的场景数据集会展开其中
+`enabled=true` 的 record，每条 record 独立创建一个 `test_scenario_runs` 记录。因此一个
+Scenario 目标可能产生多个场景 run，计划目标结果中的 `scenario_run_ids` 会包含全部 run ID。
+
+目标只有在至少产生一个场景 run 且所有 run 均通过时才判定为通过；任一 record 失败都会使
+该目标失败。计划运行的 `target_count` 仍表示 Scenario 目标数量，不表示展开后的 record 数量。
+record 的请求覆盖、模板解析和校验规则见 [场景组合接口文档](api_scenarios.md)。
+
 更新请求必须额外携带计划 `version`，冲突返回 HTTP `409`。
 
 ## 手动执行

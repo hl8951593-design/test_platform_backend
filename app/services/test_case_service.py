@@ -1,4 +1,5 @@
 import json
+import copy
 import uuid
 import time
 from typing import Any
@@ -14,6 +15,12 @@ from app.core.variable_renderer import render_variables
 from app.models.test_case import TestCase, TestCaseExecution
 from app.models.user import User
 from app.repositories.test_case_repository import TestCaseRepository
+from app.runner.assertion_engine import json_values_equal
+from app.runner.retry import (
+    failed_assertions_are_retryable,
+    method_allows_retry,
+    retry_delay_seconds,
+)
 from app.schemas.test_case import (
     BatchExecuteRequest,
     TestCaseCreateRequest,
@@ -31,13 +38,34 @@ class TestCaseService:
         self.permission_service = PermissionService(db)
         self._environment_context_cache: dict[int, tuple[Any, dict[str, str]]] = {}
 
-    def list_cases(self, *, project_id: int, current_user: User) -> list[TestCase]:
+    def list_cases(
+        self,
+        *,
+        project_id: int,
+        current_user: User,
+        keyword: str | None,
+        environment_id: int | None,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
         self.permission_service.require_project_permission(
             current_user,
             project_id,
             ProjectPermission.VIEW_CASE.value,
         )
-        return self.repository.list_by_project(project_id=project_id)
+        items, total = self.repository.list_by_project(
+            project_id=project_id,
+            keyword=keyword,
+            environment_id=environment_id,
+            page=page,
+            page_size=page_size,
+        )
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
 
     def create_case(self, *, project_id: int, payload: TestCaseCreateRequest, current_user: User) -> TestCase:
         self.permission_service.require_project_permission(
@@ -60,6 +88,7 @@ class TestCaseService:
             body=payload.body,
             assertions=[item.model_dump() for item in payload.assertions],
             extractors=[item.model_dump() for item in payload.extractors],
+            retry_policy=payload.retry_policy.model_dump(),
             created_by_id=current_user.id,
         )
 
@@ -92,6 +121,7 @@ class TestCaseService:
             body=payload.body,
             assertions=[item.model_dump() for item in payload.assertions],
             extractors=[item.model_dump() for item in payload.extractors],
+            retry_policy=payload.retry_policy.model_dump(),
         )
 
     def delete_case(self, *, project_id: int, test_case_id: int, current_user: User) -> None:
@@ -155,6 +185,7 @@ class TestCaseService:
             body=test_case.body,
             assertions=test_case.assertions or [],
             extractors=test_case.extractors or [],
+            retry_policy=test_case.retry_policy or {},
         )
         return self._execute(
             project_id=project_id,
@@ -220,18 +251,135 @@ class TestCaseService:
         started_at = time.perf_counter()
         response_snapshot: dict[str, Any] | None = None
         assertion_results: list[dict[str, Any]] | None = None
+        attempt_history: list[dict[str, Any]] = []
         error_message: str | None = None
         status_value = "passed"
+        policy = payload.retry_policy
+        retry_allowed_for_method = method_allows_retry(payload.method, policy)
+        execution_deadline = (
+            time.monotonic() + timeout_seconds
+            if timeout_seconds is not None
+            else None
+        )
 
-        try:
-            response_snapshot = self._send_request(request_snapshot, timeout_seconds=timeout_seconds)
-            assertion_results = self._run_assertions(payload.assertions, response_snapshot)
-            if any(not result["passed"] for result in assertion_results):
-                status_value = "failed"
-            self._run_extractors(payload.extractors, response_snapshot, variables)
-        except Exception as exc:  # noqa: BLE001
-            status_value = "error"
-            error_message = str(exc)
+        for attempt in range(1, policy.attempts + 1):
+            attempt_started = time.perf_counter()
+            attempt_detail: dict[str, Any] = {
+                "attempt": attempt,
+                "status": "running",
+                "retry_reason": None,
+                "wait_ms": 0,
+            }
+            response_snapshot = None
+            assertion_results = None
+            retry_reason: str | None = None
+            response_headers: dict[str, Any] | None = None
+            try:
+                remaining = (
+                    execution_deadline - time.monotonic()
+                    if execution_deadline is not None
+                    else timeout_seconds
+                )
+                if remaining is not None and remaining <= 0:
+                    raise httpx.TimeoutException("Scenario execution deadline exceeded")
+                response_snapshot = self._send_request(
+                    request_snapshot,
+                    timeout_seconds=remaining,
+                )
+                response_headers = response_snapshot.get("headers") or {}
+                attempt_detail["status_code"] = response_snapshot["status_code"]
+                if (
+                    policy.enabled
+                    and retry_allowed_for_method
+                    and response_snapshot["status_code"] in policy.status_codes
+                ):
+                    retry_reason = f"http_status_{response_snapshot['status_code']}"
+                    status_value = "failed"
+                    error_message = (
+                        f"HTTP {response_snapshot['status_code']} is retryable"
+                    )
+                else:
+                    assertion_results = self._run_assertions(
+                        payload.assertions, response_snapshot
+                    )
+                    attempt_detail["assertion_results"] = copy.deepcopy(
+                        assertion_results
+                    )
+                    if any(not result["passed"] for result in assertion_results):
+                        status_value = "failed"
+                        error_message = "Assertion failed"
+                        if (
+                            policy.enabled
+                            and retry_allowed_for_method
+                            and failed_assertions_are_retryable(assertion_results)
+                        ):
+                            retry_reason = "polling_assertion_failed"
+                    else:
+                        self._run_extractors(
+                            payload.extractors, response_snapshot, variables
+                        )
+                        status_value = "passed"
+                        error_message = None
+            except httpx.TimeoutException as exc:
+                status_value = "error"
+                error_message = str(exc)
+                if (
+                    policy.enabled
+                    and retry_allowed_for_method
+                    and policy.retry_timeouts
+                ):
+                    retry_reason = "timeout"
+            except httpx.RequestError as exc:
+                status_value = "error"
+                error_message = str(exc)
+                if (
+                    policy.enabled
+                    and retry_allowed_for_method
+                    and policy.retry_network_errors
+                ):
+                    retry_reason = "network_error"
+            except Exception as exc:  # noqa: BLE001
+                status_value = "error"
+                error_message = str(exc)
+
+            can_retry = retry_reason is not None and attempt < policy.attempts
+            attempt_detail["status"] = (
+                "retrying"
+                if can_retry
+                else "passed"
+                if status_value == "passed"
+                else "failed"
+            )
+            attempt_detail["retry_reason"] = retry_reason
+            attempt_detail["error_message"] = error_message
+            attempt_detail["duration_ms"] = int(
+                (time.perf_counter() - attempt_started) * 1000
+            )
+
+            if can_retry:
+                wait_seconds = retry_delay_seconds(
+                    policy,
+                    attempt=attempt,
+                    response_headers=response_headers,
+                )
+                if (
+                    execution_deadline is not None
+                    and time.monotonic() + wait_seconds >= execution_deadline
+                ):
+                    attempt_detail["status"] = "failed"
+                    attempt_detail["retry_reason"] = "deadline_exceeded"
+                    error_message = "Scenario execution deadline exceeded"
+                    status_value = "error"
+                    attempt_history.append(attempt_detail)
+                    break
+                attempt_detail["wait_ms"] = int(wait_seconds * 1000)
+                attempt_history.append(attempt_detail)
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+                continue
+
+            attempt_history.append(attempt_detail)
+            break
 
         duration_ms = int((time.perf_counter() - started_at) * 1000)
         return self.repository.create_execution(
@@ -244,6 +392,7 @@ class TestCaseService:
             request_snapshot=mask_sensitive(request_snapshot),
             response_snapshot=response_snapshot,
             assertion_results=assertion_results,
+            attempt_history=attempt_history,
             error_message=error_message,
             duration_ms=duration_ms,
         )
@@ -357,17 +506,14 @@ class TestCaseService:
             if generated_content_type:
                 headers.setdefault("Content-Type", generated_content_type)
 
-        try:
-            response = httpx.request(
-                request_snapshot["method"],
-                request_snapshot["url"],
-                content=data,
-                headers=headers,
-                timeout=max(min(timeout_seconds or 20, 20), 0.1),
-                follow_redirects=True,
-            )
-        except httpx.RequestError as exc:
-            raise RuntimeError(f"请求失败: {exc}") from exc
+        response = httpx.request(
+            request_snapshot["method"],
+            request_snapshot["url"],
+            content=data,
+            headers=headers,
+            timeout=max(min(timeout_seconds or 20, 20), 0.1),
+            follow_redirects=True,
+        )
 
         raw_body = response.text
         return {
@@ -433,7 +579,7 @@ class TestCaseService:
                 passed = str(item["expected"]) in actual
             elif item["type"] == "json_equals":
                 actual = self._get_json_path(response_snapshot.get("json"), item.get("path"))
-                passed = actual == item["expected"]
+                passed = json_values_equal(actual, item["expected"])
             results.append({"assertion": item, "actual": actual, "passed": passed})
         return results
 

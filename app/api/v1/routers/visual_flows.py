@@ -11,9 +11,27 @@ router = APIRouter()
 
 
 @router.get("")
-def list_flows(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    items = VisualFlowService(db).list_flows(project_id=project_id, current_user=current_user)
-    return success(data=[FlowSummaryRead.model_validate(item) for item in items])
+def list_flows(
+    project_id: int,
+    keyword: str | None = None,
+    flow_status: str | None = Query(default=None, alias="status"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = VisualFlowService(db).list_flows(
+        project_id=project_id,
+        current_user=current_user,
+        keyword=keyword,
+        flow_status=flow_status,
+        page=page,
+        page_size=page_size,
+    )
+    result["items"] = [
+        FlowSummaryRead.model_validate(item) for item in result["items"]
+    ]
+    return success(data=result)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

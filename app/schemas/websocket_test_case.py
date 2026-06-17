@@ -3,6 +3,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.retry import RetryPolicyConfig
+
 
 class WebSocketMessageConfig(BaseModel):
     type: Literal["text", "json"] = "text"
@@ -14,6 +16,7 @@ class WebSocketAssertionConfig(BaseModel):
     expected: Any
     message_index: int = Field(default=0, ge=0)
     path: str | None = None
+    retry_on_failure: bool = False
 
 
 class WebSocketExtractorConfig(BaseModel):
@@ -34,6 +37,7 @@ class WebSocketTestCaseConfig(BaseModel):
     receive_timeout_ms: int = Field(default=10000, ge=1, le=120000)
     assertions: list[WebSocketAssertionConfig] = Field(default_factory=list)
     extractors: list[WebSocketExtractorConfig] = Field(default_factory=list)
+    retry_policy: RetryPolicyConfig = Field(default_factory=RetryPolicyConfig)
 
 
 class WebSocketTestCaseCreateRequest(WebSocketTestCaseConfig):
@@ -97,6 +101,7 @@ class WebSocketTestCaseRead(BaseModel):
     receive_timeout_ms: int
     assertions: list[dict[str, Any]] | None
     extractors: list[dict[str, Any]] | None
+    retry_policy: dict[str, Any] | None
     created_by_id: int
     last_executed_at: datetime | None
     last_execution_status: str | None
@@ -116,6 +121,7 @@ class WebSocketTestCaseExecutionRead(BaseModel):
     session_snapshot: dict[str, Any]
     response_snapshot: dict[str, Any] | None
     assertion_results: list[dict[str, Any]] | None
+    attempt_history: list[dict[str, Any]] | None
     error_message: str | None
     duration_ms: int | None
     created_at: datetime

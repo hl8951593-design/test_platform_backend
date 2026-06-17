@@ -90,6 +90,7 @@ class FlowSummaryRead(BaseModel):
     id: int
     name: str
     description: str | None
+    status: str
     node_count: int
     current_version: int
     updated_at: datetime

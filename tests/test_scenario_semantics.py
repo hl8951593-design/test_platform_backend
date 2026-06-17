@@ -60,6 +60,42 @@ class ScenarioDatasetSemanticsTests(unittest.TestCase):
         self.service._execute_dataset.side_effect = lambda **kwargs: kwargs["dataset"]["id"]
         self.assertEqual(self.execute(None), [None])
 
+    def test_each_enabled_record_creates_an_independent_run(self):
+        self.version.definition["datasets"] = [{
+            "id": "records",
+            "name": "Records",
+            "enabled": True,
+            "variables": {"tenant_id": 1001},
+            "records": [
+                {
+                    "id": "RECORD-1",
+                    "name": "VIP",
+                    "enabled": True,
+                    "request_overrides": [],
+                },
+                {
+                    "id": "RECORD-2",
+                    "name": "Blocked",
+                    "enabled": True,
+                    "request_overrides": [],
+                },
+                {
+                    "id": "RECORD-3",
+                    "name": "Disabled",
+                    "enabled": False,
+                    "request_overrides": [],
+                },
+            ],
+        }]
+        self.service._execute_dataset.side_effect = (
+            lambda **kwargs: kwargs["dataset"]["record_id"]
+        )
+
+        self.assertEqual(self.execute(None), ["RECORD-1", "RECORD-2"])
+        calls = self.service._execute_dataset.call_args_list
+        self.assertEqual(calls[0].kwargs["dataset"]["variables"], {"tenant_id": 1001})
+        self.assertEqual(calls[1].kwargs["dataset"]["record_name"], "Blocked")
+
 
 if __name__ == "__main__":
     unittest.main()

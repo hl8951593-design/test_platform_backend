@@ -20,6 +20,7 @@ class DeletionRouteTests(unittest.TestCase):
         expected_routes = (
             (visual_flows.router, "/{flow_id}"),
             (scenarios.router, "/{scenario_id}"),
+            (scenarios.run_router, "/{run_id}"),
             (test_plans.router, "/{plan_id}"),
             (projects.router, "/{project_id}"),
         )

@@ -1,4 +1,5 @@
 from app.models.defect import Defect
+from app.models.media import MediaObject
 from app.models.project import (
     Project,
     ProjectEnvironment,
@@ -29,6 +30,7 @@ __all__ = [
     "BrowserCapture",
     "BrowserCaptureEntry",
     "Defect",
+    "MediaObject",
     "Project",
     "ProjectEnvironment",
     "ProjectEnvironmentVariable",

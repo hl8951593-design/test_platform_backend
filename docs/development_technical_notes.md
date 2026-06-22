@@ -6,10 +6,10 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 最近更新日期 | 2026-06-17 |
-| 当前开发基线 | 2.8 |
-| 当前阶段 | P0 后端稳定性、P1 统一执行/报告能力与缺陷跟踪后端能力已实现 |
-| 数据库迁移 | 已升级至 `0018_create_defect_tables.py` |
+| 最近更新日期 | 2026-06-20 |
+| 当前开发基线 | 3.0.2 |
+| 当前阶段 | 场景组合已切换为破坏性 nodes 契约；P1 统一执行/报告与缺陷媒体能力已实现 |
+| 数据库迁移 | 目标库已升级并验证至 `0020_migrate_scenarios_to_nodes.py`；47 个历史版本已转换为 nodes |
 | 当前主要协议 | HTTP、WebSocket |
 | 当前主要执行方式 | 单用例同步执行、场景手工执行异步返回并通过 SSE 推送、测试计划持久化后台执行、可视化流程同步执行、WebSocket 长连接手动调试 |
 
@@ -57,10 +57,10 @@
 | WebSocket 测试用例 | 联调中 | 自动执行、长连接手动调试、收发日志、主动断开 | [WebSocket 接口文档](api_websocket_test_cases.md) |
 | AI 测试能力 | 已实现 | DeepSeek 接入、HTTP/WebSocket 用例生成与扩写 | [AI 接口文档](api_ai.md) |
 | 可视化测试流程 | 联调中 | 版本化 DAG、HTTP/WebSocket 节点、条件、延迟、数据绑定和执行 | [流程接口文档](api_visual_flows.md) |
-| 场景组合与实时运行 | 联调中 | 版本快照、dataset record 独立运行、请求覆盖、变量追踪、异步启动、运行快照和持久化 SSE | [场景接口文档](api_scenarios.md)、[执行图谱](scenario_execution_graph.md) |
+| 场景组合与实时运行 | 联调中 | nodes 绑定动作、版本快照、dataset record 独立运行、请求覆盖、受限脚本、异步启动和持久化 SSE | [场景接口文档](api_scenarios.md)、[执行图谱](scenario_execution_graph.md) |
 | 执行记录 | 联调中 | 已统一查询 HTTP、WebSocket、场景和 Flow 历史，支持筛选、分页及协议专属详情 | [统一执行记录接口](api_execution_records.md) |
 | 测试报告 | 联调中 | 测试计划与 Flow 支持报告历史、结构化指标、明细、HTML 下载和按日趋势 | [测试报告接口](api_test_reports.md) |
-| 缺陷跟踪 | 已实现 | 项目缺陷 CRUD、富文本清洗、状态流转、权限和项目删除清理 | [缺陷跟踪接口文档](api_defects.md) |
+| 缺陷跟踪与媒体 | 已实现 | 项目缺陷 CRUD、富文本清洗、状态流转、MinIO 图片附件、权限和删除清理 | [缺陷跟踪接口文档](api_defects.md)、[媒体存储接口文档](api_media.md) |
 | 浏览器接口采集 | 联调中 | Chrome 插件采集批次、HTTP/WebSocket 草稿幂等同步与结构化 AI | [浏览器采集接口文档](api_browser_captures.md) |
 | 接口定义与导入 | 待规划 | 独立接口资产、OpenAPI 导入、从接口生成用例 | 本文档开发计划 |
 
@@ -79,6 +79,7 @@
 -> 通过持久化 SSE 展示步骤、连线和最终状态
 -> 持久化用例执行和流程节点执行记录
 -> 记录、查询和推进项目缺陷生命周期
+-> 上传缺陷截图到 MinIO，并以附件元数据和短期签名 URL 安全展示
 ```
 
 ### 2.2 当前主要缺口
@@ -633,10 +634,13 @@ test_scenario_executions
   `test_scenario_runs` 增加可空的 `record_id`、`record_name`，兼容历史运行。
 - 步骤重试数据库迁移为 `0017_add_step_retry_policies.py`，为 HTTP/WebSocket 用例增加
   `retry_policy`，为两类执行记录增加 `attempt_history`。
+- 场景节点破坏性迁移为 `0020_migrate_scenarios_to_nodes.py`：首用例前动作绑定到首节点前置，
+  用例间动作绑定到下一节点前置，末尾动作绑定到末节点后置；不能保持 teardown 或停止边界的
+  数据阻断升级。运行时只读 `nodes`。
 - 代码发布前必须执行 `alembic upgrade head`；否则会因缺少
   `test_scenario_executions`、`test_scenario_run_events` 或 record 字段报错。
-- records 保存在场景版本 JSON 中，不新增独立 record 表；旧版本读取时归一化，新版本写入
-  records。迁移只补充运行身份字段，不改写历史场景版本。
+- records 保存在场景版本 JSON 中，不新增独立 record 表；旧 dataset-level overrides
+  读取时归一化，新版本只写 records。0020 会改写历史场景版本的编排结构，但不改变用例快照。
 
 当前限制与后续方向：
 
@@ -670,8 +674,9 @@ test_scenario_executions
 | 列表查询能力补齐 | 已实现 | HTTP/WebSocket 用例支持分页、关键字和环境筛选；Flow 支持分页、关键字和状态筛选 |
 | 错误响应一致性 | 已实现 | HTTP/校验/框架 404/未处理异常统一 `{code,message,data}`；500 返回 request ID 且不泄露内部异常 |
 | 缺陷跟踪后端接口 | 已实现 | 支持项目缺陷 CRUD、富文本清洗、状态流转校验和 `defect:*` 权限 |
-| 数据库迁移验证 | 进行中 | 目标数据库已升级至 `0018_defects`；继续补全新库从零升级和 CI 验证 |
-| 自动化测试基线 | 进行中 | 当前 `unittest discover` 共 101 项通过；继续接入 CI 并增加真实 SSE/数据库集成测试 |
+| 缺陷图片存储 | 已实现 | 私有 MinIO 桶、格式/大小校验、附件绑定、预签名读取、单对象/缺陷/项目清理 |
+| 数据库迁移验证 | 已完成 | 目标库已到 `0020_scenario_nodes`；47 个版本无遗留 `steps`，4 个场景详情回读通过 |
+| 自动化测试基线 | 进行中 | 当前 `unittest discover` 共 118 项通过；继续接入 CI 并增加真实 MinIO/MySQL 集成测试 |
 
 P0 完成条件：
 
@@ -794,6 +799,7 @@ P2 完成条件：
 | 非幂等请求重试产生重复副作用 | POST/PATCH 可能重复创建或扣款 | 默认禁止；仅显式开启并配合业务幂等键 |
 | 高并发重试放大被测服务压力 | 多 record 同时失败可能形成重试风暴 | 指数退避、Full Jitter、最大等待和场景 deadline |
 | 500 错误难以跨端定位 | 前端只能看到通用错误，排障依赖人工关联时间 | 返回并记录 `X-Request-ID`，通过 request ID 关联服务日志 |
+| MinIO 与 MySQL 缺少跨系统事务 | 极端失败可能产生孤儿对象或元数据 | 写入失败立即补偿删除；删除失败保留元数据并返回 503；后续增加 outbox、周期巡检和生命周期规则 |
 
 ## 12. 进度更新记录
 
@@ -808,3 +814,7 @@ P2 完成条件：
 | 2026-06-15 | 2.6 | 新增统一执行记录列表与详情，聚合 HTTP、WebSocket、场景和 Flow；支持项目、类型、状态、环境、执行人、时间和关键字筛选；详情保留协议专属快照、attempt、事件和节点日志；无需新增迁移；完整回归 89 项通过 |
 | 2026-06-15 | 2.7 | 新增测试报告历史、计划与 Flow 结构化报告、指标统计、安全 HTML 导出和按日趋势；计划报告展开 dataset record 场景运行，Flow 报告展开节点明细；无需新增迁移；完整回归 98 项通过 |
 | 2026-06-17 | 2.8 | 新增缺陷跟踪后端接口、`defects` 表、`defect:*` 权限、富文本清洗和状态流转校验；迁移升级至 0018；完整回归 101 项通过 |
+| 2026-06-17 | 2.9 | 接入 MinIO 缺陷图片存储，新增 `media_objects`、安全图片校验、附件绑定、动态预签名 URL 和删除清理；代码迁移 head 升级至 0019；完整回归 106 项通过 |
+| 2026-06-19 | 3.0 | 场景定义破坏性切换为 nodes 与绑定动作；新增随机、固定值和受限脚本动作、运行列表分页及统一 202 响应；加入可阻断的 0020 一次性迁移；完整回归 116 项通过 |
+| 2026-06-20 | 3.0.1 | 扩展 0020 顺序迁移以覆盖用例间 condition 和 setup 用例；目标库 47 个版本全部转换，修复场景列表 `KeyError: nodes`；完整回归 117 项通过 |
+| 2026-06-20 | 3.0.2 | 修复创建重复名称场景时唯一键异常在 flush 阶段漏出为 500；flush/commit 竞态统一返回 HTTP 409；完整回归 118 项通过 |

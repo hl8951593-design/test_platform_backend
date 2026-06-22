@@ -7,7 +7,7 @@
 
 ```mermaid
 flowchart TD
-    A["创建或更新场景"] --> B["校验步骤、数据集、record 和请求覆盖"]
+    A["创建或更新场景"] --> B["校验 nodes、绑定动作、record 和请求覆盖"]
     B --> C["生成不可变 Scenario Version"]
 
     C --> D{"执行入口"}
@@ -36,7 +36,7 @@ flowchart TD
     R -->|"测试计划"| T["同步进入计划目标执行"]
     S --> U["BackgroundTasks 执行 queued runs"]
     T --> V["逐个或并行执行 Scenario 目标"]
-    U --> W["每个 run 顺序执行场景步骤"]
+    U --> W["每个 run 按节点顺序执行绑定动作和主用例"]
     V --> W
 
     W --> X["保存步骤结果、变量快照、请求响应快照"]
@@ -49,18 +49,19 @@ flowchart TD
 ```mermaid
 flowchart TD
     A["run_started"] --> B["初始化 dataset variables 和变量来源"]
-    B --> C{"还有下一步骤?"}
+    B --> B1["展开 nodes<br/>before_actions → test_case → after_actions"]
+    B1 --> C{"还有下一步骤?"}
     C -->|"否"| Z["汇总 run 状态并写入终态事件"]
     C -->|"是"| D{"已超出 deadline?"}
 
     D -->|"是"| E["当前步骤 timeout"]
-    E --> F["后续步骤 skipped"]
-    F --> Z
+    E --> F["仍尝试本节点 after_actions<br/>后续节点 skipped"]
+    F --> C
 
     D -->|"否"| G{"前一步要求停止?"}
-    G -->|"是"| H["当前步骤 skipped<br/>reason=previous_step_failed"]
+    G -->|"前置动作已阻断"| H["剩余前置与 test_case skipped"]
     H --> C
-    G -->|"否"| I["写入 transition_started"]
+    G -->|"否或当前是 after_action"| I["写入 transition_started"]
 
     I --> J["复制步骤保存的 case snapshot"]
     J --> K["合并步骤 config"]
@@ -72,21 +73,35 @@ flowchart TD
 
     P -->|"api_case"| Q["进入 HTTP 步骤内部 Attempt 循环"]
     P -->|"websocket_case"| R["进入 WebSocket 步骤内部 Attempt 循环"]
-    P -->|"delay"| S["等待 0 到 300000 ms"]
+    P -->|"delay"| S["按 duration_ms 等待"]
     P -->|"condition"| T["受限表达式计算 variables / steps"]
+    P -->|"random / fixed_value"| T1["生成类型化值并写入 output 变量"]
+    P -->|"script"| T2["受限子进程执行声明的 inputs / outputs"]
 
     Q --> U["最终成功后提取响应变量"]
     R --> U
     S --> U
     T --> U
+    T1 --> U
+    T2 --> U
     U --> V["保存 request/session、response、assertions、extractions"]
     V --> W{"步骤通过?"}
 
     W -->|"是"| C
     W -->|"否且 continue_on_failure=true"| C
-    W -->|"否且 continue_on_failure=false"| X["设置停止标记"]
+    W -->|"否且为 before_action<br/>continue_on_failure=false"| X["跳过本节点剩余前置和主用例"]
+    W -->|"否且为 test_case<br/>continue_on_failure=false"| X1["完成本节点后置后停止后续节点"]
+    W -->|"否且为 after_action"| C
     X --> C
+    X1 --> C
 ```
+
+节点语义：
+
+- 每个 `nodes[]` 项只有一个 HTTP/WebSocket `test_case`，动作通过容器绑定位置。
+- 前置动作阻断后仍执行本节点所有 `after_actions`；主用例失败也先完成本节点后置动作。
+- 后置动作之间不使用失败停止标记，确保每个清理动作都被尝试；失败仍参与 run 终态汇总。
+- 运行时只读取 `nodes`，不兼容读取 `steps/execution_phase`。
 
 run 最终状态按步骤结果汇总：
 
@@ -160,10 +175,12 @@ WebSocket 覆盖支持：
 
 | 流程 | 支持情况 | 行为 |
 | --- | --- | --- |
-| 单接口串行流程 | 支持 | 多个 `api_case` 按步骤顺序执行 |
+| 单接口串行流程 | 支持 | 多个节点按顺序执行，每节点绑定一个主用例 |
 | HTTP 与 WebSocket 混合流程 | 支持 | 两类用例可在同一场景内顺序组合 |
-| 等待流程 | 支持 | `delay` 步骤支持 0 到 300000 ms，也可使用模板值 |
+| 等待流程 | 支持 | `delay` 动作使用非负整数 `duration_ms` |
 | 条件门禁 | 支持 | `condition` 使用受限表达式读取 `variables` 和历史 `steps` |
+| 随机与固定值 | 支持 | 保留 JSON 类型并通过 `output` 写入场景变量 |
+| 受限脚本 | 支持 | Python/JavaScript 白名单、独立子进程、超时和声明式输入输出 |
 | 失败即停 | 支持 | 默认失败后剩余步骤标记为 `skipped` |
 | 失败后继续 | 支持 | 步骤设置 `continue_on_failure=true` 后继续，但 run 最终仍失败 |
 | HTTP 步骤内部重试 | 支持 | 网络错误、超时、配置状态码和轮询断言可重试 |

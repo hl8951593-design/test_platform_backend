@@ -9,6 +9,7 @@ from app.models.project import (
     ProjectMemberPermission,
 )
 from app.models.defect import Defect
+from app.models.media import MediaObject
 from app.models.scenario import (
     TestScenario,
     TestScenarioExecution,
@@ -152,6 +153,7 @@ class ProjectRepository:
         self.db.execute(
             delete(WebSocketTestCase).where(WebSocketTestCase.project_id == project_id)
         )
+        self.db.execute(delete(MediaObject).where(MediaObject.project_id == project_id))
         self.db.execute(delete(Defect).where(Defect.project_id == project_id))
 
         if environment_ids:

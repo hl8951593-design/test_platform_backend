@@ -2,6 +2,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.defect import Defect
+from app.models.media import MediaObject
 from app.models.user import User
 
 
@@ -43,7 +44,7 @@ class DefectRepository:
             ).where(*conditions)
         ) or 0
         statement = (
-            base.options(selectinload(Defect.reporter))
+            base.options(selectinload(Defect.reporter), selectinload(Defect.attachments))
             .order_by(Defect.updated_at.desc(), Defect.id.desc())
             .offset((page - 1) * page_size)
             .limit(page_size)
@@ -53,7 +54,7 @@ class DefectRepository:
     def get_by_id(self, *, project_id: int, defect_id: int) -> Defect | None:
         statement = (
             select(Defect)
-            .options(selectinload(Defect.reporter))
+            .options(selectinload(Defect.reporter), selectinload(Defect.attachments))
             .where(Defect.project_id == project_id, Defect.id == defect_id)
         )
         return self.db.scalar(statement)
@@ -115,3 +116,9 @@ class DefectRepository:
     def delete(self, defect: Defect) -> None:
         self.db.delete(defect)
         self.db.commit()
+
+    def replace_attachments(self, *, defect: Defect, attachments: list[MediaObject]) -> Defect:
+        defect.attachments = attachments
+        self.db.commit()
+        updated = self.get_by_id(project_id=defect.project_id, defect_id=defect.id)
+        return updated or defect

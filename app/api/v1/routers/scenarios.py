@@ -108,7 +108,6 @@ def delete_scenario(
 @router.post(
     "/{scenario_id}/execute",
     status_code=status.HTTP_202_ACCEPTED,
-    response_model=ScenarioExecutionQueuedRead,
     summary="异步执行场景",
 )
 def execute_scenario(
@@ -131,20 +130,29 @@ def execute_scenario(
         background_tasks.add_task(
             ScenarioService.execute_queued_execution, execution["execution_id"]
         )
-    return execution
+    return success(
+        data=ScenarioExecutionQueuedRead.model_validate(execution),
+        message="场景执行请求已受理",
+    )
 
 
 @run_router.get("", summary="查询场景调试历史")
 def list_scenario_runs(
     project_id: int,
     scenario_id: int | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=200, ge=1, le=200),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    runs = ScenarioService(db).list_runs(
-        project_id=project_id, scenario_id=scenario_id, current_user=current_user
+    result = ScenarioService(db).list_runs(
+        project_id=project_id, scenario_id=scenario_id, current_user=current_user,
+        page=page, page_size=page_size,
     )
-    return success(data=[ScenarioRunRead.model_validate(run) for run in runs])
+    result["items"] = [
+        ScenarioRunRead.model_validate(run) for run in result["items"]
+    ]
+    return success(data=result)
 
 
 @run_router.get("/{run_id}", summary="查询场景运行详情")

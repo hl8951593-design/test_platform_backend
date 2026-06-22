@@ -16,6 +16,8 @@ projects
 -> defects.project_id
 users
 -> defects.reporter_id
+defects
+-> media_objects.defect_id
 ```
 
 当前已实现：
@@ -28,6 +30,7 @@ users
 - 推进缺陷状态；
 - 富文本 HTML 服务端清洗；
 - 项目删除时清理项目下缺陷。
+- 绑定已上传的 MinIO 图片附件，并在读取时返回短期预签名 URL。
 
 ## 权限
 
@@ -119,7 +122,8 @@ reopened -> active | confirmed | fixed | closed
   "bug_type": "functional",
   "urgency": "critical",
   "status": "new",
-  "content_html": "<p>复现步骤...</p>"
+  "content_html": "<p>复现步骤...</p>",
+  "media_ids": [12, 13]
 }
 ```
 
@@ -133,6 +137,7 @@ reopened -> active | confirmed | fixed | closed
 | `urgency` | 是 | `low`、`medium`、`high`、`critical` |
 | `status` | 否 | 当前状态，默认 `new` |
 | `content_html` | 是 | 富文本内容 HTML |
+| `media_ids` | 否 | 通过媒体上传接口取得的对象 ID 列表；创建时默认空数组 |
 
 创建人自动记录为 `reporter_id`，响应中通过 `reporter_name` 返回用户名或账号。
 
@@ -144,7 +149,8 @@ reopened -> active | confirmed | fixed | closed
 | `PUT` | `/defects/{defect_id}?project_id={project_id}` | `defect:update` | 更新缺陷字段 |
 | `DELETE` | `/defects/{defect_id}?project_id={project_id}` | `defect:delete` | 删除缺陷 |
 
-更新请求体与创建请求体一致。如果 `status` 发生变化，也会执行状态流转校验。
+更新请求体与创建请求体基本一致。如果 `status` 发生变化，也会执行状态流转校验。
+更新时 `media_ids` 不传表示保留原附件；传数组表示用该完整列表替换附件绑定，传空数组表示解绑全部附件。
 
 ## 推进缺陷状态
 
@@ -176,6 +182,16 @@ reopened -> active | confirmed | fixed | closed
   "urgency": "critical",
   "status": "confirmed",
   "content_html": "<p>复现步骤...</p>",
+  "attachments": [
+    {
+      "id": 12,
+      "original_filename": "order-state.png",
+      "content_type": "image/png",
+      "size_bytes": 183024,
+      "download_url": "http://minio.example/testplatform/...?X-Amz-Signature=...",
+      "created_at": "2026-06-17 07:55:00"
+    }
+  ],
   "reporter_name": "韩梅梅",
   "created_at": "2026-06-17 08:00:00",
   "updated_at": "2026-06-17 09:00:00"
@@ -192,10 +208,13 @@ reopened -> active | confirmed | fixed | closed
 - 仅允许 `http`、`https`、相对路径和受限图片 `data:` URL；
 - 不保留内联 `style`。
 
-如果后续改为独立附件存储，粘贴图片应转换为附件 URL 后再写回标准 `content_html`。
+图片附件不把预签名 URL 持久化进 `content_html`。前端使用 `attachments[].download_url`
+展示图片；地址过期后调用媒体 URL 刷新接口。这样历史缺陷不会依赖已经过期的临时地址。
 
 ## 兼容性和迁移
 
-- 新增数据库表 `defects`。
-- Alembic 迁移文件为 `0018_create_defect_tables.py`，revision 为 `0018_defects`。
+- 缺陷基础表迁移为 `0018_create_defect_tables.py`。
+- 媒体附件表迁移为 `0019_create_media_objects.py`，revision 为 `0019_media_objects`。
+- 旧客户端不传 `media_ids` 时仍可创建缺陷；更新时不传该字段会保留已有附件。
 - 部署前必须执行 `alembic upgrade head`。
+- 媒体接口和部署配置详见 [媒体存储接口文档](api_media.md)。

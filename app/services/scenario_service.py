@@ -1,7 +1,9 @@
 import ast
 import copy
 import hashlib
+import secrets
 import re
+import string
 import time
 import uuid
 from datetime import datetime
@@ -40,6 +42,7 @@ from app.schemas.scenario import (
 from app.schemas.test_case import TestCaseRequestConfig
 from app.schemas.websocket_test_case import WebSocketTestCaseConfig
 from app.services.permission_service import PermissionService
+from app.services.scenario_script_sandbox import run_scenario_script
 from app.services.test_case_service import TestCaseService
 from app.services.websocket_test_case_service import WebSocketTestCaseService
 
@@ -80,7 +83,7 @@ class ScenarioService:
             created_by_id=current_user.id, updated_by_id=current_user.id,
         )
         self.db.add(scenario)
-        self.db.flush()
+        self._flush_unique()
         self.db.add(TestScenarioVersion(
             scenario_id=scenario.id, version=1, definition=definition, created_by_id=current_user.id
         ))
@@ -155,7 +158,7 @@ class ScenarioService:
         version = self._get_version(scenario, scenario_version)
         definition = decrypt_sensitive(copy.deepcopy(version.definition))
         self._normalize_definition_datasets(definition)
-        self._ensure_trace_metadata(definition["steps"])
+        self._ensure_trace_metadata(self._execution_steps(definition))
         self._validate_request_overrides(definition)
         selected_environment_id = environment_id or scenario.environment_id
         self._get_environment(project_id, selected_environment_id)
@@ -220,7 +223,8 @@ class ScenarioService:
         version = self._get_version(scenario)
         definition = decrypt_sensitive(copy.deepcopy(version.definition))
         self._normalize_definition_datasets(definition)
-        self._ensure_trace_metadata(definition["steps"])
+        execution_steps = self._execution_steps(definition)
+        self._ensure_trace_metadata(execution_steps)
         self._validate_request_overrides(definition)
         selected_environment_id = environment_id or scenario.environment_id
         self._get_environment(project_id, selected_environment_id)
@@ -288,7 +292,7 @@ class ScenarioService:
                 variables_snapshot=mask_sensitive(copy.deepcopy(dataset.get("variables") or {})),
                 step_results=[
                     self._pending_result(step, index)
-                    for index, step in enumerate(definition["steps"])
+                    for index, step in enumerate(execution_steps)
                 ],
                 triggered_by_id=current_user.id,
                 started_at=now,
@@ -299,7 +303,7 @@ class ScenarioService:
                 run,
                 version.version,
                 "run_queued",
-                {"status": "queued", "total_steps": len(definition["steps"])},
+                {"status": "queued", "total_steps": len(execution_steps)},
                 commit=False,
             )
         scenario.last_run_at = now
@@ -342,7 +346,7 @@ class ScenarioService:
                 return
             definition = decrypt_sensitive(copy.deepcopy(version.definition))
             service._normalize_definition_datasets(definition)
-            service._ensure_trace_metadata(definition["steps"])
+            service._ensure_trace_metadata(service._execution_steps(definition))
             service._validate_request_overrides(definition)
             execution.status = "running"
             execution.started_at = datetime.utcnow()
@@ -378,15 +382,22 @@ class ScenarioService:
             execution.finished_at = datetime.utcnow()
             db.commit()
 
-    def list_runs(self, *, project_id: int, scenario_id: int | None, current_user: User) -> list[TestScenarioRun]:
+    def list_runs(
+        self, *, project_id: int, scenario_id: int | None, current_user: User,
+        page: int, page_size: int,
+    ) -> dict[str, Any]:
         self._require_view(current_user, project_id)
         filters = [TestScenarioRun.project_id == project_id]
         if scenario_id is not None:
             filters.append(TestScenarioRun.scenario_id == scenario_id)
-        return list(self.db.scalars(
+        total = self.db.scalar(
+            select(func.count()).select_from(TestScenarioRun).where(*filters)
+        ) or 0
+        items = list(self.db.scalars(
             select(TestScenarioRun).where(*filters).order_by(TestScenarioRun.started_at.desc(), TestScenarioRun.id.desc())
-            .limit(200)
+            .offset((page - 1) * page_size).limit(page_size)
         ).all())
+        return {"items": items, "total": total, "page": page, "page_size": page_size}
 
     def get_run(self, *, project_id: int, run_id: int, current_user: User) -> TestScenarioRun:
         self._require_view(current_user, project_id)
@@ -538,21 +549,33 @@ class ScenarioService:
                 "run_started",
                 {
                     "status": "running",
-                    "total_steps": len(definition["steps"]),
+                    "total_steps": len(self._execution_steps(definition)),
                     "started_at": self._iso_utc(started_at),
                 },
             )
 
+        ordered_steps = self._execution_steps(definition)
+        self._ensure_trace_metadata(ordered_steps)
         results: list[dict[str, Any]] = []
         variable_sources: dict[str, dict[str, Any]] = {}
-        stop = False
+        global_stop = False
+        blocked_nodes: set[str] = set()
+        stop_after_nodes: set[str] = set()
+        previous_node_id: str | None = None
         previous_step: dict[str, Any] | None = None
+        previous_step_index: int | None = None
         overrides_by_step: dict[str, list[dict[str, Any]]] = {}
         for override in request_overrides or []:
             overrides_by_step.setdefault(str(override.get("step_id")), []).append(
                 override
             )
-        for index, step in enumerate(definition["steps"]):
+        for index, step in enumerate(ordered_steps):
+            node_id = str(step["_node_id"])
+            node_phase = str(step["_node_phase"])
+            if previous_node_id is not None and node_id != previous_node_id:
+                if previous_node_id in stop_after_nodes:
+                    global_stop = True
+            previous_node_id = node_id
             result_index = index if emit_events else index + 1
             if deadline is not None and datetime.utcnow() >= deadline:
                 result = self._timeout_result(step, result_index)
@@ -563,7 +586,7 @@ class ScenarioService:
                         results,
                         variables,
                         variable_sources,
-                        definition["steps"][index + 1:],
+                        ordered_steps[index + 1:],
                         index + 1,
                     )
                     self._append_event(
@@ -572,9 +595,9 @@ class ScenarioService:
                         "step_failed",
                         self._step_event_payload(result, step, continue_on_failure=False),
                     )
-                stop = True
+                stop_after_nodes.add(node_id)
                 continue
-            if stop:
+            if global_stop or (node_id in blocked_nodes and node_phase != "after"):
                 result = self._skipped_result(step, result_index)
                 results.append(result)
                 if emit_events:
@@ -583,7 +606,7 @@ class ScenarioService:
                         results,
                         variables,
                         variable_sources,
-                        definition["steps"][index + 1:],
+                        ordered_steps[index + 1:],
                         index + 1,
                     )
                     self._append_event(
@@ -594,7 +617,11 @@ class ScenarioService:
                             "step_id": step["id"],
                             "step_index": index,
                             "status": "skipped",
-                            "reason": "previous_step_failed",
+                            "reason": (
+                                "previous_node_failed"
+                                if global_stop
+                                else "before_action_failed"
+                            ),
                         },
                     )
                 continue
@@ -605,7 +632,7 @@ class ScenarioService:
                     "transition_started",
                     {
                         "source_step_id": previous_step["id"],
-                        "source_step_index": index - 1,
+                        "source_step_index": previous_step_index,
                         "target_step_id": step["id"],
                         "target_step_index": index,
                         "reason": self._transition_reason(previous_step, results[-1]),
@@ -628,7 +655,7 @@ class ScenarioService:
                     *[
                         self._pending_result(item, pending_index)
                         for pending_index, item in enumerate(
-                            definition["steps"][current_index + 1:],
+                            ordered_steps[current_index + 1:],
                             start=current_index + 1,
                         )
                     ],
@@ -670,7 +697,7 @@ class ScenarioService:
                     results,
                     variables,
                     variable_sources,
-                    definition["steps"][index + 1:],
+                    ordered_steps[index + 1:],
                     index + 1,
                 )
                 self._append_event(
@@ -684,8 +711,11 @@ class ScenarioService:
                     ),
                 )
             if result["status"] != "passed" and not step.get("continue_on_failure", False):
-                stop = True
+                stop_after_nodes.add(node_id)
+                if node_phase == "before":
+                    blocked_nodes.add(node_id)
             previous_step = step
+            previous_step_index = index
 
         finished_at = datetime.utcnow()
         run.step_results = results
@@ -763,6 +793,8 @@ class ScenarioService:
             if remaining is not None and remaining <= 0:
                 raise TimeoutError("Scenario execution deadline exceeded")
             config = self._render(raw_config, variables)
+            if step["kind"] == "condition":
+                config["expression"] = raw_config["expression"]
             resolved_bindings = self._resolved_bindings(
                 step=step,
                 raw_config=raw_config,
@@ -774,7 +806,7 @@ class ScenarioService:
             if on_started is not None:
                 on_started(started_at, resolved_bindings)
             if step["kind"] == "delay":
-                delay_seconds = config.get("delayMs", config.get("delay_ms", 0)) / 1000
+                delay_seconds = config["duration_ms"] / 1000
                 if remaining is not None and delay_seconds > remaining:
                     raise TimeoutError("Scenario execution deadline exceeded")
                 time.sleep(delay_seconds)
@@ -784,6 +816,47 @@ class ScenarioService:
                 if not passed:
                     status_value = "failed"
                     error_message = "条件判断结果为 false"
+            elif step["kind"] == "random":
+                random_type = config["type"]
+                if random_type == "integer":
+                    output = secrets.randbelow(config["max"] - config["min"] + 1) + config["min"]
+                elif random_type == "string":
+                    alphabet = string.ascii_letters + string.digits
+                    output = "".join(secrets.choice(alphabet) for _ in range(config["length"]))
+                else:
+                    output = str(uuid.uuid4())
+                variables[config["output"]] = copy.deepcopy(output)
+                variable_sources[config["output"]] = {
+                    "source_step_id": step["id"],
+                    "source_extraction_id": f"action:{step['id']}",
+                    "masked": False,
+                }
+            elif step["kind"] == "fixed_value":
+                output = copy.deepcopy(config["value"])
+                variables[config["output"]] = copy.deepcopy(output)
+                variable_sources[config["output"]] = {
+                    "source_step_id": step["id"],
+                    "source_extraction_id": f"action:{step['id']}",
+                    "masked": self._trace_masked(config, config["output"]),
+                }
+            elif step["kind"] == "script":
+                missing = [name for name in config["inputs"] if name not in variables]
+                if missing:
+                    raise ValueError(f"Script inputs are unavailable: {', '.join(missing)}")
+                output = run_scenario_script(
+                    language=config["language"],
+                    code=config["code"],
+                    inputs={name: copy.deepcopy(variables[name]) for name in config["inputs"]},
+                    outputs=config["outputs"],
+                    timeout_ms=config["timeout_ms"],
+                )
+                for name in config["outputs"]:
+                    variables[name] = copy.deepcopy(output.get(name))
+                    variable_sources[name] = {
+                        "source_step_id": step["id"],
+                        "source_extraction_id": f"action:{step['id']}:{name}",
+                        "masked": self._trace_masked(config, name),
+                    }
             elif step["kind"] == "api_case":
                 data = copy.deepcopy(step["case_snapshot"])
                 data["environment_id"] = environment_id
@@ -838,9 +911,35 @@ class ScenarioService:
                 variables=variables,
                 variable_sources=variable_sources,
             )
+            if step["kind"] in {"random", "fixed_value"}:
+                name = str(config["output"])
+                extracted_variables.append({
+                    "extraction_id": f"action:{step['id']}",
+                    "name": name,
+                    "path": "",
+                    "value": (
+                        "***" if variable_sources[name]["masked"] else copy.deepcopy(output)
+                    ),
+                    "masked": variable_sources[name]["masked"],
+                })
+            elif step["kind"] == "script":
+                for name in config["outputs"]:
+                    extracted_variables.append({
+                        "extraction_id": f"action:{step['id']}:{name}",
+                        "name": name,
+                        "path": name,
+                        "value": (
+                            "***"
+                            if variable_sources[name]["masked"]
+                            else copy.deepcopy(output.get(name))
+                        ),
+                        "masked": variable_sources[name]["masked"],
+                    })
         finished_at = datetime.utcnow()
         result = {
             "step_id": step["id"], "step_index": step_index, "kind": step["kind"], "name": step["name"],
+            "node_id": step.get("_node_id"), "node_index": step.get("_node_index"),
+            "node_phase": step.get("_node_phase"),
             "status": status_value if status_value in {"passed", "timeout"} else "failed",
             "message": self._step_message(status_value, error_message),
             "extracted_variables": extracted_variables,
@@ -1121,6 +1220,40 @@ class ScenarioService:
             "skipped": "Execution skipped",
         }.get(status_value, "Execution failed")
 
+    @staticmethod
+    def _execution_steps(definition: dict[str, Any]) -> list[dict[str, Any]]:
+        nodes = definition.get("nodes")
+        if not isinstance(nodes, list):
+            raise RuntimeError("Scenario definition has not been migrated to nodes")
+        steps: list[dict[str, Any]] = []
+        for node_index, node in enumerate(nodes):
+            node_id = str(node.get("id") or "")
+            groups = (
+                ("before", node.get("before_actions") or []),
+                ("test_case", [node.get("test_case")]),
+                ("after", node.get("after_actions") or []),
+            )
+            for phase, items in groups:
+                for item in items:
+                    if not isinstance(item, dict):
+                        raise RuntimeError(
+                            f"Scenario node {node_id or node_index} is missing its test_case"
+                        )
+                    step = copy.deepcopy(item)
+                    step["_node_id"] = node_id
+                    step["_node_index"] = node_index
+                    step["_node_phase"] = phase
+                    steps.append(step)
+        return steps
+
+    @classmethod
+    def _test_case_steps(cls, definition: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            step
+            for step in cls._execution_steps(definition)
+            if step["_node_phase"] == "test_case"
+        ]
+
     def _select_datasets(
         self, definition: dict[str, Any], dataset_ids: list[str] | None
     ) -> list[dict[str, Any]]:
@@ -1382,6 +1515,9 @@ class ScenarioService:
             "step_index": index,
             "kind": step["kind"],
             "name": step["name"],
+            "node_id": step.get("_node_id"),
+            "node_index": step.get("_node_index"),
+            "node_phase": step.get("_node_phase"),
             "status": "pending",
             "extracted_variables": [],
             "resolved_bindings": [],
@@ -1400,6 +1536,9 @@ class ScenarioService:
             "step_index": index,
             "kind": step["kind"],
             "name": step["name"],
+            "node_id": step.get("_node_id"),
+            "node_index": step.get("_node_index"),
+            "node_phase": step.get("_node_phase"),
             "status": "running",
             "started_at": ScenarioService._iso_utc(started_at),
             "extracted_variables": [],
@@ -1462,28 +1601,43 @@ class ScenarioService:
 
     def _validated_definition(self, project_id: int, payload: ScenarioPayload) -> dict:
         self._get_environment(project_id, payload.environment_id)
-        steps = []
-        for item in payload.steps:
-            step = item.model_dump()
-            if item.kind == "api_case":
-                asset = self.db.scalar(select(TestCase).where(TestCase.id == item.reference_id, TestCase.project_id == project_id))
-            elif item.kind == "websocket_case":
-                asset = self.db.scalar(select(WebSocketTestCase).where(
-                    WebSocketTestCase.id == item.reference_id, WebSocketTestCase.project_id == project_id
+        nodes = []
+        for node_item in payload.nodes:
+            node = node_item.model_dump()
+            test_case_item = node_item.test_case
+            if test_case_item.kind == "api_case":
+                asset = self.db.scalar(select(TestCase).where(
+                    TestCase.id == test_case_item.reference_id,
+                    TestCase.project_id == project_id,
                 ))
             else:
-                asset = None
-            if item.kind in {"api_case", "websocket_case"}:
-                if asset is None:
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"步骤引用用例不存在: {item.id}")
-                step.update({"name": asset.name, "method": asset.method if item.kind == "api_case" else "WS", "path": asset.path})
-                step["case_snapshot"] = self._case_snapshot(asset, websocket=item.kind == "websocket_case")
-            steps.append(step)
-        self._ensure_trace_metadata(steps)
+                asset = self.db.scalar(select(WebSocketTestCase).where(
+                    WebSocketTestCase.id == test_case_item.reference_id,
+                    WebSocketTestCase.project_id == project_id,
+                ))
+            if asset is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"步骤引用用例不存在: {test_case_item.id}",
+                )
+            node["test_case"].update({
+                "name": asset.name,
+                "method": asset.method if test_case_item.kind == "api_case" else "WS",
+                "path": asset.path,
+                "case_snapshot": self._case_snapshot(
+                    asset, websocket=test_case_item.kind == "websocket_case"
+                ),
+            })
+            for action in [*node["before_actions"], *node["after_actions"]]:
+                action.pop("reference_id", None)
+                action.pop("method", None)
+                action.pop("path", None)
+            nodes.append(node)
         definition = {
-            "steps": steps,
+            "nodes": nodes,
             "datasets": [item.model_dump() for item in payload.datasets],
         }
+        self._ensure_trace_metadata(self._execution_steps(definition))
         self._validate_request_overrides(definition)
         return encrypt_sensitive(definition)
 
@@ -1491,7 +1645,7 @@ class ScenarioService:
         self._normalize_definition_datasets(definition)
         steps = {
             str(step.get("id")): step
-            for step in definition.get("steps", [])
+            for step in self._test_case_steps(definition)
             if step.get("id") is not None
         }
         supported_targets = {
@@ -1816,15 +1970,13 @@ class ScenarioService:
         version = self._get_version(scenario)
         definition = decrypt_sensitive(copy.deepcopy(version.definition))
         self._normalize_definition_datasets(definition)
-        public_steps = []
-        for item in definition["steps"]:
-            step = copy.deepcopy(item)
-            step.pop("case_snapshot", None)
-            public_steps.append(step)
+        public_nodes = copy.deepcopy(definition["nodes"])
+        for node in public_nodes:
+            node["test_case"].pop("case_snapshot", None)
         return {
             "id": scenario.id, "project_id": scenario.project_id, "environment_id": scenario.environment_id,
             "current_version": scenario.current_version, "name": scenario.name, "description": scenario.description,
-            "tags": scenario.tags, "steps": public_steps, "datasets": mask_sensitive(definition["datasets"]),
+            "tags": scenario.tags, "nodes": public_nodes, "datasets": mask_sensitive(definition["datasets"]),
             "created_at": scenario.created_at, "updated_at": scenario.updated_at, "last_run_at": scenario.last_run_at,
         }
 
@@ -1924,18 +2076,27 @@ class ScenarioService:
         return True, current
 
     def _evaluate_condition(self, expression: str, variables: dict[str, Any], results: list[dict]) -> bool:
+        expression = re.sub(
+            r"\{\{\s*([^{}]+?)\s*\}\}",
+            lambda match: repr(self._resolve_path(variables, match.group(1).strip())),
+            expression,
+        )
         tree = ast.parse(expression, mode="eval")
         allowed = (ast.Expression, ast.BoolOp, ast.UnaryOp, ast.Compare, ast.Name, ast.Load, ast.Constant,
-                   ast.Subscript, ast.And, ast.Or, ast.Not, ast.Eq, ast.NotEq, ast.Gt, ast.GtE, ast.Lt, ast.LtE)
+                   ast.Subscript, ast.And, ast.Or, ast.Not, ast.USub, ast.UAdd,
+                   ast.Eq, ast.NotEq, ast.Gt, ast.GtE, ast.Lt, ast.LtE)
         if any(not isinstance(node, allowed) for node in ast.walk(tree)):
             raise ValueError("条件表达式包含不支持的语法")
         return bool(eval(compile(tree, "<scenario-condition>", "eval"), {"__builtins__": {}}, {
             "variables": variables, "steps": results,
+            "true": True, "false": False, "null": None,
         }))
 
     def _skipped_result(self, step: dict, index: int) -> dict:
         now = datetime.utcnow().isoformat()
         return {"step_id": step["id"], "step_index": index, "kind": step["kind"], "name": step["name"],
+                "node_id": step.get("_node_id"), "node_index": step.get("_node_index"),
+                "node_phase": step.get("_node_phase"),
                 "status": "skipped", "message": "Execution skipped",
                 "extracted_variables": [], "resolved_bindings": [],
                 "attempt_history": [],
@@ -1945,6 +2106,8 @@ class ScenarioService:
     def _timeout_result(self, step: dict, index: int) -> dict:
         now = datetime.utcnow().isoformat()
         return {"step_id": step["id"], "step_index": index, "kind": step["kind"], "name": step["name"],
+                "node_id": step.get("_node_id"), "node_index": step.get("_node_index"),
+                "node_phase": step.get("_node_phase"),
                 "status": "timeout", "message": "Scenario execution deadline exceeded",
                 "extracted_variables": [], "resolved_bindings": [],
                 "attempt_history": [],
@@ -1956,8 +2119,20 @@ class ScenarioService:
         try:
             self.db.commit()
         except IntegrityError as exc:
-            self.db.rollback()
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="同一项目下场景名称不能重复") from exc
+            self._raise_name_conflict(exc)
+
+    def _flush_unique(self) -> None:
+        try:
+            self.db.flush()
+        except IntegrityError as exc:
+            self._raise_name_conflict(exc)
+
+    def _raise_name_conflict(self, exc: IntegrityError) -> None:
+        self.db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="同一项目下场景名称不能重复",
+        ) from exc
 
     def _require_view(self, user: User, project_id: int) -> None:
         self.permission_service.require_project_permission(user, project_id, ProjectPermission.VIEW_SCENARIO.value)

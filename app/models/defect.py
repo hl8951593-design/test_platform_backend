@@ -29,6 +29,12 @@ class Defect(Base):
 
     project = relationship("Project")
     reporter = relationship("User")
+    attachments = relationship(
+        "MediaObject",
+        back_populates="defect",
+        order_by="MediaObject.id",
+        passive_deletes=True,
+    )
 
     @property
     def assignee_name(self) -> str | None:

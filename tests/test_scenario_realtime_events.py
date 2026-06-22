@@ -17,7 +17,7 @@ class ScenarioRealtimeEventTests(unittest.TestCase):
             "id": step_id,
             "kind": "delay",
             "name": step_id,
-            "config": {"delayMs": 0},
+            "config": {"duration_ms": 0},
             "continue_on_failure": False,
         }
 
@@ -45,7 +45,18 @@ class ScenarioRealtimeEventTests(unittest.TestCase):
         self.service._append_event = MagicMock(side_effect=append_event)
         self.service._run_dataset(
             run=run,
-            definition={"steps": steps},
+            definition={
+                "nodes": [
+                    {
+                        "id": f"NODE-{index}",
+                        "name": step["name"],
+                        "before_actions": [],
+                        "test_case": step,
+                        "after_actions": [],
+                    }
+                    for index, step in enumerate(steps, start=1)
+                ]
+            },
             variables={},
             current_user=self.user,
             scenario_version=4,

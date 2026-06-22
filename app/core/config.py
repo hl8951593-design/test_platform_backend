@@ -20,6 +20,16 @@ class Settings(BaseSettings):
 
     REDIS_URL: str = "redis://127.0.0.1:6379/0"
 
+    MINIO_ENDPOINT_URL: str = "http://127.0.0.1:9000"
+    MINIO_PUBLIC_ENDPOINT_URL: str = ""
+    MINIO_ACCESS_KEY: str = ""
+    MINIO_SECRET_KEY: str = ""
+    MINIO_BUCKET: str = "testplatform"
+    MINIO_REGION: str = "us-east-1"
+    MINIO_SECURE: bool = False
+    MEDIA_MAX_IMAGE_BYTES: int = 10 * 1024 * 1024
+    MEDIA_PRESIGNED_URL_EXPIRE_SECONDS: int = 3600
+
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
     DEEPSEEK_MODEL: str = "deepseek-v4-flash"

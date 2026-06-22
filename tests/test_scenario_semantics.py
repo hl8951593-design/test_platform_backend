@@ -20,10 +20,22 @@ class ScenarioDatasetSemanticsTests(unittest.TestCase):
             id=21,
             version=2,
             definition={
-                "steps": [{"id": "step-1"}],
+                "nodes": [{
+                    "id": "node-1",
+                    "name": "Node 1",
+                    "before_actions": [],
+                    "test_case": {"id": "step-1", "kind": "api_case"},
+                    "after_actions": [],
+                }],
                 "datasets": [
-                    {"id": "enabled", "name": "Enabled", "enabled": True, "variables": {}},
-                    {"id": "disabled", "name": "Disabled", "enabled": False, "variables": {}},
+                    {
+                        "id": "enabled", "name": "Enabled", "enabled": True,
+                        "variables": {}, "records": [{"id": "R-1", "name": "Record", "enabled": True, "request_overrides": []}],
+                    },
+                    {
+                        "id": "disabled", "name": "Disabled", "enabled": False,
+                        "variables": {}, "records": [{"id": "R-2", "name": "Record", "enabled": True, "request_overrides": []}],
+                    },
                 ],
             },
         )
@@ -95,6 +107,67 @@ class ScenarioDatasetSemanticsTests(unittest.TestCase):
         calls = self.service._execute_dataset.call_args_list
         self.assertEqual(calls[0].kwargs["dataset"]["variables"], {"tenant_id": 1001})
         self.assertEqual(calls[1].kwargs["dataset"]["record_name"], "Blocked")
+
+
+class ScenarioNodeActionTests(unittest.TestCase):
+    def test_before_failure_skips_case_but_always_runs_every_after_action(self):
+        db = MagicMock()
+        service = ScenarioService(db)
+        executed: list[str] = []
+
+        def execute_step(**kwargs):
+            step_id = kwargs["step"]["id"]
+            executed.append(step_id)
+            return {
+                "step_id": step_id,
+                "status": "passed" if step_id == "teardown-2" else "failed",
+            }
+
+        service._execute_step = MagicMock(side_effect=execute_step)
+        run = SimpleNamespace(
+            id=101,
+            project_id=7,
+            environment_id=3,
+            status="queued",
+            started_at=None,
+            finished_at=None,
+            step_results=[],
+            variables_snapshot={},
+            current_step_id=None,
+            current_step_index=None,
+            duration_ms=None,
+        )
+        definition = {
+            "nodes": [{
+                "id": "node-1",
+                "name": "Node 1",
+                "before_actions": [
+                    {"id": "setup", "name": "Setup", "kind": "condition", "continue_on_failure": False},
+                ],
+                "test_case": {"id": "main", "name": "Main", "kind": "api_case", "continue_on_failure": False},
+                "after_actions": [
+                    {"id": "teardown-1", "name": "Cleanup 1", "kind": "delay", "continue_on_failure": False},
+                    {"id": "teardown-2", "name": "Cleanup 2", "kind": "delay", "continue_on_failure": False},
+                ],
+            }]
+        }
+
+        service._run_dataset(
+            run=run,
+            definition=definition,
+            variables={},
+            current_user=SimpleNamespace(id=5),
+            scenario_version=1,
+            deadline=None,
+            emit_events=False,
+        )
+
+        self.assertEqual(executed, ["setup", "teardown-1", "teardown-2"])
+        self.assertEqual([item["step_id"] for item in run.step_results], [
+            "setup", "main", "teardown-1", "teardown-2",
+        ])
+        self.assertEqual(run.step_results[1]["status"], "skipped")
+        self.assertEqual(run.status, "failed")
 
 
 if __name__ == "__main__":

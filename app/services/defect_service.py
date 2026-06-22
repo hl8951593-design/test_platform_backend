@@ -16,6 +16,7 @@ from app.schemas.defect import (
     DefectUpdateRequest,
 )
 from app.services.permission_service import PermissionService
+from app.services.media_service import MediaService
 
 
 ALLOWED_STATUS_TRANSITIONS: dict[str, set[str]] = {
@@ -34,6 +35,7 @@ class DefectService:
         self.db = db
         self.repository = DefectRepository(db)
         self.permission_service = PermissionService(db)
+        self.media_service = MediaService(db)
 
     def list_defects(
         self,
@@ -59,6 +61,7 @@ class DefectService:
             page=page,
             page_size=page_size,
         )
+        items = [self.media_service.attach_download_urls(item) for item in items]
         return {"items": items, "total": total, "page": page, "page_size": page_size}
 
     def get_defect(self, *, project_id: int, defect_id: int, current_user: User) -> Defect:
@@ -67,7 +70,8 @@ class DefectService:
             project_id,
             ProjectPermission.VIEW_DEFECT.value,
         )
-        return self._get_defect_or_404(project_id=project_id, defect_id=defect_id)
+        defect = self._get_defect_or_404(project_id=project_id, defect_id=defect_id)
+        return self.media_service.attach_download_urls(defect)
 
     def create_defect(
         self,
@@ -81,7 +85,12 @@ class DefectService:
             project_id,
             ProjectPermission.CREATE_DEFECT.value,
         )
-        return self.repository.create(
+        attachments = self.media_service.resolve_pending_attachments(
+            project_id=project_id,
+            media_ids=payload.media_ids,
+            current_user=current_user,
+        )
+        defect = self.repository.create(
             project_id=project_id,
             title=payload.title,
             assignee=payload.assignee,
@@ -91,6 +100,9 @@ class DefectService:
             content_html=sanitize_defect_html(payload.content_html),
             reporter_id=current_user.id,
         )
+        if attachments:
+            defect = self.repository.replace_attachments(defect=defect, attachments=attachments)
+        return self.media_service.attach_download_urls(defect)
 
     def update_defect(
         self,
@@ -107,7 +119,15 @@ class DefectService:
         )
         defect = self._get_defect_or_404(project_id=project_id, defect_id=defect_id)
         self._validate_transition(defect.status, payload.status)
-        return self.repository.update(
+        attachments = None
+        if payload.media_ids is not None:
+            attachments = self.media_service.resolve_pending_attachments(
+                project_id=project_id,
+                media_ids=payload.media_ids,
+                current_user=current_user,
+                defect_id=defect_id,
+            )
+        updated = self.repository.update(
             defect=defect,
             title=payload.title,
             assignee=payload.assignee,
@@ -116,6 +136,12 @@ class DefectService:
             status=payload.status,
             content_html=sanitize_defect_html(payload.content_html),
         )
+        if attachments is not None:
+            updated = self.repository.replace_attachments(
+                defect=updated,
+                attachments=attachments,
+            )
+        return self.media_service.attach_download_urls(updated)
 
     def delete_defect(self, *, project_id: int, defect_id: int, current_user: User) -> None:
         self.permission_service.require_project_permission(
@@ -124,6 +150,8 @@ class DefectService:
             ProjectPermission.DELETE_DEFECT.value,
         )
         defect = self._get_defect_or_404(project_id=project_id, defect_id=defect_id)
+        for media in getattr(defect, "attachments", ()):
+            self.media_service.storage.delete(bucket=media.bucket, object_key=media.object_key)
         self.repository.delete(defect)
 
     def transition_status(

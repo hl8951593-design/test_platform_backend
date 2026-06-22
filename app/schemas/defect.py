@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.media import MediaObjectRead
+
 
 DefectBugType = Literal[
     "functional",
@@ -27,11 +29,14 @@ class DefectBaseRequest(BaseModel):
 
 
 class DefectCreateRequest(DefectBaseRequest):
-    pass
+    media_ids: list[int] = Field(default_factory=list, description="已上传且待绑定的媒体对象 ID")
 
 
 class DefectUpdateRequest(DefectBaseRequest):
-    pass
+    media_ids: list[int] | None = Field(
+        default=None,
+        description="完整附件 ID 列表；不传则保留现有附件",
+    )
 
 
 class DefectStatusUpdateRequest(BaseModel):
@@ -48,6 +53,7 @@ class DefectRead(BaseModel):
     status: str
     content_html: str
     reporter_name: str | None
+    attachments: list[MediaObjectRead] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 

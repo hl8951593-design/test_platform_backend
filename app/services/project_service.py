@@ -8,6 +8,7 @@ from app.models.project import Project, ProjectEnvironment
 from app.models.scenario import TestScenario, TestScenarioRun
 from app.models.user import User
 from app.repositories.project_repository import ProjectRepository
+from app.repositories.media_repository import MediaRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.project import (
     EnvironmentTestCaseRead,
@@ -21,6 +22,7 @@ from app.schemas.project import (
     TestCaseEnvironmentBindRequest,
 )
 from app.services.permission_service import PermissionService
+from app.services.object_storage_service import ObjectStorageService
 
 
 class ProjectService:
@@ -29,6 +31,8 @@ class ProjectService:
         self.project_repository = ProjectRepository(db)
         self.user_repository = UserRepository(db)
         self.permission_service = PermissionService(db)
+        self.media_repository = MediaRepository(db)
+        self.object_storage = ObjectStorageService()
 
     def create(self, payload: ProjectCreateRequest, current_user: User) -> Project:
         return self.project_repository.create(
@@ -56,6 +60,8 @@ class ProjectService:
 
     def delete(self, project_id: int, current_user: User) -> None:
         project = self.permission_service.require_project_creator_or_admin(current_user, project_id)
+        for media in self.media_repository.list_by_project(project_id):
+            self.object_storage.delete(bucket=media.bucket, object_key=media.object_key)
         self.project_repository.delete_project(project)
 
     def grant_normal_tester_permissions(

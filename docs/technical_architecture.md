@@ -14,8 +14,16 @@ WebSocket 测试用例接口见 [WebSocket 测试用例接口技术文档](api_w
 
 缺陷跟踪接口见 [缺陷跟踪接口文档](api_defects.md)。
 
+MinIO 图片附件接口和部署配置见 [媒体存储接口文档](api_media.md)。
+
 场景从触发到 dataset record、步骤、变量和事件持久化的完整关系见
 [场景组合执行流程图谱](scenario_execution_graph.md)。
+
+场景版本只保存 `nodes[]`：每个节点绑定一个 HTTP/WebSocket 主用例，并以
+`before_actions[]`、`after_actions[]` 显式表达动作位置。执行器按节点顺序展开为
+`before_actions -> test_case -> after_actions`；前置或主用例失败不会跳过本节点后置动作，
+后置动作逐项尝试，失败仍如实计入运行终态。旧 `steps/execution_phase` 只允许通过
+`0020_scenario_nodes` 一次性迁移，运行时没有兼容分支。
 
 ## 1. 项目定位
 
@@ -36,6 +44,7 @@ WebSocket 测试用例接口见 [WebSocket 测试用例接口技术文档](api_w
 | 认证 | JWT | 支持前后端分离认证 |
 | 密码加密 | passlib[bcrypt] | 用户密码哈希存储 |
 | 缓存/临时状态 | Redis | 保存 token 状态、任务状态、临时变量和限流数据 |
+| 对象存储 | MinIO（S3 兼容） | 私有保存缺陷截图等二进制媒体，MySQL 只保存对象键和元数据 |
 | HTTP 执行引擎 | httpx | 执行接口测试步骤 |
 | 异步任务 | FastAPI BackgroundTasks（当前）/ 独立 Worker（演进目标） | 当前场景手工执行在响应后继续运行；生产可靠性阶段迁移到独立 Worker |
 | 实时事件 | SSE + MySQL 持久化事件表 | 支持鉴权请求头、Last-Event-ID 重放、心跳和终态关闭 |
@@ -356,6 +365,24 @@ attempt 历史；场景保留 dataset record、变量、步骤结果和持久化
 
 被删除资源通过外连接返回历史记录，资源名称允许为 `null`。统一执行记录是报告域能力，使用
 `report:view`，不要求调用方同时具备四类资源查看权限。
+
+### 4.12 媒体对象存储
+
+缺陷图片采用 MySQL 元数据与 MinIO 对象分离的存储边界：
+
+```text
+前端 multipart 上传图片
+-> FastAPI 校验项目权限、大小、MIME 和文件签名
+-> MinIO 私有桶 testplatform 保存对象
+-> media_objects 保存项目、所有者、对象键和文件元数据
+-> 创建/更新缺陷时用 media_ids 绑定 defect_id
+-> 查询缺陷时按需生成短期 S3 V4 预签名 URL
+```
+
+数据库不保存 MinIO 凭据，也不保存会过期的预签名 URL。对象键使用随机 UUID，原始文件名
+仅作为展示元数据。当前仅接受 PNG、JPEG、GIF 和 WebP；SVG 因可嵌入脚本不进入首版白名单。
+删除单个媒体、缺陷或项目时同步删除对象。MinIO 和 MySQL 不具备跨系统原子事务，因此删除
+中存储不可用时接口返回 `503` 并保留数据库记录，便于重试；后续可增加 outbox 和孤儿对象巡检。
 
 ## 5. 自研测试报告设计
 

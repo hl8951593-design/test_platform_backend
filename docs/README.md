@@ -8,10 +8,10 @@
 | 项目 | 当前值 |
 | --- | --- |
 | 最近核对日期 | 2026-06-17 |
-| 开发基线 | 2.8 |
-| Alembic head | `0018_defects` |
+| 开发基线 | 2.9 |
+| Alembic head | `0019_media_objects` |
 | 回归命令 | `.\.venv\Scripts\python.exe -m unittest discover -s tests -v` |
-| 最近完整回归 | 101 项通过 |
+| 最近完整回归 | 106 项通过 |
 
 数字基线只能在实际执行命令后更新。数据库结构以 Alembic migration 和当前模型共同为准，
 不能只修改模型而遗漏迁移。
@@ -22,11 +22,16 @@
 | --- | --- |
 | [技术架构](technical_architecture.md) | 分层、模块关系、执行模型、基础设施和演进边界 |
 | [场景执行图谱](scenario_execution_graph.md) | 场景触发、dataset record 展开、步骤执行、变量链路、状态和持久化关系 |
+| [场景数据驱动契约](scenario-data-driven-contract.md) | record 展开、请求覆盖与兼容读取规则 |
+| [场景运行事件契约](scenario-run-events-contract.md) | SSE 顺序、重连、事件类型与校准边界 |
+| [场景运行详情契约](scenario-run-detail-contract.md) | run 身份、步骤结果、快照和运行中字段 |
+| [场景变量追踪契约](scenario-variable-tracing-contract.md) | 变量来源、动作写入、绑定与脱敏 |
 | [开发进度与计划](development_technical_notes.md) | 当前完成度、风险、优先级、迁移基线和验收计划 |
 | [统一错误响应](api_errors.md) | HTTP 错误 envelope、字段定位、500 request ID 和 OpenAPI 契约 |
 | [统一执行记录](api_execution_records.md) | HTTP、WebSocket、场景和 Flow 执行历史的公共列表与详情契约 |
 | [测试报告](api_test_reports.md) | 测试计划和 Flow 的报告历史、结构化指标、明细与 HTML 导出 |
 | [缺陷跟踪](api_defects.md) | 项目缺陷 CRUD、富文本清洗、状态流转和权限契约 |
+| [媒体存储](api_media.md) | MinIO 图片上传、附件绑定、临时访问地址和清理契约 |
 | `api_*.md` | 已实现接口、请求响应、权限、错误、兼容规则和部署要求 |
 | `front_tech_docs/` | 前端接入、页面交互和客户端状态管理约定 |
 | `alembic/versions/` | 数据库结构变更及升级顺序 |
@@ -42,6 +47,7 @@
 - [统一执行记录](api_execution_records.md)
 - [测试报告](api_test_reports.md)
 - [缺陷跟踪](api_defects.md)
+- [媒体存储](api_media.md)
 - [项目权限](api_project_permissions.md)
 - [环境配置](api_environment_configs.md)
 - [HTTP 测试用例](api_test_cases.md)

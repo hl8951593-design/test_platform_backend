@@ -43,7 +43,13 @@ class ScenarioRequestOverrideTests(unittest.TestCase):
 
     def definition(self, overrides, step=None):
         return {
-            "steps": [step or self.api_step()],
+            "nodes": [{
+                "id": "NODE-1",
+                "name": "Create order",
+                "before_actions": [],
+                "test_case": step or self.api_step(),
+                "after_actions": [],
+            }],
             "datasets": [{
                 "id": "DATA-1",
                 "name": "VIP customer",

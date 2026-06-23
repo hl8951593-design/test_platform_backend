@@ -125,6 +125,283 @@ POST https://api.deepseek.com/chat/completions
 
 使用 JSON 模式时，调用方必须在 `messages` 中明确要求模型输出 JSON，否则模型可能无法稳定返回合法 JSON。
 
+## AI Skills
+
+平台 AI 业务能力以正式 skill 包组织。每个 skill 包至少包含：
+
+```text
+SKILL.md
+manifest.json
+prompts/
+```
+
+`SKILL.md` 面向 agent 触发和阅读，`manifest.json` 面向后端、前端和 agent 编排，描述版本、协议、能力列表、输入 schema 和输出 schema。
+
+当前内置 skill：
+
+| Skill ID | 协议 | 能力 |
+| --- | --- | --- |
+| `http-test-case` | HTTP | 接口测试用例生成、扩写 |
+| `websocket-test-case` | WebSocket | WebSocket 测试用例生成、扩写 |
+| `scenario-composer` | Mixed | 从候选 HTTP/WebSocket 用例智能组合场景草稿 |
+
+### 查询可用 Skills
+
+| 项目 | 内容 |
+| --- | --- |
+| 接口 | `/ai/skills` |
+| 方法 | `GET` |
+| 认证 | `Authorization: Bearer <access_token>` |
+| 说明 | 返回当前后端已注册的 AI skills、operation、输入输出 schema 和 JSON Schema |
+
+响应示例：
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": [
+    {
+      "id": "http-test-case",
+      "name": "http-test-case",
+      "description": "Generate or expand HTTP API test case drafts...",
+      "version": "1.0.0",
+      "domain": "test_case",
+      "protocol": "http",
+      "operations": [
+        {
+          "name": "generate",
+          "summary": "Generate HTTP API test case drafts...",
+          "input_schema": "AITestCaseGenerateRequest",
+          "output_schema": "AIGeneratedTestCaseResponse",
+          "input_json_schema": {},
+          "output_json_schema": {},
+          "requires_environment": true,
+          "requires_source": false
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 查询 Skill 详情
+
+| 项目 | 内容 |
+| --- | --- |
+| 接口 | `/ai/skills/{skill_id}` |
+| 方法 | `GET` |
+| 认证 | `Authorization: Bearer <access_token>` |
+| 说明 | 查询单个 skill 的 manifest 信息 |
+
+### 运行 Skill
+
+| 项目 | 内容 |
+| --- | --- |
+| 接口 | `/ai/skills/{skill_id}/run` |
+| 方法 | `POST` |
+| 认证 | `Authorization: Bearer <access_token>` |
+| 说明 | 统一运行 AI skill。后端根据 skill 和 operation 分发到对应业务适配器 |
+
+请求字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| operation | string | 是 | skill operation，例如 `generate`、`expand` |
+| project_id | integer | 是 | 当前项目 ID |
+| environment_id | integer/null | 否 | 当前环境 ID。生成类 operation 通常必填；扩写类不传时使用源用例环境 |
+| source_id | integer/null | 否 | 源资源 ID。扩写测试用例时为源测试用例 ID |
+| input | object | 是 | 按 operation 的 `input_schema` 提交 |
+
+HTTP 用例生成示例：
+
+```json
+{
+  "operation": "generate",
+  "project_id": 1,
+  "environment_id": 2,
+  "input": {
+    "interface_text": "GET /api/users/{id} returns {\"id\":1,\"name\":\"demo\"}",
+    "generate_count": 3,
+    "include_assertions": true
+  }
+}
+```
+
+HTTP 用例扩写示例：
+
+```json
+{
+  "operation": "expand",
+  "project_id": 1,
+  "environment_id": 2,
+  "source_id": 1001,
+  "input": {
+    "requirement": "扩写边界值和异常参数",
+    "generate_count": 5,
+    "include_assertions": true
+  }
+}
+```
+
+智能场景组合示例：
+
+```json
+{
+  "operation": "compose",
+  "project_id": 1,
+  "environment_id": 2,
+  "input": {
+    "requirement": "组合登录后查询用户详情的主链路，登录步骤提取 token，详情查询使用 token",
+    "scenario_name": "用户详情主链路",
+    "http_test_case_ids": [1001, 1002],
+    "websocket_test_case_ids": [],
+    "include_bindings": true,
+    "include_assertions": true,
+    "include_hooks": true,
+    "include_datasets": false,
+    "include_latest_execution": true,
+    "execute_candidates": false,
+    "self_validate": true,
+    "max_validation_attempts": 3,
+    "max_nodes": 10
+  }
+}
+```
+
+`scenario-composer` 返回结构：
+
+```json
+{
+  "code": 0,
+  "message": "AI Skill 执行成功",
+  "data": {
+    "project_id": 1,
+    "environment_id": 2,
+    "environment_name": "UAT",
+    "source_summary": "组合登录和用户详情查询",
+    "scenario": {
+      "name": "用户详情主链路",
+      "description": "登录后查询用户详情",
+      "environment_id": 2,
+      "tags": ["ai-composed"],
+      "nodes": [],
+      "datasets": []
+    },
+    "warnings": [],
+    "self_validated": true,
+    "validation_attempts": [
+      {
+        "attempt": 1,
+        "status": "passed",
+        "run_id": 123,
+        "duration_ms": 856,
+        "summary": {
+          "total_steps": 2,
+          "passed": 2,
+          "failed": 0,
+          "timeout": 0,
+          "skipped": 0
+        },
+        "issues": []
+      }
+    ]
+  }
+}
+```
+
+场景组合规则：
+
+- `scenario-composer` 不直接保存场景，只返回草稿；前端确认后再调用场景创建接口。
+- `reference_id` 只能引用 `http_test_case_ids` / `websocket_test_case_ids` 中传入的候选用例。
+- 默认读取候选用例最近一次执行的请求/响应样本，帮助 AI 理解接口语义、响应字段和依赖关系。
+- `execute_candidates=true` 时，后端会在组合前实际执行候选用例以获取样本；该开关可能产生业务副作用，调用方应谨慎启用。
+- `self_validate=true` 默认开启。后端会在生成草稿后执行一次未保存场景进行自验证；如果执行失败，会把失败步骤、断言失败、变量提取错误和响应样本反馈给模型修复，最多 `max_validation_attempts=3` 轮。
+- 自验证执行不落库保存场景，但会产生场景运行记录和底层用例执行记录，用于审计和查看执行详情。
+- 实际执行候选用例或自验证场景时，除场景管理权限外，还需要 `test:execute` 权限。
+- skill 会根据候选用例配置和请求/响应样本生成或补充 `assertions`、`extractors`、`_scenario_context.extractions`、`_scenario_context.bindings`。
+- skill 可以生成必要的 `before_actions` / `after_actions`，用于固定变量、随机数据、等待、条件门禁、清理或轻量计算。
+- 后端会二次校验 AI 返回，丢弃非候选引用；如果没有可用节点则返回 `502`。
+- `include_datasets=false` 时会丢弃 AI 返回的数据集草稿。
+- 生成结果必须满足 `ScenarioCreateRequest`，因此可直接作为创建场景请求体使用。
+
+响应结构与对应旧业务接口保持一致。旧接口继续可用，新接入的 agent 和前端编排建议优先使用 skill 列表和统一运行入口。
+
+### 可观测 Skill Run
+
+同步接口 `/ai/skills/{skill_id}/run` 仍然保留。需要类似 Codex 的过程展示时，前端应使用异步 run：
+
+```text
+POST /api/v1/ai/skills/{skill_id}/runs
+GET  /api/v1/ai/skill-runs/{run_id}
+GET  /api/v1/ai/skill-runs/{run_id}/events
+```
+
+创建 run 的请求体与同步运行一致：
+
+```json
+{
+  "operation": "compose",
+  "project_id": 1,
+  "environment_id": 2,
+  "input": {
+    "requirement": "组合登录后查询用户详情的主链路",
+    "http_test_case_ids": [1001, 1002],
+    "include_latest_execution": true
+  }
+}
+```
+
+创建响应：
+
+```json
+{
+  "code": 0,
+  "message": "AI Skill Run 已创建",
+  "data": {
+    "run_id": "ai-run-...",
+    "skill_id": "scenario-composer",
+    "operation": "compose",
+    "status": "queued"
+  }
+}
+```
+
+事件流使用 SSE，前端带 `Last-Event-ID` 可断点续读：
+
+```text
+event: run.started
+data: {}
+
+event: tool.started
+data: {"name":"load_candidate_cases","http_test_case_ids":[1001,1002]}
+
+event: model.delta
+data: {"content":"..."}
+
+event: step.completed
+data: {"title":"校验 AI 返回结构"}
+
+event: run.completed
+data: {"result":{}}
+```
+
+事件类型约定：
+
+| 事件 | 说明 |
+| --- | --- |
+| `run.queued` / `run.started` / `run.completed` / `run.failed` | Run 生命周期 |
+| `step.started` / `step.completed` | 平台内部步骤，例如权限校验、结构校验 |
+| `tool.started` / `tool.completed` | 工具或数据访问，例如读取候选用例、执行候选接口 |
+| `model.started` / `model.delta` / `model.completed` | 模型调用过程和流式输出 |
+| `heartbeat` | SSE 心跳 |
+
+安全规则：
+
+- 事件 payload 会经过敏感字段脱敏，例如 authorization、cookie、password、token、secret。
+- run 只能由创建者或管理员读取/订阅。
+- 不返回模型原始 Chain of Thought；前端可展示执行轨迹、工具调用、模型流式内容和校验摘要。
+
 ## 错误处理
 
 | 场景 | 后端状态码 | 说明 |
@@ -132,6 +409,9 @@ POST https://api.deepseek.com/chat/completions
 | 未配置 `DEEPSEEK_API_KEY` | 500 | 本地服务配置缺失 |
 | DeepSeek 返回 4xx/5xx | 502 | 上游 AI 服务返回异常 |
 | 网络错误或超时 | 503 | 无法连接 DeepSeek |
+| skill 不存在 | 404 | `skill_id` 未注册 |
+| operation 不存在或缺少必要上下文 | 400 | operation 不属于该 skill，或缺少 `environment_id` / `source_id` |
+| skill input 校验失败 | 422 | `input` 不符合 operation 的输入 schema |
 
 ## 后续扩展方向
 

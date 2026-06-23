@@ -37,6 +37,8 @@ from app.schemas.scenario import (
     ScenarioCreateRequest,
     ScenarioDatasetRequest,
     ScenarioPayload,
+    ScenarioScriptExecuteUnsavedRead,
+    ScenarioScriptExecuteUnsavedRequest,
     ScenarioUpdateRequest,
 )
 from app.schemas.test_case import TestCaseRequestConfig
@@ -148,6 +150,119 @@ class ScenarioService:
             )
         self.db.delete(scenario)
         self.db.commit()
+
+    def execute_unsaved_script_action(
+        self,
+        *,
+        project_id: int,
+        payload: ScenarioScriptExecuteUnsavedRequest,
+        current_user: User,
+    ) -> ScenarioScriptExecuteUnsavedRead:
+        self.permission_service.require_project_permission(
+            current_user,
+            project_id,
+            ProjectPermission.EXECUTE_TEST.value,
+        )
+        environment_exists = self.db.scalar(
+            select(ProjectEnvironment.id).where(
+                ProjectEnvironment.id == payload.environment_id,
+                ProjectEnvironment.project_id == project_id,
+            )
+        )
+        if environment_exists is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="环境不存在")
+
+        started_at = time.perf_counter()
+        try:
+            outputs = run_scenario_script(
+                language=payload.language,
+                code=payload.code,
+                inputs={
+                    name: copy.deepcopy(payload.input_values[name])
+                    for name in payload.inputs
+                    if name in payload.input_values
+                },
+                outputs=payload.outputs,
+                timeout_ms=payload.timeout_ms,
+            )
+            status_value = "passed"
+            error_message = ""
+        except Exception as exc:  # noqa: BLE001
+            outputs = {}
+            status_value = "error" if isinstance(exc, TimeoutError) else "failed"
+            error_message = str(exc)
+
+        return ScenarioScriptExecuteUnsavedRead(
+            status=status_value,
+            duration_ms=max(0, int((time.perf_counter() - started_at) * 1000)),
+            outputs=outputs,
+            error_message=error_message,
+        )
+
+    def validate_unsaved_scenario(
+        self,
+        *,
+        project_id: int,
+        payload: ScenarioCreateRequest,
+        current_user: User,
+        trigger_type: str = "ai_validation",
+        deadline: datetime | None = None,
+    ) -> TestScenarioRun:
+        self.permission_service.require_project_permission(
+            current_user,
+            project_id,
+            ProjectPermission.EXECUTE_TEST.value,
+        )
+        definition = decrypt_sensitive(self._validated_definition(project_id, payload))
+        self._normalize_definition_datasets(definition)
+        self._ensure_trace_metadata(self._execution_steps(definition))
+        self._validate_request_overrides(definition)
+        self._get_environment(project_id, payload.environment_id)
+
+        datasets = self._expand_dataset_records(definition.get("datasets") or [])
+        if not datasets:
+            datasets = [{"id": None, "name": None, "variables": {}, "request_overrides": []}]
+        dataset = datasets[0]
+        variables = copy.deepcopy(dataset.get("variables") or {})
+        started_at = datetime.utcnow()
+        run = TestScenarioRun(
+            scenario_id=None,
+            scenario_version_id=None,
+            project_id=project_id,
+            environment_id=payload.environment_id,
+            dataset_id=dataset.get("id"),
+            dataset_name=dataset.get("name"),
+            record_id=dataset.get("record_id"),
+            record_name=dataset.get("record_name"),
+            status="running",
+            trigger_type=trigger_type,
+            idempotency_key=None,
+            request_hash=request_fingerprint({
+                "scenario": payload.model_dump(mode="json"),
+                "dataset_id": dataset.get("id"),
+                "record_id": dataset.get("record_id"),
+                "trigger_type": trigger_type,
+            }),
+            scenario_snapshot=mask_sensitive(definition),
+            variables_snapshot=mask_sensitive(variables),
+            step_results=[],
+            triggered_by_id=current_user.id,
+            started_at=started_at,
+        )
+        self.db.add(run)
+        self.db.commit()
+        self.db.refresh(run)
+
+        return self._run_dataset(
+            run=run,
+            definition=definition,
+            variables=variables,
+            request_overrides=copy.deepcopy(dataset.get("request_overrides") or []),
+            current_user=current_user,
+            scenario_version=0,
+            deadline=deadline,
+            emit_events=False,
+        )
 
     def execute_scenario(self, *, project_id: int, scenario_id: int, environment_id: int | None,
                          dataset_ids: list[str] | None, idempotency_key: str | None, current_user: User,
@@ -1973,8 +2088,16 @@ class ScenarioService:
         public_nodes = copy.deepcopy(definition["nodes"])
         for node in public_nodes:
             node["test_case"].pop("case_snapshot", None)
+        environment_name = self.db.scalar(
+            select(ProjectEnvironment.name).where(
+                ProjectEnvironment.id == scenario.environment_id,
+                ProjectEnvironment.project_id == scenario.project_id,
+                ProjectEnvironment.is_deleted.is_(False),
+            )
+        )
         return {
             "id": scenario.id, "project_id": scenario.project_id, "environment_id": scenario.environment_id,
+            "environment_name": environment_name,
             "current_version": scenario.current_version, "name": scenario.name, "description": scenario.description,
             "tags": scenario.tags, "nodes": public_nodes, "datasets": mask_sensitive(definition["datasets"]),
             "created_at": scenario.created_at, "updated_at": scenario.updated_at, "last_run_at": scenario.last_run_at,

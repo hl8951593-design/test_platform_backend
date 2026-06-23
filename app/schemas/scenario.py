@@ -127,6 +127,32 @@ class ScenarioActionRequest(ScenarioExecutableRequest):
     kind: Literal["condition", "delay", "random", "fixed_value", "script"]
 
 
+class ScenarioScriptExecuteUnsavedRequest(BaseModel):
+    environment_id: int = Field(gt=0)
+    language: Literal["python", "javascript"]
+    code: str = Field(min_length=1)
+    inputs: list[str] = Field(default_factory=list, max_length=100)
+    outputs: list[str] = Field(default_factory=list, min_length=1, max_length=100)
+    timeout_ms: int = Field(default=10000, gt=0, le=60000)
+    input_values: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("inputs", "outputs")
+    @classmethod
+    def validate_variable_names(cls, values: list[str]) -> list[str]:
+        if any(not re.fullmatch(VARIABLE_NAME_PATTERN, value) for value in values):
+            raise ValueError("变量名必须以字母或下划线开头，只能包含字母、数字和下划线")
+        if len(values) != len(set(values)):
+            raise ValueError("变量名不能重复")
+        return values
+
+
+class ScenarioScriptExecuteUnsavedRead(BaseModel):
+    status: Literal["passed", "failed", "error"]
+    duration_ms: int
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    error_message: str = ""
+
+
 class ScenarioNodeRequest(BaseModel):
     id: str = Field(min_length=1, max_length=128)
     name: str = Field(min_length=1, max_length=200)
@@ -312,6 +338,7 @@ class ScenarioRead(BaseModel):
     id: int
     project_id: int
     environment_id: int
+    environment_name: str | None = None
     current_version: int
     name: str
     description: str | None

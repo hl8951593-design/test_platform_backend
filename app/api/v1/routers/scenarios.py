@@ -21,12 +21,15 @@ from app.schemas.scenario import (
     ScenarioExecutionQueuedRead,
     ScenarioRead,
     ScenarioRunRead,
+    ScenarioScriptExecuteUnsavedRead,
+    ScenarioScriptExecuteUnsavedRequest,
     ScenarioUpdateRequest,
 )
 from app.services.scenario_service import ScenarioService
 
 router = APIRouter()
 run_router = APIRouter()
+actions_router = APIRouter()
 
 
 @router.get("", summary="查询项目场景列表")
@@ -105,6 +108,40 @@ def delete_scenario(
     return success(message="场景删除成功")
 
 
+def _execute_unsaved_script_action(
+    project_id: int,
+    payload: ScenarioScriptExecuteUnsavedRequest,
+    db: Session,
+    current_user: User,
+):
+    result = ScenarioService(db).execute_unsaved_script_action(
+        project_id=project_id,
+        payload=payload,
+        current_user=current_user,
+    )
+    return success(data=ScenarioScriptExecuteUnsavedRead.model_validate(result), message="ok")
+
+
+@router.post("/actions/script/execute-unsaved", summary="调试未保存脚本动作")
+def execute_unsaved_script_action(
+    project_id: int,
+    payload: ScenarioScriptExecuteUnsavedRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return _execute_unsaved_script_action(project_id, payload, db, current_user)
+
+
+@router.post("/actions/script/execute-unsave", summary="调试未保存脚本动作")
+def execute_unsave_script_action(
+    project_id: int,
+    payload: ScenarioScriptExecuteUnsavedRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return _execute_unsaved_script_action(project_id, payload, db, current_user)
+
+
 @router.post(
     "/{scenario_id}/execute",
     status_code=status.HTTP_202_ACCEPTED,
@@ -134,6 +171,16 @@ def execute_scenario(
         data=ScenarioExecutionQueuedRead.model_validate(execution),
         message="场景执行请求已受理",
     )
+
+
+@actions_router.post("/script/execute-unsaved", summary="调试未保存脚本动作")
+def execute_unsaved_script_action_legacy(
+    project_id: int,
+    payload: ScenarioScriptExecuteUnsavedRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return _execute_unsaved_script_action(project_id, payload, db, current_user)
 
 
 @run_router.get("", summary="查询场景调试历史")

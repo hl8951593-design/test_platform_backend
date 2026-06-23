@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 import httpx
@@ -57,6 +58,59 @@ class AIService:
             usage=data.get("usage"),
             finish_reason=choice.get("finish_reason"),
         )
+
+    def chat_stream(self, payload: AIChatRequest):
+        if not settings.DEEPSEEK_API_KEY:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="DeepSeek API Key 未配置",
+            )
+
+        request_body = self._build_chat_payload(payload)
+        request_body["stream"] = True
+        endpoint = f"{settings.DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {settings.DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            with httpx.Client(timeout=settings.DEEPSEEK_TIMEOUT_SECONDS) as client:
+                with client.stream("POST", endpoint, headers=headers, json=request_body) as response:
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if not line:
+                            continue
+                        text = line.removeprefix("data:").strip()
+                        if text == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(text)
+                        except ValueError:
+                            continue
+                        choice = (data.get("choices") or [{}])[0]
+                        delta = choice.get("delta") or {}
+                        content = delta.get("content")
+                        if content:
+                            yield {"type": "delta", "content": content}
+                        finish_reason = choice.get("finish_reason")
+                        if finish_reason:
+                            yield {
+                                "type": "done",
+                                "finish_reason": finish_reason,
+                                "model": data.get("model") or request_body["model"],
+                                "usage": data.get("usage"),
+                            }
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=self._extract_error_message(exc.response),
+            ) from exc
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"DeepSeek 请求失败: {exc}",
+            ) from exc
 
     def _build_chat_payload(self, payload: AIChatRequest) -> dict[str, Any]:
         request_body: dict[str, Any] = {

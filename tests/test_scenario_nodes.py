@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 
+from app.core.sensitive_data import encrypt_sensitive
 from app.schemas.scenario import ScenarioCreateRequest
 from app.services.scenario_script_sandbox import run_scenario_script
 from app.services.scenario_service import ScenarioService
@@ -172,6 +173,46 @@ class ScenarioNodeExecutionTests(unittest.TestCase):
         self.assertEqual(context.exception.status_code, 409)
         self.assertEqual(context.exception.detail, "同一项目下场景名称不能重复")
         db.rollback.assert_called_once_with()
+
+    def test_detail_includes_environment_name(self):
+        db = MagicMock()
+        db.scalar.return_value = "UAT"
+        service = ScenarioService(db)
+        service._get_version = MagicMock(return_value=SimpleNamespace(
+            definition=encrypt_sensitive({
+                "nodes": [{
+                    "id": "NODE-1",
+                    "name": "Login",
+                    "before_actions": [],
+                    "test_case": {
+                        "id": "CASE-1",
+                        "kind": "api_case",
+                        "name": "Login",
+                        "case_snapshot": {"headers": {}},
+                    },
+                    "after_actions": [],
+                }],
+                "datasets": [],
+            })
+        ))
+        scenario = SimpleNamespace(
+            id=14,
+            project_id=1,
+            environment_id=2,
+            current_version=1,
+            name="登录场景",
+            description=None,
+            tags=[],
+            created_at=None,
+            updated_at=None,
+            last_run_at=None,
+        )
+
+        detail = service._detail(scenario)
+
+        self.assertEqual(detail["environment_name"], "UAT")
+        self.assertEqual(detail["environment_id"], 2)
+        self.assertNotIn("case_snapshot", detail["nodes"][0]["test_case"])
 
 
 class ScenarioNodeMigrationTests(unittest.TestCase):

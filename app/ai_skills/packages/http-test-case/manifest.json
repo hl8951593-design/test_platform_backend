@@ -1,0 +1,27 @@
+{
+  "version": "1.0.0",
+  "domain": "test_case",
+  "protocol": "http",
+  "operations": [
+    {
+      "name": "generate",
+      "summary": "Generate HTTP API test case drafts from API docs, curl snippets, URLs, request samples, or business notes.",
+      "input_schema": "AITestCaseGenerateRequest",
+      "output_schema": "AIGeneratedTestCaseResponse",
+      "requires_environment": true,
+      "requires_source": false
+    },
+    {
+      "name": "expand",
+      "summary": "Expand one existing HTTP API test case into boundary, negative, exception, security, or business variants.",
+      "input_schema": "AITestCaseExpandRequest",
+      "output_schema": "AIGeneratedTestCaseResponse",
+      "requires_environment": false,
+      "requires_source": true
+    }
+  ],
+  "resources": {
+    "generate_system_prompt": "prompts/generate_system.md",
+    "expand_system_prompt": "prompts/expand_system.md"
+  }
+}

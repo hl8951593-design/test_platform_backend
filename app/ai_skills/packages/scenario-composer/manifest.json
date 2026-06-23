@@ -1,0 +1,18 @@
+{
+  "version": "1.0.0",
+  "domain": "scenario",
+  "protocol": "mixed",
+  "operations": [
+    {
+      "name": "compose",
+      "summary": "Compose an executable scenario draft from selected HTTP and WebSocket test cases and a natural language business goal.",
+      "input_schema": "AIScenarioComposeRequest",
+      "output_schema": "AIGeneratedScenarioResponse",
+      "requires_environment": true,
+      "requires_source": false
+    }
+  ],
+  "resources": {
+    "compose_system_prompt": "prompts/compose_system.md"
+  }
+}

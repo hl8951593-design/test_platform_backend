@@ -87,11 +87,22 @@ POST /api/v1/ai/chat
 
 ## WebSocket 用例 AI 能力
 
-WebSocket AI 生成与扩写由 `app/services/ai_websocket_test_case_service.py` 独立实现，避免 HTTP 提示词中的 method、query、body 和状态码概念污染 WebSocket 用例。
+HTTP 与 WebSocket 的 AI 生成、扩写已经改造为正式 skill 包：
+
+```text
+app/ai_skills/packages/http-test-case/
+app/ai_skills/packages/websocket-test-case/
+app/ai_skills/packages/scenario-composer/
+```
+
+每个 skill 包包含 `SKILL.md` 元数据和 `prompts/` 资源。后端通过 `app/ai_skills/registry.py` 注册 skill，通过 `AISkillRunner` 统一调用 AI 数据源。业务 service 只负责权限、环境、源用例等上下文准备。
+
+WebSocket skill 独立维护提示词和输出归一化规则，避免 HTTP 提示词中的 method、query、body 和状态码概念污染 WebSocket 用例。
 
 ```text
 WebSocket 文档或源用例
--> WebSocket 专用 system prompt
+-> websocket-test-case skill
+-> WebSocket 专用 system prompt 资源
 -> DeepSeek JSON Output
 -> 过滤 HTTP 字段和非法断言
 -> 自动校正 receive_count
@@ -100,3 +111,72 @@ WebSocket 文档或源用例
 ```
 
 扩写类型包括握手鉴权、子协议、消息顺序、消息字段异常、畸形消息、推送数量、超时、连接关闭和业务会话变体。
+
+## Skill 架构约定
+
+AI skill 分为三层：
+
+| 层级 | 位置 | 职责 |
+| --- | --- | --- |
+| Skill 包 | `app/ai_skills/packages/{skill_id}/` | 保存 `SKILL.md`、`manifest.json`、prompt 和后续可复用资源 |
+| Runtime adapter | `app/ai_skills/{skill_module}.py` | 把业务上下文转换成 AI 请求，解析和归一化模型输出 |
+| Business service | `app/services/*_service.py`、`app/services/ai_skill_service.py` | 权限校验、查询项目资源、统一 list/run 分发 |
+
+当前内置 skill：
+
+| Skill ID | 说明 |
+| --- | --- |
+| `http-test-case` | HTTP 测试用例生成和扩写 |
+| `websocket-test-case` | WebSocket 测试用例生成和扩写 |
+| `scenario-composer` | 从候选测试用例、请求响应样本和业务目标智能组合场景草稿 |
+
+统一发现与运行接口：
+
+```text
+GET  /api/v1/ai/skills
+GET  /api/v1/ai/skills/{skill_id}
+POST /api/v1/ai/skills/{skill_id}/run
+```
+
+可观测异步运行接口：
+
+```text
+POST /api/v1/ai/skills/{skill_id}/runs
+GET  /api/v1/ai/skill-runs/{run_id}
+GET  /api/v1/ai/skill-runs/{run_id}/events
+```
+
+`AI Skill Run` 是平台级可观测执行层，不绑定具体 agent 实现。当前 skill、后续平台 agent、
+更复杂的多步编排都应复用同一套 run/event/trace 语义。事件只记录可展示的执行轨迹、工具调用、
+模型流式输出和校验摘要，不暴露模型原始 Chain of Thought。
+
+事件 payload 必须脱敏，run 默认只允许创建者和管理员读取。
+
+旧业务接口继续保留兼容，内部也走 skill runtime。
+
+## 新增 Skill 流程
+
+1. 在 `app/ai_skills/packages/{skill_id}/` 新建正式 skill 包。
+2. `SKILL.md` frontmatter 只写 `name` 和 `description`，正文写 agent 使用说明。
+3. `manifest.json` 写版本、领域、协议、operation、输入输出 schema 和资源路径。
+4. 把 prompt、模板或参考资料放到包内资源目录，例如 `prompts/`。
+5. 新增 `app/ai_skills/{skill_module}.py` runtime adapter，并调用 `register_ai_skill(...)` 注册。
+6. 如需通用 `/ai/skills/{skill_id}/run` 支持，在 `AISkillService.run_skill` 中添加该 skill 的业务分发。
+7. 补测试：manifest 可发现、JSON Schema 可返回、统一 run 可分发、旧业务接口行为不变。
+
+设计原则：
+
+- service 不写长 prompt，只准备业务上下文。
+- prompt 和 agent 可读说明必须放在正式 skill 包里。
+- adapter 只做 AI 请求构造、响应解析、归一化和 schema 校验。
+- 每个 operation 都必须声明输入输出 schema，方便前端和 agent 自动编排。
+- 新增 skill 时不要影响已有 skill 的 prompt、响应结构和权限边界。
+
+`scenario-composer` 特别约定：
+
+- 默认读取候选用例最近一次执行样本，让模型基于真实 request/response 理解接口字段、断言和变量依赖。
+- 只有请求显式传 `execute_candidates=true` 时才实际执行候选用例；该模式额外要求 `test:execute` 权限。
+- 实际执行可能造成业务副作用，因此前端默认应保持 `execute_candidates=false`，仅在用户确认调试/探测时开启。
+- 默认 `self_validate=true`。生成草稿后会复用 `ScenarioService.validate_unsaved_scenario` 执行未保存场景，失败时将结构化执行问题反馈给模型修复，最多 3 次。
+- 自验证能力位于场景服务层，后续平台 agent 可以复用；不要在某个前端页面或单个 skill 中重复实现执行逻辑。
+- AI 返回后，adapter 仍会强制过滤非候选 `reference_id`，并通过 `ScenarioCreateRequest` 校验。

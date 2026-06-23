@@ -1,0 +1,27 @@
+{
+  "version": "1.0.0",
+  "domain": "test_case",
+  "protocol": "websocket",
+  "operations": [
+    {
+      "name": "generate",
+      "summary": "Generate WebSocket session test case drafts from protocol docs, connection URLs, captured traffic, message examples, or business notes.",
+      "input_schema": "AIWebSocketTestCaseGenerateRequest",
+      "output_schema": "AIGeneratedWebSocketTestCaseResponse",
+      "requires_environment": true,
+      "requires_source": false
+    },
+    {
+      "name": "expand",
+      "summary": "Expand one existing WebSocket test case into handshake, subprotocol, message sequence, payload, timeout, close, or business variants.",
+      "input_schema": "AIWebSocketTestCaseExpandRequest",
+      "output_schema": "AIGeneratedWebSocketTestCaseResponse",
+      "requires_environment": false,
+      "requires_source": true
+    }
+  ],
+  "resources": {
+    "generate_system_prompt": "prompts/generate_system.md",
+    "expand_system_prompt": "prompts/expand_system.md"
+  }
+}

@@ -2,6 +2,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.scenario import ScenarioCreateRequest
 from app.schemas.test_case import TestCaseCreateRequest
 from app.schemas.websocket_test_case import WebSocketTestCaseCreateRequest
 
@@ -34,6 +35,99 @@ class AIProviderRead(BaseModel):
     base_url: str
     default_model: str
     configured: bool
+
+
+class AISkillOperationRead(BaseModel):
+    name: str
+    summary: str
+    input_schema: str
+    output_schema: str
+    input_json_schema: dict[str, Any] = Field(default_factory=dict)
+    output_json_schema: dict[str, Any] = Field(default_factory=dict)
+    requires_environment: bool = False
+    requires_source: bool = False
+
+
+class AISkillRead(BaseModel):
+    id: str
+    name: str
+    description: str
+    version: str
+    domain: str
+    protocol: str
+    operations: list[AISkillOperationRead]
+
+
+class AISkillRunRequest(BaseModel):
+    operation: str = Field(description="Skill operation name, for example generate or expand")
+    project_id: int = Field(description="当前项目 ID")
+    environment_id: int | None = Field(default=None, description="当前环境 ID；生成类操作通常必填")
+    source_id: int | None = Field(default=None, description="源资源 ID；扩写类操作通常为测试用例 ID")
+    input: dict[str, Any] = Field(default_factory=dict, description="按 skill operation input_schema 提交的入参")
+
+
+class AISkillRunQueuedRead(BaseModel):
+    run_id: str
+    skill_id: str
+    operation: str
+    status: Literal["queued", "running", "completed", "failed"]
+
+
+class AIRunEventRead(BaseModel):
+    sequence: int
+    event: str
+    payload: dict[str, Any]
+    created_at: str
+
+
+class AISkillRunRead(BaseModel):
+    run_id: str
+    skill_id: str
+    operation: str
+    project_id: int
+    status: Literal["queued", "running", "completed", "failed"]
+    events: list[AIRunEventRead] = Field(default_factory=list)
+    result: Any | None = None
+    error_message: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class AIScenarioComposeRequest(BaseModel):
+    requirement: str = Field(min_length=1, description="自然语言场景组合目标")
+    scenario_name: str | None = Field(default=None, max_length=128, description="期望场景名称")
+    http_test_case_ids: list[int] = Field(default_factory=list, max_length=50, description="候选 HTTP 测试用例 ID")
+    websocket_test_case_ids: list[int] = Field(default_factory=list, max_length=50, description="候选 WebSocket 测试用例 ID")
+    include_bindings: bool = Field(default=True, description="是否尝试基于提取器和变量引用生成绑定说明")
+    include_assertions: bool = Field(default=True, description="是否根据请求和响应样本补充场景步骤断言")
+    include_hooks: bool = Field(default=True, description="是否生成必要的前置和后置动作")
+    include_datasets: bool = Field(default=False, description="是否生成数据集草稿")
+    include_latest_execution: bool = Field(default=True, description="是否读取候选用例最近一次执行的请求和响应样本")
+    execute_candidates: bool = Field(default=False, description="是否在组合前实际执行候选用例以获取请求和响应样本")
+    self_validate: bool = Field(default=True, description="生成场景草稿后是否执行未保存场景进行自验证")
+    max_validation_attempts: int = Field(default=3, ge=1, le=3, description="自验证失败后的最大生成/修复尝试次数，最多 3 次")
+    max_nodes: int = Field(default=10, ge=1, le=50, description="最多组合节点数")
+    extra_requirements: str | None = Field(default=None, description="额外组合要求")
+
+
+class AIScenarioValidationAttemptRead(BaseModel):
+    attempt: int
+    status: Literal["passed", "failed", "error", "timeout"]
+    run_id: int | None = None
+    duration_ms: int | None = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    issues: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AIGeneratedScenarioResponse(BaseModel):
+    project_id: int
+    environment_id: int
+    environment_name: str | None = None
+    source_summary: str
+    scenario: ScenarioCreateRequest
+    warnings: list[str] = Field(default_factory=list)
+    self_validated: bool = False
+    validation_attempts: list[AIScenarioValidationAttemptRead] = Field(default_factory=list)
 
 
 class AITestCaseGenerateRequest(BaseModel):

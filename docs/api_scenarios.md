@@ -17,6 +17,7 @@
 
 请求字段同时接受 snake_case 和文档注明的 camelCase 别名；响应统一使用 snake_case。
 列表响应结构为 `{items, total, page, page_size}`，`page_size` 最大为 200。
+场景列表、详情、创建和更新响应包含 `environment_id` 与 `environment_name`，前端可直接展示环境名称。
 
 ## 场景定义与版本
 
@@ -122,6 +123,68 @@
 并限制语言、语法、超时、输入输出大小及子进程资源。随机和固定值使用 `config.output` 写入变量，
 脚本使用 `config.outputs`。
 
+### 未保存脚本动作调试
+
+| 项目 | 内容 |
+| --- | --- |
+| Canonical 接口 | `POST /api/v1/scenarios/actions/script/execute-unsaved?project_id={project_id}` |
+| 兼容接口 | `POST /api/v1/scenario-actions/script/execute-unsaved?project_id={project_id}` |
+| 认证 | `Authorization: Bearer <access_token>` |
+| 权限 | `test:execute` |
+| 说明 | 调试未保存的脚本动作，不落库，不要求 `inputs[]` 来自前置节点 |
+
+请求示例：
+
+```json
+{
+  "environment_id": 1,
+  "language": "python",
+  "code": "if companyId != 1:\n    result = True\nelse:\n    result = False",
+  "inputs": ["companyId"],
+  "outputs": ["result"],
+  "timeout_ms": 10000,
+  "input_values": {
+    "companyId": 9527
+  }
+}
+```
+
+成功响应：
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "status": "passed",
+    "duration_ms": 22,
+    "outputs": {
+      "result": true
+    },
+    "error_message": ""
+  }
+}
+```
+
+脚本运行失败仍返回 HTTP `200`，由 `data.status` 表示调试结果，方便前端展示调试卡：
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "status": "failed",
+    "duration_ms": 20,
+    "outputs": {},
+    "error_message": "NameError: name 'companyId' is not defined"
+  }
+}
+```
+
+请求参数非法、无权限、环境不存在等调用错误仍按标准 HTTP 错误返回。正式保存和整场运行时仍校验
+`inputs[]` 必须来自前置变量；未保存调试只把 `input_values` 中已提供且在 `inputs[]`
+声明的值注入本次沙箱。
+
 这是破坏性升级。迁移 `0020_migrate_scenarios_to_nodes.py` 先按旧阶段规则稳定排序：首个
 主用例前的动作绑定到首节点前置，用例之间的动作绑定到下一节点前置，末尾动作绑定到末节点
 后置。这样旧的 `case -> condition -> case` 会保持执行和失败阻断语义。无法保持全局 teardown
@@ -130,6 +193,18 @@
 更新请求必须携带当前 `version`。版本冲突返回 HTTP `409` 和 `current_version`。
 每次更新生成不可变的 `test_scenario_versions` 记录。场景版本保存基础用例执行快照，
 后续修改基础用例不会改变旧版本。
+
+## AI 智能场景组合
+
+智能场景组合通过 AI skill 统一入口提供：
+
+```text
+POST /api/v1/ai/skills/scenario-composer/run
+```
+
+该能力根据候选 HTTP/WebSocket 测试用例和自然语言目标生成 `ScenarioCreateRequest`
+兼容的场景草稿，不直接保存。前端应让用户确认草稿后再调用场景创建接口。详细请求和响应示例见
+`docs/api_ai.md` 的 `scenario-composer` 说明。
 
 ## 数据集选择
 

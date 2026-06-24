@@ -1,10 +1,11 @@
 import json
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user, get_db
+from app.core.execution_worker import execution_worker
 from app.core.response import success
 from app.models.user import User
 from app.schemas.ai import (
@@ -29,6 +30,20 @@ from app.services.ai_test_case_service import AITestCaseService
 from app.services.ai_websocket_test_case_service import AIWebSocketTestCaseService
 
 router = APIRouter()
+
+
+def _submit_ai_skill_run(run_id: str, skill_id: str, payload_data: dict, user_id: int) -> None:
+    if not execution_worker.submit(
+        AISkillRunService.execute_run,
+        run_id,
+        skill_id,
+        payload_data,
+        user_id,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="执行队列已满，请稍后重试",
+        )
 
 
 @router.post("/browser-captures/{capture_id}/entries/{entry_id}/generate-cases", summary="AI 根据浏览器采集草稿生成用例")
@@ -121,7 +136,6 @@ def run_ai_skill(
 def create_ai_skill_run(
     skill_id: str,
     payload: AISkillRunRequest,
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
 ):
     queued = AISkillRunService().create_run(
@@ -129,8 +143,7 @@ def create_ai_skill_run(
         payload=payload,
         current_user=current_user,
     )
-    background_tasks.add_task(
-        AISkillRunService.execute_run,
+    _submit_ai_skill_run(
         queued.run_id,
         skill_id,
         payload.model_dump(mode="json"),

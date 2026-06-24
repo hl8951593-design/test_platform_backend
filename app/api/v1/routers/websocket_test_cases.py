@@ -1,7 +1,11 @@
-from fastapi import APIRouter, Depends, Query, status
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user, get_db
+from app.core.config import settings
+from app.core.execution_worker import execution_worker
 from app.core.response import success
 from app.models.user import User
 from app.schemas.websocket_test_case import (
@@ -19,6 +23,31 @@ from app.services.websocket_debug_session_service import WebSocketDebugSessionSe
 from app.services.websocket_test_case_service import WebSocketTestCaseService
 
 router = APIRouter()
+
+
+def _submit_websocket_execution(execution_id: int) -> Future[None]:
+    future = execution_worker.submit_future(
+        WebSocketTestCaseService.execute_queued_execution,
+        execution_id,
+    )
+    if future is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="执行队列已满，请稍后重试",
+        )
+    return future
+
+
+def _wait_for_websocket_execution(db: Session, execution) -> None:
+    future = _submit_websocket_execution(execution.id)
+    try:
+        future.result(timeout=settings.EXECUTION_REQUEST_WAIT_TIMEOUT_SECONDS)
+    except FutureTimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="WebSocket 测试用例执行超时，请稍后在执行中心查看结果",
+        ) from exc
+    db.refresh(execution)
 
 
 @router.post("/debug-sessions", status_code=status.HTTP_201_CREATED, summary="创建 WebSocket 长连接调试会话")
@@ -146,10 +175,18 @@ def delete_case(
     return success(message="WebSocket 测试用例删除成功")
 
 
-@router.post("/{test_case_id}/execute")
+@router.post(
+    "/{test_case_id}/execute",
+    status_code=status.HTTP_200_OK,
+    summary="异步执行已保存 WebSocket 测试用例",
+)
 def execute_saved_case(project_id: int, test_case_id: int, environment_id: int | None = Query(default=None), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    execution = WebSocketTestCaseService(db).execute_saved_case(project_id=project_id, test_case_id=test_case_id, environment_id=environment_id, current_user=current_user)
-    return success(data=WebSocketTestCaseExecutionRead.model_validate(execution))
+    execution = WebSocketTestCaseService(db).enqueue_saved_case(project_id=project_id, test_case_id=test_case_id, environment_id=environment_id, current_user=current_user)
+    _wait_for_websocket_execution(db, execution)
+    return success(
+        data=WebSocketTestCaseExecutionRead.model_validate(execution),
+        message="WebSocket 测试用例执行完成",
+    )
 
 
 @router.post("/execute-unsaved")
@@ -158,7 +195,30 @@ def execute_unsaved_case(project_id: int, payload: UnsavedWebSocketTestCaseExecu
     return success(data=WebSocketTestCaseExecutionRead.model_validate(execution))
 
 
-@router.post("/batch-execute")
+@router.post("/batch-execute", status_code=status.HTTP_200_OK)
 def batch_execute(project_id: int, payload: WebSocketBatchExecuteRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    executions = WebSocketTestCaseService(db).batch_execute(project_id=project_id, payload=payload, current_user=current_user)
-    return success(data=[WebSocketTestCaseExecutionRead.model_validate(item) for item in executions])
+    service = WebSocketTestCaseService(db)
+    executions = [
+        service.enqueue_saved_case(
+            project_id=project_id,
+            test_case_id=test_case_id,
+            environment_id=payload.environment_id,
+            current_user=current_user,
+        )
+        for test_case_id in payload.websocket_test_case_ids
+    ]
+    futures = [_submit_websocket_execution(execution.id) for execution in executions]
+    try:
+        for future in futures:
+            future.result(timeout=settings.EXECUTION_REQUEST_WAIT_TIMEOUT_SECONDS)
+    except FutureTimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="批量 WebSocket 测试用例执行超时，请稍后在执行中心查看结果",
+        ) from exc
+    for execution in executions:
+        db.refresh(execution)
+    return success(
+        data=[WebSocketTestCaseExecutionRead.model_validate(item) for item in executions],
+        message="批量 WebSocket 测试用例执行完成",
+    )

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.permissions import ProjectPermission
 from app.core.variable_renderer import render_variables
+from app.db.session import SessionLocal
 from app.models.user import User
 from app.models.visual_flow import VisualFlow, VisualFlowExecution, VisualFlowVersion
 from app.repositories.visual_flow_repository import VisualFlowRepository
@@ -178,6 +179,87 @@ class VisualFlowService:
         )
         return execution, version.version, self.repository.list_node_executions(execution.id)
 
+    def enqueue_saved(
+        self,
+        *,
+        project_id: int,
+        flow_id: int,
+        environment_id: int | None,
+        idempotency_key: str | None,
+        current_user: User,
+    ) -> tuple[VisualFlowExecution, int | None, list]:
+        self._require(current_user, project_id, ProjectPermission.EXECUTE_TEST.value)
+        existing = self._idempotent(project_id, idempotency_key)
+        if existing:
+            return existing, self._version_number(existing), self.repository.list_node_executions(existing.id)
+        flow = self._get_flow(project_id, flow_id)
+        version = self.repository.get_version(flow_id=flow.id, version=flow.current_version)
+        if version is None:
+            raise HTTPException(status_code=404, detail="Flow version not found")
+        definition = FlowDefinition.model_validate(version.definition)
+        selected_environment_id = environment_id or definition.environment_id
+        self._validate(definition, project_id=project_id, executable=True)
+        if selected_environment_id is not None:
+            self._require_environment(project_id, selected_environment_id)
+        case_snapshots = self._case_snapshots(definition, project_id)
+        execution = self.repository.create_execution(
+            flow_id=flow.id,
+            flow_version_id=version.id,
+            project_id=project_id,
+            environment_id=selected_environment_id,
+            user_id=current_user.id,
+            idempotency_key=idempotency_key,
+            context_snapshot={
+                "definition": self._mask(self._stored_definition(definition)),
+                "referencedCases": self._mask(case_snapshots),
+            },
+            status="queued",
+        )
+        return execution, version.version, []
+
+    @staticmethod
+    def execute_queued_execution(execution_id: int) -> None:
+        with SessionLocal() as db:
+            execution = db.get(VisualFlowExecution, execution_id)
+            if execution is None or execution.status not in {"queued", "running"}:
+                return
+            current_user = db.get(User, execution.trigger_user_id)
+            if current_user is None or not current_user.is_active:
+                execution.status = "failed"
+                execution.finished_at = datetime.utcnow()
+                db.commit()
+                return
+            if execution.flow_version_id is None:
+                execution.status = "failed"
+                execution.finished_at = datetime.utcnow()
+                db.commit()
+                return
+            version = db.get(VisualFlowVersion, execution.flow_version_id)
+            if version is None:
+                execution.status = "failed"
+                execution.finished_at = datetime.utcnow()
+                db.commit()
+                return
+            try:
+                definition = FlowDefinition.model_validate(version.definition)
+                VisualFlowService(db)._execute(
+                    definition=definition,
+                    project_id=execution.project_id,
+                    environment_id=execution.environment_id,
+                    flow_id=execution.flow_id,
+                    flow_version_id=execution.flow_version_id,
+                    idempotency_key=execution.idempotency_key,
+                    current_user=current_user,
+                    existing_execution=execution,
+                )
+            except Exception:  # noqa: BLE001
+                db.rollback()
+                failed = db.get(VisualFlowExecution, execution_id)
+                if failed is not None and failed.status in {"queued", "running"}:
+                    failed.status = "failed"
+                    failed.finished_at = datetime.utcnow()
+                    db.commit()
+
     def execute_unsaved(
         self,
         *,
@@ -213,6 +295,7 @@ class VisualFlowService:
         flow_version_id: int | None,
         idempotency_key: str | None,
         current_user: User,
+        existing_execution: VisualFlowExecution | None = None,
     ) -> VisualFlowExecution:
         selected_environment_id = environment_id or definition.environment_id
         self._validate(definition, project_id=project_id, executable=True)
@@ -225,18 +308,25 @@ class VisualFlowService:
             if selected_environment_id is not None
             else {}
         )
-        execution = self.repository.create_execution(
-            flow_id=flow_id,
-            flow_version_id=flow_version_id,
-            project_id=project_id,
-            environment_id=selected_environment_id,
-            user_id=current_user.id,
-            idempotency_key=idempotency_key,
-            context_snapshot={
-                "definition": self._mask(self._stored_definition(definition)),
-                "referencedCases": self._mask(case_snapshots),
-            },
-        )
+        if existing_execution is None:
+            execution = self.repository.create_execution(
+                flow_id=flow_id,
+                flow_version_id=flow_version_id,
+                project_id=project_id,
+                environment_id=selected_environment_id,
+                user_id=current_user.id,
+                idempotency_key=idempotency_key,
+                context_snapshot={
+                    "definition": self._mask(self._stored_definition(definition)),
+                    "referencedCases": self._mask(case_snapshots),
+                },
+            )
+        else:
+            execution = existing_execution
+            execution.status = "running"
+            execution.started_at = datetime.utcnow()
+            execution.finished_at = None
+            self.db.commit()
         nodes = {node.id: node for node in definition.nodes}
         incoming = {node_id: [] for node_id in nodes}
         outgoing = {node_id: [] for node_id in nodes}

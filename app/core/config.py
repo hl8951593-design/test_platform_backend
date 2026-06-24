@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
     DEEPSEEK_MODEL: str = "deepseek-v4-flash"
     DEEPSEEK_TIMEOUT_SECONDS: float = 60.0
+    EXECUTION_WORKER_MAX_WORKERS: int = 8
+    EXECUTION_WORKER_QUEUE_SIZE: int = 256
+    EXECUTION_REQUEST_WAIT_TIMEOUT_SECONDS: float = 300.0
     TEST_PLAN_SCHEDULER_ENABLED: bool = True
     TEST_PLAN_SCHEDULER_INTERVAL_SECONDS: int = 30
     TEST_PLAN_DEFAULT_TIMEZONE: str = "Asia/Shanghai"

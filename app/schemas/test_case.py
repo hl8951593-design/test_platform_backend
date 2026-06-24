@@ -1,8 +1,9 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from app.core.async_response import public_execution_status
 from app.schemas.retry import RetryPolicyConfig
 
 
@@ -79,6 +80,11 @@ class TestCaseRead(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    @field_validator("last_execution_status", mode="before")
+    @classmethod
+    def _hide_internal_pending_status(cls, value):
+        return public_execution_status(value)
+
     model_config = {"from_attributes": True}
 
 
@@ -96,5 +102,10 @@ class TestCaseExecutionRead(BaseModel):
     error_message: str | None
     duration_ms: int | None
     created_at: datetime
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _hide_internal_pending_status(cls, value):
+        return public_execution_status(value)
 
     model_config = {"from_attributes": True}

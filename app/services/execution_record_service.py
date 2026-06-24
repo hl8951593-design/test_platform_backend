@@ -4,6 +4,7 @@ from typing import Any
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.async_response import public_execution_status
 from app.core.permissions import ProjectPermission
 from app.models.user import User
 from app.repositories.execution_record_repository import ExecutionRecordRepository
@@ -59,7 +60,7 @@ class ExecutionRecordService:
             resource_name=values.get("resource_name"),
             environment_id=values.get("environment_id"),
             scenario_run_id=scenario_run_id,
-            status=values["status"],
+            status=public_execution_status(values["status"]),
             trigger_type=trigger_type,
             trigger_user_id=values["trigger_user_id"],
             duration_ms=duration_ms,
@@ -161,6 +162,7 @@ class ExecutionRecordService:
             "created_at": execution.created_at,
         })
         detail = self._column_values(execution)
+        detail["status"] = public_execution_status(detail.get("status"))
         return ExecutionRecordDetail(summary=summary, detail=detail)
 
     def _get_websocket_detail(self, *, project_id: int, execution_id: int):
@@ -186,6 +188,7 @@ class ExecutionRecordService:
             "created_at": execution.created_at,
         })
         detail = self._column_values(execution)
+        detail["status"] = public_execution_status(detail.get("status"))
         return ExecutionRecordDetail(summary=summary, detail=detail)
 
     def _get_scenario_detail(self, *, project_id: int, execution_id: int):
@@ -215,6 +218,7 @@ class ExecutionRecordService:
             "created_at": execution.created_at,
         })
         detail = self._column_values(execution)
+        detail["status"] = public_execution_status(detail.get("status"))
         detail["events"] = [
             self._column_values(event)
             for event in self.repository.list_scenario_events(execution.id)
@@ -250,6 +254,7 @@ class ExecutionRecordService:
             "created_at": execution.created_at,
         })
         detail = self._column_values(execution)
+        detail["status"] = public_execution_status(detail.get("status"))
         detail["node_executions"] = [
             self._column_values(node)
             for node in self.repository.list_flow_nodes(execution.id)

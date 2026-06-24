@@ -1,12 +1,13 @@
 import json
 import time
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user, get_db
+from app.core.execution_worker import execution_worker
 from app.core.response import success
 from app.db.session import SessionLocal
 from app.models.scenario import (
@@ -30,6 +31,14 @@ from app.services.scenario_service import ScenarioService
 router = APIRouter()
 run_router = APIRouter()
 actions_router = APIRouter()
+
+
+def _submit_scenario_execution(execution_id: str) -> None:
+    if not execution_worker.submit(ScenarioService.execute_queued_execution, execution_id):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="执行队列已满，请稍后重试",
+        )
 
 
 @router.get("", summary="查询项目场景列表")
@@ -151,7 +160,6 @@ def execute_scenario(
     project_id: int,
     scenario_id: int,
     payload: ScenarioExecuteRequest,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -164,9 +172,7 @@ def execute_scenario(
         current_user=current_user,
     )
     if execution["status"] == "queued":
-        background_tasks.add_task(
-            ScenarioService.execute_queued_execution, execution["execution_id"]
-        )
+        _submit_scenario_execution(execution["execution_id"])
     return success(
         data=ScenarioExecutionQueuedRead.model_validate(execution),
         message="场景执行请求已受理",

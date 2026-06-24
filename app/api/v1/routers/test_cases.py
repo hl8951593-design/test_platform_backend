@@ -1,7 +1,11 @@
-from fastapi import APIRouter, Depends, Query, status
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user, get_db
+from app.core.config import settings
+from app.core.execution_worker import execution_worker
 from app.core.response import success
 from app.models.user import User
 from app.schemas.test_case import (
@@ -88,7 +92,36 @@ def delete_test_case(
     return success(message="测试用例删除成功")
 
 
-@router.post("/{test_case_id}/execute", summary="执行已保存测试用例")
+def _submit_http_execution(execution_id: int) -> Future[None]:
+    future = execution_worker.submit_future(
+        TestCaseService.execute_queued_execution,
+        execution_id,
+    )
+    if future is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="执行队列已满，请稍后重试",
+        )
+    return future
+
+
+def _wait_for_http_execution(db: Session, execution) -> None:
+    future = _submit_http_execution(execution.id)
+    try:
+        future.result(timeout=settings.EXECUTION_REQUEST_WAIT_TIMEOUT_SECONDS)
+    except FutureTimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="测试用例执行超时，请稍后在执行中心查看结果",
+        ) from exc
+    db.refresh(execution)
+
+
+@router.post(
+    "/{test_case_id}/execute",
+    status_code=status.HTTP_200_OK,
+    summary="异步执行已保存测试用例",
+)
 def execute_saved_test_case(
     project_id: int,
     test_case_id: int,
@@ -96,13 +129,17 @@ def execute_saved_test_case(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    execution = TestCaseService(db).execute_saved_case(
+    execution = TestCaseService(db).enqueue_saved_case(
         project_id=project_id,
         test_case_id=test_case_id,
         environment_id=environment_id,
         current_user=current_user,
     )
-    return success(data=TestCaseExecutionRead.model_validate(execution), message="测试用例执行完成")
+    _wait_for_http_execution(db, execution)
+    return success(
+        data=TestCaseExecutionRead.model_validate(execution),
+        message="测试用例执行完成",
+    )
 
 
 @router.post("/execute-unsaved", summary="执行未保存测试用例")
@@ -120,16 +157,39 @@ def execute_unsaved_test_case(
     return success(data=TestCaseExecutionRead.model_validate(execution), message="临时测试用例执行完成")
 
 
-@router.post("/batch-execute", summary="批量执行测试用例")
+@router.post(
+    "/batch-execute",
+    status_code=status.HTTP_200_OK,
+    summary="异步批量执行测试用例",
+)
 def batch_execute_test_cases(
     project_id: int,
     payload: BatchExecuteRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    executions = TestCaseService(db).batch_execute(
-        project_id=project_id,
-        payload=payload,
-        current_user=current_user,
+    service = TestCaseService(db)
+    executions = [
+        service.enqueue_saved_case(
+            project_id=project_id,
+            test_case_id=test_case_id,
+            environment_id=payload.environment_id,
+            current_user=current_user,
+        )
+        for test_case_id in payload.test_case_ids
+    ]
+    futures = [_submit_http_execution(execution.id) for execution in executions]
+    try:
+        for future in futures:
+            future.result(timeout=settings.EXECUTION_REQUEST_WAIT_TIMEOUT_SECONDS)
+    except FutureTimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="批量测试用例执行超时，请稍后在执行中心查看结果",
+        ) from exc
+    for execution in executions:
+        db.refresh(execution)
+    return success(
+        data=[TestCaseExecutionRead.model_validate(item) for item in executions],
+        message="批量测试用例执行完成",
     )
-    return success(data=[TestCaseExecutionRead.model_validate(item) for item in executions], message="批量执行完成")

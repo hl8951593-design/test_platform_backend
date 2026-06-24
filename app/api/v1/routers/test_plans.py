@@ -3,11 +3,12 @@ import logging
 import time
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user, get_db
 from app.core.config import settings
+from app.core.execution_worker import execution_worker
 from app.core.response import success
 from app.core.sensitive_data import verify_webhook_signature
 from app.db.session import SessionLocal
@@ -59,6 +60,14 @@ def _execute_plan_run_background(run_id: int) -> None:
                 run.finished_at = datetime.utcnow()
                 db.commit()
             logger.exception("Test plan run %s failed in background execution", run_id)
+
+
+def _submit_plan_run(run_id: int) -> None:
+    if not execution_worker.submit(_execute_plan_run_background, run_id):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="执行队列已满，请稍后重试",
+        )
 
 
 @router.get("", summary="查询测试计划列表")
@@ -144,7 +153,6 @@ async def trigger_webhook(
     project_id: int,
     event: str,
     request: Request,
-    background_tasks: BackgroundTasks,
     x_webhook_timestamp: str = Header(alias="X-Webhook-Timestamp"),
     x_webhook_signature: str = Header(alias="X-Webhook-Signature"),
     idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=128),
@@ -173,20 +181,20 @@ async def trigger_webhook(
     )
     for run in runs:
         if run.status == "pending":
-            background_tasks.add_task(_execute_plan_run_background, run.id)
+            _submit_plan_run(run.id)
     return success(data={"runs": [_run_data(run) for run in runs]}, message="Webhook accepted")
 
 
 @router.post("/{plan_id}/execute", status_code=status.HTTP_202_ACCEPTED, summary="手动执行测试计划")
 def execute_plan(project_id: int, plan_id: int, payload: TestPlanExecuteRequest,
-                 background_tasks: BackgroundTasks, db: Session = Depends(get_db),
+                 db: Session = Depends(get_db),
                  current_user: User = Depends(get_current_user)):
     run = TestPlanService(db).create_plan_run(
         project_id=project_id, plan_id=plan_id, environment_id=payload.environment_id,
         idempotency_key=payload.idempotency_key, current_user=current_user,
     )
     if run.status == "pending":
-        background_tasks.add_task(_execute_plan_run_background, run.id)
+        _submit_plan_run(run.id)
     return success(data=_run_data(run, include_results=True), message="测试计划执行已受理")
 
 

@@ -2,6 +2,7 @@ import json
 import copy
 import uuid
 import time
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode
 
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.permissions import ProjectPermission
 from app.core.sensitive_data import mask_sensitive
 from app.core.variable_renderer import render_variables
+from app.db.session import SessionLocal
 from app.models.test_case import TestCase, TestCaseExecution
 from app.models.user import User
 from app.repositories.test_case_repository import TestCaseRepository
@@ -21,6 +23,7 @@ from app.runner.retry import (
     method_allows_retry,
     retry_delay_seconds,
 )
+from app.schemas.retry import RetryPolicyConfig
 from app.schemas.test_case import (
     BatchExecuteRequest,
     TestCaseCreateRequest,
@@ -175,24 +178,106 @@ class TestCaseService:
     ) -> TestCaseExecution:
         test_case = self._get_case_or_404(project_id=project_id, test_case_id=test_case_id)
         selected_environment_id = environment_id or test_case.environment_id
-        payload = TestCaseRequestConfig(
-            environment_id=selected_environment_id,
-            method=test_case.method,
-            path=test_case.path,
-            headers=test_case.headers,
-            query_params=test_case.query_params,
-            body_type=test_case.body_type,
-            body=test_case.body,
-            assertions=test_case.assertions or [],
-            extractors=test_case.extractors or [],
-            retry_policy=test_case.retry_policy or {},
-        )
+        payload = self._saved_case_payload(test_case, environment_id=selected_environment_id)
         return self._execute(
             project_id=project_id,
             test_case_id=test_case_id,
             payload=payload,
             current_user=current_user,
         )
+
+    def enqueue_saved_case(
+        self,
+        *,
+        project_id: int,
+        test_case_id: int,
+        environment_id: int | None,
+        current_user: User,
+    ) -> TestCaseExecution:
+        self.permission_service.require_project_permission(
+            current_user,
+            project_id,
+            ProjectPermission.EXECUTE_TEST.value,
+        )
+        test_case = self._get_case_or_404(project_id=project_id, test_case_id=test_case_id)
+        selected_environment_id = environment_id or test_case.environment_id
+        payload = self._saved_case_payload(test_case, environment_id=selected_environment_id)
+        environment, variables = self._load_environment_context(
+            project_id=project_id,
+            environment_id=payload.environment_id,
+        )
+        request_snapshot = self._build_request_snapshot(
+            payload=payload,
+            base_url=environment.base_url if environment else None,
+            variables=variables,
+        )
+        execution = TestCaseExecution(
+            project_id=project_id,
+            test_case_id=test_case_id,
+            environment_id=payload.environment_id,
+            scenario_run_id=None,
+            executed_by_id=current_user.id,
+            status="queued",
+            request_snapshot=mask_sensitive(request_snapshot),
+            response_snapshot=None,
+            assertion_results=None,
+            attempt_history=[],
+            error_message=None,
+            duration_ms=None,
+        )
+        test_case.last_execution_status = "running"
+        test_case.last_executed_at = datetime.utcnow()
+        self.db.add(execution)
+        self.db.commit()
+        self.db.refresh(execution)
+        return execution
+
+    @staticmethod
+    def execute_queued_execution(execution_id: int) -> None:
+        with SessionLocal() as db:
+            execution = db.get(TestCaseExecution, execution_id)
+            if execution is None or execution.status not in {"queued", "running"}:
+                return
+            current_user = db.get(User, execution.executed_by_id)
+            if current_user is None or not current_user.is_active:
+                execution.status = "failed"
+                execution.error_message = "执行用户不存在或已停用"
+                execution.duration_ms = 0
+                db.commit()
+                return
+            if execution.test_case_id is None:
+                execution.status = "failed"
+                execution.error_message = "异步执行暂不支持未保存测试用例"
+                execution.duration_ms = 0
+                db.commit()
+                return
+            try:
+                service = TestCaseService(db)
+                test_case = service._get_case_or_404(
+                    project_id=execution.project_id,
+                    test_case_id=execution.test_case_id,
+                )
+                payload = service._saved_case_payload(
+                    test_case,
+                    environment_id=execution.environment_id,
+                )
+                execution.status = "running"
+                db.commit()
+                service._execute(
+                    project_id=execution.project_id,
+                    test_case_id=execution.test_case_id,
+                    payload=payload,
+                    current_user=current_user,
+                    queued_execution_id=execution.id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                failed = db.get(TestCaseExecution, execution_id)
+                if failed is not None and failed.status in {"queued", "running"}:
+                    failed.status = "failed"
+                    failed.error_message = str(exc)
+                    failed.duration_ms = 0
+                    db.commit()
 
     def execute_unsaved_case(
         self,
@@ -241,6 +326,7 @@ class TestCaseService:
         current_user: User,
         scenario_run_id: int | None = None,
         timeout_seconds: float | None = None,
+        queued_execution_id: int | None = None,
     ) -> TestCaseExecution:
         environment, variables = self._load_environment_context(
             project_id=project_id,
@@ -254,7 +340,7 @@ class TestCaseService:
         attempt_history: list[dict[str, Any]] = []
         error_message: str | None = None
         status_value = "passed"
-        policy = payload.retry_policy
+        policy = getattr(payload, "retry_policy", None) or RetryPolicyConfig()
         retry_allowed_for_method = method_allows_retry(payload.method, policy)
         execution_deadline = (
             time.monotonic() + timeout_seconds
@@ -382,7 +468,30 @@ class TestCaseService:
             break
 
         duration_ms = int((time.perf_counter() - started_at) * 1000)
-        return self.repository.create_execution(
+        if queued_execution_id is not None:
+            execution = self.db.get(TestCaseExecution, queued_execution_id)
+            if execution is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="测试用例执行记录不存在",
+                )
+            execution.status = status_value
+            execution.request_snapshot = mask_sensitive(request_snapshot)
+            execution.response_snapshot = response_snapshot
+            execution.assertion_results = assertion_results
+            execution.attempt_history = attempt_history
+            execution.error_message = error_message
+            execution.duration_ms = duration_ms
+            if test_case_id is not None:
+                test_case = self.db.get(TestCase, test_case_id)
+                if test_case is not None and test_case.project_id == project_id:
+                    test_case.last_execution_status = status_value
+                    test_case.last_executed_at = datetime.utcnow()
+            self.db.commit()
+            self.db.refresh(execution)
+            return execution
+
+        return self._create_execution_record(
             project_id=project_id,
             test_case_id=test_case_id,
             environment_id=payload.environment_id,
@@ -395,6 +504,36 @@ class TestCaseService:
             attempt_history=attempt_history,
             error_message=error_message,
             duration_ms=duration_ms,
+        )
+
+    def _create_execution_record(self, **values) -> TestCaseExecution:
+        try:
+            return self.repository.create_execution(**values)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            fallback = dict(values)
+            fallback.pop("scenario_run_id", None)
+            fallback.pop("attempt_history", None)
+            return self.repository.create_execution(**fallback)
+
+    @staticmethod
+    def _saved_case_payload(
+        test_case: TestCase,
+        *,
+        environment_id: int | None,
+    ) -> TestCaseRequestConfig:
+        return TestCaseRequestConfig(
+            environment_id=environment_id,
+            method=test_case.method,
+            path=test_case.path,
+            headers=test_case.headers,
+            query_params=test_case.query_params,
+            body_type=test_case.body_type,
+            body=test_case.body,
+            assertions=test_case.assertions or [],
+            extractors=test_case.extractors or [],
+            retry_policy=getattr(test_case, "retry_policy", None) or {},
         )
 
     def _validate_environment(self, *, project_id: int, environment_id: int | None) -> None:

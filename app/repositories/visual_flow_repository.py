@@ -202,17 +202,19 @@ class VisualFlowRepository:
         user_id: int,
         idempotency_key: str | None,
         context_snapshot: dict,
+        status: str = "running",
     ) -> VisualFlowExecution:
+        now = datetime.utcnow()
         execution = VisualFlowExecution(
             flow_id=flow_id,
             flow_version_id=flow_version_id,
             project_id=project_id,
             environment_id=environment_id,
-            status="running",
+            status=status,
             trigger_user_id=user_id,
             idempotency_key=idempotency_key,
             context_snapshot=context_snapshot,
-            started_at=datetime.utcnow(),
+            started_at=now if status == "running" else None,
         )
         self.db.add(execution)
         self.db.commit()

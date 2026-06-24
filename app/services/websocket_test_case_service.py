@@ -1,6 +1,7 @@
 import json
 import copy
 import time
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -11,11 +12,13 @@ from sqlalchemy.orm import Session
 from app.core.permissions import ProjectPermission
 from app.core.sensitive_data import mask_sensitive
 from app.core.variable_renderer import render_variables
+from app.db.session import SessionLocal
 from app.models.user import User
 from app.models.websocket_test_case import WebSocketTestCase, WebSocketTestCaseExecution
 from app.repositories.websocket_test_case_repository import WebSocketTestCaseRepository
 from app.runner.assertion_engine import json_values_equal
 from app.runner.retry import failed_assertions_are_retryable, retry_delay_seconds
+from app.schemas.retry import RetryPolicyConfig
 from app.schemas.websocket_test_case import (
     UnsavedWebSocketTestCaseExecuteRequest,
     WebSocketBatchExecuteRequest,
@@ -102,15 +105,83 @@ class WebSocketTestCaseService:
 
     def _execute_saved(self, project_id: int, test_case_id: int, environment_id: int | None, current_user: User):
         case = self._get_case(project_id, test_case_id)
-        payload = WebSocketTestCaseConfig(
-            environment_id=environment_id or case.environment_id,
-            path=case.path, headers=case.headers, subprotocols=case.subprotocols or [],
-            messages=case.messages or [], receive_count=case.receive_count,
-            connect_timeout_ms=case.connect_timeout_ms, receive_timeout_ms=case.receive_timeout_ms,
-            assertions=case.assertions or [], extractors=case.extractors or [],
-            retry_policy=case.retry_policy or {},
-        )
+        payload = self._saved_case_payload(case, environment_id=environment_id or case.environment_id)
         return self._execute(project_id, test_case_id, payload, current_user)
+
+    def enqueue_saved_case(
+        self,
+        *,
+        project_id: int,
+        test_case_id: int,
+        environment_id: int | None,
+        current_user: User,
+    ) -> WebSocketTestCaseExecution:
+        self._require(current_user, project_id, ProjectPermission.EXECUTE_TEST.value)
+        case = self._get_case(project_id, test_case_id)
+        payload = self._saved_case_payload(case, environment_id=environment_id or case.environment_id)
+        environment, variables = self._load_environment_context(project_id, payload.environment_id)
+        snapshot = self._build_session_snapshot(payload, environment.base_url if environment else None, variables)
+        execution = WebSocketTestCaseExecution(
+            project_id=project_id,
+            websocket_test_case_id=test_case_id,
+            environment_id=payload.environment_id,
+            scenario_run_id=None,
+            executed_by_id=current_user.id,
+            status="queued",
+            session_snapshot=mask_sensitive(snapshot),
+            response_snapshot=None,
+            assertion_results=None,
+            attempt_history=[],
+            error_message=None,
+            duration_ms=None,
+        )
+        case.last_execution_status = "running"
+        case.last_executed_at = datetime.utcnow()
+        self.repository.db.add(execution)
+        self.repository.db.commit()
+        self.repository.db.refresh(execution)
+        return execution
+
+    @staticmethod
+    def execute_queued_execution(execution_id: int) -> None:
+        with SessionLocal() as db:
+            execution = db.get(WebSocketTestCaseExecution, execution_id)
+            if execution is None or execution.status not in {"queued", "running"}:
+                return
+            current_user = db.get(User, execution.executed_by_id)
+            if current_user is None or not current_user.is_active:
+                execution.status = "failed"
+                execution.error_message = "执行用户不存在或已停用"
+                execution.duration_ms = 0
+                db.commit()
+                return
+            if execution.websocket_test_case_id is None:
+                execution.status = "failed"
+                execution.error_message = "异步执行暂不支持未保存 WebSocket 测试用例"
+                execution.duration_ms = 0
+                db.commit()
+                return
+            try:
+                service = WebSocketTestCaseService(db)
+                case = service._get_case(execution.project_id, execution.websocket_test_case_id)
+                payload = service._saved_case_payload(case, environment_id=execution.environment_id)
+                execution.status = "running"
+                db.commit()
+                service._execute(
+                    execution.project_id,
+                    execution.websocket_test_case_id,
+                    payload,
+                    current_user,
+                    queued_execution_id=execution.id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                failed = db.get(WebSocketTestCaseExecution, execution_id)
+                if failed is not None and failed.status in {"queued", "running"}:
+                    failed.status = "failed"
+                    failed.error_message = str(exc)
+                    failed.duration_ms = 0
+                    db.commit()
 
     def _execute(
         self,
@@ -120,6 +191,7 @@ class WebSocketTestCaseService:
         current_user: User,
         scenario_run_id: int | None = None,
         timeout_seconds: float | None = None,
+        queued_execution_id: int | None = None,
     ):
         environment, variables = self._load_environment_context(project_id, payload.environment_id)
         snapshot = self._build_session_snapshot(payload, environment.base_url if environment else None, variables)
@@ -129,7 +201,7 @@ class WebSocketTestCaseService:
         attempt_history: list[dict[str, Any]] = []
         error_message = None
         status_value = "passed"
-        policy = payload.retry_policy
+        policy = getattr(payload, "retry_policy", None) or RetryPolicyConfig()
         execution_deadline = (
             time.monotonic() + timeout_seconds
             if timeout_seconds is not None
@@ -226,13 +298,57 @@ class WebSocketTestCaseService:
                 continue
             attempt_history.append(attempt_detail)
             break
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        if queued_execution_id is not None:
+            execution = self.repository.db.get(WebSocketTestCaseExecution, queued_execution_id)
+            if execution is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="WebSocket 测试用例执行记录不存在",
+                )
+            execution.status = status_value
+            execution.session_snapshot = mask_sensitive(snapshot)
+            execution.response_snapshot = response_snapshot
+            execution.assertion_results = assertion_results
+            execution.attempt_history = attempt_history
+            execution.error_message = error_message
+            execution.duration_ms = duration_ms
+            if test_case_id is not None:
+                case = self.repository.db.get(WebSocketTestCase, test_case_id)
+                if case is not None and case.project_id == project_id:
+                    case.last_execution_status = status_value
+                    case.last_executed_at = datetime.utcnow()
+            self.repository.db.commit()
+            self.repository.db.refresh(execution)
+            return execution
+
         return self.repository.create_execution(
             project_id=project_id, websocket_test_case_id=test_case_id, environment_id=payload.environment_id,
             scenario_run_id=scenario_run_id, executed_by_id=current_user.id, status=status_value,
             session_snapshot=mask_sensitive(snapshot),
             response_snapshot=response_snapshot, assertion_results=assertion_results,
             attempt_history=attempt_history, error_message=error_message,
-            duration_ms=int((time.perf_counter() - started_at) * 1000),
+            duration_ms=duration_ms,
+        )
+
+    @staticmethod
+    def _saved_case_payload(
+        case: WebSocketTestCase,
+        *,
+        environment_id: int | None,
+    ) -> WebSocketTestCaseConfig:
+        return WebSocketTestCaseConfig(
+            environment_id=environment_id,
+            path=case.path,
+            headers=case.headers,
+            subprotocols=case.subprotocols or [],
+            messages=case.messages or [],
+            receive_count=case.receive_count,
+            connect_timeout_ms=case.connect_timeout_ms,
+            receive_timeout_ms=case.receive_timeout_ms,
+            assertions=case.assertions or [],
+            extractors=case.extractors or [],
+            retry_policy=getattr(case, "retry_policy", None) or {},
         )
 
     def _run_session(self, snapshot: dict[str, Any], *, timeout_seconds: float | None = None) -> dict[str, Any]:

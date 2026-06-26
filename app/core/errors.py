@@ -1,5 +1,4 @@
 import logging
-import uuid
 from http import HTTPStatus
 from typing import Any
 
@@ -9,6 +8,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.core.logging import get_request_id
 
 
 logger = logging.getLogger(__name__)
@@ -53,27 +54,40 @@ def error_response(
 
 def register_exception_handlers(application: FastAPI) -> None:
     @application.exception_handler(StarletteHTTPException)
-    async def http_exception_handler(_: Request, exc: StarletteHTTPException):
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+        request_id = _request_id(request)
+        _log_http_exception(request, exc, request_id)
+        headers = dict(exc.headers or {})
+        headers.setdefault("X-Request-ID", request_id)
         return error_response(
             status_code=exc.status_code,
             message=_detail_message(exc.detail, exc.status_code),
             data=exc.detail,
-            headers=exc.headers,
+            headers=headers,
         )
 
     @application.exception_handler(RequestValidationError)
     async def validation_exception_handler(
-        _: Request, exc: RequestValidationError
+        request: Request, exc: RequestValidationError
     ):
+        request_id = _request_id(request)
+        logger.warning(
+            "Request validation failed request_id=%s method=%s path=%s errors=%s",
+            request_id,
+            request.method,
+            request.url.path,
+            exc.errors(),
+        )
         return error_response(
             status_code=422,
             message="request validation failed",
             data=exc.errors(),
+            headers={"X-Request-ID": request_id},
         )
 
     @application.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request_id = _request_id(request)
         logger.error(
             "Unhandled request error request_id=%s method=%s path=%s",
             request_id,
@@ -103,3 +117,29 @@ def _detail_message(detail: Any, status_code: int) -> str:
         return HTTPStatus(status_code).phrase.lower()
     except ValueError:
         return "request failed"
+
+
+def _request_id(request: Request) -> str:
+    request_id = getattr(request.state, "request_id", None)
+    if request_id:
+        return str(request_id)
+    context_request_id = get_request_id()
+    if context_request_id and context_request_id != "-":
+        return context_request_id
+    return request.headers.get("X-Request-ID") or "-"
+
+
+def _log_http_exception(
+    request: Request,
+    exc: StarletteHTTPException,
+    request_id: str,
+) -> None:
+    log_method = logger.warning if exc.status_code < 500 else logger.error
+    log_method(
+        "HTTP exception request_id=%s method=%s path=%s status=%s detail=%s",
+        request_id,
+        request.method,
+        request.url.path,
+        exc.status_code,
+        exc.detail,
+    )

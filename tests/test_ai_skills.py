@@ -1,5 +1,6 @@
 import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi import HTTPException
@@ -31,6 +32,19 @@ class FakeAIService:
         return SimpleNamespace(content=json.dumps(self.content, ensure_ascii=False))
 
 
+class FakeSequentialAIService:
+    def __init__(self, contents):
+        self.contents = list(contents)
+        self.requests = []
+
+    def chat(self, payload):
+        self.requests.append(payload)
+        content = self.contents.pop(0)
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False)
+        return SimpleNamespace(content=content)
+
+
 class AISkillTests(unittest.TestCase):
     def test_formal_skill_metadata_is_loaded(self):
         skill = get_ai_skill("http-test-case")
@@ -38,6 +52,17 @@ class AISkillTests(unittest.TestCase):
         self.assertEqual(skill.name, "http-test-case")
         self.assertIn("HTTP API test case", skill.description)
         self.assertEqual(skill.package.info().protocol, "http")
+
+    def test_http_prompts_declare_strict_json_contract(self):
+        prompt_dir = Path("app/ai_skills/packages/http-test-case/prompts")
+
+        for prompt_name in ("generate_system.md", "expand_system.md"):
+            content = (prompt_dir / prompt_name).read_text(encoding="utf-8")
+            self.assertIn('{"source_summary":"","cases":[],"warnings":[]}', content)
+            self.assertIn("字段名必须完整且不能拆行", content)
+            self.assertIn("字符串值中禁止输出真实换行", content)
+            self.assertIn("必须使用 expected 字段", content)
+            self.assertIn("禁止使用 value、expect、actual", content)
 
     def test_skill_service_lists_manifest_and_json_schema(self):
         skills = AISkillService(SimpleNamespace()).list_skills()
@@ -92,6 +117,7 @@ class AISkillTests(unittest.TestCase):
         self.assertEqual(result.cases[0].method, "POST")
         self.assertEqual(result.cases[0].path, "/login")
         self.assertEqual(result.cases[0].query_params, {"client": "web"})
+        self.assertNotIn("raw_model", result.model_dump())
         self.assertIn("接口测试用例生成助手", service.ai_service.requests[0].messages[0].content)
 
     def test_generic_skill_run_delegates_to_http_generation(self):
@@ -866,6 +892,103 @@ class AISkillTests(unittest.TestCase):
         self.assertIn("model.delta", events)
         self.assertIn("model.completed", events)
         self.assertIn("step.completed", events)
+
+    def test_runner_repairs_invalid_json_once(self):
+        skill = get_ai_skill("http-test-case")
+        service = FakeSequentialAIService([
+            '{"source_summary":"bad","cases":[}',
+            {
+                "source_summary": "health",
+                "cases": [{
+                    "name": "health repaired",
+                    "method": "GET",
+                    "path": "/health",
+                    "body_type": "none",
+                    "body": None,
+                }],
+                "warnings": [],
+            },
+        ])
+        runner = AISkillRunner(service)
+
+        result = runner.run(
+            skill,
+            {
+                "mode": "generate",
+                "project_id": 1,
+                "environment_id": 2,
+                "environment": SimpleNamespace(id=2, name="dev", base_url="https://api.example.test", description=None),
+                "variables": [],
+                "payload": AITestCaseGenerateRequest(interface_text="GET /health"),
+                "include_assertions": True,
+            },
+        )
+
+        self.assertEqual(result.cases[0].path, "/health")
+        self.assertEqual(len(service.requests), 2)
+        self.assertIn("JSON 修复器", service.requests[1].messages[0].content)
+
+    def test_http_skill_repairs_unescaped_quotes_locally(self):
+        skill = get_ai_skill("http-test-case")
+
+        result = skill.parse_response(
+            """
+            {
+              "source_summary": "health",
+              "cases": [
+                {
+                  "name": "bad "quote" case",
+                  "method": "GET",
+                  "path": "/health",
+                  "body_type": "none",
+                  "body": null
+                }
+              ],
+              "warnings": []
+            }
+            """,
+            {
+                "project_id": 1,
+                "environment_id": 2,
+                "include_assertions": True,
+            },
+        )
+
+        self.assertEqual(result.cases[0].name, 'bad "quote" case')
+        self.assertEqual(result.cases[0].path, "/health")
+
+    def test_http_skill_repairs_control_characters_and_broken_keys_locally(self):
+        skill = get_ai_skill("http-test-case")
+        raw_content = (
+            '{\n'
+            '  "source_summary": "health",\n'
+            '  "cases\n": [\n'
+            '    {\n'
+            '      "name": "missing quote before comma\n,\n'
+            '      "description": "line one\nline two",\n'
+            '      "method\n": "GET",\n'
+            '      "path": "/health",\n'
+            '      "body_type": "none",\n'
+            '      "body": null\n'
+            '    }\n'
+            '  ],\n'
+            '  "warnings": []\n'
+            '}\n'
+        )
+
+        result = skill.parse_response(
+            raw_content,
+            {
+                "project_id": 1,
+                "environment_id": 2,
+                "include_assertions": True,
+            },
+        )
+
+        self.assertEqual(result.cases[0].name, "missing quote before comma")
+        self.assertEqual(result.cases[0].description, "line one\nline two")
+        self.assertEqual(result.cases[0].method, "GET")
+        self.assertEqual(result.cases[0].path, "/health")
 
     def test_ai_run_routes_are_declared(self):
         from app.main import create_app

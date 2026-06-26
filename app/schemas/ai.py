@@ -175,7 +175,6 @@ class AIGeneratedTestCaseResponse(BaseModel):
     source_summary: str
     cases: list[TestCaseCreateRequest]
     warnings: list[str] = Field(default_factory=list)
-    raw_model: str | None = Field(default=None, description="模型原始输出，默认仅调试时使用")
 
 
 class AIWebSocketTestCaseGenerateRequest(BaseModel):

@@ -124,7 +124,8 @@ class VisualFlowService:
     def update_flow(self, *, project_id: int, flow_id: int, payload, current_user: User) -> dict[str, Any]:
         self._require(current_user, project_id, ProjectPermission.MANAGE_FLOW.value)
         flow = self._get_flow(project_id, flow_id)
-        if flow.current_version != payload.expected_version:
+        expected_version = payload.expected_version or flow.current_version
+        if flow.current_version != expected_version:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"message": "Flow version conflict", "current_version": flow.current_version},
@@ -134,7 +135,7 @@ class VisualFlowService:
         stored = self._stored_definition(definition)
         version = self.repository.update_flow(
             flow=flow,
-            expected_version=payload.expected_version,
+            expected_version=expected_version,
             name=payload.name,
             description=payload.description,
             definition=stored,

@@ -17,15 +17,18 @@
 | 能力 | 当前状态 | 代码位置 |
 | --- | --- | --- |
 | Chat Completions | 已接入 | `app/services/ai_service.py` |
-| JSON Output | 已接入基础参数 | `response_format=json` |
-| AI 生成测试用例 | 已接入 | `app/services/ai_test_case_service.py` |
-| AI 扩写测试用例 | 已接入 | `app/services/ai_test_case_service.py` |
+| JSON Output | 已接入业务解析、兼容修复和 Schema 校验 | `app/ai_skills/base.py` |
+| AI 生成测试用例 | 已接入正式 skill 包 | `app/ai_skills/packages/http-test-case/` |
+| AI 扩写测试用例 | 已接入正式 skill 包 | `app/ai_skills/packages/http-test-case/` |
+| WebSocket 用例 AI | 已接入正式 skill 包 | `app/ai_skills/packages/websocket-test-case/` |
+| 智能场景组合 | 已接入正式 skill 包和自验证 | `app/ai_skills/packages/scenario-composer/` |
+| AI Skill Run | 已接入可观测 run/event/SSE | `app/services/ai_skill_run_service.py` |
 | Thinking 参数 | 已接入基础参数 | `thinking` |
 | Reasoning Effort | 已接入基础参数 | `reasoning_effort` |
 | 多轮对话 | 接口层已支持 messages 透传，业务侧待封装 | `AIChatRequest.messages` |
 | 对话前缀续写 | 待扩展 | 需要支持 beta base_url 和 message.prefix |
 | FIM 补全 | 待扩展 | 需要新增 `/completions` 封装 |
-| 流式输出 | 待扩展 | 需要 SSE 或 WebSocket 支持 |
+| 流式输出 | AIService 已支持，当前用于 AI Skill Run 事件 | `AIService.chat_stream` |
 
 当前接口：
 
@@ -34,6 +37,12 @@ GET  /api/v1/ai/provider
 POST /api/v1/ai/chat
 POST /api/v1/ai/test-cases/generate
 POST /api/v1/ai/test-cases/{test_case_id}/expand
+POST /api/v1/ai/websocket-test-cases/generate
+POST /api/v1/ai/websocket-test-cases/{test_case_id}/expand
+GET  /api/v1/ai/skills
+POST /api/v1/ai/skills/{skill_id}/run
+POST /api/v1/ai/skills/{skill_id}/runs
+GET  /api/v1/ai/skill-runs/{run_id}/events
 ```
 
 ## 2. DeepSeek 基础调用模型
@@ -115,41 +124,52 @@ DeepSeek JSON 模式注意事项：
 - prompt 中必须给出期望 JSON 结构样例。
 - `max_tokens` 要足够大，避免 JSON 被截断。
 - 需要处理 content 为空或 JSON 解析失败的情况。
+- 业务 prompt 必须明确字段名不能拆行，字符串中不能输出真实换行、制表符或其他控制字符。
+- HTTP 测试用例根对象固定为 `source_summary`、`cases`、`warnings`，断言必须使用 `expected` 字段。
 
 推荐后端解析流程：
 
 ```text
 调用 AIService.chat(response_format=json)
 -> 检查 content 非空
--> json.loads(content)
+-> load_model_json 提取和本地修复 JSON
+-> 仍失败时调用一次模型 JSON 修复
 -> Pydantic Schema 校验
 -> 失败时返回可读错误，不直接落库
 ```
 
-测试用例生成推荐 JSON 结构：
+HTTP 测试用例生成推荐 JSON 根结构：
 
 ```json
 {
-  "name": "登录成功",
-  "description": "验证有效账号密码可以登录",
-  "method": "POST",
-  "path": "/finance/api/login",
-  "headers": {
-    "Content-Type": "application/json"
-  },
-  "query_params": {},
-  "body_type": "json",
-  "body": {
-    "username": "admin",
-    "password": "admin"
-  },
-  "assertions": [
+  "source_summary": "登录接口",
+  "cases": [
     {
-      "type": "status_code",
-      "expected": 200
+      "name": "登录成功",
+      "description": "验证有效账号密码可以登录",
+      "environment_id": 1,
+      "environment_ids": [1],
+      "method": "POST",
+      "path": "/finance/api/login",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "query_params": {},
+      "body_type": "json",
+      "body": {
+        "username": "demo",
+        "password": "{{password}}"
+      },
+      "assertions": [
+        {
+          "type": "status_code",
+          "expected": 200
+        }
+      ],
+      "extractors": []
     }
   ],
-  "extractors": []
+  "warnings": []
 }
 ```
 
@@ -290,8 +310,8 @@ AIService.fim_completion(prompt, suffix, max_tokens, stop)
 AIProvider 层
 -> 只负责 DeepSeek 请求、错误转换、响应解析
 
-AICapability 层
--> 封装测试用例生成、失败分析、断言推荐等能力
+AISkill Runtime 层
+-> 读取 skill 包、构造 prompt、解析修复 JSON、归一化输出、写入 run/event
 
 业务 API 层
 -> 负责权限校验、读取项目数据、调用能力层、落库或返回结果
@@ -301,16 +321,13 @@ AICapability 层
 
 ```text
 app/services/ai_service.py
-app/services/ai_capabilities/
-  test_case_generation.py
-  failure_analysis.py
-  assertion_recommendation.py
-  report_summary.py
+app/ai_skills/base.py
+app/ai_skills/{skill_module}.py
+app/ai_skills/packages/{skill_id}/
 app/schemas/ai.py
-app/schemas/ai_capabilities.py
 ```
 
-不要把 prompt 模板散落在 Router 中。Prompt 应该放在能力 Service 或独立模板模块中，方便测试和迭代。
+不要把 prompt 模板散落在 Router 或 Service 中。Prompt 应放在正式 skill 包的 `prompts/` 资源目录中，方便测试、审阅和迭代。
 
 ## 9. Prompt 模板规范
 
@@ -319,8 +336,10 @@ app/schemas/ai_capabilities.py
 - 角色定义：说明模型在本平台中的角色。
 - 输入说明：列出后端传入的数据字段。
 - 输出要求：如果要程序解析，必须要求 JSON。
-- 输出示例：给出完整 JSON 样例。
+- 输出示例：给出完整 JSON 根对象样例。
 - 约束：禁止编造未提供的接口字段，禁止输出密钥。
+- JSON 严格性：字段名和字符串必须完整双引号闭合；字段名不能拆行；字符串中不得输出真实控制字符；禁止尾逗号、注释、单引号和半截 JSON。
+- 业务字段：HTTP 用例断言必须使用 `expected` 字段，禁止 `value`、`expect`、`actual` 等替代字段。
 
 测试用例生成 system prompt 示例：
 
@@ -363,29 +382,27 @@ AI 调用前必须做脱敏：
 
 优先级建议：
 
-1. 增加 AI 调用日志表，记录 provider、model、usage、status、duration。
-2. 增加脱敏工具，统一处理请求头、环境变量、请求体。
-3. 增加 JSON Output 的解析和 Pydantic 校验工具。
-4. 开发“根据接口信息生成测试用例草稿”能力。
-5. 开发“根据执行记录分析失败原因”能力。
-6. 接入对话前缀续写，用于代码或固定格式文本生成。
-7. 接入 FIM 补全，用于脚本和结构片段补全。
-8. 根据前端需要评估流式输出，选择 SSE 或 WebSocket。
+1. 持久化 AI run/event 和调用日志，记录 provider、model、usage、status、duration。
+2. 增加项目级 AI 开关、额度、审计和费用统计。
+3. 将当前内存 AI run/event store 迁移到可靠存储或任务队列。
+4. 开发“根据执行记录分析失败原因”能力。
+5. 接入对话前缀续写，用于代码或固定格式文本生成。
+6. 接入 FIM 补全，用于脚本和结构片段补全。
+7. 扩展 prompt 契约测试，覆盖新增 skill 的 JSON 输出边界。
 
 ## 12. 当前实现边界
 
-当前已完成的是“AI 数据源基础接入”，不是完整 AI 业务功能。
+当前已完成 DeepSeek 基础接入、正式 skill 包、HTTP/WebSocket 用例生成与扩写、场景组合、自验证、AI Skill Run 事件展示和 JSON 修复兜底。
 
 当前不负责：
 
 - AI 会话历史保存。
-- AI 调用日志保存。
-- 自动生成测试用例并落库。
-- AI 输出自动修复。
-- 流式返回。
+- 持久化 AI 调用日志、token 费用和项目级额度。
+- 自动生成测试用例并直接落库。
+- 服务重启后恢复内存中的 AI Skill Run 事件。
 - FIM 和前缀续写实际接口封装。
 
-后续开发时应优先复用当前 `AIService.chat`，等业务场景明确后再扩展 beta 能力。
+后续开发时应优先复用当前 `AIService.chat` / `chat_stream` 和 `AISkillRunner`，等业务场景明确后再扩展 beta 能力。
 
 ## 13. AI 生成测试用例接口设计
 

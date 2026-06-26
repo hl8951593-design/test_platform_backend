@@ -7,11 +7,11 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 最近核对日期 | 2026-06-17 |
-| 开发基线 | 2.9 |
-| Alembic head | `0019_media_objects` |
-| 回归命令 | `.\.venv\Scripts\python.exe -m unittest discover -s tests -v` |
-| 最近完整回归 | 106 项通过 |
+| 最近核对日期 | 2026-06-25 |
+| 开发基线 | 3.0.4 |
+| Alembic head | `0020_scenario_nodes` |
+| 回归命令 | `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v` |
+| 最近完整回归 | 147 项通过 |
 
 数字基线只能在实际执行命令后更新。数据库结构以 Alembic migration 和当前模型共同为准，
 不能只修改模型而遗漏迁移。
@@ -38,6 +38,7 @@
 | [场景运行详情契约](scenario-run-detail-contract.md) | run 身份、步骤结果、快照和运行中字段 |
 | [场景变量追踪契约](scenario-variable-tracing-contract.md) | 变量来源、动作写入、绑定与脱敏 |
 | [开发进度与计划](development_technical_notes.md) | 当前完成度、风险、优先级、迁移基线和验收计划 |
+| [后端日志与排查](logging.md) | request_id、请求日志、执行队列和 AI JSON 修复日志定位 |
 | [统一错误响应](api_errors.md) | HTTP 错误 envelope、字段定位、500 request ID 和 OpenAPI 契约 |
 | [统一执行记录](api_execution_records.md) | HTTP、WebSocket、场景和 Flow 执行历史的公共列表与详情契约 |
 | [测试报告](api_test_reports.md) | 测试计划和 Flow 的报告历史、结构化指标、明细与 HTML 导出 |
@@ -54,6 +55,7 @@
 ## 接口文档
 
 - [认证](api_auth.md)
+- [后端日志与排查](logging.md)
 - [统一错误响应](api_errors.md)
 - [统一执行记录](api_execution_records.md)
 - [测试报告](api_test_reports.md)

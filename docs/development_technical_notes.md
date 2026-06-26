@@ -6,9 +6,9 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 最近更新日期 | 2026-06-24 |
-| 当前开发基线 | 3.0.2 |
-| 当前阶段 | 场景组合已切换为破坏性 nodes 契约；P1 统一执行/报告与缺陷媒体能力已实现；执行入口开始统一迁移到共享执行工作池 |
+| 最近更新日期 | 2026-06-25 |
+| 当前开发基线 | 3.0.4 |
+| 当前阶段 | 场景组合已切换为破坏性 nodes 契约；P1 统一执行/报告与缺陷媒体能力已实现；执行入口开始统一迁移到共享执行工作池；AI Skill Runtime 完成 JSON 修复兜底和提示词契约收紧 |
 | 数据库迁移 | 目标库已升级并验证至 `0020_migrate_scenarios_to_nodes.py`；47 个历史版本已转换为 nodes |
 | 当前主要协议 | HTTP、WebSocket |
 | 当前主要执行方式 | 已保存 HTTP/WebSocket 用例、批量用例和已保存 Flow 内部通过共享执行工作池运行，但对前端保持原最终结果返回；场景、测试计划和 AI Skill Run 使用异步受理/事件查询；未保存调试、WebSocket 长连接调试和媒体上传仍为同步边界 |
@@ -55,7 +55,7 @@
 | 环境与变量 | 已实现 | 多环境、默认环境、环境变量、用例环境绑定 | [环境配置接口文档](api_environment_configs.md) |
 | HTTP 测试用例 | 已实现 | 用例保存、多环境绑定、临时调试、断言、提取、批量执行 | [测试用例接口文档](api_test_cases.md) |
 | WebSocket 测试用例 | 联调中 | 自动执行、长连接手动调试、收发日志、主动断开 | [WebSocket 接口文档](api_websocket_test_cases.md) |
-| AI 测试能力 | 已实现 | DeepSeek 接入、HTTP/WebSocket 用例生成与扩写 | [AI 接口文档](api_ai.md) |
+| AI 测试能力 | 已实现 | DeepSeek 接入、正式 AI Skill 包、HTTP/WebSocket 用例生成与扩写、场景组合、可观测 Skill Run、JSON 修复兜底 | [AI 接口文档](api_ai.md)、[AI 开发记录](development_ai_notes.md) |
 | 可视化测试流程 | 联调中 | 版本化 DAG、HTTP/WebSocket 节点、条件、延迟、数据绑定和执行 | [流程接口文档](api_visual_flows.md) |
 | 场景组合与实时运行 | 联调中 | nodes 绑定动作、版本快照、dataset record 独立运行、请求覆盖、受限脚本、异步启动和持久化 SSE | [场景接口文档](api_scenarios.md)、[执行图谱](scenario_execution_graph.md) |
 | 执行记录 | 联调中 | 已统一查询 HTTP、WebSocket、场景和 Flow 历史，支持筛选、分页及协议专属详情 | [统一执行记录接口](api_execution_records.md) |
@@ -541,7 +541,7 @@ WebSocket 调试使用独立长连接会话管理器 `app/services/websocket_deb
 
 ## 7. AI 测试能力
 
-AI 模块使用 DeepSeek OpenAI 兼容接口，通过独立业务服务生成测试用例草稿，不直接写入用例表。
+AI 模块使用 DeepSeek OpenAI 兼容接口，通过正式 AI Skill Runtime 生成测试资产草稿，不直接写入用例表或场景表。
 
 当前已实现：
 
@@ -550,6 +550,11 @@ AI 模块使用 DeepSeek OpenAI 兼容接口，通过独立业务服务生成测
 - 基于已保存 HTTP 用例扩写边界、异常和业务变体。
 - 根据 WebSocket 协议描述生成 WebSocket 测试用例草稿。
 - 基于已保存 WebSocket 用例扩写握手、鉴权、消息顺序、超时和关闭场景。
+- 通过正式 skill 包管理 `SKILL.md`、`manifest.json` 和 prompt 资源。
+- 使用统一 AI Skill Runtime 构造请求、解析模型输出、归一化和 Schema 校验。
+- 可观测 AI Skill Run 支持创建、查询、SSE 订阅事件、模型增量输出、敏感 payload 脱敏和创建者/管理员访问控制。
+- HTTP 用例生成/扩写提示词已明确根对象、字段名不可拆行、字符串中不得输出真实控制字符、断言必须使用 `expected`。
+- JSON 解析层支持提取 JSON 片段、修复尾逗号、未转义引号、字段名断行和字符串控制字符；本地失败后会触发一次模型 JSON 修复。
 - 使用 Pydantic 用例 Schema 校验 AI 输出，过滤协议不匹配字段。
 - 读取项目和环境上下文时执行项目权限校验。
 
@@ -557,6 +562,7 @@ AI 模块使用 DeepSeek OpenAI 兼容接口，通过独立业务服务生成测
 
 - 尚未保存 AI 调用日志、模型版本、token 用量和费用。
 - 尚未提供项目级 AI 开关、调用额度和审计能力。
+- AI Skill Run 事件当前不持久化，应用重启会丢失历史 run/event。
 - 尚未支持基于执行失败记录生成原因分析和修复建议。
 - AI 生成结果必须继续以草稿形式返回，由用户确认后保存。
 
@@ -827,3 +833,4 @@ P2 完成条件：
 | 2026-06-20 | 3.0.2 | 修复创建重复名称场景时唯一键异常在 flush 阶段漏出为 500；flush/commit 竞态统一返回 HTTP 409；完整回归 118 项通过 |
 | 2026-06-24 | 3.0.2-doc | 新增后端异步与非阻塞工程约束，明确多人并发场景下新增执行类能力默认采用异步任务、状态查询/事件流、超时、并发上限和 Worker 演进边界 |
 | 2026-06-24 | 3.0.3-dev | 新增共享执行工作池；已保存 HTTP/WebSocket 用例、批量用例和已保存 Flow 真实执行迁移到工作池但保持原接口最终结果返回；场景、测试计划和 AI Skill Run 继续使用异步受理后后台执行 |
+| 2026-06-25 | 3.0.4 | AI Skill Runtime 增强 JSON 解析修复和一次模型修复兜底；HTTP 用例生成/扩写提示词收紧根对象、字段名、控制字符和 `expected` 断言契约；同步 AI 技术文档；完整回归 147 项通过 |

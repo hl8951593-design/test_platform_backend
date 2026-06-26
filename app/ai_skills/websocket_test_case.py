@@ -1,12 +1,11 @@
 import json
-import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import HTTPException, status
 
-from app.ai_skills.base import AISkill, SkillPackage
+from app.ai_skills.base import AISkill, SkillPackage, load_model_json
 from app.ai_skills.registry import register_ai_skill
 from app.models.project import ProjectEnvironment, ProjectEnvironmentVariable
 from app.schemas.ai import AIChatMessage, AIChatRequest, AIGeneratedWebSocketTestCaseResponse
@@ -155,20 +154,9 @@ class WebSocketTestCaseSkill(AISkill):
         ]
 
     def _loads_json(self, raw_content: str):
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", (raw_content or "").strip(), flags=re.IGNORECASE)
-        if not text:
-            raise ValueError("empty content")
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            start, end = text.find("{"), text.rfind("}")
-            if start < 0 or end <= start:
-                raise ValueError("no JSON object found") from None
-            data = json.loads(text[start:end + 1])
+        data = load_model_json(raw_content, allow_list=True)
         if isinstance(data, list):
             return {"source_summary": "", "cases": data, "warnings": []}
-        if not isinstance(data, dict):
-            raise ValueError("root is not object")
         return data
 
     def _environment_data(self, environment: ProjectEnvironment):

@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import HTTPException, status
 from pydantic import ValidationError
 
-from app.ai_skills.base import AISkill, SkillPackage
+from app.ai_skills.base import AISkill, SkillPackage, load_model_json
 from app.ai_skills.registry import register_ai_skill
 from app.schemas.ai import AIChatMessage, AIChatRequest, AIGeneratedScenarioResponse
 from app.schemas.scenario import ScenarioCreateRequest
@@ -731,20 +731,7 @@ class ScenarioComposerSkill(AISkill):
         return number if number is not None else value
 
     def _loads_json(self, raw_content: str) -> dict[str, Any]:
-        text = (raw_content or "").strip()
-        if not text:
-            raise ValueError("empty content")
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            start, end = text.find("{"), text.rfind("}")
-            if start < 0 or end <= start:
-                raise ValueError("no JSON object found") from None
-            data = json.loads(text[start:end + 1])
-        if not isinstance(data, dict):
-            raise ValueError("root is not object")
+        data = load_model_json(raw_content)
         return data
 
     def _as_string_list(self, value: Any) -> list[str]:

@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     EXECUTION_WORKER_MAX_WORKERS: int = 8
     EXECUTION_WORKER_QUEUE_SIZE: int = 256
     EXECUTION_REQUEST_WAIT_TIMEOUT_SECONDS: float = 300.0
+    LOG_LEVEL: str = "INFO"
+    LOG_FILE_PATH: str = "logs/app.log"
+    LOG_REQUESTS: bool = True
+    LOG_SLOW_REQUEST_MS: int = 1000
     TEST_PLAN_SCHEDULER_ENABLED: bool = True
     TEST_PLAN_SCHEDULER_INTERVAL_SECONDS: int = 30
     TEST_PLAN_DEFAULT_TIMEZONE: str = "Asia/Shanghai"

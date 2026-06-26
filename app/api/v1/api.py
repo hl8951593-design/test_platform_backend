@@ -1,8 +1,9 @@
 from fastapi import APIRouter
 
-from app.api.v1.routers import ai, auth, browser_captures, defects, environment_configs, execution_records, media, projects, scenarios, test_cases, test_plans, test_reports, users, visual_flows, websocket_test_cases
+from app.api.v1.routers import agents, ai, auth, browser_captures, defects, environment_configs, execution_records, media, projects, scenarios, test_cases, test_plans, test_reports, users, visual_flows, websocket_test_cases
 
 api_router = APIRouter()
+api_router.include_router(agents.router, prefix="/agents", tags=["AI Agents"])
 api_router.include_router(test_reports.router, prefix="/reports", tags=["Test reports"])
 api_router.include_router(execution_records.router, prefix="/execution-records", tags=["Execution records"])
 api_router.include_router(defects.router, prefix="/defects", tags=["Defects"])

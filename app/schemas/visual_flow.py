@@ -79,7 +79,9 @@ class FlowCreateRequest(BaseModel):
 
 
 class FlowUpdateRequest(FlowCreateRequest):
-    expected_version: int = Field(ge=1)
+    expected_version: int | None = Field(default=None, alias="expectedVersion", ge=1)
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class FlowExecuteUnsavedRequest(BaseModel):

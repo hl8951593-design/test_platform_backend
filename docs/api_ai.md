@@ -125,6 +125,15 @@ POST https://api.deepseek.com/chat/completions
 
 使用 JSON 模式时，调用方必须在 `messages` 中明确要求模型输出 JSON，否则模型可能无法稳定返回合法 JSON。
 
+平台业务 skill 对 JSON 输出有额外约束：
+
+- Prompt 必须给出完整根对象示例，并明确字段名不能拆行。
+- 需要程序解析的字符串值不得包含真实换行、制表符或其他控制字符；如必须表达换行，应使用 `\n` 转义。
+- HTTP 用例生成和扩写根对象固定为 `{"source_summary":"","cases":[],"warnings":[]}`。
+- HTTP 用例断言只允许 `status_code`、`body_contains`、`json_equals`，并且必须使用 `expected` 字段；禁止使用 `value`、`expect`、`actual` 等替代字段。
+- AI 返回内容会先经过本地 JSON 解析兼容层：去除代码块、提取 JSON 片段、修复尾逗号、未转义引号、字符串中的控制字符、字段名断行等常见模型输出问题。
+- 本地解析仍失败时，`AISkillRunner` 会使用低温 JSON 修复请求重试一次；修复仍失败才返回 `502`。
+
 ## AI Skills
 
 平台 AI 业务能力以正式 skill 包组织。每个 skill 包至少包含：
@@ -401,6 +410,7 @@ data: {"result":{}}
 - 事件 payload 会经过敏感字段脱敏，例如 authorization、cookie、password、token、secret。
 - run 只能由创建者或管理员读取/订阅。
 - 不返回模型原始 Chain of Thought；前端可展示执行轨迹、工具调用、模型流式内容和校验摘要。
+- 当前 AI Skill Run 使用应用内执行工作池和内存事件仓库：适合过程展示和联调；服务重启后 run 事件不会恢复，生产治理阶段需要迁移到持久化 run/event 表或可靠队列。
 
 ## 错误处理
 
@@ -412,10 +422,13 @@ data: {"result":{}}
 | skill 不存在 | 404 | `skill_id` 未注册 |
 | operation 不存在或缺少必要上下文 | 400 | operation 不属于该 skill，或缺少 `environment_id` / `source_id` |
 | skill input 校验失败 | 422 | `input` 不符合 operation 的输入 schema |
+| AI 返回 JSON 无法解析且修复失败 | 502 | 本地修复和一次模型修复均失败 |
+| AI 返回结构无法通过业务 Schema 校验 | 502 | JSON 合法但字段不满足平台契约 |
 
 ## 后续扩展方向
 
-- 根据接口信息生成测试用例。
+- 持久化 AI run/event、模型版本、token 用量、耗时和费用。
+- 增加项目级 AI 开关、调用额度和审计。
 - 根据执行失败记录分析失败原因。
 - 根据响应报文推荐断言。
 - 根据接口文档批量生成测试用例草稿。
@@ -524,7 +537,9 @@ POST /api/v1/ai/websocket-test-cases/{test_case_id}/expand
 - 当前环境由 query 参数 `environment_id` 确定。
 - 生成结果中的每条用例都会强制写入当前 `environment_id` 和 `environment_ids=[environment_id]`。
 - AI 调用使用 DeepSeek JSON Output。
+- 提示词要求输出完整 JSON 对象、完整字段名、单行字符串、固定用例结构和 `expected` 断言字段。
 - 如果模型返回代码块、根数组、`test_cases` 别名、完整 URL、小写 method，后端会做兼容处理。
+- 如果模型返回字段名断行、字符串裸换行、尾逗号或未转义引号等常见坏 JSON，后端会尝试本地修复；仍失败时会触发一次模型 JSON 修复。
 - 如果模型返回非法断言、非法提取器或无效字段，后端会过滤或返回 `warnings`。
 - 如果最终结构无法通过平台测试用例 Schema 校验，后端返回 502。
 
@@ -583,6 +598,7 @@ POST /api/v1/ai/websocket-test-cases/{test_case_id}/expand
 - 扩写用例默认沿用源用例的 method、path、headers、body_type、extractors。
 - 主要变化应体现在 `name`、`description`、`query_params`、`body`、`assertions`。
 - 负向或异常用例通常不生成 extractors。
+- 扩写提示词同样要求合法 JSON、字段名不能拆行、字符串内部不输出真实控制字符，并要求断言使用 `expected` 字段。
 - 返回结果仍然是草稿，不直接保存到 `test_cases`。
 
 扩写类型说明：

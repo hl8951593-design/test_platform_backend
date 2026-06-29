@@ -51,8 +51,11 @@ ApprovalStatus = Literal[
     "approved",
     "rejected",
     "expired",
+    "revoked",
     "superseded",
 ]
+
+MigrationBlockStatus = Literal["open", "resolved", "cancelled"]
 
 
 class AgentRunCreateRequest(BaseModel):
@@ -60,7 +63,7 @@ class AgentRunCreateRequest(BaseModel):
     intent: str = Field(min_length=1, max_length=4000, description="用户目标")
     conversation_id: str | None = Field(default=None, max_length=64)
     max_iterations: int = Field(default=3, ge=1, le=10)
-    auto_complete: bool = Field(default=False, description="框架冒烟用：无工具时是否立即完成")
+    auto_complete: bool = Field(default=False, description="后端 smoke/debug 用；普通 Agent 对话必须保持 false 并走模型流式生成")
 
 
 class AgentRunRead(BaseModel):
@@ -89,6 +92,126 @@ class AgentRunRead(BaseModel):
     updated_at: datetime
 
 
+class AgentRunSummaryRead(BaseModel):
+    run: AgentRunRead
+    assistant_message: str | None = None
+    assistant_visible: bool = True
+    completion_source: str | None = None
+    model_invoked: bool | None = None
+    model: str | None = None
+    finish_reason: str | None = None
+    usage: dict[str, Any] | None = None
+    event_count: int
+    latest_event_sequence: int
+    latest_event_types: list[str]
+    tool_call_count: int
+    pending_tool_call_count: int
+    approval_count: int
+    pending_approval_count: int
+    migration_block_count: int
+    open_migration_block_count: int
+    memory_usage_count: int
+    blocking_tool_call_ids: list[str]
+    terminal: bool
+    can_cancel: bool
+    can_resume: bool
+    updated_at: datetime
+
+
+class AgentRunActionRead(BaseModel):
+    action_id: str
+    label: str
+    method: str
+    path: str
+    enabled: bool
+    reason: str
+    severity: str
+    resource_ids: list[str] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentRunActionStateRead(BaseModel):
+    run_summary: AgentRunSummaryRead
+    actions: list[AgentRunActionRead]
+    primary_action_ids: list[str]
+    blocked_reasons: list[str]
+    generated_at: datetime
+
+
+class AgentConversationRead(BaseModel):
+    conversation_id: str
+    project_id: int
+    title: str
+    run_count: int
+    latest_run_id: str
+    latest_run_status: RunStatus
+    created_at: datetime
+    updated_at: datetime
+
+
+class AgentConversationTranscriptRead(BaseModel):
+    conversation: AgentConversationRead
+    turns: list[AgentRunSummaryRead]
+    generated_at: datetime
+
+
+class AgentConversationExportRead(BaseModel):
+    conversation: AgentConversationRead
+    turns: list[AgentRunSummaryRead]
+    events_by_run_id: dict[str, list["AgentEventRead"]]
+    tool_calls_by_run_id: dict[str, list["AgentToolCallRead"]]
+    approvals_by_run_id: dict[str, list["AgentApprovalRead"]]
+    migration_blocks_by_run_id: dict[str, list["AgentMigrationBlockRead"]]
+    export_format: str
+    generated_at: datetime
+    derived_from: dict[str, Any]
+
+
+class AgentModelHealthRead(BaseModel):
+    provider: str
+    configured: bool
+    base_url: str
+    default_model: str
+    live: bool
+    reachable: bool | None = None
+    latency_ms: int | None = None
+    first_delta_received: bool | None = None
+    completed: bool | None = None
+    model: str | None = None
+    finish_reason: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    checked_at: datetime
+
+
+class AgentConversationSmokeRequest(BaseModel):
+    project_id: int
+    intent: str = Field(
+        default="请用一句中文回复：Agent smoke ok。不要调用工具。",
+        min_length=1,
+        max_length=4000,
+    )
+    max_iterations: int = Field(default=2, ge=1, le=3)
+
+
+class AgentConversationSmokeRead(BaseModel):
+    project_id: int
+    run_id: str
+    conversation_id: str
+    status: RunStatus
+    completed: bool
+    first_delta_received: bool
+    assistant_visible: bool
+    assistant_message: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    event_types: list[str]
+    latest_event_sequence: int
+    run_summary: AgentRunSummaryRead
+    latency_ms: int
+    generated_at: datetime
+
+
 class AgentRuntimeSnapshotRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -114,6 +237,65 @@ class AgentEventRead(BaseModel):
     event_type: str
     payload_json: dict[str, Any]
     created_at: datetime
+
+
+class AgentRunEventSnapshotRead(BaseModel):
+    run: AgentRunRead
+    events: list[AgentEventRead]
+    after_sequence: int
+    event_count: int
+    latest_event_sequence: int
+    next_after_sequence: int
+    terminal: bool
+    generated_at: datetime
+
+
+class AgentEventReplayAuditRead(BaseModel):
+    run_id: str
+    project_id: int
+    last_event_sequence: int
+    after_sequence: int
+    event_count: int
+    replay_event_count: int
+    first_replay_event_seq: int | None = None
+    last_replay_event_seq: int | None = None
+    missing_sequences: list[int]
+    duplicate_sequences: list[int]
+    unexpected_sequences: list[int]
+    replayable: bool
+    replay_cursor_valid: bool
+
+
+class AgentEventReplayStressAuditRead(BaseModel):
+    project_id: int | None = None
+    generated_at: str
+    sample_limit: int
+    cursor_count: int
+    audited_run_count: int
+    cursor_window_count: int
+    failed_run_count: int
+    failed_run_ids: list[str]
+    invalid_cursor_count: int
+    total_replay_events: int
+    max_replay_window_events: int
+    high_concurrency_replayable: bool
+    run_audits: list[dict[str, Any]]
+    derived_from: dict[str, Any]
+
+
+class AgentWorkerQueueAuditRead(BaseModel):
+    project_id: int | None = None
+    generated_at: str
+    status_counts: dict[str, int]
+    total_count: int
+    active_count: int
+    expired_lease_count: int
+    duplicate_active_lease_count: int
+    oldest_queued_age_ms: int
+    lease_scan_stable: bool
+    expired_leases: list[dict[str, Any]]
+    duplicate_active_leases: list[dict[str, Any]]
+    derived_from: dict[str, Any]
 
 
 class AgentToolCallCreateRequest(BaseModel):
@@ -190,6 +372,8 @@ class AgentCapabilitiesRead(BaseModel):
     tool_call_statuses: list[str]
     effect_submission_states: list[str]
     backend_effect_capabilities: list[str]
+    approval_statuses: list[str]
+    migration_block_statuses: list[str]
     tools: list[dict[str, Any]]
 
 
@@ -309,6 +493,7 @@ class AgentContextBuildCreateRequest(BaseModel):
     token_budget: int = Field(default=4000, ge=128)
     model_name: str | None = Field(default=None, max_length=128)
     evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
+    memory_ids_used: list[int] = Field(default_factory=list)
     required_evidence_ref_ids: list[str] = Field(default_factory=list)
     prompt_object_key: str | None = Field(default=None, max_length=512)
 
@@ -371,6 +556,14 @@ class AgentRootCauseRuleRead(BaseModel):
     updated_at: datetime
 
 
+class AgentRootCauseRuleGovernanceAuditRead(BaseModel):
+    rule_count: int
+    priority_bands: dict[str, dict[str, int]]
+    violation_count: int
+    violations: list[dict[str, Any]]
+    governance_pass: bool
+
+
 class AgentLoopObservationCreateRequest(BaseModel):
     decision_context_build_id: str = Field(min_length=1, max_length=64)
     next_action: str = Field(default="repair", max_length=64)
@@ -406,11 +599,13 @@ class AgentLoopObservationRead(BaseModel):
 class AgentRunReconcileRead(BaseModel):
     run_id: str
     processed: int
+    skipped_backoff: int = 0
     reconciled: int
     still_uncertain: int
     needs_migration: int
     manual_intervention: int
     tool_call_ids: list[str] = Field(default_factory=list)
+    skipped_backoff_tool_calls: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AgentRunResumeRead(BaseModel):
@@ -418,6 +613,7 @@ class AgentRunResumeRead(BaseModel):
     resumed: bool
     checkpoint_freshness: dict[str, Any]
     scheduled_tool_call_ids: list[str] = Field(default_factory=list)
+    executed_tool_call_ids: list[str] = Field(default_factory=list)
 
 
 class AgentBackendContractRead(BaseModel):
@@ -444,7 +640,7 @@ class AgentMigrationBlockRead(BaseModel):
     block_id: str
     run_id: str
     tool_call_id: str | None = None
-    status: str
+    status: MigrationBlockStatus
     block_type: str
     reason: str
     backend_name: str | None = None
@@ -605,6 +801,44 @@ class AgentMemoryUsageEventRead(BaseModel):
     created_at: datetime
 
 
+class AgentMemoryStalenessEventRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    project_id: int
+    memory_id: int
+    evidence_ref_type: str
+    evidence_ref_id: str
+    stale_reason: str
+    previous_stale_score: float
+    new_stale_score: float
+    previous_status: str
+    new_status: str
+    created_at: datetime
+
+
+class AgentMemoryValidationEventRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    project_id: int
+    memory_id: int
+    run_id: str | None = None
+    tool_call_id: str | None = None
+    usage_event_id: int | None = None
+    validation_source: str
+    evidence_ref_json: dict[str, Any] | None = None
+    reason: str | None = None
+    previous_confidence: float
+    new_confidence: float
+    previous_stale_score: float
+    new_stale_score: float
+    previous_status: str
+    new_status: str
+    validation_count: int
+    created_at: datetime
+
+
 class AgentMemoryFeedbackRequest(BaseModel):
     outcome: str = Field(min_length=1, max_length=64)
     caused_tool_input_change: bool | None = None
@@ -619,6 +853,7 @@ class AgentMemoryFeedbackProcessRead(BaseModel):
     processed: int
     skipped: int
     contradictions_recorded: int
+    validations_recorded: int
     results: list[dict[str, Any]]
 
 
@@ -636,6 +871,69 @@ class AgentMetricsSnapshotRead(BaseModel):
     generated_at: str
     metrics: dict[str, int | float]
     derived_from: dict[str, Any]
+
+
+class AgentAlertRead(BaseModel):
+    alert_id: str
+    severity: str
+    status: str
+    metric_key: str
+    observed_value: int | float
+    threshold: int | float
+    summary: str
+    action: str
+    runbook_id: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentAlertSnapshotRead(BaseModel):
+    project_id: int | None = None
+    generated_at: str
+    status: str
+    alerts: list[AgentAlertRead]
+    summary: dict[str, Any]
+    derived_from: dict[str, Any]
+
+
+class AgentApprovalExpireAuditRead(BaseModel):
+    project_id: int | None = None
+    generated_at: str
+    due_count: int
+    candidate_lineage_count: int
+    oldest_due_lag_ms: int
+    lineage_hotspot_count: int
+    hotspot_lineage_ids: list[str]
+    batch_safe: bool
+    derived_from: dict[str, Any]
+
+
+class AgentApprovalExpireProcessRead(BaseModel):
+    project_id: int | None = None
+    generated_at: str
+    limit: int
+    attempted: int
+    expired: int
+    skipped: int
+    skipped_duplicate_lineage_count: int
+    processed_lineage_ids: list[str]
+    lineage_lock_wait_ms: int
+    lineage_lock_skip_total: int
+    due_before: int
+    due_after: int
+    oldest_due_lag_ms_before: int
+    oldest_due_lag_ms_after: int
+    lineage_hotspot_count_before: int
+    lineage_hotspot_count_after: int
+    batch_safe: bool
+    derived_from: dict[str, Any]
+
+
+class AgentDashboardCheckRead(BaseModel):
+    name: str
+    status: str
+    severity: str
+    summary: str
+    details: dict[str, Any]
 
 
 class AgentReleaseGateToolRead(BaseModel):
@@ -674,7 +972,67 @@ class AgentReleaseGateRead(BaseModel):
     blocked_side_effect_classes: list[str]
     tool_matrix: list[AgentReleaseGateToolRead]
     expansion_gates: list[AgentReleaseGateLevelRead]
+    minimum_go_live: dict[str, Any]
+    go_live_gates: dict[str, Any]
+    final_delivery: dict[str, Any]
     violations: list[AgentReleaseGateViolationRead]
+
+
+class AgentReleaseGatePromotionRead(BaseModel):
+    project_id: int | None = None
+    current_level: str
+    target_level: str
+    target_level_summary: str
+    decision: str
+    can_promote: bool
+    blockers: list[dict[str, Any]]
+    checks: list[dict[str, Any]]
+    dashboard_checks: list[dict[str, Any]]
+    fault_injection: dict[str, Any]
+    alert_summary: dict[str, Any]
+    readiness: dict[str, Any]
+    release_gate: dict[str, Any]
+
+
+class AgentReadinessDashboardRead(BaseModel):
+    project_id: int | None = None
+    generated_at: str
+    readiness: str
+    checks: list[AgentDashboardCheckRead]
+    metrics: dict[str, int | float]
+    release_gate: AgentReleaseGateRead
+    promotion_assessment: dict[str, Any]
+    fault_injection: dict[str, Any]
+    runbooks: dict[str, Any]
+    root_cause_governance: dict[str, Any]
+    alerts: list[AgentAlertRead]
+    alert_summary: dict[str, Any]
+    derived_from: dict[str, Any]
+
+
+class AgentLaunchAuditRead(BaseModel):
+    project_id: int | None = None
+    generated_at: str
+    ready: bool
+    status: str
+    checks: list[AgentDashboardCheckRead]
+    model_health: dict[str, Any]
+    dashboard: dict[str, Any]
+    promotion: dict[str, Any]
+    derived_from: dict[str, Any]
+
+
+class AgentBackendCompletionAuditRead(BaseModel):
+    project_id: int | None = None
+    generated_at: str
+    complete: bool
+    status: str
+    checks: list[AgentDashboardCheckRead]
+    backend_scope: dict[str, Any]
+    launch_audit: dict[str, Any]
+    runtime_contracts: dict[str, Any]
+    diagnostics: dict[str, Any]
+    derived_from: dict[str, Any]
 
 
 class AgentRunbookRead(BaseModel):
@@ -706,6 +1064,18 @@ class AgentFaultInjectionCaseRead(BaseModel):
     case_id: str
     description: str
     expected: dict[str, Any]
+
+
+class AgentFaultInjectionCoverageRead(BaseModel):
+    generated_at: str
+    registered_case_count: int
+    required_case_count: int
+    covered_required_case_ids: list[str]
+    missing_required_case_ids: list[str]
+    extra_case_ids: list[str]
+    coverage_ratio: float
+    coverage_pass: bool
+    derived_from: dict[str, Any]
 
 
 class AgentFaultInjectionRequest(BaseModel):

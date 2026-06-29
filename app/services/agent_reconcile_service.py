@@ -12,12 +12,15 @@ from app.core.sensitive_data import mask_sensitive, request_fingerprint
 from app.models.agent import (
     AgentBackendContract,
     AgentCheckpoint,
+    AgentContextBuild,
     AgentEvidenceWatch,
     AgentMigrationBlock,
     AgentApproval,
     AgentReconcileAttempt,
     AgentRun,
+    AgentRuntimeSnapshot,
     AgentToolCall,
+    ProjectMemory,
 )
 from app.models.user import User
 from app.schemas.agent import ReconcileResult
@@ -27,6 +30,138 @@ from app.services.permission_service import PermissionService
 
 
 RECONCILE_ELIGIBLE_STATUSES = {"uncertain", "reconciling"}
+RECONCILE_RESULT_STATUSES = {
+    "succeeded",
+    "running",
+    "failed",
+    "not_found",
+    "conflict",
+    "unsupported_schema_version",
+}
+RECONCILE_SCHEMA_SUPPORT_VALUES = {"supported", "unsupported", "adapter_required"}
+RECONCILE_SUCCESS_RESULT_STATUSES = {"succeeded"}
+RECONCILE_BACKOFF_RESULT_STATUSES = {"running", "not_found"}
+RECONCILE_TERMINAL_FAILURE_RESULT_STATUSES = {"failed"}
+RECONCILE_DIRECT_MANUAL_RESULT_STATUSES = {"conflict"}
+RECONCILE_STATE_DEPENDENT_RESULT_STATUSES = {"not_found"}
+RECONCILE_MIGRATION_RESULT_STATUSES = {"unsupported_schema_version"}
+RECONCILE_BACKOFF_EFFECT_STATES = {"transport_sent_observed"}
+RECONCILE_BACKOFF_CAPABILITIES = {"receipt_first", "idempotency_index_only"}
+RECONCILE_RESULT_ENVELOPE_FIELDS = set(ReconcileResult.model_fields)
+RECONCILE_SUMMARY_FIELDS = {
+    "run_id",
+    "processed",
+    "skipped_backoff",
+    "reconciled",
+    "still_uncertain",
+    "needs_migration",
+    "manual_intervention",
+    "tool_call_ids",
+    "skipped_backoff_tool_calls",
+}
+RECONCILE_SKIPPED_BACKOFF_FIELDS = {"tool_call_id", "next_retry_at", "attempt_seq", "result_status"}
+PERMISSION_FRESHNESS_TOOL_STATUSES = {
+    "planned",
+    "approved",
+    "executable",
+    "failed_retryable",
+    "uncertain",
+    "reconciling",
+}
+PERMISSION_FRESHNESS_FIELDS = (
+    "revoked_required_permission_count",
+    "revoked_required_permissions",
+)
+PERMISSION_FRESHNESS_DETAIL_FIELDS = (
+    "tool_call_id",
+    "tool_name",
+    "permission",
+    "status",
+)
+PERMISSION_FRESHNESS_RESULT = "permission_stale"
+PERMISSION_FRESHNESS_ACTION = "refresh_permissions_or_manual_review"
+PERMISSION_FRESHNESS_REASON = "required_permission_revoked"
+PENDING_APPROVAL_FRESHNESS_FIELDS = (
+    "pending_approval_count",
+    "expired_pending_approval_count",
+    "stale_pending_approval_count",
+    "pending_approval_details",
+)
+PENDING_APPROVAL_DETAIL_FIELDS = (
+    "approval_id",
+    "tool_call_id",
+    "approval_lineage_id",
+    "approval_epoch",
+    "expires_at",
+    "stale_reasons",
+)
+PENDING_APPROVAL_FRESHNESS_REASONS = (
+    "pending_approval_expired",
+    "pending_approval_stale",
+    "pending_approval_after_wait",
+)
+PENDING_APPROVAL_DETAIL_STALE_REASONS = (
+    "expired",
+    "tool_call_missing",
+    "immutable_mismatch",
+    "pending_after_wait",
+)
+PENDING_APPROVAL_FRESHNESS_RESULT = "approval_stale"
+PENDING_APPROVAL_FRESHNESS_ACTION = "supersede_or_refresh_approval"
+ENVIRONMENT_FRESHNESS_FIELDS = (
+    "environment_changed_count",
+    "stale_evidence_watch_details",
+)
+ENVIRONMENT_FRESHNESS_RESULT = "environment_changed"
+ENVIRONMENT_FRESHNESS_ACTION = "revalidate_before_side_effect"
+ENVIRONMENT_FRESHNESS_REASON = "environment_updated"
+STALE_EVIDENCE_WATCH_DETAIL_FIELDS = (
+    "evidence_ref_id",
+    "ref_type",
+    "ref_id",
+    "stale_reason",
+)
+ACTIVE_EVIDENCE_REVALIDATION_FIELDS = (
+    "active_evidence_revalidation_count",
+    "active_evidence_revalidation_details",
+)
+ACTIVE_EVIDENCE_REVALIDATION_DETAIL_FIELDS = (
+    "evidence_ref_id",
+    "ref_type",
+    "ref_id",
+    "mutability_class",
+    "freshness_policy",
+)
+ACTIVE_EVIDENCE_REVALIDATION_RESULT = "evidence_stale"
+ACTIVE_EVIDENCE_REVALIDATION_ACTIONS = (
+    "materialize_latest_evidence",
+    "fetch_evidence_and_rebuild_context",
+)
+ACTIVE_EVIDENCE_REVALIDATION_REASONS = (
+    "ephemeral_latest_requires_materialization",
+    "active_evidence_requires_revalidation",
+)
+RUNTIME_SNAPSHOT_FRESHNESS_FIELDS = (
+    "checkpoint_runtime_snapshot_id",
+    "run_runtime_snapshot_id",
+    "runtime_snapshot_compatible",
+)
+RUNTIME_SNAPSHOT_FRESHNESS_RESULT = "too_old"
+RUNTIME_SNAPSHOT_FRESHNESS_ACTION = "replan_from_latest_safe_state"
+RUNTIME_SNAPSHOT_FRESHNESS_REASONS = (
+    "runtime_snapshot_missing",
+    "runtime_snapshot_mismatch",
+)
+RUNTIME_SNAPSHOT_FRESHNESS_ERROR_CODE = "checkpoint_stale_replan_required"
+ACTIVE_POLICY_REF_ROLES = {"decision_dependency", "validation_evidence", "policy_dependency"}
+
+
+def _is_active_policy_ref(item: dict[str, Any]) -> bool:
+    return (
+        item.get("active_for_policy") is True
+        and item.get("dependency_role") in ACTIVE_POLICY_REF_ROLES
+        and item.get("superseded_by_ref") is None
+    )
 
 
 class BackendContractRegistry:
@@ -197,7 +332,7 @@ class MigrationCoordinator:
         if block is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent migration block not found")
         if block.status == "resolved":
-            return block, CheckpointFreshnessGate(self.db).evaluate(run=run)
+            return block, CheckpointFreshnessGate(self.db).evaluate(run=run, current_user=current_user)
 
         now = _utcnow()
         block.status = "resolved"
@@ -219,7 +354,7 @@ class MigrationCoordinator:
                 call.error_message = None
 
         self._refresh_run_block_state_after_resolution(run)
-        freshness = CheckpointFreshnessGate(self.db).evaluate(run=run)
+        freshness = CheckpointFreshnessGate(self.db).evaluate(run=run, current_user=current_user)
         checkpoint = self.db.get(AgentCheckpoint, run.last_checkpoint_id) if run.last_checkpoint_id else None
         if checkpoint is not None:
             checkpoint.freshness_metadata_json = freshness
@@ -267,17 +402,32 @@ class CheckpointFreshnessGate:
     def __init__(self, db: Session, *, max_checkpoint_age_seconds: int = 4 * 60 * 60):
         self.db = db
         self.max_checkpoint_age_seconds = max_checkpoint_age_seconds
+        self.permission_service = PermissionService(db)
 
-    def evaluate(self, *, run: AgentRun) -> dict[str, Any]:
+    def evaluate(self, *, run: AgentRun, current_user: User | None = None) -> dict[str, Any]:
         now = _utcnow()
         checks: dict[str, Any] = {
             "checked_at": now.isoformat(),
             "run_id": run.run_id,
             "checkpoint_id": run.last_checkpoint_id,
             "checkpoint_age_seconds": None,
+            "checkpoint_runtime_snapshot_id": None,
+            "run_runtime_snapshot_id": run.runtime_snapshot_id,
+            "runtime_snapshot_compatible": False,
             "open_migration_block_count": 0,
             "stale_evidence_watch_count": 0,
+            "environment_changed_count": 0,
+            "stale_evidence_watch_details": [],
+            "active_evidence_revalidation_count": 0,
+            "active_evidence_revalidation_details": [],
+            "active_memory_needs_revalidation_count": 0,
+            "active_memory_needs_revalidation_ids": [],
             "pending_approval_count": 0,
+            "expired_pending_approval_count": 0,
+            "stale_pending_approval_count": 0,
+            "pending_approval_details": [],
+            "revoked_required_permission_count": 0,
+            "revoked_required_permissions": [],
             "backend_contract_missing_count": 0,
             "result": "fresh",
             "action": "continue_from_checkpoint",
@@ -287,10 +437,33 @@ class CheckpointFreshnessGate:
         if checkpoint is None:
             checks.update(result="too_old", action="replan_from_latest_safe_state", reason="checkpoint_missing")
             return checks
+        checks["checkpoint_runtime_snapshot_id"] = checkpoint.runtime_snapshot_id
         checks["checkpoint_age_seconds"] = int((now - checkpoint.created_at).total_seconds())
         if checks["checkpoint_age_seconds"] > self.max_checkpoint_age_seconds:
             checks.update(result="too_old", action="replan_from_latest_safe_state", reason="checkpoint_too_old")
             return checks
+
+        snapshot_exists = self.db.scalar(
+            select(AgentRuntimeSnapshot.id).where(
+                AgentRuntimeSnapshot.project_id == run.project_id,
+                AgentRuntimeSnapshot.snapshot_id == checkpoint.runtime_snapshot_id,
+            )
+        )
+        if snapshot_exists is None:
+            checks.update(
+                result=RUNTIME_SNAPSHOT_FRESHNESS_RESULT,
+                action=RUNTIME_SNAPSHOT_FRESHNESS_ACTION,
+                reason=RUNTIME_SNAPSHOT_FRESHNESS_REASONS[0],
+            )
+            return checks
+        if checkpoint.runtime_snapshot_id != run.runtime_snapshot_id:
+            checks.update(
+                result=RUNTIME_SNAPSHOT_FRESHNESS_RESULT,
+                action=RUNTIME_SNAPSHOT_FRESHNESS_ACTION,
+                reason=RUNTIME_SNAPSHOT_FRESHNESS_REASONS[1],
+            )
+            return checks
+        checks["runtime_snapshot_compatible"] = True
 
         open_blocks = self.db.scalar(
             select(func.count(AgentMigrationBlock.id)).where(
@@ -303,26 +476,71 @@ class CheckpointFreshnessGate:
             checks.update(result="backend_contract_changed", action="migration_block", reason="open_migration_blocks")
             return checks
 
-        stale_watches = self.db.scalar(
-            select(func.count(AgentEvidenceWatch.id)).where(
-                AgentEvidenceWatch.run_id == run.run_id,
-                AgentEvidenceWatch.watch_status == "stale",
+        stale_evidence = self._stale_evidence_freshness(run=run)
+        checks["stale_evidence_watch_count"] = stale_evidence["count"]
+        checks["environment_changed_count"] = stale_evidence["environment_changed_count"]
+        checks["stale_evidence_watch_details"] = stale_evidence["details"]
+        if stale_evidence["environment_changed_count"]:
+            checks.update(
+                result=ENVIRONMENT_FRESHNESS_RESULT,
+                action=ENVIRONMENT_FRESHNESS_ACTION,
+                reason=ENVIRONMENT_FRESHNESS_REASON,
             )
-        ) or 0
-        checks["stale_evidence_watch_count"] = int(stale_watches)
-        if stale_watches:
+            return checks
+        if stale_evidence["count"]:
             checks.update(result="evidence_stale", action="fetch_evidence_and_rebuild_context", reason="stale_evidence_watch")
             return checks
 
-        pending_approvals = self.db.scalar(
-            select(func.count(AgentApproval.id)).where(
-                AgentApproval.run_id == run.run_id,
-                AgentApproval.approval_status == "pending",
+        active_revalidation = self._active_evidence_revalidation(run=run)
+        checks["active_evidence_revalidation_count"] = active_revalidation["count"]
+        checks["active_evidence_revalidation_details"] = active_revalidation["details"]
+        if active_revalidation["count"]:
+            checks.update(
+                result=ACTIVE_EVIDENCE_REVALIDATION_RESULT,
+                action=active_revalidation["action"],
+                reason=active_revalidation["reason"],
             )
-        ) or 0
-        checks["pending_approval_count"] = int(pending_approvals)
-        if pending_approvals:
-            checks.update(result="approval_stale", action="supersede_or_refresh_approval", reason="pending_approval_after_wait")
+            return checks
+
+        memory_freshness = self._active_memory_freshness(run=run)
+        checks["active_memory_needs_revalidation_count"] = memory_freshness["count"]
+        checks["active_memory_needs_revalidation_ids"] = memory_freshness["memory_ids"]
+        if memory_freshness["count"]:
+            checks.update(
+                result="evidence_stale",
+                action="fetch_evidence_and_rebuild_context",
+                reason="active_memory_needs_revalidation",
+            )
+            return checks
+
+        approval_freshness = self._pending_approval_freshness(run=run, now=now)
+        checks["pending_approval_count"] = approval_freshness["pending_count"]
+        checks["expired_pending_approval_count"] = approval_freshness["expired_count"]
+        checks["stale_pending_approval_count"] = approval_freshness["stale_count"]
+        checks["pending_approval_details"] = approval_freshness["details"]
+        if approval_freshness["pending_count"]:
+            if approval_freshness["expired_count"]:
+                reason = PENDING_APPROVAL_FRESHNESS_REASONS[0]
+            elif approval_freshness["stale_count"]:
+                reason = PENDING_APPROVAL_FRESHNESS_REASONS[1]
+            else:
+                reason = PENDING_APPROVAL_FRESHNESS_REASONS[2]
+            checks.update(
+                result=PENDING_APPROVAL_FRESHNESS_RESULT,
+                action=PENDING_APPROVAL_FRESHNESS_ACTION,
+                reason=reason,
+            )
+            return checks
+
+        permission_freshness = self._permission_freshness(run=run, current_user=current_user)
+        checks["revoked_required_permission_count"] = permission_freshness["count"]
+        checks["revoked_required_permissions"] = permission_freshness["revoked_required_permissions"]
+        if permission_freshness["count"]:
+            checks.update(
+                result=PERMISSION_FRESHNESS_RESULT,
+                action=PERMISSION_FRESHNESS_ACTION,
+                reason=PERMISSION_FRESHNESS_REASON,
+            )
             return checks
 
         calls = list(
@@ -353,6 +571,194 @@ class CheckpointFreshnessGate:
             return checks
 
         return checks
+
+    def _stale_evidence_freshness(self, *, run: AgentRun) -> dict[str, Any]:
+        watches = list(
+            self.db.scalars(
+                select(AgentEvidenceWatch).where(
+                    AgentEvidenceWatch.run_id == run.run_id,
+                    AgentEvidenceWatch.watch_status == "stale",
+                )
+            ).all()
+        )
+        details = [
+            {
+                "evidence_watch_id": watch.evidence_watch_id,
+                "evidence_ref_id": watch.evidence_ref_id,
+                "ref_type": watch.ref_type,
+                "ref_id": watch.ref_id,
+                "stale_reason": watch.stale_reason,
+            }
+            for watch in watches
+        ]
+        environment_changed_count = sum(
+            1
+            for watch in watches
+            if watch.ref_type == "environment" or watch.stale_reason == "environment.updated"
+        )
+        return {
+            "count": len(watches),
+            "environment_changed_count": environment_changed_count,
+            "details": details,
+        }
+
+    def _active_evidence_revalidation(self, *, run: AgentRun) -> dict[str, Any]:
+        policy_refs = self._latest_context_policy_refs(run=run)
+        latest_details: list[dict[str, Any]] = []
+        revalidation_details: list[dict[str, Any]] = []
+        for item in policy_refs:
+            if not _is_active_policy_ref(item):
+                continue
+            detail = {
+                "evidence_ref_id": item.get("evidence_ref_id"),
+                "ref_type": item.get("ref_type"),
+                "ref_id": item.get("ref_id"),
+                "mutability_class": item.get("mutability_class"),
+                "freshness_policy": item.get("freshness_policy"),
+                "dependency_role": item.get("dependency_role"),
+            }
+            if item.get("ref_type") == "latest_execution_sample" or item.get("mutability_class") == "ephemeral_latest":
+                latest_details.append(detail)
+                continue
+            if (
+                item.get("freshness_policy") == "revalidate_on_resume"
+                or item.get("mutability_class") == "external_uncontrolled"
+                or item.get("ref_type") == "external_doc"
+            ):
+                revalidation_details.append(detail)
+
+        details = latest_details + revalidation_details
+        if latest_details:
+            return {
+                "count": len(details),
+                "details": details,
+                "action": ACTIVE_EVIDENCE_REVALIDATION_ACTIONS[0],
+                "reason": ACTIVE_EVIDENCE_REVALIDATION_REASONS[0],
+            }
+        if revalidation_details:
+            return {
+                "count": len(details),
+                "details": details,
+                "action": ACTIVE_EVIDENCE_REVALIDATION_ACTIONS[1],
+                "reason": ACTIVE_EVIDENCE_REVALIDATION_REASONS[1],
+            }
+        return {
+            "count": 0,
+            "details": [],
+            "action": "continue_from_checkpoint",
+            "reason": "fresh",
+        }
+
+    def _active_memory_freshness(self, *, run: AgentRun) -> dict[str, Any]:
+        policy_refs = self._latest_context_policy_refs(run=run)
+        memory_ids = sorted(
+            {
+                int(item["ref_id"])
+                for item in policy_refs
+                if item.get("ref_type") == "memory"
+                and _is_active_policy_ref(item)
+                and str(item.get("ref_id") or "").isdigit()
+            }
+        )
+        if not memory_ids:
+            return {"count": 0, "memory_ids": []}
+        memories = list(
+            self.db.scalars(
+                select(ProjectMemory).where(
+                    ProjectMemory.project_id == run.project_id,
+                    ProjectMemory.id.in_(memory_ids),
+                )
+            ).all()
+        )
+        stale_memory_ids = sorted(
+            memory.id
+            for memory in memories
+            if memory.status == "needs_revalidation" or memory.stale_score >= 0.8
+        )
+        return {"count": len(stale_memory_ids), "memory_ids": stale_memory_ids}
+
+    def _latest_context_policy_refs(self, *, run: AgentRun) -> list[dict[str, Any]]:
+        latest_context = self.db.scalar(
+            select(AgentContextBuild)
+            .where(AgentContextBuild.run_id == run.run_id)
+            .order_by(
+                AgentContextBuild.iteration.desc(),
+                AgentContextBuild.step_index.desc(),
+                AgentContextBuild.build_seq.desc(),
+            )
+        )
+        if latest_context is None:
+            return []
+        return list((latest_context.build_metadata_json or {}).get("policy_refs") or [])
+
+    def _pending_approval_freshness(self, *, run: AgentRun, now: datetime) -> dict[str, Any]:
+        approvals = list(
+            self.db.scalars(
+                select(AgentApproval).where(
+                    AgentApproval.run_id == run.run_id,
+                    AgentApproval.approval_status == "pending",
+                )
+            ).all()
+        )
+        details: list[dict[str, Any]] = []
+        expired_count = 0
+        stale_count = 0
+        for approval in approvals:
+            reasons: list[str] = []
+            call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == approval.tool_call_id))
+            if approval.expires_at is not None and approval.expires_at <= now:
+                expired_count += 1
+                reasons.append(PENDING_APPROVAL_DETAIL_STALE_REASONS[0])
+            if call is None:
+                stale_count += 1
+                reasons.append(PENDING_APPROVAL_DETAIL_STALE_REASONS[1])
+            elif (
+                approval.input_hash != call.input_hash
+                or approval.runtime_snapshot_id != call.runtime_snapshot_id
+                or approval.resource_scope_hash != (call.approval_scope_hash or call.input_hash)
+                or approval.approval_lineage_id != call.approval_lineage_id
+                or approval.approval_epoch != call.approval_epoch
+            ):
+                stale_count += 1
+                reasons.append(PENDING_APPROVAL_DETAIL_STALE_REASONS[2])
+            details.append({
+                "approval_id": approval.approval_id,
+                "tool_call_id": approval.tool_call_id,
+                "approval_lineage_id": approval.approval_lineage_id,
+                "approval_epoch": approval.approval_epoch,
+                "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
+                "stale_reasons": reasons or [PENDING_APPROVAL_DETAIL_STALE_REASONS[3]],
+            })
+        return {
+            "pending_count": len(approvals),
+            "expired_count": expired_count,
+            "stale_count": stale_count,
+            "details": details,
+        }
+
+    def _permission_freshness(self, *, run: AgentRun, current_user: User | None) -> dict[str, Any]:
+        if current_user is None:
+            return {"count": 0, "revoked_required_permissions": []}
+        calls = list(
+            self.db.scalars(
+                select(AgentToolCall).where(
+                    AgentToolCall.run_id == run.run_id,
+                    AgentToolCall.status.in_(PERMISSION_FRESHNESS_TOOL_STATUSES),
+                )
+            ).all()
+        )
+        revoked: list[dict[str, Any]] = []
+        for call in calls:
+            for permission in call.required_permissions_json or []:
+                if self.permission_service.has_project_permission(current_user, run.project_id, permission):
+                    continue
+                revoked.append({
+                    "tool_call_id": call.tool_call_id,
+                    "tool_name": call.tool_name,
+                    "permission": permission,
+                    "status": call.status,
+                })
+        return {"count": len(revoked), "revoked_required_permissions": revoked}
 
 
 class ReconcileWorker:
@@ -386,9 +792,24 @@ class ReconcileWorker:
             )
             .order_by(AgentToolCall.step_index.asc(), AgentToolCall.attempt_index.asc())
         ).all())
-        processed = [self.reconcile_tool_call(call=call, run=run) for call in calls]
+        now = _utcnow()
+        due_calls: list[AgentToolCall] = []
+        skipped_backoff: list[dict[str, Any]] = []
+        for call in calls:
+            latest_attempt = self._latest_attempt(call.tool_call_id)
+            if latest_attempt is not None and latest_attempt.next_retry_at is not None and latest_attempt.next_retry_at > now:
+                skipped_backoff.append({
+                    "tool_call_id": call.tool_call_id,
+                    "next_retry_at": latest_attempt.next_retry_at.isoformat(),
+                    "attempt_seq": latest_attempt.attempt_seq,
+                    "result_status": latest_attempt.result_status,
+                })
+                continue
+            due_calls.append(call)
+
+        processed = [self.reconcile_tool_call(call=call, run=run) for call in due_calls]
         self.db.commit()
-        return self._summary(run_id, processed)
+        return self._summary(run_id, processed, skipped_backoff=skipped_backoff)
 
     def reconcile_tool_call(self, *, call: AgentToolCall, run: AgentRun | None = None) -> AgentToolCall:
         run = run or self.db.scalar(select(AgentRun).where(AgentRun.run_id == call.run_id).with_for_update())
@@ -402,7 +823,7 @@ class ReconcileWorker:
         if call.backend_effect_capability == "legacy_no_receipt" and call.resolved_side_effect_class not in SAFE_SIDE_EFFECT_CLASSES:
             call.status = "manual_intervention"
             call.recovery_decision = "legacy_no_receipt_high_risk_manual"
-            call.error_code = "backend_capability_too_weak"
+            call.error_code = "backend_reconcile_not_supported"
             runtime.append_event(run, "tool.failed", {"tool_call_id": call.tool_call_id, "error_code": call.error_code}, commit=False)
             return call
 
@@ -428,7 +849,7 @@ class ReconcileWorker:
         result = self.router.reconcile(call=call, contract=contract)
         attempt = self._record_attempt(call=call, result=result)
 
-        if result.status == "succeeded":
+        if result.status in RECONCILE_SUCCESS_RESULT_STATUSES:
             call.status = "succeeded"
             call.effect_submission_state = "effect_committed"
             call.output_json_redacted = mask_sensitive(result.canonical_summary_json)
@@ -453,24 +874,24 @@ class ReconcileWorker:
             attempt.next_retry_at = _utcnow() + timedelta(seconds=self.backoff_seconds)
             runtime.append_event(run, "tool.uncertain", {"tool_call_id": call.tool_call_id, "status": result.status}, commit=False)
             return call
-        if result.status == "not_found":
+        if result.status in RECONCILE_STATE_DEPENDENT_RESULT_STATUSES:
             self._handle_not_found(run=run, call=call, attempt=attempt)
             return call
-        if result.status == "conflict":
+        if result.status in RECONCILE_DIRECT_MANUAL_RESULT_STATUSES:
             call.status = "manual_intervention"
             call.recovery_decision = "idempotency_conflict"
             call.error_code = result.error_code or "idempotency_conflict"
             call.error_message = result.error_message
             runtime.append_event(run, "tool.failed", {"tool_call_id": call.tool_call_id, "error_code": call.error_code}, commit=False)
             return call
-        if result.status == "failed":
+        if result.status in RECONCILE_TERMINAL_FAILURE_RESULT_STATUSES:
             call.status = "failed"
             call.recovery_decision = "mark_failed_from_reconcile"
             call.error_code = result.error_code or "backend_reconcile_failed"
             call.error_message = result.error_message
             runtime.append_event(run, "tool.failed", {"tool_call_id": call.tool_call_id, "error_code": call.error_code}, commit=False)
             return call
-        if result.status == "unsupported_schema_version":
+        if result.status in RECONCILE_MIGRATION_RESULT_STATUSES:
             return self._mark_needs_migration(run=run, call=call, result=result, record_attempt=False)
         return call
 
@@ -489,7 +910,7 @@ class ReconcileWorker:
                 commit=False,
             )
             return
-        if state == "transport_sent_observed" and capability in {"receipt_first", "idempotency_index_only"}:
+        if state in RECONCILE_BACKOFF_EFFECT_STATES and capability in RECONCILE_BACKOFF_CAPABILITIES:
             call.status = "uncertain"
             call.recovery_decision = "reconcile_backoff"
             attempt.next_retry_at = _utcnow() + timedelta(seconds=self.backoff_seconds)
@@ -559,16 +980,32 @@ class ReconcileWorker:
         self.db.flush()
         return attempt
 
+    def _latest_attempt(self, tool_call_id: str) -> AgentReconcileAttempt | None:
+        return self.db.scalar(
+            select(AgentReconcileAttempt)
+            .where(AgentReconcileAttempt.tool_call_id == tool_call_id)
+            .order_by(AgentReconcileAttempt.attempt_seq.desc())
+            .limit(1)
+        )
+
     @staticmethod
-    def _summary(run_id: str, calls: list[AgentToolCall]) -> dict[str, Any]:
+    def _summary(
+        run_id: str,
+        calls: list[AgentToolCall],
+        *,
+        skipped_backoff: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        skipped = skipped_backoff or []
         return {
             "run_id": run_id,
             "processed": len(calls),
+            "skipped_backoff": len(skipped),
             "reconciled": sum(1 for call in calls if call.status == "succeeded"),
             "still_uncertain": sum(1 for call in calls if call.status in {"uncertain", "reconciling"}),
             "needs_migration": sum(1 for call in calls if call.status == "needs_migration"),
             "manual_intervention": sum(1 for call in calls if call.status == "manual_intervention"),
             "tool_call_ids": [call.tool_call_id for call in calls],
+            "skipped_backoff_tool_calls": skipped,
         }
 
 

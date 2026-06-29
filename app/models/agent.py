@@ -612,6 +612,54 @@ class AgentMemoryContradictionEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 
+class AgentMemoryValidationEvent(Base):
+    __tablename__ = "ai_agent_memory_validation_events"
+    __table_args__ = (
+        Index("idx_memory_validation_project", "project_id", "created_at"),
+        Index("idx_memory_validation_memory", "memory_id", "created_at"),
+        Index("idx_memory_validation_source", "validation_source", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    memory_id: Mapped[int] = mapped_column(ForeignKey("ai_project_memories.id"), nullable=False)
+    run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tool_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    usage_event_id: Mapped[int | None] = mapped_column(ForeignKey("ai_agent_memory_usage_events.id"), nullable=True)
+    validation_source: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_ref_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    previous_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    new_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    previous_stale_score: Mapped[float] = mapped_column(Float, nullable=False)
+    new_stale_score: Mapped[float] = mapped_column(Float, nullable=False)
+    previous_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    new_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    validation_count: Mapped[int] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class AgentMemoryStalenessEvent(Base):
+    __tablename__ = "ai_agent_memory_staleness_events"
+    __table_args__ = (
+        Index("idx_memory_staleness_project", "project_id", "created_at"),
+        Index("idx_memory_staleness_memory", "memory_id", "created_at"),
+        Index("idx_memory_staleness_ref", "evidence_ref_type", "evidence_ref_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    memory_id: Mapped[int] = mapped_column(ForeignKey("ai_project_memories.id"), nullable=False)
+    evidence_ref_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_ref_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    stale_reason: Mapped[str] = mapped_column(String(128), nullable=False)
+    previous_stale_score: Mapped[float] = mapped_column(Float, nullable=False)
+    new_stale_score: Mapped[float] = mapped_column(Float, nullable=False)
+    previous_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    new_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
 class AgentMemoryEvidenceLink(Base):
     __tablename__ = "ai_agent_memory_evidence_links"
     __table_args__ = (

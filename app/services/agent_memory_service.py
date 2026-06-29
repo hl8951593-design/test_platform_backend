@@ -16,7 +16,9 @@ from app.models.agent import (
     AgentMemoryEvidenceLink,
     AgentMemoryRetrievalProfile,
     AgentMemorySourceProfile,
+    AgentMemoryStalenessEvent,
     AgentMemoryUsageEvent,
+    AgentMemoryValidationEvent,
     AgentRun,
     ProjectMemory,
 )
@@ -32,6 +34,172 @@ SEVERITY_MULTIPLIER = {
     "critical": 2.0,
 }
 
+NON_STALE_MEMORY_EVENTS = {
+    "execution_record.created",
+    "permission.changed",
+    "memory.status_changed",
+}
+
+MEMORY_FEEDBACK_PROCESS_FIELDS = (
+    "attempted",
+    "processed",
+    "skipped",
+    "contradictions_recorded",
+    "validations_recorded",
+    "results",
+)
+
+MEMORY_FEEDBACK_RESULT_BASE_FIELDS = (
+    "usage_event_id",
+    "processed",
+    "decision",
+)
+
+MEMORY_CANDIDATE_FIELDS = (
+    "memory_id",
+    "memory_version",
+    "title",
+    "content",
+    "source_type",
+    "confidence",
+    "stale_score",
+    "retrieval_score",
+    "retrieval_profile",
+    "evidence_ref",
+    "allowed_usage",
+)
+
+MEMORY_CANDIDATE_EVIDENCE_REF_FIELDS = (
+    "evidence_ref_id",
+    "ref_type",
+    "ref_id",
+    "mutability_class",
+    "dependency_role",
+    "active_for_policy",
+    "version_id",
+    "content_hash",
+    "captured_at",
+    "freshness_policy",
+    "required_for_high_risk",
+    "authority",
+)
+
+MEMORY_USAGE_EVENT_FIELDS = (
+    "id",
+    "memory_id",
+    "run_id",
+    "iteration",
+    "step_index",
+    "tool_call_id",
+    "context_build_id",
+    "retrieval_profile",
+    "retrieval_score",
+    "usage_role",
+    "active_for_policy",
+    "caused_tool_input_change",
+    "outcome",
+    "evidence_ref_json",
+    "feedback_state",
+    "feedback_processed_at",
+    "feedback_result_json",
+    "created_at",
+)
+
+MEMORY_USAGE_EVENT_EVIDENCE_REF_FIELDS = MEMORY_CANDIDATE_EVIDENCE_REF_FIELDS
+
+MEMORY_STALENESS_EVENT_FIELDS = (
+    "id",
+    "project_id",
+    "memory_id",
+    "evidence_ref_type",
+    "evidence_ref_id",
+    "stale_reason",
+    "previous_stale_score",
+    "new_stale_score",
+    "previous_status",
+    "new_status",
+    "created_at",
+)
+
+MEMORY_VALIDATION_EVENT_FIELDS = (
+    "id",
+    "project_id",
+    "memory_id",
+    "run_id",
+    "tool_call_id",
+    "usage_event_id",
+    "validation_source",
+    "evidence_ref_json",
+    "reason",
+    "previous_confidence",
+    "new_confidence",
+    "previous_stale_score",
+    "new_stale_score",
+    "previous_status",
+    "new_status",
+    "validation_count",
+    "created_at",
+)
+
+MEMORY_SOURCE_PROFILE_FIELDS = (
+    "source_type",
+    "initial_confidence",
+    "authority",
+    "default_ttl_days",
+    "requires_source_ref",
+    "requires_content_hash",
+    "allowed_for_high_risk",
+    "status",
+)
+
+MEMORY_RETRIEVAL_PROFILE_FIELDS = (
+    "profile_name",
+    "task_scope",
+    "risk_level",
+    "min_confidence",
+    "max_stale_score",
+    "allow_memory_for_high_risk",
+    "semantic_weight",
+    "confidence_weight",
+    "recency_weight",
+    "authority_weight",
+    "validation_weight",
+    "stale_weight",
+    "contradiction_weight",
+    "max_contradiction_penalty",
+    "version",
+    "status",
+    "change_reason",
+)
+
+MEMORY_ENTITY_FIELDS = (
+    "id",
+    "project_id",
+    "memory_type",
+    "title",
+    "content",
+    "content_hash",
+    "memory_version",
+    "source_type",
+    "source_ref_json",
+    "authority",
+    "confidence",
+    "initial_confidence",
+    "confidence_reason_json",
+    "contradiction_count",
+    "recent_contradiction_count",
+    "validation_count",
+    "recent_validation_count",
+    "stale_score",
+    "stale_reason_json",
+    "status",
+    "evidence_refs_json",
+    "watched_refs_json",
+    "created_by",
+    "created_at",
+    "updated_at",
+)
+
 
 @dataclass(frozen=True)
 class MemoryCandidate:
@@ -46,6 +214,10 @@ class MemoryCandidate:
     retrieval_profile: str
     evidence_ref: dict[str, Any]
     allowed_usage: str
+
+
+def memory_candidate_to_payload(candidate: MemoryCandidate) -> dict[str, Any]:
+    return {field: getattr(candidate, field) for field in MEMORY_CANDIDATE_FIELDS}
 
 
 class MemorySourceProfileResolver:
@@ -158,6 +330,13 @@ class MemoryManager:
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={"code": "memory_source_ref_required"},
             )
+        self._validate_source_ref_requirements(
+            source_type=source_type,
+            source_ref_json=source_ref_json,
+            profile=profile,
+        )
+        parsed_refs = EvidenceRefResolver().parse(evidence_refs)
+        self._validate_source_evidence_requirements(source_type=source_type, parsed_refs=parsed_refs)
         content_hash = request_fingerprint({"content": content})
         now = _utcnow()
         expires_at = None
@@ -190,13 +369,13 @@ class MemoryManager:
                     "ref_type": ref.ref_type,
                     "ref_id": ref.ref_id,
                 }
-                for ref in EvidenceRefResolver().parse(evidence_refs)
+                for ref in parsed_refs
             ],
             created_by=current_user.id,
         )
         self.db.add(memory)
         self.db.flush()
-        for ref in EvidenceRefResolver().parse(evidence_refs):
+        for ref in parsed_refs:
             self.db.add(
                 AgentMemoryEvidenceLink(
                     memory_id=memory.id,
@@ -237,13 +416,21 @@ class MemoryManager:
             memory.content_hash = request_fingerprint({"content": content})
             changed = True
         if source_ref_json is not None:
+            profile = self.source_profiles.get(source_type=memory.source_type)
+            self._validate_source_ref_requirements(
+                source_type=memory.source_type,
+                source_ref_json=source_ref_json,
+                profile=profile,
+            )
             redacted = mask_sensitive(source_ref_json)
             if memory.source_ref_json != redacted:
                 memory.source_ref_json = redacted
                 changed = True
         if evidence_refs is not None:
+            parsed_refs = EvidenceRefResolver().parse(evidence_refs)
+            self._validate_source_evidence_requirements(source_type=memory.source_type, parsed_refs=parsed_refs)
             memory.evidence_refs_json = [mask_sensitive(dict(item)) for item in evidence_refs]
-            self._replace_evidence_links(memory=memory, evidence_refs=evidence_refs)
+            self._replace_evidence_links(memory=memory, parsed_refs=parsed_refs)
             changed = True
         if status_value is not None:
             self._validate_memory_status_transition(memory=memory, status_value=status_value)
@@ -270,12 +457,20 @@ class MemoryManager:
         reason: str | None = None,
     ) -> ProjectMemory:
         memory = self._get_memory_for_update(memory_id=memory_id, current_user=current_user)
+        if memory.source_type == "repair_inferred":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "repair_inferred_requires_execution_validation"},
+            )
         now = _utcnow()
+        previous_confidence = memory.confidence
+        previous_stale_score = memory.stale_score
+        previous_status = memory.status
         memory.status = "active"
         memory.validation_count += 1
         memory.recent_validation_count += 1
         memory.last_validated_at = now
-        memory.confidence = _clamp(memory.confidence + 0.1, memory.initial_confidence, 0.95)
+        memory.confidence = _clamp(memory.confidence + 0.1, 0.0, 0.95)
         memory.stale_score = _clamp(memory.stale_score - 0.25, 0.0, 1.0)
         memory.memory_version += 1
         memory.confidence_reason_json = {
@@ -284,6 +479,14 @@ class MemoryManager:
             "validated_by": current_user.id,
             "validated_at": now.isoformat(),
         }
+        self._record_validation_event(
+            memory=memory,
+            validation_source="user_confirmed",
+            reason=reason,
+            previous_confidence=previous_confidence,
+            previous_stale_score=previous_stale_score,
+            previous_status=previous_status,
+        )
         self.db.commit()
         self.db.refresh(memory)
         return memory
@@ -297,7 +500,7 @@ class MemoryManager:
     ) -> ProjectMemory:
         memory = self._get_memory_for_update(memory_id=memory_id, current_user=current_user)
         memory.status = "rejected"
-        memory.confidence = 0.0
+        memory.confidence = min(memory.confidence, 0.10)
         memory.stale_score = 1.0
         memory.memory_version += 1
         memory.confidence_reason_json = {
@@ -309,6 +512,40 @@ class MemoryManager:
         self.db.commit()
         self.db.refresh(memory)
         return memory
+
+    def _record_validation_event(
+        self,
+        *,
+        memory: ProjectMemory,
+        validation_source: str,
+        reason: str | None,
+        previous_confidence: float,
+        previous_stale_score: float,
+        previous_status: str,
+        run_id: str | None = None,
+        tool_call_id: str | None = None,
+        usage_event_id: int | None = None,
+        evidence_ref_json: dict[str, Any] | None = None,
+    ) -> None:
+        self.db.add(
+            AgentMemoryValidationEvent(
+                project_id=memory.project_id,
+                memory_id=memory.id,
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                usage_event_id=usage_event_id,
+                validation_source=validation_source,
+                evidence_ref_json=evidence_ref_json,
+                reason=reason,
+                previous_confidence=previous_confidence,
+                new_confidence=memory.confidence,
+                previous_stale_score=previous_stale_score,
+                new_stale_score=memory.stale_score,
+                previous_status=previous_status,
+                new_status=memory.status,
+                validation_count=memory.validation_count,
+            )
+        )
 
     def retrieve(
         self,
@@ -324,8 +561,20 @@ class MemoryManager:
         limit: int = 5,
     ) -> list[MemoryCandidate]:
         self.permission_service.require_project_access(current_user, project_id)
-        profile = self.retrieval_profiles.get(profile_name=profile_name)
         run = self.db.scalar(select(AgentRun).where(AgentRun.run_id == run_id)) if run_id else None
+        try:
+            profile = self.retrieval_profiles.get(profile_name=profile_name)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            if run is not None and detail.get("code") == "memory_retrieval_profile_missing":
+                from app.services.agent_runtime_service import AgentRuntimeService
+
+                AgentRuntimeService(self.db).append_event(
+                    run,
+                    "memory.retrieval_profile_missing",
+                    {"profile_name": profile_name, "error_code": "memory_retrieval_profile_missing"},
+                )
+            raise
         memories = list(
             self.db.scalars(
                 select(ProjectMemory)
@@ -335,10 +584,40 @@ class MemoryManager:
         )
         candidates: list[MemoryCandidate] = []
         for memory in memories:
-            if not self._passes_hard_gate(memory=memory, profile=profile, task_risk=task_risk):
+            hard_gate_reason = self._hard_gate_filter_reason(memory=memory, profile=profile, task_risk=task_risk)
+            if hard_gate_reason is not None:
+                if run is not None and hard_gate_reason == "low_confidence":
+                    from app.services.agent_runtime_service import AgentRuntimeService
+
+                    AgentRuntimeService(self.db).append_event(
+                        run,
+                        "memory.low_confidence_filtered",
+                        {
+                            "memory_id": memory.id,
+                            "profile_name": profile.profile_name,
+                            "confidence": memory.confidence,
+                            "min_confidence": profile.min_confidence,
+                            "error_code": "memory_low_confidence_filtered",
+                        },
+                    )
                 continue
             semantic = _semantic_score(query=query, memory=memory)
             penalty = compute_contradiction_penalty(memory=memory, profile=profile)
+            if run is not None and penalty > 0:
+                from app.services.agent_runtime_service import AgentRuntimeService
+
+                AgentRuntimeService(self.db).append_event(
+                    run,
+                    "memory.contradiction_penalty_applied",
+                    {
+                        "memory_id": memory.id,
+                        "profile_name": profile.profile_name,
+                        "contradiction_penalty": round(penalty, 6),
+                        "contradiction_count": memory.contradiction_count,
+                        "recent_contradiction_count": memory.recent_contradiction_count,
+                        "error_code": "memory_contradiction_penalty_applied",
+                    },
+                )
             score = _retrieval_score(memory=memory, profile=profile, semantic_score=semantic, contradiction_penalty=penalty)
             evidence_ref = self.evidence_adapter.to_evidence_ref(memory=memory, usage_role=usage_role)
             candidates.append(
@@ -387,9 +666,8 @@ class MemoryManager:
         self.permission_service.require_project_access(current_user, memory.project_id)
         return memory
 
-    def _replace_evidence_links(self, *, memory: ProjectMemory, evidence_refs: list[dict[str, Any]]) -> None:
+    def _replace_evidence_links(self, *, memory: ProjectMemory, parsed_refs: list[EvidenceRef]) -> None:
         self.db.execute(delete(AgentMemoryEvidenceLink).where(AgentMemoryEvidenceLink.memory_id == memory.id))
-        parsed_refs = EvidenceRefResolver().parse(evidence_refs)
         memory.watched_refs_json = [
             {
                 "evidence_ref_id": ref.evidence_ref_id,
@@ -410,6 +688,41 @@ class MemoryManager:
                 )
             )
 
+    def _validate_source_evidence_requirements(self, *, source_type: str, parsed_refs: list[EvidenceRef]) -> None:
+        if source_type != "execution_learned":
+            return
+        execution_record_ids = {
+            ref.ref_id
+            for ref in parsed_refs
+            if ref.ref_type == "execution_record"
+        }
+        if len(execution_record_ids) < 2:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "execution_learned_requires_two_execution_evidence"},
+            )
+
+    def _validate_source_ref_requirements(
+        self,
+        *,
+        source_type: str,
+        source_ref_json: dict[str, Any] | None,
+        profile: AgentMemorySourceProfile,
+    ) -> None:
+        if not profile.requires_content_hash:
+            return
+        source_ref = source_ref_json or {}
+        if not any(source_ref.get(key) for key in ("content_hash", "document_hash", "source_hash")):
+            code = (
+                "document_imported_source_hash_required"
+                if source_type == "document_imported"
+                else "memory_source_content_hash_required"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": code},
+            )
+
     def _validate_memory_status_transition(self, *, memory: ProjectMemory, status_value: str) -> None:
         allowed = {"active", "needs_review", "needs_revalidation", "suspect", "rejected", "archived"}
         if status_value not in allowed:
@@ -420,26 +733,36 @@ class MemoryManager:
                 detail={"code": "memory_requires_explicit_validation"},
             )
 
-    def _passes_hard_gate(
+    def _hard_gate_filter_reason(
         self,
         *,
         memory: ProjectMemory,
         profile: AgentMemoryRetrievalProfile,
         task_risk: str,
-    ) -> bool:
+    ) -> str | None:
         if memory.status not in {"active", "needs_revalidation"}:
-            return False
+            return "status_not_retrievable"
         if memory.expires_at and memory.expires_at < _utcnow():
-            return False
+            return "expired"
+        stale_reason = memory.stale_reason_json.get("reason") if isinstance(memory.stale_reason_json, dict) else None
+        if task_risk == "high" and stale_reason == "environment.updated":
+            return "environment_updated"
         if memory.confidence < profile.min_confidence:
-            return False
+            return "low_confidence"
         if memory.stale_score > profile.max_stale_score:
-            return False
+            return "stale_score_high"
         if task_risk == "high" and not profile.allow_memory_for_high_risk:
-            return False
+            return "profile_disallows_high_risk"
+        if task_risk == "high":
+            try:
+                source_profile = self.source_profiles.get(source_type=memory.source_type)
+            except HTTPException:
+                return "source_profile_missing"
+            if not source_profile.allowed_for_high_risk:
+                return "source_disallows_high_risk"
         if task_risk == "high" and memory.authority == "agent":
-            return False
-        return True
+            return "agent_memory_disallowed_for_high_risk"
+        return None
 
     def record_contradiction(
         self,
@@ -460,6 +783,7 @@ class MemoryManager:
         if severity not in SEVERITY_MULTIPLIER:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail={"code": "invalid_memory_contradiction_severity"})
         now = _utcnow()
+        same_failure_repeated = _same_failure_repeated(memory=memory, failure_fingerprint=failure_fingerprint)
         event = AgentMemoryContradictionEvent(
             memory_id=memory.id,
             run_id=run_id,
@@ -480,7 +804,7 @@ class MemoryManager:
         memory.stale_score = _clamp(memory.stale_score + 0.25, 0.0, 1.0)
         if severity == "critical":
             memory.status = "needs_revalidation"
-        elif severity == "high":
+        elif severity == "high" or same_failure_repeated:
             memory.status = "suspect"
         self.db.commit()
         self.db.refresh(event)
@@ -498,6 +822,11 @@ class MemoryStalenessWorker:
         evidence_ref_id: str,
         stale_reason: str,
     ) -> int:
+        if stale_reason in NON_STALE_MEMORY_EVENTS:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "memory_event_not_stale_event", "event_type": stale_reason},
+            )
         links = list(
             self.db.scalars(
                 select(AgentMemoryEvidenceLink).where(
@@ -511,13 +840,80 @@ class MemoryStalenessWorker:
             memory = self.db.get(ProjectMemory, link.memory_id)
             if memory is None or memory.status == "rejected":
                 continue
+            previous_stale_score = memory.stale_score
+            previous_status = memory.status
             memory.stale_score = _clamp(memory.stale_score + _stale_delta(stale_reason), 0.0, 1.0)
             memory.stale_reason_json = {"reason": stale_reason, "evidence_ref_type": evidence_ref_type, "evidence_ref_id": evidence_ref_id}
             if stale_reason in {"manifest.changed", "environment.updated"} or memory.stale_score >= 0.8:
                 memory.status = "needs_revalidation"
+            self.db.add(
+                AgentMemoryStalenessEvent(
+                    project_id=memory.project_id,
+                    memory_id=memory.id,
+                    evidence_ref_type=evidence_ref_type,
+                    evidence_ref_id=evidence_ref_id,
+                    stale_reason=stale_reason,
+                    previous_stale_score=previous_stale_score,
+                    new_stale_score=memory.stale_score,
+                    previous_status=previous_status,
+                    new_status=memory.status,
+                )
+            )
             touched += 1
         self.db.commit()
         return touched
+
+
+class MemoryMaintenanceWorker:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def process_expired_ttl(self, *, project_id: int | None = None, limit: int = 100) -> dict[str, Any]:
+        now = _utcnow()
+        conditions = [
+            ProjectMemory.expires_at.is_not(None),
+            ProjectMemory.expires_at <= now,
+            ProjectMemory.validation_count == 0,
+            ProjectMemory.status.notin_(["rejected", "archived"]),
+        ]
+        if project_id is not None:
+            conditions.append(ProjectMemory.project_id == project_id)
+        memories = list(
+            self.db.scalars(
+                select(ProjectMemory)
+                .where(*conditions)
+                .order_by(ProjectMemory.expires_at.asc(), ProjectMemory.id.asc())
+                .limit(limit)
+                .with_for_update()
+            ).all()
+        )
+        results: list[dict[str, Any]] = []
+        for memory in memories:
+            previous_status = memory.status
+            previous_stale_score = memory.stale_score
+            memory.stale_score = _clamp(memory.stale_score + 0.10, 0.0, 1.0)
+            memory.stale_reason_json = {
+                "reason": "memory_ttl.expired",
+                "expires_at": memory.expires_at.isoformat() if memory.expires_at else None,
+                "processed_at": now.isoformat(),
+            }
+            if memory.stale_score >= 0.8:
+                memory.status = "needs_revalidation"
+            results.append(
+                {
+                    "memory_id": memory.id,
+                    "previous_status": previous_status,
+                    "new_status": memory.status,
+                    "previous_stale_score": previous_stale_score,
+                    "new_stale_score": memory.stale_score,
+                }
+            )
+        self.db.commit()
+        return {
+            "attempted": len(memories),
+            "processed": len(results),
+            "results": results,
+        }
 
 
 class MemoryFeedbackWorker:
@@ -529,6 +925,98 @@ class MemoryFeedbackWorker:
     def __init__(self, db: Session):
         self.db = db
         self.permission_service = PermissionService(db)
+
+    def process_execution_record_created(
+        self,
+        *,
+        execution_record_id: str,
+        verdict: str,
+        current_user: User,
+        run_id: str | None = None,
+        tool_call_id: str | None = None,
+        evidence_ref_json: dict[str, Any] | None = None,
+        failure_fingerprint: str | None = None,
+        contradiction_type: str | None = None,
+        severity: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        outcome = self._execution_record_outcome(verdict)
+        links = list(
+            self.db.scalars(
+                select(AgentMemoryEvidenceLink)
+                .where(
+                    AgentMemoryEvidenceLink.evidence_ref_type == "execution_record",
+                    AgentMemoryEvidenceLink.evidence_ref_id == execution_record_id,
+                )
+                .order_by(AgentMemoryEvidenceLink.id.asc())
+            ).all()
+        )
+        results: list[dict[str, Any]] = []
+        contradictions = 0
+        validations = 0
+        now = _utcnow()
+        for link in links:
+            memory = self.db.get(ProjectMemory, link.memory_id)
+            if memory is None or memory.status == "rejected":
+                result = {
+                    "memory_id": link.memory_id,
+                    "processed": False,
+                    "decision": "memory_missing_or_rejected",
+                }
+                results.append(result)
+                continue
+            self.permission_service.require_project_access(current_user, memory.project_id)
+            usage = AgentMemoryUsageEvent(
+                memory_id=memory.id,
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                retrieval_profile="execution_record.created",
+                retrieval_score=1.0,
+                usage_role="validation_basis" if outcome == "validated" else "contradiction_basis",
+                active_for_policy=True,
+                caused_tool_input_change=outcome in self.CONTRADICTION_OUTCOMES,
+                outcome=outcome,
+                evidence_ref_json=evidence_ref_json
+                or {
+                    "evidence_ref_id": f"execution_record:{execution_record_id}",
+                    "ref_type": "execution_record",
+                    "ref_id": execution_record_id,
+                    "mutability_class": "immutable",
+                    "dependency_role": "decision_dependency",
+                    "active_for_policy": True,
+                },
+                feedback_state="pending",
+                feedback_result_json={
+                    "failure_fingerprint": failure_fingerprint,
+                    "contradiction_type": contradiction_type or "execution_record_created",
+                    "severity": severity,
+                    "reason": reason or f"execution_record.created verdict={verdict}",
+                    "execution_record_id": execution_record_id,
+                    "event_type": "execution_record.created",
+                },
+                created_at=now,
+            )
+            self.db.add(usage)
+            self.db.flush()
+            result = self._process_usage_event(usage)
+            results.append(result)
+            if result["decision"] == "contradiction_recorded":
+                contradictions += 1
+            if result["decision"] == "memory_validated":
+                validations += 1
+        self.db.commit()
+        return {
+            field: value
+            for field, value in {
+                "attempted": len(links),
+                "processed": sum(1 for item in results if item.get("processed")),
+                "skipped": sum(1 for item in results if not item.get("processed")),
+                "contradictions_recorded": contradictions,
+                "validations_recorded": validations,
+                "results": results,
+            }.items()
+            if field in MEMORY_FEEDBACK_PROCESS_FIELDS
+        }
 
     def record_usage_feedback(
         self,
@@ -557,6 +1045,7 @@ class MemoryFeedbackWorker:
                 "processed": 0,
                 "skipped": 1,
                 "contradictions_recorded": 0,
+                "validations_recorded": 0,
                 "results": [usage.feedback_result_json or {"usage_event_id": usage.id, "decision": "already_processed"}],
             }
         usage.outcome = outcome
@@ -590,18 +1079,26 @@ class MemoryFeedbackWorker:
         )
         results: list[dict[str, Any]] = []
         contradictions = 0
+        validations = 0
         for usage in events:
             result = self._process_usage_event(usage)
             results.append(result)
             if result["decision"] == "contradiction_recorded":
                 contradictions += 1
+            if result["decision"] == "memory_validated":
+                validations += 1
         self.db.commit()
         return {
-            "attempted": len(events),
-            "processed": sum(1 for item in results if item.get("processed")),
-            "skipped": sum(1 for item in results if not item.get("processed")),
-            "contradictions_recorded": contradictions,
-            "results": results,
+            field: value
+            for field, value in {
+                "attempted": len(events),
+                "processed": sum(1 for item in results if item.get("processed")),
+                "skipped": sum(1 for item in results if not item.get("processed")),
+                "contradictions_recorded": contradictions,
+                "validations_recorded": validations,
+                "results": results,
+            }.items()
+            if field in MEMORY_FEEDBACK_PROCESS_FIELDS
         }
 
     def _process_usage_event(self, usage: AgentMemoryUsageEvent) -> dict[str, Any]:
@@ -616,11 +1113,22 @@ class MemoryFeedbackWorker:
 
         if outcome in self.POSITIVE_OUTCOMES:
             delta = 0.05 if usage.active_for_policy or usage.caused_tool_input_change else 0.03
+            validated = outcome == "validated"
+            stale_delta = 0.10 if validated else 0.08
             before_confidence = memory.confidence
             before_stale = memory.stale_score
+            before_status = memory.status
             memory.confidence = _clamp(memory.confidence + delta, 0.0, 0.95)
-            memory.stale_score = _clamp(memory.stale_score - 0.08, 0.0, 1.0)
-            if memory.status == "needs_revalidation" and memory.stale_score <= 0.5 and memory.confidence >= memory.initial_confidence:
+            memory.stale_score = _clamp(memory.stale_score - stale_delta, 0.0, 1.0)
+            if validated:
+                memory.validation_count += 1
+                memory.recent_validation_count += 1
+                memory.last_validated_at = now
+                memory.memory_version += 1
+            if (
+                (memory.status == "needs_revalidation" and memory.stale_score <= 0.5 and memory.confidence >= memory.initial_confidence)
+                or (validated and memory.status in {"needs_review", "needs_revalidation", "suspect"})
+            ):
                 memory.status = "active"
             memory.confidence_reason_json = {
                 **(memory.confidence_reason_json or {}),
@@ -628,14 +1136,31 @@ class MemoryFeedbackWorker:
                 "last_feedback_at": now.isoformat(),
                 "last_feedback_usage_event_id": usage.id,
             }
+            if validated:
+                memory.confidence_reason_json["last_validation_reason"] = metadata.get("reason")
+                memory.confidence_reason_json["last_validation_source"] = metadata.get("event_type") or "memory_feedback"
+                self._record_validation_event(
+                    memory=memory,
+                    validation_source=metadata.get("event_type") or "memory_feedback",
+                    reason=metadata.get("reason"),
+                    previous_confidence=before_confidence,
+                    previous_stale_score=before_stale,
+                    previous_status=before_status,
+                    run_id=usage.run_id,
+                    tool_call_id=usage.tool_call_id,
+                    usage_event_id=usage.id,
+                    evidence_ref_json=usage.evidence_ref_json,
+                )
             result = {
                 "usage_event_id": usage.id,
                 "processed": True,
-                "decision": "confidence_adjusted",
+                "decision": "memory_validated" if validated else "confidence_adjusted",
                 "confidence_delta": round(memory.confidence - before_confidence, 6),
                 "stale_delta": round(memory.stale_score - before_stale, 6),
                 "memory_status": memory.status,
             }
+            if validated:
+                result["validation_count"] = memory.validation_count
             self._mark_processed(usage, now=now, result={**metadata, **result})
             return result
 
@@ -678,25 +1203,29 @@ class MemoryFeedbackWorker:
             )
             self.db.add(event)
             before_confidence = memory.confidence
+            before_stale = memory.stale_score
+            same_failure_repeated = _same_failure_repeated(memory=memory, failure_fingerprint=event.failure_fingerprint)
             memory.contradiction_count += 1
             memory.recent_contradiction_count += 1
             memory.last_contradicted_at = now
             memory.last_failure_fingerprint = event.failure_fingerprint
             memory.max_recent_severity = _max_severity(memory.max_recent_severity, severity)
-            memory.confidence = _clamp(memory.confidence - _feedback_confidence_delta(severity), 0.0, 0.95)
+            memory.confidence = _clamp(memory.confidence - 0.15, 0.0, 0.95)
             memory.stale_score = _clamp(memory.stale_score + 0.25, 0.0, 1.0)
             if severity == "critical" or usage.active_for_policy:
                 memory.status = "needs_revalidation"
-            elif severity == "high":
+            elif severity == "high" or same_failure_repeated:
                 memory.status = "suspect"
             result = {
                 "usage_event_id": usage.id,
                 "processed": True,
                 "decision": "contradiction_recorded",
                 "confidence_delta": round(memory.confidence - before_confidence, 6),
+                "stale_delta": round(memory.stale_score - before_stale, 6),
                 "memory_status": memory.status,
                 "contradiction_type": contradiction_type,
                 "severity": severity,
+                "same_failure_repeated": same_failure_repeated,
             }
             self._mark_processed(usage, now=now, result={**metadata, **result})
             return result
@@ -710,6 +1239,51 @@ class MemoryFeedbackWorker:
         usage.feedback_state = "processed"
         usage.feedback_processed_at = now
         usage.feedback_result_json = result
+
+    def _record_validation_event(
+        self,
+        *,
+        memory: ProjectMemory,
+        validation_source: str,
+        reason: str | None,
+        previous_confidence: float,
+        previous_stale_score: float,
+        previous_status: str,
+        run_id: str | None = None,
+        tool_call_id: str | None = None,
+        usage_event_id: int | None = None,
+        evidence_ref_json: dict[str, Any] | None = None,
+    ) -> None:
+        self.db.add(
+            AgentMemoryValidationEvent(
+                project_id=memory.project_id,
+                memory_id=memory.id,
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                usage_event_id=usage_event_id,
+                validation_source=validation_source,
+                evidence_ref_json=evidence_ref_json,
+                reason=reason,
+                previous_confidence=previous_confidence,
+                new_confidence=memory.confidence,
+                previous_stale_score=previous_stale_score,
+                new_stale_score=memory.stale_score,
+                previous_status=previous_status,
+                new_status=memory.status,
+                validation_count=memory.validation_count,
+            )
+        )
+
+    def _execution_record_outcome(self, verdict: str) -> str:
+        normalized = verdict.strip().lower()
+        if normalized in {"validated", "valid", "confirmed", "succeeded", "passed", "supports"}:
+            return "validated"
+        if normalized in {"contradicted", "contradicts", "failed", "failed_due_to_memory", "incorrect", "refutes"}:
+            return "caused_failure"
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": "invalid_execution_record_memory_verdict"},
+        )
 
 
 def compute_contradiction_penalty(
@@ -729,12 +1303,12 @@ def compute_contradiction_penalty(
 
 def _default_source_profiles() -> list[dict[str, Any]]:
     return [
-        {"source_type": "user_confirmed", "initial_confidence": 0.85, "authority": "user", "requires_source_ref": False, "allowed_for_high_risk": True},
-        {"source_type": "execution_learned", "initial_confidence": 0.70, "authority": "system_record", "requires_source_ref": True, "allowed_for_high_risk": True},
-        {"source_type": "document_imported", "initial_confidence": 0.75, "authority": "document", "requires_source_ref": True, "allowed_for_high_risk": True},
-        {"source_type": "agent_summarized", "initial_confidence": 0.45, "authority": "agent", "requires_source_ref": False, "allowed_for_high_risk": False},
-        {"source_type": "repair_inferred", "initial_confidence": 0.40, "authority": "agent", "requires_source_ref": False, "allowed_for_high_risk": False},
-        {"source_type": "external_imported", "initial_confidence": 0.55, "authority": "external", "requires_source_ref": True, "allowed_for_high_risk": False},
+        {"source_type": "user_confirmed", "initial_confidence": 0.85, "authority": "user", "requires_source_ref": False, "requires_content_hash": False, "allowed_for_high_risk": True},
+        {"source_type": "execution_learned", "initial_confidence": 0.70, "authority": "system_record", "requires_source_ref": True, "requires_content_hash": False, "allowed_for_high_risk": True},
+        {"source_type": "document_imported", "initial_confidence": 0.75, "authority": "document", "requires_source_ref": True, "requires_content_hash": True, "allowed_for_high_risk": True},
+        {"source_type": "agent_summarized", "initial_confidence": 0.45, "authority": "agent", "requires_source_ref": False, "requires_content_hash": False, "allowed_for_high_risk": False},
+        {"source_type": "repair_inferred", "initial_confidence": 0.40, "authority": "agent", "requires_source_ref": False, "requires_content_hash": False, "allowed_for_high_risk": False},
+        {"source_type": "external_imported", "initial_confidence": 0.55, "authority": "external", "requires_source_ref": True, "requires_content_hash": False, "allowed_for_high_risk": False},
     ]
 
 
@@ -795,22 +1369,18 @@ def _max_severity(current: str | None, new: str) -> str:
     return current
 
 
+def _same_failure_repeated(*, memory: ProjectMemory, failure_fingerprint: str | None) -> bool:
+    return bool(failure_fingerprint and memory.last_failure_fingerprint == failure_fingerprint)
+
+
 def _stale_delta(reason: str) -> float:
     if reason == "environment.updated":
         return 0.30
     if reason in {"document.updated", "manifest.changed"}:
         return 0.25
+    if reason in {"report.updated", "report.deleted", "report.regenerated"}:
+        return 0.20
     return 0.20
-
-
-def _feedback_confidence_delta(severity: str) -> float:
-    if severity == "critical":
-        return 0.25
-    if severity == "high":
-        return 0.18
-    if severity == "low":
-        return 0.06
-    return 0.12
 
 
 def _clamp(value: float, low: float, high: float) -> float:

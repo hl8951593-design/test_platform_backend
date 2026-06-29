@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from app.ai_skills.base import AISkill, SkillPackage, load_model_json
 from app.ai_skills.registry import register_ai_skill
 from app.schemas.ai import AIChatMessage, AIChatRequest, AIGeneratedScenarioResponse
-from app.schemas.scenario import ScenarioCreateRequest
+from app.schemas.scenario import ScenarioActionRequest, ScenarioCreateRequest
 
 
 class ScenarioComposerSkill(AISkill):
@@ -136,7 +136,11 @@ class ScenarioComposerSkill(AISkill):
                 node_id = f"NODE-{index}"
             step_label = str(raw_node.get("name") or candidate["name"])
             before_actions = (
-                self._actions(raw_node.get("before_actions", raw_node.get("beforeActions")))
+                self._actions(
+                    raw_node.get("before_actions", raw_node.get("beforeActions")),
+                    warnings,
+                    scope=f"{step_label} before_actions",
+                )
                 if payload.include_hooks
                 else []
             )
@@ -150,7 +154,11 @@ class ScenarioComposerSkill(AISkill):
                 step_label=step_label,
             )
             after_actions = (
-                self._actions(raw_node.get("after_actions", raw_node.get("afterActions")))
+                self._actions(
+                    raw_node.get("after_actions", raw_node.get("afterActions")),
+                    warnings,
+                    scope=f"{step_label} after_actions",
+                )
                 if payload.include_hooks
                 else []
             )
@@ -192,10 +200,98 @@ class ScenarioComposerSkill(AISkill):
             "datasets": datasets,
         }
 
-    def _actions(self, value: Any) -> list[dict[str, Any]]:
+    def _actions(self, value: Any, warnings: list[str], *, scope: str) -> list[dict[str, Any]]:
         if not isinstance(value, list):
             return []
-        return [item for item in value if isinstance(item, dict)]
+        actions: list[dict[str, Any]] = []
+        for index, item in enumerate(value, start=1):
+            if not isinstance(item, dict):
+                warnings.append(f"{scope} 第 {index} 个动作不是对象，已忽略")
+                continue
+            normalized = self._normalize_action(item, warnings, scope=scope, index=index)
+            if normalized is not None:
+                actions.append(normalized)
+        return actions
+
+    def _normalize_action(
+        self,
+        raw_action: dict[str, Any],
+        warnings: list[str],
+        *,
+        scope: str,
+        index: int,
+    ) -> dict[str, Any] | None:
+        action = dict(raw_action)
+        config = action.get("config") if isinstance(action.get("config"), dict) else {}
+        config = dict(config)
+        kind = str(action.get("kind") or action.get("type") or "").strip()
+        if not kind:
+            kind = self._infer_action_kind(action, config)
+            if kind:
+                warnings.append(f"{scope} 第 {index} 个动作缺少 kind，已根据配置推断为 {kind}")
+        if not kind:
+            warnings.append(f"{scope} 第 {index} 个动作缺少 kind 且无法推断，已忽略")
+            return None
+
+        action_id = str(action.get("id") or f"{scope.upper().replace(' ', '-')}-{index}")[:128]
+        action_payload = {
+            "id": action_id,
+            "kind": kind,
+            "name": str(action.get("name") or action_id)[:200],
+            "config": self._normalize_action_config(action, config, kind),
+            "continue_on_failure": bool(action.get("continue_on_failure", action.get("continueOnFailure", False))),
+        }
+        try:
+            return ScenarioActionRequest.model_validate(action_payload).model_dump(mode="json")
+        except ValidationError as exc:
+            warnings.append(f"{scope} 第 {index} 个动作配置无效，已忽略: {exc.errors()}")
+            return None
+
+    def _normalize_action_config(self, action: dict[str, Any], config: dict[str, Any], kind: str) -> dict[str, Any]:
+        if kind == "delay":
+            if "duration_ms" not in config:
+                duration = action.get("duration_ms", action.get("durationMs", action.get("duration")))
+                if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+                    config["duration_ms"] = int(duration)
+            return config
+        if kind == "fixed_value":
+            if "output" not in config and action.get("output") is not None:
+                config["output"] = action["output"]
+            if "value" not in config and "value" in action:
+                config["value"] = action["value"]
+            return config
+        if kind == "random":
+            for key in ("output", "type", "min", "max", "length"):
+                if key not in config and key in action:
+                    config[key] = action[key]
+            return config
+        if kind == "condition":
+            if "expression" not in config and action.get("expression") is not None:
+                config["expression"] = action["expression"]
+            return config
+        if kind == "script":
+            for key in ("language", "code", "inputs", "outputs", "timeout_ms"):
+                if key not in config and key in action:
+                    config[key] = action[key]
+            if "timeout_ms" not in config and action.get("timeoutMs") is not None:
+                config["timeout_ms"] = action["timeoutMs"]
+            return config
+        return config
+
+    @staticmethod
+    def _infer_action_kind(action: dict[str, Any], config: dict[str, Any]) -> str:
+        if "expression" in config or "expression" in action:
+            return "condition"
+        if any(key in config or key in action for key in ("duration_ms", "durationMs", "duration")):
+            return "delay"
+        if ("output" in config or "output" in action) and ("value" in config or "value" in action):
+            return "fixed_value"
+        random_type = config.get("type", action.get("type"))
+        if random_type in {"integer", "string", "uuid"} and ("output" in config or "output" in action):
+            return "random"
+        if "code" in config or "code" in action:
+            return "script"
+        return ""
 
     def _step_config(
         self,

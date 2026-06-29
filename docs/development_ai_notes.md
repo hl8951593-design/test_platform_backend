@@ -78,7 +78,7 @@ POST /api/v1/ai/chat
 - 上游错误转换为后端统一异常。
 - `AIService.chat_stream` 支持 DeepSeek SSE 增量读取，当前用于可观测 AI Skill Run 的 `model.delta` 事件。
 - HTTP/WebSocket 测试用例生成与扩写已迁移到正式 skill 包。
-- `scenario-composer` 已支持候选用例样本读取、场景草稿生成和自验证修复。
+- `scenario-composer` 已支持候选用例样本读取、场景草稿生成、自验证修复，以及 `before_actions` / `after_actions` 缺失 `kind` 时的可确定动作归一化修复。
 - AI Skill Run 支持创建 run、查询 run、SSE 订阅事件、敏感 payload 脱敏和创建者/管理员访问控制。
 - Skill Runtime 支持本地 JSON 兼容修复和一次模型 JSON 修复兜底。
 
@@ -189,3 +189,4 @@ GET  /api/v1/ai/skill-runs/{run_id}/events
 - 默认 `self_validate=true`。生成草稿后会复用 `ScenarioService.validate_unsaved_scenario` 执行未保存场景，失败时将结构化执行问题反馈给模型修复，最多 3 次。
 - 自验证能力位于场景服务层，后续平台 agent 可以复用；不要在某个前端页面或单个 skill 中重复实现执行逻辑。
 - AI 返回后，adapter 仍会强制过滤非候选 `reference_id`，并通过 `ScenarioCreateRequest` 校验。
+- AI 返回的 `before_actions` / `after_actions` 会先进入 adapter 归一化；缺失 `kind` 但能从配置确定动作类型时自动补齐，无法推断或配置不合法时丢弃并写入 warnings，避免非关键动作导致整个草稿失败。

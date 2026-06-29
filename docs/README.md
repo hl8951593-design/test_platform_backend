@@ -44,6 +44,7 @@
 | [测试报告](api_test_reports.md) | 测试计划和 Flow 的报告历史、结构化指标、明细与 HTML 导出 |
 | [缺陷跟踪](api_defects.md) | 项目缺陷 CRUD、富文本清洗、状态流转和权限契约 |
 | [媒体存储](api_media.md) | MinIO 图片上传、附件绑定、临时访问地址和清理契约 |
+| [Agent 前端接口契约](api_agent_frontend_contract.md) | Harness Loop Agent 前端接入接口、SSE、字段契约和限制 |
 | `api_*.md` | 已实现接口、请求响应、权限、错误、兼容规则和部署要求 |
 | `front_tech_docs/` | 前端接入、页面交互和客户端状态管理约定 |
 | `alembic/versions/` | 数据库结构变更及升级顺序 |
@@ -71,6 +72,7 @@
 - [可视化流程](api_visual_flows.md)
 - [浏览器采集](api_browser_captures.md)
 - [AI 能力](api_ai.md)
+- [Agent 前端接口契约](api_agent_frontend_contract.md)
 
 ## 变更维护契约
 

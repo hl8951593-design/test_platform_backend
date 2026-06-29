@@ -20,6 +20,12 @@ Recovery  能从中断、超时、未知提交状态中恢复
 
 这套 Agent 应建立在现有平台的 `AIService / AISkillRunner / Skill 包 / Run-Event-SSE / Scenario / Flow / Execution Records / Reports / Project Permissions` 之上。Agent 不直接改数据库、不直接调用模型 HTTP、不直接绕过权限体系。Agent 的职责是理解用户目标、规划动作、选择工具、观察结果、循环纠错、输出可审计结果；真实业务副作用全部通过现有平台 Service 和 Skill 发起。
 
+当前后端对话执行由 `AgentConversationRunner` 承担模型规划和结果回灌层：它在模型调用前用 `normal_plan_v1` 检索项目 Memory，以 `usage_role=conversation_context` 注入非 policy 上下文，写入 `memory.context_injected` 和 `AgentMemoryUsageEvent(active_for_policy=false)`；随后把 ToolRegistry 以受控协议暴露给模型，模型只能输出 `agent_tool_request` JSON 请求。后端解析工具请求后必须先写 `model.tool_request_detected`，再通过 `ExecutionLedgerService.create_tool_call(enqueue=False)` 进入 ToolCall 事实账本，并复用 `ToolExecutor.execute_tool_call` 完成权限、审批、策略和后端 adapter 校验。工具结果通过 `tool.result_observed` 进入下一轮模型上下文，最终自然语言回复由 `model.delta`、`model.completed.content` 和 `run.completed.result.message` 输出给前端，且必须是 GitHub Flavored Markdown；若模型流式内容存在表格换行等格式问题，Runner 在完成前写入 `model.markdown_normalized(replace_content=true)` 并用规范化 Markdown 覆盖最终 summary。该闭环不允许绕过 ExecutionLedger，也不允许把 Memory 或模型工具请求 JSON 当成用户可见回复；高风险动作仍必须依赖 EvidenceRef、审批和工具结果，而不是 conversation Memory。
+
+场景组合是该闭环的首个 query-first 业务 recipe：用户要求创建、生成或组合测试场景时，模型必须先调用 `testcase.query_project_cases` 获取当前项目全量 HTTP/WebSocket 用例，再基于返回的真实 case id 调用 `scenario.compose_draft`。如果模型在没有成功 query 结果的同一 run 内直接请求 `scenario.compose_draft`，Harness 不执行下游 AISkill，而是创建可审计 ToolCall、写入 `tool.failed` / `tool.result_observed` 与 `scenario_compose_requires_case_query`，把失败结果回灌给模型继续规划，直到 query -> compose -> final answer 或达到迭代上限。
+
+审批恢复同样必须走同一事实源：当模型规划出的 ToolCall 需要人工确认时，Run 进入 `needs_human` 并记录 `blocking_tool_call_ids_json`；approve 只负责固定 approval lineage/epoch 和释放 queue，不直接伪造完成结果。`POST /api/v1/agents/runs/{run_id}/resume` 先运行 Checkpoint Freshness Gate，通过后执行已批准的 blocking ToolCall，写入 `tool.result_observed(resumed_after_approval=true)`，清理已成功的 blocking id，并调用 `AgentConversationRunner.complete_after_tool_results` 基于工具输出生成最终回复。resume payload 使用 `executed_tool_call_ids` 告知前端哪些阻断工具已在恢复过程中执行。
+
 本四次修正版在三次修正版的基础上，继续修复 5 个组合尺度问题。这些问题不是单个机制内部不正确，而是多个机制组合、批量运行、长时间等待或渐进式接入时会重新产生的缝隙：
 
 ```text
@@ -165,6 +171,20 @@ MigrationCoordinator 负责 ToolCall needs_migration 与 Run needs_migration 的
 AgentRuntimeSnapshot 解决“Agent 当时看到了哪些 tool、manifest、schema、policy、prompt”。
 BackendExecutionContract 解决“下游当时按哪个 request/output/reconcile schema 接收、保存和解释结果”。
 BackendEffectCapability 解决“下游是否支持 durable receipt、idempotency index、legacy reconcile 或只能人工恢复”。
+```
+
+运行时能力出口 `GET /api/v1/agents/capabilities` 必须暴露开发计划 4.2 冻结的全部状态枚举，包括 Run、ToolCall、Effect Submission State、BackendEffectCapability、Approval 与 Migration Block。该出口是前端、OpenAPI schema 与运行时服务共享的机器可读枚举契约，后端测试需要从 4.2 文档抽取枚举并与 capabilities 响应保持精确一致。
+
+模型连通诊断出口 `GET /api/v1/agents/model-health` 必须继续复用 `AIService.provider_config()` 与 `AIService.chat_stream()`，不得直接拼接 DeepSeek HTTP，也不得返回 `DEEPSEEK_API_KEY`。默认 `live=false` 只读配置状态；`live=true` 仅 admin 可用，用极小流式探测验证 provider reachable、first_delta_received 和 completed，用于排查 Run 已创建但前端没有 assistant 回复的问题。该接口不写 Agent Run/EventStore，不作为事实源。
+
+对话链路诊断出口 `POST /api/v1/agents/conversation-smoke` 是 admin-only 端到端 smoke。它必须创建真实 Agent Run，复用 `AgentConversationRunner`、`AIService.chat_stream()`、EventStore 和 Run Summary 聚合路径，同步返回 `first_delta_received`、`completed`、`event_types` 与 `run_summary`。它用于证明 provider 已可达后，完整 `POST /runs -> runner -> model.delta -> run.completed -> summary` 链路是否工作；该接口会产生真实审计记录，因此不得暴露给普通用户路径。
+
+Required Agent Conversation smoke payload contract:
+
+```text
+fields=project_id,run_id,conversation_id,status,completed,first_delta_received,assistant_visible,assistant_message,error_code,error_message,event_types,latest_event_sequence,run_summary,latency_ms,generated_at
+run_summary_fields=run,assistant_message,assistant_visible,completion_source,model_invoked,model,finish_reason,usage,event_count,latest_event_sequence,latest_event_types,tool_call_count,pending_tool_call_count,approval_count,pending_approval_count,migration_block_count,open_migration_block_count,memory_usage_count,blocking_tool_call_ids,terminal,can_cancel,can_resume,updated_at
+source=AgentConversationSmokeRead
 ```
 
 不能用 `runtime_snapshot_id` 替代下游历史 schema 契约，也不能用理想状态的 `backend_accepted` 替代真实下游能力声明。
@@ -537,13 +557,33 @@ class EvidenceRef:
 | dependency_role | 是否进入 replay_policy 判断 | 用途 |
 |---|---:|---|
 | `decision_dependency` | 是 | 本次 tool input 或动作选择直接依赖 |
+| `policy_dependency` | 是 | Memory 直接影响本次 tool input、修复路径或动作选择 |
 | `validation_evidence` | 是 | 用于证明本次结果有效，例如最新 dry-run 成功记录 |
 | `audit_background` | 否 | 解释为什么曾经做过某次修复，不影响当前副作用判断 |
 | `trace_only` | 否 | 链路追溯、日志展示、用户说明 |
 | `superseded` | 否 | 已被更新证据替代，只保留审计 |
 
+Required EvidenceRef authoring contract:
+
+```text
+mutability_classes=immutable,versioned,mutable_current,ephemeral_latest,external_uncontrolled
+frozen_mutability_classes=immutable,versioned
+volatile_mutability_classes=mutable_current,ephemeral_latest,external_uncontrolled
+active_policy_dependency_roles=decision_dependency,validation_evidence,policy_dependency
+audit_dependency_roles=audit_background,trace_only,superseded
+dependency_roles=decision_dependency,validation_evidence,policy_dependency,audit_background,trace_only,superseded
+freshness_policies=none,revalidate_on_resume,revalidate_before_side_effect
+default_mutability_class=mutable_current
+default_dependency_role=audit_background
+policy_filter=active_for_policy=true;dependency_role=in_active_policy_dependency_roles;superseded_by_ref=null
+```
+
+EvidenceRef 编写规范必须和 `EvidenceRefResolver` 保持一致：缺省 ref 只能作为 `audit_background`，不能自动进入策略；参与 replay_policy 的证据必须 `active_for_policy=true`、`dependency_role` 属于 `decision_dependency / validation_evidence / policy_dependency`，且没有 `superseded_by_ref`；`audit_background / trace_only / superseded` 只能进入审计与诊断，不得污染 replay policy。
+
 
 Memory 与 EvidenceRef 的关系是强约束：MemoryManager 检索出的每一条候选记忆，都必须转换为 `ref_type=memory` 的 EvidenceRef，再进入 ContextBuilder。禁止把 memory 文本绕过 EvidenceRef 生命周期管理直接塞进 prompt。
+
+ContextBuilder 通过 `memory_ids_used` 审计本次上下文显式使用了哪些 Memory。只要 `memory_ids_used` 非空，就必须在 `evidence_refs` 中提供对应 `ref_type=memory` 且 `ref_id` 匹配的 EvidenceRef；否则拒绝构建，写入 `memory.bypassed_evidence_ref` 事件，并由 `memory_bypassed_evidence_ref_total` 触发 P0 告警。
 
 ```python
 def memory_to_evidence_ref(memory, usage_role: str) -> EvidenceRef:
@@ -556,8 +596,8 @@ def memory_to_evidence_ref(memory, usage_role: str) -> EvidenceRef:
         captured_at=now_iso(),
         mutability_class="mutable_current",
         freshness_policy="revalidate_before_side_effect",
-        dependency_role=usage_role,  # decision_dependency / audit_background / trace_only
-        active_for_policy=(usage_role == "decision_dependency"),
+        dependency_role=usage_role,  # trace_only / policy_dependency
+        active_for_policy=(usage_role == "policy_dependency"),
         superseded_by_ref=None,
         required_for_high_risk=False,
         authority=f"memory:{memory.source_type}",
@@ -568,8 +608,8 @@ def memory_to_evidence_ref(memory, usage_role: str) -> EvidenceRef:
 
 ```text
 1. Memory 默认不是硬事实，只能作为 candidate experience。
-2. Memory 如果只是给模型提供背景经验，dependency_role=audit_background 或 trace_only，active_for_policy=false。
-3. Memory 如果直接影响本次 tool input、修复路径或动作选择，必须标记为 decision_dependency，active_for_policy=true。
+2. Memory 如果只是给模型提供背景经验，dependency_role=trace_only，active_for_policy=false。
+3. Memory 如果直接影响本次 tool input、修复路径或动作选择，必须标记为 policy_dependency，active_for_policy=true。
 4. high_risk / business_create / business_update / destructive / external_effect 动作不得只依赖 memory；必须至少有一个 system_record / project_config / execution_record / document_imported 的冻结或可重验证据支撑。
 5. ToolPolicyResolver 必须把 active memory evidence 视为 mutable_current；resume 前必须 revalidate 或降权。
 ```
@@ -583,7 +623,7 @@ def select_policy_evidence_refs(all_refs: list[EvidenceRef]) -> list[EvidenceRef
     return [
         ref for ref in all_refs
         if ref.active_for_policy
-        and ref.dependency_role in {"decision_dependency", "validation_evidence"}
+        and ref.dependency_role in {"decision_dependency", "validation_evidence", "policy_dependency"}
         and ref.dependency_role != "superseded"
         and ref.superseded_by_ref is None
     ]
@@ -1002,6 +1042,19 @@ class IdempotentToolBackend:
 
 注意：`runtime_snapshot_id` 是 Agent 侧语义，不是下游历史 schema 的唯一解释依据。下游必须使用 `backend_contract_version / reconcile_contract_version / output_schema_hash` 解释历史结果。
 
+Required backend adapter contract defaults:
+
+```text
+reconcile_contract_version=reconcile-v1
+result_adapter_version=v1
+compatibility_status=active
+owner_team=test-platform
+unsafe_side_effect_requires_backend_contract=true
+seed_contracts_from_tool_registry=true
+```
+
+Backend Adapter SDK 的 ToolSpec 是 operation 级 backend contract 的唯一代码事实源：每个接入 Agent 的 ToolSpec 必须携带 `BackendContractSpec`，request/output schema hash 必须分别来自 ToolSpec input/output schema；运行时启动或创建 snapshot 前通过 `AgentRuntimeService.ensure_backend_contracts()` seed `ai_agent_backend_contracts`，Release Gate `tool_matrix` 必须展示同一 backend contract 的 name、operation、version、effect capability 与 compatibility status。
+
 ### 8.2 ReconcileResult 标准 envelope
 
 ```json
@@ -1019,6 +1072,25 @@ class IdempotentToolBackend:
   "error_code": null,
   "error_message": null
 }
+```
+
+Required Reconcile contract:
+
+```text
+eligible_tool_call_statuses=uncertain,reconciling
+result_statuses=succeeded,running,failed,not_found,conflict,unsupported_schema_version
+schema_support_values=supported,unsupported,adapter_required
+success_result_statuses=succeeded
+backoff_result_statuses=running,not_found
+terminal_failure_result_statuses=failed
+direct_manual_result_statuses=conflict
+state_dependent_result_statuses=not_found
+migration_result_statuses=unsupported_schema_version
+backoff_effect_states=transport_sent_observed
+backoff_capabilities=receipt_first,idempotency_index_only
+result_envelope_fields=found,status,schema_support,backend_contract_version,output_schema_version,external_resource_type,external_resource_id,acceptance_id,canonical_summary_json,raw_output_object_key,error_code,error_message
+summary_fields=run_id,processed,skipped_backoff,reconciled,still_uncertain,needs_migration,manual_intervention,tool_call_ids,skipped_backoff_tool_calls
+skipped_backoff_fields=tool_call_id,next_retry_at,attempt_seq,result_status
 ```
 
 ### 8.3 下游能力分级契约
@@ -1123,6 +1195,8 @@ async def reconcile_tool_call(call):
         return ledger.mark_failed_from_reconcile(call.id, result)
 ```
 
+WorkerQueue 执行入口还必须防止 `uncertain/reconciling` ToolCall 被误调度为普通执行；命中时不调用后端工具，队列项失败，ToolCall 保持 uncertain，并输出 `tool_call_uncertain_reconcile_required`，强制先走 ReconcileWorker。
+
 `handle_not_found_by_state_and_capability` 必须是显式规则函数，不能把所有 business_create 的 `not_found` 都转成人工，也不能把所有 `not_found` 都当成安全重试。
 
 ---
@@ -1182,6 +1256,8 @@ sequenceDiagram
 ```text
 如果 backend_effect_capability != receipt_first，ToolExecutor 不得写 backend_accepted。
 如果没有 backend_accepted，恢复逻辑不能使用“receipt 已存在”的判断分支。
+如果后端已返回成功但 tool.effect_committed / tool.completed 写入 EventStore 失败，ToolExecutor 必须保留 effect_committed 输出哈希，将 tool_call 标记为 uncertain，并进入 reconcile_required_after_eventstore_failure，禁止把已发生副作用误写成普通 failed。
+EventStore / Outbox 同事务持久化失败必须回滚当前事实写入并返回 `event_outbox_write_failed`，避免调用方只看到原始数据库异常；Outbox 发布阶段失败仍由 publisher 重试/死信处理，不影响已持久化 EventStore 事实。
 SSE 失败不影响 tool 结果。事实在 EventStore，Outbox 负责异步发布。
 ```
 
@@ -1257,6 +1333,66 @@ fresh -> 可从 checkpoint 继续。
 stale_but_revalidatable -> 先 materialize/revalidate evidence，再继续。
 stale_requires_replan -> 废弃 active plan，重新进入 Plan。
 stale_requires_human -> 外部资源缺失或权限变化，转人工。
+```
+
+Memory freshness 属于 active evidence freshness 的一部分。Freshness Gate 必须读取最新 ContextBuild 的 `policy_refs`，识别 `ref_type=memory` 且 `active_for_policy=true` 的 EvidenceRef，再回查对应 `ProjectMemory`；只要任一 active policy Memory 已进入 `needs_revalidation` 或 `stale_score>=0.8`，恢复结果必须视为可重验陈旧证据，当前实现返回 `result=evidence_stale`、`action=fetch_evidence_and_rebuild_context`、`reason=active_memory_needs_revalidation`，并把命中的 memory id 暴露为 `active_memory_needs_revalidation_ids`。这条规则避免 Memory 已被 EvidenceWatch 或反馈降权后，旧 checkpoint 仍绕过 Memory 生命周期直接 resume。
+
+Runtime snapshot compatibility 是 Freshness Gate 的第一层恢复语义。Checkpoint 保存的是创建时的 `runtime_snapshot_id`，resume 时必须确认该 snapshot 仍存在，且与 run 当前 `runtime_snapshot_id` 一致；如果 run 已被迁移到另一个 runtime snapshot，或 checkpoint 引用的 snapshot 不存在，当前实现返回 `result=too_old`、`action=replan_from_latest_safe_state`，`reason` 分别为 `runtime_snapshot_mismatch` 或 `runtime_snapshot_missing`。这避免旧 checkpoint 用过期 tool registry、manifest bundle 或 policy hash 解释新的运行态。
+当 resume 因该类 stale checkpoint 暂停 Run 时，`AgentRun.error_code` 与 `run.paused` 事件必须使用冻结错误码 `checkpoint_stale_replan_required`，而不是只暴露内部 action `replan_from_latest_safe_state`。
+
+Required runtime snapshot freshness contract:
+
+```text
+freshness_fields=checkpoint_runtime_snapshot_id,run_runtime_snapshot_id,runtime_snapshot_compatible
+result=too_old
+action=replan_from_latest_safe_state
+reasons=runtime_snapshot_missing,runtime_snapshot_mismatch
+paused_error_code=checkpoint_stale_replan_required
+```
+
+Permission freshness 用于把恢复前权限重验前移到 resume gate。Freshness Gate 在传入 `current_user` 时，会检查恢复后仍可能继续调度或执行的 ToolCall（`planned/approved/executable/failed_retryable/uncertain/reconciling`），逐项重验 `required_permissions_json`；只要当前操作者缺少任一权限，当前实现返回 `result=permission_stale`、`action=refresh_permissions_or_manual_review`、`reason=required_permission_revoked`，并输出 `revoked_required_permissions`。这不会取代 execute-time 权限校验，而是避免长时间等待后先恢复运行、再由 executor 才发现权限已被撤销。
+
+Required permission freshness contract:
+
+```text
+tool_statuses=approved,executable,failed_retryable,planned,reconciling,uncertain
+freshness_fields=revoked_required_permission_count,revoked_required_permissions
+detail_fields=tool_call_id,tool_name,permission,status
+result=permission_stale
+action=refresh_permissions_or_manual_review
+reason=required_permission_revoked
+```
+
+Pending approval freshness 必须把“仍在等待审批”和“审批本身已经陈旧”区分开。Freshness Gate 会读取 run 内 pending approval，输出 `pending_approval_details`，并分别统计 `expired_pending_approval_count` 与 `stale_pending_approval_count`；过期 approval 返回 `reason=pending_approval_expired`，input hash、runtime snapshot、resource scope、lineage 或 epoch 与当前 ToolCall 不一致时返回 `reason=pending_approval_stale`。这与 approve 接口的不可变校验保持一致，让恢复入口可以直接引导 expire/supersede，而不是只暴露一个模糊的 pending count。
+
+Required pending approval freshness contract:
+
+```text
+freshness_fields=pending_approval_count,expired_pending_approval_count,stale_pending_approval_count,pending_approval_details
+detail_fields=approval_id,tool_call_id,approval_lineage_id,approval_epoch,expires_at,stale_reasons
+reasons=pending_approval_expired,pending_approval_stale,pending_approval_after_wait
+stale_reasons=expired,tool_call_missing,immutable_mismatch,pending_after_wait
+result=approval_stale
+action=supersede_or_refresh_approval
+```
+
+Environment freshness 是 stale evidence 的特殊恢复路径。Freshness Gate 会把 `ref_type=environment` 或 `stale_reason=environment.updated` 的 stale watch 从普通 evidence stale 中分离，返回 `result=environment_changed`、`action=revalidate_before_side_effect`、`reason=environment_updated`，并暴露 `environment_changed_count` 与 `stale_evidence_watch_details`。这样环境更新不会被误归入需要重建上下文的通用 evidence stale，而是进入副作用前环境重验流程。
+
+Active evidence freshness 还必须主动处理未冻结的 latest 证据与外部不可控证据。Freshness Gate 会读取最新 ContextBuild 的 `policy_refs`；只要仍存在 `ref_type=latest_execution_sample` 或 `mutability_class=ephemeral_latest` 的 active policy ref，当前实现返回 `result=evidence_stale`、`action=materialize_latest_evidence`、`reason=ephemeral_latest_requires_materialization`，并输出 `active_evidence_revalidation_details`。这把 6.2.2 的 materialize_latest_evidence 流程前移到 resume gate，避免未冻结 latest 样本在长时间等待后被旧 checkpoint 直接复用。对于 `freshness_policy=revalidate_on_resume`、`mutability_class=external_uncontrolled` 或 `ref_type=external_doc` 的 active policy ref，Freshness Gate 返回 `result=evidence_stale`、`action=fetch_evidence_and_rebuild_context`、`reason=active_evidence_requires_revalidation`，在 resume 前强制重新获取证据并重建上下文，避免外部文档或平台资源变化绕过 replay policy。
+
+Required evidence freshness contract:
+
+```text
+environment_fields=environment_changed_count,stale_evidence_watch_details
+environment_detail_fields=evidence_ref_id,ref_type,ref_id,stale_reason
+environment_result=environment_changed
+environment_action=revalidate_before_side_effect
+environment_reason=environment_updated
+active_evidence_fields=active_evidence_revalidation_count,active_evidence_revalidation_details
+active_evidence_detail_fields=evidence_ref_id,ref_type,ref_id,mutability_class,freshness_policy
+active_evidence_result=evidence_stale
+active_evidence_actions=materialize_latest_evidence,fetch_evidence_and_rebuild_context
+active_evidence_reasons=ephemeral_latest_requires_materialization,active_evidence_requires_revalidation
 ```
 
 恢复策略伪代码：
@@ -1446,9 +1582,6 @@ def approve_tool_call(tool_call_id, approver_id, expected_input_hash,
         call = select_tool_call_for_update(tool_call_id)
         approval = select_current_approval_for_update(lineage.current_approval_id)
 
-        if call.status in {"obsolete", "cancelled", "superseded"}:
-            return Conflict("tool_call_superseded")
-
         if call.status not in {"pending_approval", "planned"}:
             return Conflict("tool_call_not_approvable")
 
@@ -1630,6 +1763,29 @@ def expire_one_lineage_short_tx(lineage_id):
 
 如果某个 run 下 lineage 数量很大，后台任务必须分页处理，不允许按 run 一次性锁全量 lineage。
 
+当前后端实现映射：
+
+```text
+ApprovalExpireScanner.audit(project_id)
+  -> 只读统计 pending 且 expires_at <= now 的 approval
+  -> 输出 due_count、candidate_lineage_count、oldest_due_lag_ms、lineage_hotspot_count、hotspot_lineage_ids、batch_safe
+
+ApprovalExpireScanner.expire_due_summary(project_id, limit)
+  -> 处理前后复用 audit 快照
+  -> 按 approval_lineage_id / expires_at 固定排序选取候选
+  -> 每个 approval_lineage_id 只尝试一次短事务；同一 lineage 内重复 due pending 计入 skipped_duplicate_lineage_count
+  -> 逐 lineage 调用 ApprovalMutationGuard.expire_approval，保持幂等与既有 mutation/event 写入路径
+  -> mutation log details 记录 lineage_lock_wait_ms；当前无 SKIP LOCKED 跳过时 lineage_lock_skip_total 输出 0
+  -> 输出 attempted、expired、skipped、skipped_duplicate_lineage_count、processed_lineage_ids、lineage_lock_wait_ms、lineage_lock_skip_total、due_before/due_after、hotspot 前后变化
+
+GET  /api/v1/agents/approvals/expire-audit
+POST /api/v1/agents/approvals/expire
+```
+
+Approval expire 批处理接口必须支持 admin 全局治理和 project-scoped 治理两种模式：不带 `project_id` 时仅 admin 可读取或执行全局过期扫描；带 `project_id` 时必须先校验项目访问权限，并只审计或处理该项目关联 approval lineage，避免普通用户跨项目枚举 due backlog 或触发全局 expire。
+
+Dashboard / Alert 使用 `approval_expire_due_total`、`approval_expire_batch_lag_ms`、`approval_lineage_hotspot_total` 发现 due backlog 与同 lineage 多 pending 热点；dashboard metrics catalog 同时要求 `approval_lineage_lock_wait_ms` 与 `approval_lineage_lock_skip_total`，用于观测 approve/supersede/expire 获取 lineage 锁的等待和批量扫描跳过锁数量；`agent_approval_expire_backlog` 与 `agent_approval_expire_batch_lag` 为 P2，`agent_approval_lineage_hotspot` 为 P1，`agent_approval_lineage_lock_wait` 与 `agent_approval_lineage_lock_skip` 为 P2 并指向 `approval_stale` runbook。
+
 ### 11.4 Execute-time check 仍然必须保留
 
 即使 approve 接口已经做了 lineage 互斥，Worker 执行前仍然必须调用 `get_valid_approval`：
@@ -1784,12 +1940,13 @@ CREATE TABLE ai_agent_loop_observations (
 | `RC_CONTEXT_OMITTED_HIGH_RISK` | `decision_context_degradation_level=heavy` 且 `required_evidence_complete_for_decision=false` 且存在 `same_failure_no_progress` | `context_degraded_heavy` | `context_degraded_heavy -> required_evidence_omitted -> same_failure_no_progress` | `fetch_full_evidence_and_rebuild_context` | 10 |
 | `RC_EVIDENCE_INCOMPLETE` | 存在 `evidence_incomplete_for_high_risk_action` 且 degradation 非 heavy | `evidence_incomplete_for_high_risk_action` | `evidence_incomplete -> unsafe_to_continue` | `fetch_required_evidence` | 20 |
 | `RC_MEMORY_CONTRADICTION` | `memory_contradiction_delta > 0` 且 same failure 出现 | `memory_contradiction` | `memory_used -> contradiction_detected -> repair_failed` | `demote_memory_and_replan` | 30 |
-| `RC_POLICY_LOOP` | `policy_loop` 命中 | `policy_loop` | `same_action -> policy_rejected -> repeated_attempt` | `change_plan_or_require_human` | 40 |
-| `RC_REPAIR_REGRESSION` | `repair_regression` 或 `new_failures_outside_scope` 命中 | `repair_regression` | `patch_applied -> new_failure -> regression` | `rollback_patch_or_human_review` | 50 |
+| `RC_POLICY_LOOP` | `policy_loop` 命中 | `policy_loop` | `same_action -> policy_rejected -> repeated_attempt` | `change_plan_or_require_human` | 18 |
+| `RC_REPAIR_REGRESSION` | `repair_regression` 或 `new_failures_outside_scope` 命中 | `repair_regression` | `patch_applied -> new_failure -> regression` | `rollback_patch_or_human_review` | 65 |
 | `RC_NO_PROGRESS_PURE` | `same_failure_no_progress` 且无 context/evidence/memory/policy 信号 | `same_failure_no_progress` | `repair_attempt -> same_failure` | `stop_or_escalate_repair_strategy` | 60 |
-| `RC_RESOURCE_LIMIT` | `cost_budget_exceeded` 或 `context_budget_exhausted` 命中 | `resource_limit` | `budget_exhausted -> cannot_continue` | `pause_or_request_budget` | 70 |
+| `RC_RESOURCE_LIMIT` | `cost_budget_exceeded` 或 `context_budget_exhausted` 命中 | `resource_limit` | `budget_exhausted -> cannot_continue` | `pause_or_request_budget` | 85 |
 | `RC_MAX_ITERATIONS` | 只命中 `max_iterations` | `max_iterations` | `iteration_limit -> stop` | `human_review_or_extend_limit` | 80 |
-| `RC_UNKNOWN` | 无规则命中 | `unknown` | `unknown` | `manual_diagnosis` | 999 |
+| `RC_UNKNOWN` | 明确登记为 `accepted_unknown` | `unknown` | `unknown` | `manual_diagnosis` | 900 |
+| `RC_RULE_MISSING` | 无规则命中且未登记为 accepted unknown | `root_cause_rule_missing` | `unclassified_reason -> root_cause_rule_missing` | `add_explicit_root_cause_rule` | 999 |
 
 规则要求：
 
@@ -1812,6 +1969,22 @@ RootCause 规则的数字 priority 不能靠维护者猜。优先级必须落入
 | Repair Quality | 60-79 | repair regression、same failure no progress、memory contradiction | 修复质量或经验污染问题 |
 | Resource / Limit | 80-89 | cost、context、iteration budget | 资源或上限触发 |
 | Fallback | 900-999 | unknown/manual diagnosis | 无明确规则命中 |
+
+Required RootCause rule authoring contract:
+
+```text
+priority_bands=safety:1-19,evidence_context:20-39,recovery:40-59,repair_quality:60-79,resource_limit:80-89,fallback:900-999
+default_rules=RC_CONTEXT_OMITTED_HIGH_RISK:safety:10,RC_PERMISSION_REVOKED:safety:15,RC_POLICY_LOOP:safety:18,RC_EVIDENCE_INCOMPLETE:evidence_context:20,RC_MEMORY_CONTRADICTION:evidence_context:30,RC_APPROVAL_PENDING:recovery:40,RC_BACKEND_CAPABILITY_DEGRADED:recovery:45,RC_NO_PROGRESS_PURE:repair_quality:60,RC_REPAIR_REGRESSION:repair_quality:65,RC_MAX_ITERATIONS:resource_limit:80,RC_RESOURCE_LIMIT:resource_limit:85,RC_UNKNOWN:fallback:900,RC_RULE_MISSING:fallback:999
+governance_fields=priority_bands,violations,violation_count,governance_pass
+new_rule_required_fixtures=3
+fallback_rule_id=RC_RULE_MISSING
+accepted_unknown_rule_id=RC_UNKNOWN
+missing_rule_metric=root_cause_rule_missing_total
+```
+
+RootCause Rule 新增规范必须和 `RootCauseRuleEngine.audit_rule_governance()` 保持一致：新增 rule 先选 priority band，再写 rule_id、reason_key、match expression、root_cause_primary、causal_chain、mitigation_action 和至少 3 个测试夹具；无法分类但已接受的原因必须显式命中 `RC_UNKNOWN`，未登记的新 reason 必须落到 `RC_RULE_MISSING` 并触发 `root_cause_rule_missing_total`，不能通过新增黑盒推断函数绕过规则表。
+
+后端实现必须提供 `RootCauseRuleEngine.audit_rule_governance()`，返回 priority band 范围、违规规则列表和 `governance_pass`，并通过管理员只读接口 `GET /api/v1/agents/root-cause-rules/audit` 暴露给运营、CI 和发布门禁使用。默认规则也必须通过该审计：`RC_PERMISSION_REVOKED` 使用 Safety / Policy band 内的 priority=15，`RC_POLICY_LOOP` 使用 Safety / Policy band 内的 priority=18，`RC_EVIDENCE_INCOMPLETE` 使用 Evidence / Context band 内的 priority=20，`RC_MEMORY_CONTRADICTION` 使用 Evidence / Context band 内的 priority=30，`RC_BACKEND_CAPABILITY_DEGRADED` 使用 Backend / Recovery band 内的 priority=45，`RC_NO_PROGRESS_PURE` 使用 Repair Quality band 内的 priority=60，`RC_REPAIR_REGRESSION` 使用 Repair Quality band 内的 priority=65，`RC_MAX_ITERATIONS` 使用 Resource / Limit band 内的 priority=80，`RC_RESOURCE_LIMIT` 使用 Resource / Limit band 内的 priority=85，`RC_UNKNOWN` 使用 Fallback band 内的 priority=900，`RC_RULE_MISSING` 使用 Fallback band 内的 priority=999。任何 priority 超出 band 或未知 band 的规则都必须被审计为 violation，不能只依赖人工 review 发现。
 
 新增规则流程：
 
@@ -2066,14 +2239,14 @@ Memory is candidate experience, not source of truth.
 
 不同来源必须有不同初始置信度：
 
-| source_type | 初始 confidence | authority | 说明 |
-|---|---:|---|---|
-| `user_confirmed` | `0.85` | `user` | 用户明确确认的项目规则或偏好 |
-| `execution_learned` | `0.70` | `system_record` | 多次执行记录归纳出的经验，必须有关联 execution evidence |
-| `document_imported` | `0.75` | `document` | 从接口文档、测试规范、项目文档导入，必须有 content_hash |
-| `agent_summarized` | `0.45` | `agent` | Agent 自己总结的经验，默认未验证 |
-| `repair_inferred` | `0.40` | `agent` | 单次 Repair 推断出的经验，必须后续验证 |
-| `external_imported` | `0.55` | `external` | 外部系统导入，受 stale 和 source freshness 影响 |
+| source_type | 初始 confidence | authority | 默认创建状态 | allowed_for_high_risk | 说明 |
+|---|---:|---|---|---|---|
+| `user_confirmed` | `0.85` | `user` | `active` | `true` | 用户明确确认的项目规则或偏好 |
+| `execution_learned` | `0.70` | `system_record` | `needs_review` | `true` | 多次执行记录归纳出的经验，必须有关联 execution evidence；验证后才可 active |
+| `document_imported` | `0.75` | `document` | `active` | `true` | 从接口文档、测试规范、项目文档导入，必须有 content_hash |
+| `agent_summarized` | `0.45` | `agent` | `needs_review` | `false` | Agent 自己总结的经验，默认未验证 |
+| `repair_inferred` | `0.40` | `agent` | `needs_review` | `false` | 单次 Repair 推断出的经验，必须后续验证 |
+| `external_imported` | `0.55` | `external` | `needs_review` | `false` | 外部系统导入，受 stale 和 source freshness 影响 |
 
 实现要求：
 
@@ -2081,6 +2254,8 @@ Memory is candidate experience, not source of truth.
 1. ai_project_memories.confidence 不再依赖单一 DEFAULT 0.5000 作为真实初始值。
 2. 创建 memory 时必须通过 MemorySourceProfileResolver 写入 source-specific initial_confidence。
 3. 如果 source_type 未配置 profile，memory 创建失败或进入 status=needs_review。
+4. high-risk 检索必须同时检查 retrieval profile 与 source profile 的 allowed_for_high_risk；不允许 external_imported 或 agent-sourced memory 仅靠手工提高 confidence 进入高风险 policy refs。
+5. 默认 source profiles 必须显式声明 `requires_content_hash`，其中 `document_imported=true`，其余内置 source_type 为 `false`；运行时 source_ref hash 校验必须读取 profile，而不是硬编码来源名称。
 ```
 
 ---
@@ -2174,6 +2349,9 @@ def memory_hard_gate(memory, task_risk, profile):
     if memory.expires_at and memory.expires_at < now():
         return Reject("memory_expired")
 
+    if task_risk == "high" and memory.stale_reason == "environment.updated":
+        return Reject("environment_updated_for_high_risk")
+
     if memory.confidence < profile.min_confidence:
         return Reject("memory_confidence_too_low")
 
@@ -2226,6 +2404,8 @@ CREATE TABLE ai_agent_memory_retrieval_profiles (
 | `repair_v1` | Repair / Critic | `0.55` | `0.60` | confidence 与 validation 提权，降低陈旧经验干扰 |
 | `high_risk_action_v1` | 高风险动作前 | `0.75` | `0.30` | memory 只能辅助，不能作为唯一依据 |
 | `audit_explain_v1` | 解释/审计 | `0.20` | `0.90` | 可展示低置信记忆，但不进入 policy refs |
+
+上述 source profile 与 retrieval profile 表格是冻结治理契约，不只是说明性文字。后端测试必须从本节表格抽取 `source_type -> initial_confidence/authority` 和 `profile -> min_confidence/max_stale_score`，并与默认 resolver seed 对齐；每个 retrieval profile 必须保持 active、version=1、非空 `change_reason`，且所有 ranking 权重字段由 profile 显式管理。
 
 计算公式必须引用 profile，而不是常量：
 
@@ -2306,6 +2486,8 @@ def compute_contradiction_penalty(memory, profile, now):
     return clamp(raw, 0.0, profile.max_contradiction_penalty)
 ```
 
+该公式、Severity multiplier 表和默认上限是冻结契约。后端测试必须从本节抽取 multiplier 与 `profile.max_contradiction_penalty` 默认值，和 `SEVERITY_MULTIPLIER` / `compute_contradiction_penalty` 的实际输出对齐；任何调整都必须同时改文档、默认 profile seed 与公式测试。
+
 默认上限：
 
 ```text
@@ -2360,6 +2542,28 @@ CREATE TABLE ai_agent_memory_evidence_links (
 );
 ```
 
+EvidenceWatch stale 触发必须记录可审计事件：
+
+```sql
+CREATE TABLE ai_agent_memory_staleness_events (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  project_id BIGINT NOT NULL,
+  memory_id BIGINT NOT NULL,
+  evidence_ref_type VARCHAR(64) NOT NULL,
+  evidence_ref_id VARCHAR(128) NOT NULL,
+  stale_reason VARCHAR(128) NOT NULL,
+  previous_stale_score DECIMAL(5,4) NOT NULL,
+  new_stale_score DECIMAL(5,4) NOT NULL,
+  previous_status VARCHAR(32) NOT NULL,
+  new_status VARCHAR(32) NOT NULL,
+  created_at DATETIME NOT NULL,
+
+  INDEX idx_memory_staleness_project (project_id, created_at),
+  INDEX idx_memory_staleness_memory (memory_id, created_at),
+  INDEX idx_memory_staleness_ref (evidence_ref_type, evidence_ref_id)
+);
+```
+
 外部事件处理表：
 
 | 平台事件 | Memory 动作 |
@@ -2367,9 +2571,14 @@ CREATE TABLE ai_agent_memory_evidence_links (
 | `scenario.updated` | 关联 scenario 的 memory `stale_score +0.20`，必要时 `needs_revalidation` |
 | `testcase.updated` | 关联 testcase 的 memory `stale_score +0.20` |
 | `environment.updated` | 关联 environment 的 memory `stale_score +0.30`，高风险 profile 直接排除 |
-| `manifest.changed` | 关联 skill/tool manifest 的 memory `needs_revalidation` |
+| `manifest.changed` | 关联 skill/tool manifest 的 memory `stale_score +0.25`，并进入 `needs_revalidation` |
 | `document.updated` | 关联 document 的 memory `stale_score +0.25` |
-| `execution_record.created` | 可用于验证或反驳 memory，生成 validation/contradiction event |
+| `report.updated` | 关联 report 的 memory `stale_score +0.20` |
+| `report.deleted` | 关联 report 的 memory `stale_score +0.20` |
+| `report.regenerated` | 关联 report 的 memory `stale_score +0.20` |
+| `execution_record.created` | 通过 `MemoryFeedbackWorker.process_execution_record_created` 复用 EvidenceLink 验证或反驳关联 memory，生成 validation/contradiction event；若误路由到 MemoryStalenessWorker，则以 `422 memory_event_not_stale_event` 拒绝 |
+| `permission.changed` | 不进入 MemoryStalenessWorker；以 `422 memory_event_not_stale_event` 拒绝后交由 execute-time permission check 重新判断 |
+| `memory.status_changed` | 不进入 MemoryStalenessWorker；以 `422 memory_event_not_stale_event` 拒绝后只作为审计/检索事实，不递归生成 stale event |
 
 ---
 
@@ -2386,6 +2595,13 @@ MemoryManager.retrieve
 -> LoopObservation.memory_usage / memory_contradiction_delta
 -> RootCauseRuleEngine
 ```
+
+`LoopObservation.memory_usage / memory_contradiction_delta` 必须由 `LoopController` 从 decision `ContextBuild.build_metadata_json.policy_refs` 中的 memory refs 自动派生：
+
+- `memory_usage.memory_ids` 记录进入 active policy refs 的 memory id。
+- `memory_contradiction_delta` 统计这些 memory 已记录的 contradiction events。
+- 调用方显式传入同名字段时可覆盖，但默认不得要求调用方手工补齐，否则 `RC_MEMORY_CONTRADICTION` 会漏判为普通 `same_failure_no_progress`。
+- 高风险动作不能只依赖 Memory，也不能用任意非 Memory 引用绕过；执行前必须至少有一个 active policy ref 同时满足受信来源（`system_record` / `project_config` / `execution_record` / `document_imported`）与冻结或可重验证条件（`immutable/versioned` 且带 `content_hash/version_id/snapshot_id`，或 `freshness_policy=revalidate_before_side_effect`）。
 
 MemoryCandidate：
 
@@ -2439,7 +2655,19 @@ CREATE TABLE ai_agent_memory_usage_events (
 ```python
 def validate_memory_usage_for_high_risk(action, active_refs):
     if action.side_effect_class in {"business_create", "business_update", "destructive", "external_effect"}:
-        if all(ref.ref_type == "memory" for ref in active_refs):
+        trusted_support = any(
+            (
+                ref.ref_type in {"system_record", "project_config", "execution_record", "document_imported"}
+                or ref.authority in {"system_record", "project_config", "execution_record", "document_imported"}
+            )
+            and (
+                ref.mutability_class in {"immutable", "versioned"}
+                and (ref.content_hash or ref.version_id or ref.snapshot_id)
+                or ref.freshness_policy == "revalidate_before_side_effect"
+            )
+            for ref in active_refs
+        )
+        if not trusted_support:
             return Deny("high_risk_action_cannot_depend_only_on_memory")
         if any(ref.ref_type == "memory" and ref.authority.startswith("memory:agent") for ref in active_refs):
             return RequireRevalidation("agent_memory_used_for_high_risk")
@@ -2456,7 +2684,7 @@ def validate_memory_usage_for_high_risk(action, active_refs):
 | memory 被用户明确否定 | `status=rejected; confidence=min(confidence,0.10)` |
 | 同一 memory 连续导致相同 failure fingerprint | `status=suspect; recent_contradiction_count +1` |
 | 关联 scenario/testcase/environment/manifest/document 变化 | 通过 EvidenceWatch 更新 `stale_score` 或 `needs_revalidation` |
-| 超过 TTL 未被执行样本验证 | `stale_score +0.10`，超过阈值后 `needs_revalidation` |
+| 超过 TTL 未被执行样本验证 | `MemoryMaintenanceWorker.process_expired_ttl` 将 `stale_score +0.10`，超过阈值后 `needs_revalidation` |
 | 用户确认正确 | `confidence +0.10`，刷新 `last_validated_at`，新增 validation event |
 | 多次 execution evidence 验证正确 | `validation_count +1; confidence +0.05; stale_score -0.10` |
 
@@ -2481,13 +2709,81 @@ MVP 阶段不允许 Agent 无约束自动写长期记忆。写入分级：
 | `agent_summarized` | P1/P2 | 默认 `needs_review` 或低 confidence |
 | `repair_inferred` | P2 | 必须后续执行验证，不得直接 active |
 
+`document_imported` 创建或更新 `source_ref_json` 时必须携带文档内容 hash（`content_hash` / `document_hash` / `source_hash`），否则返回 `document_imported_source_hash_required`。
+
 写入 API 必须区分：
 
 ```text
+GET  /api/v1/agents/memories                # 查询项目 memory
 POST /api/v1/agents/memories               # 创建用户确认或文档导入 memory
 POST /api/v1/agents/memories/{id}/validate # 用户或系统验证
 POST /api/v1/agents/memories/{id}/reject   # 用户否定
 PATCH /api/v1/agents/memories/{id}         # 修改会 memory_version +1
+POST /api/v1/agents/memories/retrieve      # 按 retrieval_profile 检索并包装 EvidenceRef
+GET  /api/v1/agents/memory-source-profiles
+GET  /api/v1/agents/memory-retrieval-profiles
+GET  /api/v1/agents/memory-usage-events
+GET  /api/v1/agents/memory-validation-events # 查询 Memory validation 审计事件
+GET  /api/v1/agents/memory-staleness-events # 查询 EvidenceWatch stale 审计事件
+POST /api/v1/agents/memory-usage-events/{usage_event_id}/feedback
+POST /api/v1/agents/memory-feedback/process
+```
+
+`GET /api/v1/agents/memory-usage-events` 的权限边界必须区分全局审计与 run scoped 查询：不带 `run_id` 时仅 admin 可读取最近 usage events；带 `run_id` 时必须先通过 `AgentRuntimeService.get_run(run_id, current_user)` 校验项目访问，再按该 run 过滤返回，不能让普通用户通过全局列表枚举跨项目 Memory 使用轨迹。
+
+Required Memory entity payload contract:
+
+```text
+fields=id,project_id,memory_type,title,content,content_hash,memory_version,source_type,source_ref_json,authority,confidence,initial_confidence,confidence_reason_json,contradiction_count,recent_contradiction_count,validation_count,recent_validation_count,stale_score,stale_reason_json,status,evidence_refs_json,watched_refs_json,created_by,created_at,updated_at
+source=AgentMemoryRead
+```
+
+Required Memory profile catalog payload contract:
+
+```text
+source_profile_fields=source_type,initial_confidence,authority,default_ttl_days,requires_source_ref,requires_content_hash,allowed_for_high_risk,status
+retrieval_profile_fields=profile_name,task_scope,risk_level,min_confidence,max_stale_score,allow_memory_for_high_risk,semantic_weight,confidence_weight,recency_weight,authority_weight,validation_weight,stale_weight,contradiction_weight,max_contradiction_penalty,version,status,change_reason
+source=MemoryProfileCatalogRoutes
+```
+
+Required Memory usage event payload contract:
+
+```text
+fields=id,memory_id,run_id,iteration,step_index,tool_call_id,context_build_id,retrieval_profile,retrieval_score,usage_role,active_for_policy,caused_tool_input_change,outcome,evidence_ref_json,feedback_state,feedback_processed_at,feedback_result_json,created_at
+evidence_ref_fields=evidence_ref_id,ref_type,ref_id,mutability_class,dependency_role,active_for_policy,version_id,content_hash,captured_at,freshness_policy,required_for_high_risk,authority
+source=GET /api/v1/agents/memory-usage-events
+```
+
+Required Memory staleness event payload contract:
+
+```text
+fields=id,project_id,memory_id,evidence_ref_type,evidence_ref_id,stale_reason,previous_stale_score,new_stale_score,previous_status,new_status,created_at
+source=GET /api/v1/agents/memory-staleness-events
+```
+
+Required Memory validation event payload contract:
+
+```text
+fields=id,project_id,memory_id,run_id,tool_call_id,usage_event_id,validation_source,evidence_ref_json,reason,previous_confidence,new_confidence,previous_stale_score,new_stale_score,previous_status,new_status,validation_count,created_at
+source=GET /api/v1/agents/memory-validation-events
+```
+
+Required Memory retrieval payload contract:
+
+```text
+candidate_fields=memory_id,memory_version,title,content,source_type,confidence,stale_score,retrieval_score,retrieval_profile,evidence_ref,allowed_usage
+evidence_ref_fields=evidence_ref_id,ref_type,ref_id,mutability_class,dependency_role,active_for_policy,version_id,content_hash,captured_at,freshness_policy,required_for_high_risk,authority
+source=MemoryManager.retrieve
+```
+
+`POST /api/v1/agents/memory-feedback/process` 是 admin-only 全局后台处理入口，用于消费 pending/retry usage feedback 并驱动 confidence、stale、validation 与 contradiction 更新；普通项目用户不得触发全局 Memory feedback 批处理。
+
+Required Memory feedback process payload contract:
+
+```text
+fields=attempted,processed,skipped,contradictions_recorded,validations_recorded,results
+result_base_fields=usage_event_id,processed,decision
+source=MemoryFeedbackWorker.process_due
 ```
 
 ---
@@ -2500,11 +2796,11 @@ PATCH /api/v1/agents/memories/{id}         # 修改会 memory_version +1
 | `memory_used_active_policy_total` | Memory 进入 active policy refs 次数 |
 | `memory_high_risk_blocked_total` | 高风险动作因只依赖 memory 被阻断次数 |
 | `memory_contradiction_total` | Memory 被证明矛盾次数 |
-| `memory_contradiction_penalty_applied_total` | contradiction penalty 生效次数 |
-| `memory_needs_revalidation_total` | Memory 因外部变化进入 needs_revalidation 次数 |
-| `memory_evidence_watch_stale_total` | EvidenceWatch 触发 memory stale 次数 |
-| `memory_low_confidence_filtered_total` | 因 confidence 低被 hard gate 过滤次数 |
-| `memory_retrieval_profile_missing_total` | 检索 profile 缺失次数 |
+| `memory_contradiction_penalty_applied_total` | contradiction penalty 生效次数；带 run 上下文的检索评分写入 `memory.contradiction_penalty_applied` 事件 |
+| `memory_needs_revalidation_total` | Memory 因外部变化或 TTL 降权进入 needs_revalidation 次数；P1 告警 `agent_memory_needs_revalidation` 指向 `checkpoint_stale` runbook |
+| `memory_evidence_watch_stale_total` | EvidenceWatch 触发 memory stale 次数；按 `ai_agent_memory_staleness_events` 计数 |
+| `memory_low_confidence_filtered_total` | 因 confidence 低被 hard gate 过滤次数；带 run 上下文的检索过滤写入 `memory.low_confidence_filtered` 事件 |
+| `memory_retrieval_profile_missing_total` | 检索 profile 缺失次数；带 run 上下文的检索失败写入 `memory.retrieval_profile_missing` 事件 |
 | `memory_bypassed_evidence_ref_total` | 检测到 memory 绕过 EvidenceRef 的违规次数，必须 P0 报警 |
 
 ---
@@ -2534,14 +2830,31 @@ MemoryManager
 
 ```text
 GET  /api/v1/agents/capabilities
+GET  /api/v1/agents/metrics
+GET  /api/v1/agents/model-health
+GET  /api/v1/agents/conversations
+GET  /api/v1/agents/conversations/{conversation_id}/runs
+GET  /api/v1/agents/conversations/{conversation_id}/transcript
+GET  /api/v1/agents/conversations/{conversation_id}/export
+GET  /api/v1/agents/runs
 POST /api/v1/agents/runs
 GET  /api/v1/agents/runs/{run_id}
+GET  /api/v1/agents/runs/{run_id}/summary
+GET  /api/v1/agents/runs/{run_id}/actions
 GET  /api/v1/agents/runs/{run_id}/events
+POST /api/v1/agents/runs/{run_id}/context-builds
+GET  /api/v1/agents/runs/{run_id}/context-builds
+POST /api/v1/agents/runs/{run_id}/loop-observations
+GET  /api/v1/agents/runs/{run_id}/loop-observations
 POST /api/v1/agents/runs/{run_id}/cancel
 
 POST /api/v1/agents/tool-calls/{tool_call_id}/approve
 POST /api/v1/agents/tool-calls/{tool_call_id}/reject
 GET  /api/v1/agents/tool-calls/{tool_call_id}
+GET  /api/v1/agents/runs/{run_id}/approvals
+GET  /api/v1/agents/approvals/expire-audit
+POST /api/v1/agents/approvals/expire
+GET  /api/v1/agents/events/replay-stress-audit
 
 POST /api/v1/agents/runs/{run_id}/resume
 POST /api/v1/agents/runs/{run_id}/reconcile
@@ -2558,9 +2871,118 @@ POST /api/v1/agents/memories/{memory_id}/validate
 POST /api/v1/agents/memories/{memory_id}/reject
 GET  /api/v1/agents/memory-retrieval-profiles
 GET  /api/v1/agents/memory-usage-events
+GET  /api/v1/agents/memory-validation-events
+GET  /api/v1/agents/memory-staleness-events
+GET  /api/v1/agents/runbooks
 ```
 
-Approve API 必须要求前端提交：
+`GET /api/v1/agents/backend-contracts/{backend_name}/operations/{backend_operation}` 是 admin-only 全局 backend operation contract 查询接口；响应包含 schema hash、reconcile contract、result adapter 与 operation 级 effect capability，不能允许普通项目用户枚举跨 backend 的 contract/capability 信息。
+
+`GET /api/v1/agents/runtime-snapshots/{snapshot_id}` 与 `GET /api/v1/agents/tool-calls/{tool_call_id}` 属于 object-scoped 读取接口，必须分别按 snapshot.project_id 与 ToolCall 所属 run.project_id 校验项目访问权限；项目成员和 admin 可读取，项目外用户必须 403，避免冻结运行时快照或执行明细被跨项目枚举。
+
+Required RuntimeSnapshot entity payload contract:
+
+```text
+fields=snapshot_id,project_id,created_by,runtime_hash,tool_registry_hash,manifest_bundle_hash,prompt_bundle_hash,policy_version_hash,tools_json,manifests_json,adapters_json,policies_json,created_at
+source=AgentRuntimeSnapshotRead
+```
+
+Required ToolCall entity payload contract:
+
+```text
+fields=tool_call_id,run_id,step_index,attempt_index,runtime_snapshot_id,tool_name,tool_version,schema_hash,manifest_hash,idempotency_scope,idempotency_key,base_side_effect_class,resolved_side_effect_class,base_replay_policy,resolved_replay_policy,policy_reason_json,status,execution_phase,effect_submission_state,input_hash,input_json_redacted,evidence_refs_json,policy_evidence_refs_json,audit_evidence_refs_json,evidence_mutability_summary_json,decision_context_build_id,output_hash,output_json_redacted,required_permissions_json,permission_snapshot_json,approval_required,approval_scope_hash,approval_lineage_id,approval_epoch,approved_approval_id,approved_by,approved_at,backend_name,backend_operation,backend_contract_version,backend_request_schema_hash,backend_output_schema_hash,reconcile_contract_version,result_adapter_version,backend_effect_capability,recovery_decision,error_code,error_message,current_approval,approval_lineage,recent_reconcile_attempts,created_at,updated_at
+source=AgentToolCallRead
+```
+
+`GET /api/v1/agents/runs/{run_id}/summary`、`GET/POST /api/v1/agents/runs/{run_id}/context-builds`、`GET/POST /api/v1/agents/runs/{run_id}/loop-observations`、`GET /api/v1/agents/runs/{run_id}/approvals`、`GET /api/v1/agents/runs/{run_id}/migration-blocks` 与 `POST /api/v1/agents/runs/{run_id}/migration-blocks/{block_id}/resolve` 属于 run-derived resource API；路由层或服务层必须通过 `AgentRuntimeService.get_run` / `PolicyManager.require_run_access` / `MigrationCoordinator` 等等价路径先校验 run 所属项目访问权限，项目外用户必须 403，避免 Summary、ContextBuild、LoopObservation、Approval 与 MigrationBlock 被跨项目枚举或操作。
+
+Required ContextBuild entity payload contract:
+
+```text
+fields=context_build_id,run_id,iteration,step_index,build_seq,build_purpose,model_name,token_budget,estimated_input_tokens,context_degradation_level,compressed_sections_json,omitted_evidence_refs_json,required_evidence_refs_json,required_evidence_complete,decision_quality_risk,prompt_object_key,prompt_hash,build_metadata_json,created_at
+source=AgentContextBuildRead
+```
+
+Required LoopObservation entity payload contract:
+
+```text
+fields=observation_id,run_id,iteration,step_index,decision_context_build_id,decision_context_degradation_level,iteration_context_degradation_max,required_evidence_complete_for_decision,omitted_required_evidence_refs_json,next_action,next_action_is_high_risk,stop_action_reason,stop_reasons_all_json,root_cause_primary,root_cause_rule_id,causal_chain_json,mitigation_action,observation_json,created_at
+source=AgentLoopObservationRead
+```
+
+Required Agent Run entity payload contract:
+
+```text
+fields=run_id,project_id,user_id,conversation_id,intent,status,current_iteration,current_step_index,max_iterations,runtime_snapshot_id,last_checkpoint_id,last_event_sequence,migration_block_count,blocking_tool_call_ids_json,result_json,error_code,error_message,started_at,completed_at,created_at,updated_at
+source=AgentRunRead
+```
+
+Required Agent Run summary payload contract:
+
+```text
+fields=run,assistant_message,assistant_visible,completion_source,model_invoked,model,finish_reason,usage,event_count,latest_event_sequence,latest_event_types,tool_call_count,pending_tool_call_count,approval_count,pending_approval_count,migration_block_count,open_migration_block_count,memory_usage_count,blocking_tool_call_ids,terminal,can_cancel,can_resume,updated_at
+source=AgentRunSummaryRead
+```
+
+`GET /api/v1/agents/runs/{run_id}/actions` 是 Codex 式右侧操作区的只读聚合接口。它不新增事实源，只读取 Run、ToolCall、Approval、MigrationBlock 等当前状态，输出固定 action 列表：`view_summary`、`stream_events`、`cancel_run`、`review_approvals`、`resume_run`、`reconcile_run`、`resolve_migration`、`open_runbook`。`enabled=false` 时必须给出稳定 `reason`，让前端不用从多个接口反推按钮禁用原因；`primary_action_ids` 按后端优先级输出当前最需要用户关注的操作。
+
+Required Agent Run action state payload contract:
+
+```text
+fields=run_summary,actions,primary_action_ids,blocked_reasons,generated_at
+action_fields=action_id,label,method,path,enabled,reason,severity,resource_ids,details
+action_ids=view_summary,stream_events,cancel_run,review_approvals,resume_run,reconcile_run,resolve_migration,open_runbook
+source=AgentRunActionStateRead
+```
+
+`GET /api/v1/agents/conversations/{conversation_id}/transcript` 是 conversation-scoped 的只读聚合接口，用于恢复 Codex 式多轮 transcript。它不新增事实源，只读取同项目、同 `conversation_id` 的 `AgentRun`，并按 run 创建时间升序嵌套 `AgentRunSummaryRead`；最新状态、assistant 最终回复、tool/approval/migration/memory 计数仍以 run summary 聚合为准。该接口必须带 `project_id` 并先校验项目访问权限，项目外用户不得通过 conversation_id 枚举跨项目历史。
+
+Required Agent Conversation transcript payload contract:
+
+```text
+fields=conversation,turns,generated_at
+conversation_fields=conversation_id,project_id,title,run_count,latest_run_id,latest_run_status,created_at,updated_at
+turn_fields=run,assistant_message,assistant_visible,completion_source,model_invoked,model,finish_reason,usage,event_count,latest_event_sequence,latest_event_types,tool_call_count,pending_tool_call_count,approval_count,pending_approval_count,migration_block_count,open_migration_block_count,memory_usage_count,blocking_tool_call_ids,terminal,can_cancel,can_resume,updated_at
+source=AgentConversationTranscriptRead
+```
+
+`GET /api/v1/agents/conversations/{conversation_id}/export` 是 conversation-scoped 的只读导出接口，用于前端下载或调试 Codex 式 conversation。它必须复用 transcript 的项目权限校验和 run 顺序，不新增事实源，只按 run_id 分组读取 `AgentEvent`、`AgentToolCall`、`AgentApproval` 与 `AgentMigrationBlock`；导出数据必须使用 redacted 字段和已脱敏 payload，不能绕过现有敏感信息处理。
+
+Required Agent Conversation export payload contract:
+
+```text
+fields=conversation,turns,events_by_run_id,tool_calls_by_run_id,approvals_by_run_id,migration_blocks_by_run_id,export_format,generated_at,derived_from
+conversation_fields=conversation_id,project_id,title,run_count,latest_run_id,latest_run_status,created_at,updated_at
+turn_fields=run,assistant_message,assistant_visible,completion_source,model_invoked,model,finish_reason,usage,event_count,latest_event_sequence,latest_event_types,tool_call_count,pending_tool_call_count,approval_count,pending_approval_count,migration_block_count,open_migration_block_count,memory_usage_count,blocking_tool_call_ids,terminal,can_cancel,can_resume,updated_at
+event_fields=event_seq,event_type,payload_json,created_at
+tool_call_fields=tool_call_id,run_id,step_index,attempt_index,runtime_snapshot_id,tool_name,tool_version,schema_hash,manifest_hash,idempotency_scope,idempotency_key,base_side_effect_class,resolved_side_effect_class,base_replay_policy,resolved_replay_policy,policy_reason_json,status,execution_phase,effect_submission_state,input_hash,input_json_redacted,evidence_refs_json,policy_evidence_refs_json,audit_evidence_refs_json,evidence_mutability_summary_json,decision_context_build_id,output_hash,output_json_redacted,required_permissions_json,permission_snapshot_json,approval_required,approval_scope_hash,approval_lineage_id,approval_epoch,approved_approval_id,approved_by,approved_at,backend_name,backend_operation,backend_contract_version,backend_request_schema_hash,backend_output_schema_hash,reconcile_contract_version,result_adapter_version,backend_effect_capability,recovery_decision,error_code,error_message,current_approval,approval_lineage,recent_reconcile_attempts,created_at,updated_at
+source=AgentConversationExportRead
+```
+
+`GET /api/v1/agents/worker-queue/audit` 与 `GET /api/v1/agents/events/replay-stress-audit` 是操作审计治理接口，必须支持 admin 全局审计与 project-scoped 审计两种模式：不带 `project_id` 时仅 admin 可读取全局结果；带 `project_id` 时必须先校验项目访问权限，并只返回该项目关联 run 的 WorkerQueue 或 replay stress 审计结果。
+
+Required WorkerQueue audit payload contract:
+
+```text
+fields=project_id,generated_at,status_counts,total_count,active_count,expired_lease_count,duplicate_active_lease_count,oldest_queued_age_ms,lease_scan_stable,expired_leases,duplicate_active_leases,derived_from
+expired_lease_fields=queue_id,run_id,tool_call_id,lease_owner,lease_expires_at,attempt_count,last_error_code
+duplicate_active_fields=tool_call_id,queue_ids,statuses,lease_owners
+derived_from_fields=queue_table,active_statuses,scope
+source=AgentWorkerQueueAuditService.audit
+```
+
+`POST /api/v1/agents/outbox/publish` 是 admin-only 全局后台处理入口，用于发布、重试或死信 Agent Outbox 待发布事件；普通项目用户不得手动触发全局 Outbox 发布批处理。
+
+Required Outbox publish payload contract:
+
+```text
+fields=attempted,published,failed,dead_letter,pending_remaining,outbox_publish_lag_ms
+source=AgentOutboxPublisher.publish_pending
+```
+
+所有 Harness 文档中声明的 `/api/v1/agents...` 路径及其 HTTP method 必须能在 FastAPI OpenAPI paths 中找到；测试从开发计划和架构文档抽取 method+path 并与 `create_app().openapi()["paths"]` 对齐，历史 memory `{id}` 占位符归一化为当前 `{memory_id}`，避免文档 API 契约和路由实现分叉。
+
+Approve/Reject API 必须要求前端提交：
 
 ```json
 {
@@ -2572,15 +2994,43 @@ Approve API 必须要求前端提交：
 }
 ```
 
+OpenAPI 中 `POST /api/v1/agents/tool-calls/{tool_call_id}/approve` 与 `POST /api/v1/agents/tool-calls/{tool_call_id}/reject` 必须共用 `AgentApprovalDecisionRequest` 请求体，并将上述五个 CAS 字段保持为 required；`reason` 只能作为可选审计说明，不能替代 CAS 校验字段。
+
+Required Approval concurrency contract:
+
+```text
+final_statuses=approved,rejected,expired,superseded
+approvable_tool_call_statuses=planned,pending_approval
+supersede_blocked_tool_call_statuses=leased,running_pre_effect,effect_sent,uncertain,reconciling,succeeded
+immutable_fields=input_hash,runtime_snapshot_id,resource_scope_hash,approval_lineage_id,approval_epoch
+mutation_types=create,approve,reject,supersede,create_replacement,expire
+event_types=approval.created,approval.approved,approval.rejected,approval.superseded,approval.expired,approval.approve_conflict,approval.reject_conflict
+conflict_error_codes=approval_stale_or_superseded,approval_epoch_conflict,approval_input_changed,tool_call_not_approvable,cannot_supersede_executing_call
+approve_reject_schema_required_fields=input_hash,runtime_snapshot_id,resource_scope_hash,approval_lineage_id,approval_epoch
+reason_required=false
+replacement_atomic=true
+expire_process_one_lineage_per_mutation=true
+```
+
+Approval 并发规范必须和 `ApprovalMutationGuard` 保持一致：approve/reject 只能操作当前 lineage epoch 的 pending approval；replacement 必须在同一事务中把旧 approval 标记为 `superseded`、旧 ToolCall 标记为 `obsolete`、创建 replacement ToolCall 与新 pending approval，并递增 `approval_epoch`；过期扫描必须逐 lineage 短事务处理，不能批量长事务锁多个 lineage。
+
 错误码：
 
 | HTTP | code | 含义 |
 |---:|---|---|
 | 409 | `approval_stale_or_superseded` | 审批已过期、被替代或状态不再是 pending |
-| 409 | `approval_epoch_changed` | repair 已创建 replacement tool_call，前端审批页过期 |
+| 409 | `approval_epoch_conflict` | repair 已创建 replacement tool_call，前端审批页过期 |
 | 409 | `approval_input_changed` | 前端提交的 input_hash 已不是当前审批 input |
-| 409 | `tool_call_not_approvable` | tool_call 已执行、取消、废弃或不在可审批状态 |
+| 409 | `tool_call_obsolete` | tool_call 已执行、取消、废弃或不在可审批/可创建后续调用状态 |
 | 409 | `run_migration_blocked` | Run 存在 open migration block，不能继续 resume |
+| 409 | `checkpoint_stale_replan_required` | checkpoint/runtime snapshot 过旧，必须从最新安全状态重新规划 |
+| 403 | `permission_revoked_before_execution` | execute-time 或 resume freshness 发现权限已撤销 |
+| 422 | `backend_contract_unsupported` | backend operation contract 缺失或 schema/version 不兼容 |
+| 423 | `tool_call_uncertain_reconcile_required` | uncertain/reconciling ToolCall 误入执行队列，必须先 reconcile |
+| 424 | `backend_reconcile_not_supported` | 高风险旧后端缺少 receipt/reconcile 能力，不能自动确认副作用 |
+| 424 | `backend_capability_too_weak` | operation 级 BackendEffectCapability 弱于高风险动作要求 |
+| 422 | `memory_event_not_stale_event` | 非 stale 平台事件误路由到 MemoryStalenessWorker |
+| 500 | `event_outbox_write_failed` | EventStore / Outbox 同事务写入失败，主事务已回滚 |
 
 SSE 事件类型扩展：
 
@@ -2599,8 +3049,13 @@ step.completed
 step.failed
 
 model.started
+memory.context_injected
+memory.context_unavailable
 model.delta
 model.completed
+model.tool_request_invalid
+model.tool_request_repaired
+model.tool_request_repair_failed
 
 tool.planned
 tool.leased
@@ -2638,6 +3093,18 @@ migration.block_resolved
 heartbeat
 ```
 
+无工具调用的对话型 Run 通过 `AIService.chat_stream()` 生成模型输出，但模型输出仍必须先写入 EventStore：`memory.context_injected` 表示本轮模型调用前已注入项目 Memory，`model.started` 表示模型调用开始，`model.delta.content` 表示流式增量，`model.completed.content` 表示完整 assistant 文本。普通自然语言的 `model.delta` 必须在模型 stream 仍在进行时实时写入 EventStore/SSE；只有疑似 `agent_tool_request` 的输出需要先缓冲到可判断格式，避免工具请求 JSON 被前端展示为 assistant 文本。SSE 只负责读取这些事件并传输给前端，刷新后的最终文本以 `run.completed.result.message` 校准。`POST /api/v1/agents/runs/{run_id}/cancel` 是外部并发取消信号，`AgentConversationRunner` 必须在模型 stream、工具请求 repair、ToolCall 创建前和 final summary 结束后重新读取 run terminal 状态；一旦 `run.cancelled` 已写入，后续不得再写 `model.completed(final_summary=true)` 或 `run.completed` 覆盖取消结果。
+
+普通 `POST /api/v1/agents/runs` 创建后必须把非 terminal run 交给 `AgentConversationRunner`。MySQL 与文件 SQLite 环境都应提交后台 worker；只有 in-memory SQLite 单元测试库可以跳过后台线程，避免测试库跨线程不可见。生产或本地文件库中如果事件链停在 `run.started` 且只有 heartbeat，就视为 runner 启动链路异常，必须通过 `GET /api/v1/agents/runs/{run_id}/events/snapshot`、`GET /api/v1/agents/model-health` 携带 `live=true`，或 `POST /api/v1/agents/conversation-smoke` 定位。
+
+真实环境排障还必须能从后端仓库运行 `scripts/agent_conversation_e2e_check.py`。该脚本复用普通用户 `create_agent_run` 路径，而不是 admin-only smoke shortcut；它先做 `AgentModelHealthService.check(live=True)`，再在真实数据库上创建普通 run，并通过 `AgentRuntimeService.get_event_snapshot` 轮询 EventStore。成功条件是 `model.started`、至少一个 `model.delta`、`model.completed`、`run.completed` 和 summary `assistant_visible=true` 全部出现。若脚本成功但前端没有显示回复，架构判断应转向前端 SSE 解析、鉴权 header、cursor 或渲染状态，而不是继续怀疑 provider key、MySQL 迁移或 runner 启动。
+
+`AgentRunCreateRequest.auto_complete` 不属于真实模型对话路径，只能用于后端 smoke/debug、EventStore replay 和 Outbox 回归。auto-complete Run 可以写入 `run.completed`，但结果必须显式标记 `completion_source=smoke_auto_complete`、`model_invoked=false`、`assistant_visible=false`，以证明它没有调用模型，也不能被 UI 渲染为 assistant 对话气泡。
+
+模型工具请求格式错误不应直接让 Codex 风格对话断流：`AgentConversationRunner` 发现 `agent_tool_request` JSON 缺字段、类型错误或非法 JSON 时，必须写入 `model.tool_request_invalid`，追加一条修复提示并再次调用模型，`model.started.repair_attempt=true` 标记这次修复调用。修复输出若成为合法工具请求，写入 `model.tool_request_repaired` 后继续 `model.tool_request_detected -> ToolCall`；修复仍不合法时写入 `model.tool_request_repair_failed` 并按模型错误终止 run。
+
+业务 recipe 级工具顺序也由 Harness 校验，而不是只依赖提示词。当前规则是：`scenario.compose_draft` 在同一 run 内必须看到至少一个成功的 `testcase.query_project_cases` ToolCall；缺失时该 compose ToolCall 在执行前失败，`error_code=scenario_compose_requires_case_query`，并通过 `tool.result_observed` 作为模型下一轮输入。该失败属于可恢复的流程纠正信号，前端展示为 ToolCall 错误，最终是否失败仍以 run terminal 状态为准。
+
 ---
 
 ## 17. 监控与报警
@@ -2647,6 +3114,7 @@ heartbeat
 | `tool_call_uncertain_total` | 未知提交状态数量 |
 | `tool_call_reconcile_success_total` | reconcile 成功数量 |
 | `tool_call_reconcile_manual_total` | reconcile 转人工数量 |
+| `reconcile_backoff_active_total` | 当前被 `next_retry_at` backoff 闸门节流的 ToolCall 数量 |
 | `tool_call_orphan_recovered_total` | lease 超时后恢复数量 |
 | `tool_call_send_intent_orphan_total` | 只记录发送意图后 Worker 崩溃数量 |
 | `tool_call_safe_retry_after_send_intent_not_found_total` | send_intent + not_found 后安全重试数量 |
@@ -2682,6 +3150,588 @@ heartbeat
 | `backend_contract_migration_block_total` | 下游契约兼容性阻断数量 |
 | `run_migration_blocked_total` | Run 因 ToolCall migration block 被级联阻断数量 |
 | `outbox_publish_lag_ms` | 事件发布延迟 |
+| `event_replay_gap_total` | EventStore event_seq gap run 数量 |
+| `event_replay_stress_failed_total` | 项目级 replay stress audit 中不可重放的 run 数量 |
+| `event_replay_stress_cursor_window_total` | replay stress audit 覆盖的 Last-Event-ID 游标窗口数量 |
+| `event_replay_stress_max_window_events` | 单个游标窗口最大重放事件数 |
+| `fault_injection_required_case_total` | 当前生产硬化 required fault cases 数量 |
+| `fault_injection_registered_case_total` | 当前已注册 fault injection cases 数量 |
+| `fault_injection_missing_required_total` | required fault cases 缺失数量 |
+| `fault_injection_coverage_ratio` | required fault cases 注册覆盖率 |
+| `worker_queue_expired_lease_total` | WorkerQueue 当前过期 lease 数量 |
+| `worker_queue_duplicate_active_lease_total` | 同一 ToolCall 存在多个 active queue 行的数量 |
+| `worker_queue_oldest_queued_age_ms` | 当前最老 queued 任务等待时长 |
+| `approval_expire_due_total` | 当前已到期但仍 pending 的 approval 数量 |
+| `approval_expire_batch_lag_ms` | 最老到期 approval 的过期滞后 |
+| `approval_lineage_hotspot_total` | 同一 approval_lineage 下存在多个已到期 pending approval 的热点数量 |
+
+Readiness dashboard 后端聚合接口：
+
+```text
+GET /api/v1/agents/metrics
+GET /api/v1/agents/dashboard
+GET /api/v1/agents/launch-audit
+GET /api/v1/agents/backend-completion-audit
+GET /api/v1/agents/runbooks
+GET /api/v1/agents/model-health
+GET /api/v1/agents/release-gates
+GET /api/v1/agents/release-gates/promotion
+GET /api/v1/agents/alerts
+GET /api/v1/agents/worker-queue/audit
+GET /api/v1/agents/approvals/expire-audit
+POST /api/v1/agents/approvals/expire
+GET /api/v1/agents/fault-injections/coverage
+GET /api/v1/agents/events/replay-stress-audit
+GET /api/v1/agents/runs/{run_id}/runbook
+GET /api/v1/agents/runs/{run_id}/events/snapshot
+GET /api/v1/agents/runs/{run_id}/events/replay-audit
+```
+
+Dashboard 不新增事实源，只聚合现有可审计服务：
+
+```text
+AgentMetricsService.snapshot
+AgentReleaseGateService.snapshot
+AgentReleaseGateService.promotion_assessment
+AgentFaultInjectionService.list_cases
+AgentFaultInjectionCoverageService.audit
+AgentRunbookService.list_runbooks
+AgentRunbookService.diagnose_run
+AgentAlertService.snapshot
+AgentEventReplayAuditService.audit_run
+AgentEventReplayAuditService.audit_project
+AgentWorkerQueueAuditService.audit
+ApprovalExpireScanner.audit
+```
+
+Reconcile backoff 闸门规则：
+
+```text
+每个 ToolCall 以最新 AgentReconcileAttempt.attempt_seq 为准
+latest_attempt.next_retry_at > now 时，本轮 reconcile_run 跳过该 ToolCall
+跳过项不调用 BackendReconcileRouter / backend adapter
+AgentRunReconcileRead 返回 skipped_backoff 与 skipped_backoff_tool_calls
+reconcile_backoff_active_total 统计当前仍在 backoff 窗口内的 uncertain/reconciling ToolCall
+```
+
+Event replay audit 规则：
+
+```text
+last_event_sequence 必须等于 EventStore 中连续 event_seq 的最大值
+event_seq 必须覆盖 1..last_event_sequence
+duplicate / missing / unexpected sequences 均视为 replayable=false
+after_sequence 对应 SSE Last-Event-ID，返回 replay_event_count 与 first/last replay seq
+```
+
+Event replay stress audit 规则：
+
+```text
+按 project_id 抽样最近 runs，sample_limit 默认 100
+每个 run 生成 cursor_count 个 Last-Event-ID 窗口，默认覆盖 0 / 中间位置 / last_event_sequence-1
+任一 cursor window replayable=false 或 replay_cursor_valid=false，计入 failed_run_ids
+high_concurrency_replayable 仅在 failed_run_count=0 且 invalid_cursor_count=0 时为 true
+event_replay_stress_failed_total > 0 触发 P1 告警
+```
+
+Required Agent Event entity payload contract:
+
+```text
+fields=event_seq,event_type,payload_json,created_at
+source=AgentEventRead
+```
+
+Required Agent Run event snapshot payload contract:
+
+```text
+fields=run,events,after_sequence,event_count,latest_event_sequence,next_after_sequence,terminal,generated_at
+event_fields=event_seq,event_type,payload_json,created_at
+source=AgentRunEventSnapshotRead
+```
+
+Required Event Replay audit payload contract:
+
+```text
+run_fields=run_id,project_id,last_event_sequence,after_sequence,event_count,replay_event_count,first_replay_event_seq,last_replay_event_seq,missing_sequences,duplicate_sequences,unexpected_sequences,replayable,replay_cursor_valid
+stress_fields=project_id,generated_at,sample_limit,cursor_count,audited_run_count,cursor_window_count,failed_run_count,failed_run_ids,invalid_cursor_count,total_replay_events,max_replay_window_events,high_concurrency_replayable,run_audits,derived_from
+stress_run_fields=run_id,project_id,last_event_sequence,event_count,cursor_audits,replayable
+cursor_fields=after_sequence,replay_event_count,first_replay_event_seq,last_replay_event_seq,replayable,replay_cursor_valid
+derived_from_fields=runs,events,cursor_policy
+source=AgentEventReplayAuditService
+```
+
+Fault injection coverage audit 规则：
+
+```text
+GET /api/v1/agents/fault-injections 与 GET /api/v1/agents/fault-injections/coverage 是 admin-only 全局生产硬化目录/审计接口
+POST /api/v1/agents/fault-injections/run 是 admin-only 生产硬化执行入口，必须指定 project_id，普通项目用户不得触发故障注入执行
+required set 覆盖 26 个生产硬化故障注入用例
+registered_case_count 来自 AgentFaultInjectionService.list_cases
+missing_required_case_ids 非空时 coverage_pass=false
+fault_injection_missing_required_total > 0 触发 P1 告警
+dashboard 的 fault_injection summary、metrics 与 GET /fault-injections/coverage 必须使用同一审计结果
+dashboard 的 fault_injection_catalog_complete check details 必须输出 covered_required_case_ids / missing_required_case_ids / extra_case_ids
+```
+
+Required fault injection payload contract:
+
+```text
+case_fields=case_id,description,expected
+coverage_fields=generated_at,registered_case_count,required_case_count,covered_required_case_ids,missing_required_case_ids,extra_case_ids,coverage_ratio,coverage_pass,derived_from
+run_fields=project_id,requested,passed,failed,results
+result_fields=case_id,run_id,tool_call_id,passed,observed,evidence
+source=AgentFaultInjectionService_and_AgentFaultInjectionCoverageService
+```
+
+Required fault injection cases:
+
+```text
+send_intent_not_found
+transport_sent_not_found
+backend_accepted_not_found
+effect_committed_reconcile_reuse
+tool_succeeded_eventstore_write_failed
+outbox_publish_failure
+reconcile_conflict
+unsupported_schema_version
+migration_block_resolve_checkpoint_continue
+legacy_no_receipt_high_risk
+approval_epoch_conflict
+approval_supersede_replacement_atomic
+approval_expired_before_approve
+checkpoint_stale
+context_heavy_evidence_incomplete
+loop_observation_decision_context_binding
+evidence_historical_volatile_excluded
+evidence_mixed_volatile_frozen_requires_revalidation
+memory_contradiction
+memory_stale_evidence_watch
+memory_bypassed_evidence_ref
+duplicate_idempotency_key
+permission_revoked_before_execution
+worker_queue_reconcile_required
+root_cause_rule_missing
+high_risk_memory_only_blocked
+```
+
+WorkerQueue audit 规则：
+
+```text
+queued / leased 视为 active queue 状态
+leased 且 lease_expires_at <= now 计入 expired_lease_count
+同一 tool_call_id 同时存在多个 active queue 行计入 duplicate_active_lease_count
+lease_scan_stable 仅在 expired_lease_count=0 且 duplicate_active_lease_count=0 时为 true
+```
+
+Approval expire audit 规则：
+
+```text
+pending 且 expires_at <= now 计入 approval_expire_due_total
+oldest_due_lag_ms 取最早到期 approval 到当前时间的滞后
+同一 approval_lineage_id 下 due pending 数量 > 1 计入 lineage_hotspot_count
+batch_safe 仅在 lineage_hotspot_count=0 时为 true
+```
+
+Required Approval expire payload contract:
+
+```text
+audit_fields=project_id,generated_at,due_count,candidate_lineage_count,oldest_due_lag_ms,lineage_hotspot_count,hotspot_lineage_ids,batch_safe,derived_from
+process_fields=project_id,generated_at,limit,attempted,expired,skipped,skipped_duplicate_lineage_count,processed_lineage_ids,lineage_lock_wait_ms,lineage_lock_skip_total,due_before,due_after,oldest_due_lag_ms_before,oldest_due_lag_ms_after,lineage_hotspot_count_before,lineage_hotspot_count_after,batch_safe,derived_from
+derived_from_fields=approval_table,mutation_log_table,candidate_order,processing_model,scope
+source=ApprovalExpireScanner
+```
+
+Dashboard readiness 状态：
+
+```text
+pass       所有 P0/P1 checks 通过
+attention  P0 通过，但存在 P1 live recovery attention
+blocked    任一 P0 check 失败
+```
+
+当前 checks：
+
+```text
+metrics_catalog_complete
+release_gate_current_level_clean
+fault_injection_catalog_complete
+root_cause_rule_governance
+runbook_catalog_complete
+alert_metric_catalog_complete
+live_recovery_attention
+monitoring_alerts_clear
+release_gate_promotion_assessment
+```
+
+Required metrics snapshot payload contract:
+
+```text
+fields=project_id,generated_at,metrics,derived_from
+derived_from_fields=counters,outbox_publish_lag_ms,scope
+metrics_key_source=REQUIRED_DASHBOARD_METRICS
+source=AgentMetricsService.snapshot
+```
+
+Required readiness dashboard payload contract:
+
+```text
+fields=project_id,generated_at,readiness,checks,metrics,release_gate,promotion_assessment,fault_injection,runbooks,root_cause_governance,alerts,alert_summary,derived_from
+check_fields=name,status,severity,summary,details
+checks=metrics_catalog_complete,release_gate_current_level_clean,fault_injection_catalog_complete,root_cause_rule_governance,runbook_catalog_complete,alert_metric_catalog_complete,live_recovery_attention,monitoring_alerts_clear,release_gate_promotion_assessment
+readiness_values=pass,attention,blocked
+source=AgentReadinessDashboardService.snapshot
+```
+
+Required launch audit payload contract:
+
+```text
+fields=project_id,generated_at,ready,status,checks,model_health,dashboard,promotion,derived_from
+check_fields=name,status,severity,summary,details
+checks=model_provider_configured,normal_conversation_runtime_available,frontend_event_contract_available,dashboard_readiness_not_blocked,backend_repository_delivery_complete,frontend_external_scope_declared,promotion_assessment_available
+status_values=pass,attention,blocked
+source=AgentLaunchAuditService.audit
+```
+
+Required backend completion audit payload contract:
+
+```text
+fields=project_id,generated_at,complete,status,checks,backend_scope,launch_audit,runtime_contracts,diagnostics,derived_from
+check_fields=name,status,severity,summary,details
+checks=model_provider_configured,conversation_runner_streaming,server_side_conversation_history,tool_loop_and_approval_resume,memory_context_injection,frontend_contract_surface,observability_and_release_gate,backend_delivery_docs_synced,live_e2e_diagnostic_available
+status_values=pass,attention,blocked
+source=AgentBackendCompletionAuditService.audit
+```
+
+`GET /api/v1/agents/backend-completion-audit` 是后端仓库范围内 Agent 功能完成度的聚合审计口。带 `project_id` 时按项目权限读取，不带 `project_id` 时仅 admin 可读全局审计。它复用 `AgentLaunchAuditService.audit` 的模型配置、dashboard 与 release gate 输入，并额外固定校验对话流式生成、服务端历史、工具循环、审批恢复、Memory 注入、前端契约面、观测/门禁、文档同步和真实 E2E 诊断路径。该接口不得触发 live provider 调用，不得暴露 `DEEPSEEK_API_KEY`。`complete=true` 只声明后端仓库拥有的 Agent runtime/contract/diagnostic/prototype docs 范围完成；前端实现仍属于外部仓库，生产灰度仍以 release gate 为准。
+
+`GET /api/v1/agents/launch-audit` 是前端联调和上线前准备状态的聚合审计口。带 `project_id` 时按项目权限读取，不带 `project_id` 时仅 admin 可读全局审计。它聚合 `AgentModelHealthService.check(live=false)`、`AgentReadinessDashboardService.snapshot` 与 `AgentReleaseGateService.promotion_assessment`，不得触发 live provider 调用，不得暴露 `DEEPSEEK_API_KEY`。`ready=true` 只表示后端仓库拥有的 Agent 对话链路、前端事件契约、summary/actions/history/export 契约和 dashboard/release gate 输入已经可供前端集成；它不等价于 L3 生产灰度已放开。
+
+`metrics_catalog_complete` 必须输出 `required_metric_keys`、`required_metric_count` 与 `missing_metric_keys`。`required_metric_keys` 覆盖 P0/P1 监控清单中已经由 `AgentMetricsService.snapshot` 计算的所有 recovery/governance 指标，包括 `tool_call_orphan_recovered_total`、`tool_call_send_intent_orphan_total`、`tool_call_safe_retry_after_send_intent_not_found_total`、`tool_call_transport_sent_uncertain_total`、`tool_call_backend_accepted_uncertain_total`、`backend_effect_capability_receipt_first_total`、`backend_effect_capability_legacy_no_receipt_total`、`tool_call_legacy_no_receipt_manual_total`、`tool_call_backend_contract_unsupported_total`、`approval_superseded_total`、`approval_approve_conflict_total`、`context_degraded_total`、`context_decision_build_missing_total`、`runtime_snapshot_migration_block_total`、`backend_contract_migration_block_total`、`run_migration_blocked_total`、`release_gate_violation_count`、`loop_root_cause_context_degraded_total`、`loop_root_cause_unknown_total`、`invalid_repair_scope_total`、`same_failure_no_progress_total`、`memory_contradiction_penalty_applied_total`、`memory_retrieved_total`、`memory_used_active_policy_total`、`memory_retrieval_profile_missing_total`、`memory_low_confidence_filtered_total`、`memory_evidence_watch_stale_total` 与 `backend_capability_degraded_total`，防止 dashboard 只校验部分高优先级指标而漏掉 P1/P2 观测面。
+
+Required dashboard metrics:
+
+```text
+approval_approve_conflict_total
+approval_epoch_conflict_total
+approval_expire_batch_lag_ms
+approval_expire_due_total
+approval_lineage_hotspot_total
+approval_lineage_lock_skip_total
+approval_lineage_lock_wait_ms
+approval_replacement_atomic_total
+approval_superseded_total
+backend_capability_degraded_total
+backend_contract_migration_block_total
+backend_contract_unsupported_total
+backend_effect_capability_legacy_no_receipt_total
+backend_effect_capability_receipt_first_total
+checkpoint_freshness_failed_total
+context_decision_build_missing_total
+context_degraded_total
+context_full_evidence_required_total
+event_replay_gap_total
+event_replay_stress_cursor_window_total
+event_replay_stress_failed_total
+event_replay_stress_max_window_events
+evidence_historical_volatile_excluded_total
+evidence_mixed_volatile_frozen_total
+evidence_volatile_requires_revalidation_total
+fault_injection_coverage_ratio
+fault_injection_missing_required_total
+fault_injection_registered_case_total
+fault_injection_required_case_total
+invalid_repair_scope_total
+loop_root_cause_context_degraded_total
+loop_root_cause_unknown_total
+memory_bypassed_evidence_ref_total
+memory_contradiction_penalty_applied_total
+memory_contradiction_total
+memory_evidence_watch_stale_total
+memory_high_risk_blocked_total
+memory_low_confidence_filtered_total
+memory_needs_revalidation_total
+memory_retrieval_profile_missing_total
+memory_retrieved_total
+memory_used_active_policy_total
+migration_block_open_total
+outbox_publish_lag_ms
+permission_revoked_before_execution_total
+reconcile_backoff_active_total
+release_gate_violation_count
+root_cause_rule_missing_total
+run_migration_blocked_total
+runtime_snapshot_migration_block_total
+same_failure_no_progress_total
+tool_call_backend_accepted_uncertain_total
+tool_call_backend_contract_unsupported_total
+tool_call_duplicate_blocked_total
+tool_call_legacy_no_receipt_manual_total
+tool_call_orphan_recovered_total
+tool_call_reconcile_manual_total
+tool_call_reconcile_success_total
+tool_call_safe_retry_after_send_intent_not_found_total
+tool_call_send_intent_orphan_total
+tool_call_transport_sent_uncertain_total
+tool_call_uncertain_total
+worker_queue_duplicate_active_lease_total
+worker_queue_expired_lease_total
+worker_queue_oldest_queued_age_ms
+```
+
+`runbook_catalog_complete` 必须输出 `covered_required_runbook_ids` 与 `missing_required_runbook_ids`，dashboard check details 与顶层 runbooks summary 都要包含这两个字段。Required catalog 覆盖所有 P0/P1 alert rule 需要的处置路径，包括 `tool_call_uncertain`、`migration_blocked`、`backend_capability_degraded`、`approval_stale`、`checkpoint_stale`、`outbox_publish_lag`、`event_replay_recovery`、`fault_injection_coverage`、`worker_queue_recovery`、`context_linkage_repair`、`root_cause_rule_missing`、`memory_evidence_ref_violation` 与 `release_gate_violation`。所有 P0/P1 `AgentAlertService.ALERT_RULES` 和动态 release gate P0 alert 必须提供非空 `runbook_id`，且该 id 必须能在 `AgentRunbookService.list_runbooks()` 中找到。后端文档驱动测试必须从本段 Required catalog 抽取 required runbook id，并与代码常量、runbook catalog、dashboard `covered_required_runbook_ids` / `missing_required_runbook_ids` 以及 P0/P1 alert rule 的 `runbook_id` 引用全量比对。
+
+Required alert runbook binding contract:
+
+```text
+runbook_required_severities=P0,P1
+static_alert_rule_source=ALERT_RULES
+dynamic_alert_runbooks=agent_release_gate_violation:release_gate_violation
+dashboard_check=alert_metric_catalog_complete
+dashboard_details=runbook_required_severities,alert_runbook_ids,covered_required_runbook_alert_ids,missing_required_runbook_alert_ids,dynamic_alert_runbooks,covered_dynamic_runbook_alert_ids,missing_dynamic_runbook_alert_ids
+```
+
+每个 Runbook 的 `safe_api_actions` 必须是当前 OpenAPI 中存在的 `/api/v1/agents...` method+path。后端契约测试必须从 `AgentRunbookService.RUNBOOKS` 抽取所有 safe actions，并与 FastAPI OpenAPI 对齐，防止恢复文档和实际路由漂移。
+
+`AgentRunbookService.diagnose_run` 不得只诊断 run 内部异常；当当前 release gate snapshot 存在 tool matrix violation 时，也必须返回 `release_gate_violation` recommendation，携带当前 rollout level、违规数量和违规工具摘要，确保动态 P0 发布门禁问题能进入单次运行的恢复建议。`GET /api/v1/agents/runs/{run_id}/runbook`、`GET /api/v1/agents/runs/{run_id}/events`、`GET /api/v1/agents/runs/{run_id}/events/snapshot` 与 `GET /api/v1/agents/runs/{run_id}/events/replay-audit` 均属于 run-scoped 治理接口，必须在读取诊断、建立 SSE 事件流、拉取事件快照或执行重放审计前通过 `AgentRuntimeService.get_run` / 等价路径校验 run 所属项目访问权限；项目成员和 admin 可读取，项目外用户必须 403。
+
+Required Runbook diagnosis contract:
+
+```text
+runbook_fields=runbook_id,title,trigger,severity,steps,safe_api_actions
+diagnosis_fields=run_id,run_status,recommendations,runbooks
+recommendation_fields=runbook_id,reason,severity,action,tool_call_id,details
+recommendation_required_fields=runbook_id,reason,severity,action,details
+recommendation_optional_fields=tool_call_id
+recommendation_runbook_ids=tool_call_uncertain,migration_blocked,backend_capability_degraded,approval_stale,checkpoint_stale,outbox_publish_lag,event_replay_recovery,fault_injection_coverage,worker_queue_recovery,context_linkage_repair,root_cause_rule_missing,memory_evidence_ref_violation,release_gate_violation
+recommendation_action_contract=openapi_agent_route
+recommendation_severity_source=runbook_catalog
+checkpoint_freshness_safe_actions=continue_from_checkpoint:POST /api/v1/agents/runs/{run_id}/resume ,replan_from_latest_safe_state:POST /api/v1/agents/runs/{run_id}/context-builds ,migration_block:GET /api/v1/agents/runs/{run_id}/migration-blocks ,fetch_evidence_and_rebuild_context:POST /api/v1/agents/runs/{run_id}/context-builds ,materialize_latest_evidence:POST /api/v1/agents/runs/{run_id}/context-builds ,revalidate_before_side_effect:POST /api/v1/agents/runs/{run_id}/context-builds ,supersede_or_refresh_approval:GET /api/v1/agents/tool-calls/{tool_call_id} ,refresh_permissions_or_manual_review:GET /api/v1/agents/tool-calls/{tool_call_id}
+```
+
+`alert_metric_catalog_complete` 必须输出 `required_alert_metric_keys`、`covered_alert_metric_keys`、`missing_alert_metric_keys`、`trigger_metric_keys`、`related_metric_keys` 与 `dynamic_metric_keys`。其中 trigger 覆盖静态 `ALERT_RULES.metric_key`，related 覆盖 `ALERT_RULES.related_metric_keys`，dynamic 覆盖 release gate snapshot 生成的 `release_gate_violation_count`，确保 AgentAlertService 事实表内指标要么直接触发告警、要么作为 firing alert 上下文、要么由动态告警路径覆盖。后端文档驱动测试必须从下方 AgentAlertService 指标代码块抽取 required alert metrics，并与 `ALERT_FACT_METRICS`、trigger/related/dynamic 覆盖集合及 dashboard details 精确一致。
+
+`monitoring_alerts_clear` 必须把 P0/P1 firing alerts 转换为上线门禁结果：存在 P0 时 blocked，存在 P1 且无 P0 时 attention，P0/P1 均为空时 pass。该 check details 必须直接输出 `blocking_alert_ids`、`blocking_runbook_ids`、`p0_alert_ids` 与 `p1_alert_ids`，让 promotion endpoint、UI 与自动验收不用再从 alert summary 反推具体阻断项。
+
+Required alert snapshot payload contract:
+
+```text
+fields=project_id,generated_at,status,alerts,summary,derived_from
+alert_fields=alert_id,severity,status,metric_key,observed_value,threshold,summary,action,runbook_id,details
+summary_fields=total,by_severity,highest_severity
+status_values=ok,firing
+source=AgentAlertService.snapshot
+```
+
+Required monitoring alerts clear contract:
+
+```text
+dashboard_check=monitoring_alerts_clear
+blocking_severities=P0,P1
+status_rules=P0:blocked,P1:attention,none:pass
+detail_fields=alert_total,by_severity,highest_severity,blocking_severities,blocking_alert_count,blocking_alert_ids,blocking_runbook_ids,p0_alert_ids,p1_alert_ids
+```
+
+`release_gate_promotion_assessment` 在 dashboard 内不直接调用 `AgentReleaseGateService.promotion_assessment`，因为 promotion assessment 本身依赖 dashboard readiness。Dashboard 只输出 promotion assessment contract summary：promotion endpoint、current_level、默认 target_level=L3、target gate 是否存在、target gate static blocked_reasons、current tool violations、final delivery contract pass/missing/external scope 与 assessment_available。只要这些输入可计算，该 check 为 pass；静态 L3 blocked_reasons 和 final delivery contract 摘要会进入 summary，但不会单独导致 dashboard readiness 失败。
+
+Required dashboard promotion summary contract:
+
+```text
+summary_fields=endpoint,current_level,target_level,target_gate_known,target_gate_static_blocked_reasons,current_tool_violation_count,current_tool_violations,final_delivery_contract_pass,final_delivery_backend_repository_scope_pass,final_delivery_missing_by_category,final_delivery_external_scope_categories,assessment_available,dashboard_dependency
+dashboard_check=release_gate_promotion_assessment
+endpoint=/api/v1/agents/release-gates/promotion
+dashboard_dependency=summary_only_no_recursive_promotion_call
+```
+
+`root_cause_rule_governance` 是 dashboard P1 check，复用 `RootCauseRuleEngine.audit_rule_governance()` 的 `priority_bands`、`violations`、`violation_count` 与 `governance_pass`。Dashboard 顶层必须输出 `root_cause_governance`，当治理审计发现 priority band violation 时 readiness 降为 attention，避免显式规则表只在单独 API 中可见而不影响上线前检查。
+
+Required rollout matrix:
+
+| level | summary | allowed_side_effect_classes | blocked_side_effect_classes | required_gates |
+|---|---|---|---|---|
+| L0 | read-only tools | read_only | deterministic_compute, draft_only, execution_record, business_create, business_update, external_effect, destructive | Run/Event/Snapshot available |
+| L1 | deterministic compute and draft-only tools | read_only, deterministic_compute, draft_only | execution_record, business_create, business_update, external_effect, destructive | Ledger/Worker available |
+| L2 | execution-record tools with reconcile support | read_only, deterministic_compute, draft_only, execution_record | business_create, business_update, external_effect, destructive | Reconcile minimum support |
+| L3 | business-create tools | read_only, deterministic_compute, draft_only, execution_record, business_create | business_update, external_effect, destructive | Approval; Reconcile; Execute-time permission check |
+| L4 | receipt-first business operations | read_only, deterministic_compute, draft_only, execution_record, business_create, business_update | external_effect, destructive | durable receipt; operation-level capability |
+| L5 | external-effect and destructive operations | read_only, deterministic_compute, draft_only, execution_record, business_create, business_update, external_effect, destructive | none | strong approval; full evidence; rollback/manual path |
+
+Release gate promotion assessment 规则：
+
+```text
+GET /api/v1/agents/release-gates 是 admin-only 全局发布门禁快照接口
+GET /api/v1/agents/release-gates/promotion 必须显式输出 monitoring_alerts_clear check
+target_level 默认 L3
+target_index <= current_index 时视为 already_unlocked
+target_index > current_index 时必须同时满足：
+1. target gate static blocked_reasons 为空
+2. current tool matrix 无 rollout violations
+3. minimum go-live contract pass
+4. go-live gate contract pass
+5. final delivery contract pass
+6. readiness dashboard 为 pass
+7. monitoring alerts 无 P0/P1 blocker
+```
+
+Required release gate snapshot payload contract:
+
+```text
+fields=current_level,current_level_summary,allowed_side_effect_classes,blocked_side_effect_classes,tool_matrix,expansion_gates,minimum_go_live,go_live_gates,final_delivery,violations
+tool_fields=tool_name,tool_version,side_effect_class,replay_policy,required_permissions,backend_name,backend_operation,backend_contract_version,backend_effect_capability,backend_contract_status,rollout_allowed,rollout_decision
+level_fields=level,summary,required_gates,unlocked,blocked_reasons
+violation_fields=tool_name,reason,side_effect_class
+rollout_decision_values=allowed,blocked
+rollout_allowed_rule=current_side_effect_allowed_and_backend_contract_active_or_missing
+violation_reason=tool_side_effect_exceeds_current_rollout_level
+```
+
+Required promotion assessment contract:
+
+```text
+checks=target_level_known,target_above_current,readiness_dashboard_pass,monitoring_alerts_clear,minimum_go_live_contract_pass,go_live_gate_contract_pass,final_delivery_contract_pass,release_gate_static_reasons_clear,current_tool_matrix_clean
+blocker_sources=release_gate,tool_matrix,minimum_go_live,go_live_gates,final_delivery,monitoring_alerts,readiness_dashboard
+release_gate_fields=current_level,target_gate,violations,minimum_go_live,go_live_gates,final_delivery
+```
+
+Required promotion assessment payload contract:
+
+```text
+fields=project_id,current_level,target_level,target_level_summary,decision,can_promote,blockers,checks,dashboard_checks,fault_injection,alert_summary,readiness,release_gate
+```
+
+Required promotion decision contract:
+
+```text
+decision_values=blocked,allowed,already_unlocked
+already_unlocked_rule=target_index<=current_index
+already_unlocked_can_promote=false
+already_unlocked_blockers=empty
+target_above_current_status=already_unlocked
+```
+
+Required promotion blocker payload contract:
+
+```text
+fields=source,reason,severity,details
+details_required_field=target_level
+release_gate_details=target_level,blocked_reason,blocked_reasons
+tool_matrix_details=target_level,violation_count,violations
+minimum_go_live_details=target_level,missing_requirement_ids
+go_live_gates_details=target_level,missing_by_priority
+final_delivery_details=target_level,missing_by_category
+monitoring_alerts_details=target_level,alert_summary
+readiness_dashboard_details=target_level,readiness,alert_summary
+```
+
+Required go-live gate contract:
+
+```text
+P0=run_snapshot_event_sse_e2e,tool_call_idempotency_unique,worker_crash_recoverable,effect_submission_states_tested,reconcile_core_statuses_tested,approval_concurrency_tested,execute_time_permission_revoked_tested,event_outbox_no_double_write_loss,legacy_no_receipt_high_risk_blocked,migration_block_visible
+P1=evidence_ref_active_policy_filter,historical_volatile_evidence_excluded,context_decision_build_binding,incomplete_required_evidence_blocks_high_risk,root_cause_rule_id_required,root_cause_rule_missing_alerts,checkpoint_freshness_revalidate_replan,memory_contradiction_penalizes,memory_retrieval_wrapped_as_evidence_ref,memory_profiles_and_penalty_deterministic,high_risk_not_memory_only
+P2=multi_worker_claim_unique,distributed_lease_scan_stable,worker_queue_audit_clean,reconcile_backoff_prevents_storm,approval_expire_no_hotspot,sse_replay_stress_clean,fault_injection_coverage_complete,monitoring_dashboard_complete
+```
+
+Required go-live gate payload contract:
+
+```text
+fields=pass,priorities,tiers,missing_by_priority
+tier_fields=priority,required_gate_ids,passed_gate_ids,missing_gate_ids,checks,pass
+check_fields=gate_id,label,status,evidence
+evidence=covered_by_agent_runtime_regression_suite
+```
+
+Required minimum go-live contract:
+
+```text
+runtime_snapshot_frozen
+execution_ledger_effect_source
+tool_executor_recovery
+backend_effect_capability_declared
+reconcile_uncertain_supported
+approval_mutation_guard_concurrency
+execute_time_permission_check
+event_outbox_sse_reliable
+context_budget_observable
+evidence_ref_lifecycle_auditable
+root_cause_rule_engine_explicit
+migration_and_checkpoint_available
+p0_fault_injection_passed
+```
+
+Required minimum go-live payload contract:
+
+```text
+fields=pass,required_requirement_ids,passed_requirement_ids,missing_requirement_ids,checks,business_create_expansion_prerequisite
+check_fields=requirement_id,label,status,details
+expansion_prerequisite=business_create
+```
+
+Required final delivery contract:
+
+```text
+backend=agent_runtime_service,worker_service,reconcile_worker,outbox_publisher,backend_adapter_sdk,approval_service,migration_coordinator,metrics_exporter
+frontend=agent_run_page,agent_event_timeline,tool_call_detail_page,approval_panel,migration_block_page,root_cause_diagnostic_view,sse_realtime_status
+platform=db_migration,object_storage_bucket_policy,monitoring_dashboard,alert_rules,rollout_switch,fault_injection_scripts,rollback_plan
+documentation=backend_operation_integration_spec,tool_spec_authoring_spec,evidence_ref_authoring_spec,approval_concurrency_spec,reconcile_contract_spec,root_cause_rule_authoring_spec,runbook_uncertain_recovery,runbook_migration_blocked,runbook_approval_stale,runbook_checkpoint_stale,runbook_outbox_publish_lag,runbook_event_replay,runbook_fault_injection_coverage,runbook_worker_queue_recovery,runbook_context_linkage_repair,runbook_root_cause_rule_missing,runbook_memory_evidence_ref_violation,runbook_release_gate_violation
+```
+
+Required final delivery payload contract:
+
+```text
+fields=pass,backend_repository_scope_pass,categories,external_scope_categories,missing_by_category
+category_fields=category,external_scope,required_artifact_ids,delivered_artifact_ids,external_scope_artifact_ids,missing_artifact_ids,checks,pass
+check_fields=artifact_id,label,status,evidence
+external_scope_status=external_scope
+backend_owned_status=pass
+```
+
+AgentAlertService 当前按以下事实表指标触发 firing alerts：
+
+```text
+tool_call_uncertain_total
+tool_call_reconcile_manual_total
+reconcile_backoff_active_total
+tool_call_send_intent_orphan_total
+tool_call_safe_retry_after_send_intent_not_found_total
+tool_call_transport_sent_uncertain_total
+tool_call_backend_accepted_uncertain_total
+backend_effect_capability_receipt_first_total
+backend_effect_capability_legacy_no_receipt_total
+tool_call_legacy_no_receipt_manual_total
+tool_call_backend_contract_unsupported_total
+approval_approve_conflict_total
+approval_epoch_conflict_total
+approval_lineage_lock_wait_ms
+approval_lineage_lock_skip_total
+approval_expire_due_total
+approval_expire_batch_lag_ms
+approval_lineage_hotspot_total
+backend_contract_unsupported_total
+migration_block_open_total
+runtime_snapshot_migration_block_total
+backend_contract_migration_block_total
+run_migration_blocked_total
+outbox_publish_lag_ms
+event_replay_gap_total
+event_replay_stress_failed_total
+event_replay_stress_cursor_window_total
+event_replay_stress_max_window_events
+fault_injection_required_case_total
+fault_injection_registered_case_total
+fault_injection_missing_required_total
+fault_injection_coverage_ratio
+context_full_evidence_required_total
+checkpoint_freshness_failed_total
+context_decision_build_missing_total
+root_cause_rule_missing_total
+memory_bypassed_evidence_ref_total
+memory_high_risk_blocked_total
+memory_needs_revalidation_total
+worker_queue_expired_lease_total
+worker_queue_duplicate_active_lease_total
+release_gate_violation_count
+backend_capability_degraded_total
+```
+
+其中 `backend_effect_capability_receipt_first_total`、`backend_effect_capability_legacy_no_receipt_total`、`event_replay_stress_cursor_window_total`、`event_replay_stress_max_window_events`、`fault_injection_required_case_total`、`fault_injection_registered_case_total`、`fault_injection_coverage_ratio` 等正向或规模类指标不单独按 `> 0` 触发告警，而是作为对应 firing alert 的 `details.related_metrics` 输出：backend capability degradation 告警携带 capability 分布，event replay stress 告警携带 cursor/window 规模，fault injection coverage 告警携带 required/registered/missing/coverage ratio 上下文。`release_gate_violation_count` 由 release gate snapshot 动态告警生成，不纳入静态 `ALERT_RULES`。
 
 报警建议：
 
@@ -2690,13 +3740,35 @@ heartbeat
 | `backend_accepted + reconcile not_found` | P0 | 只有 receipt_first 工具会出现，说明下游 durable receipt 契约可能破坏 |
 | `effect_committed + reconcile not_found` | P0 | 下游业务结果一致性异常 |
 | `legacy_no_receipt` 高风险工具仍配置为自动恢复 | P0 | 配置错误，必须改成 manual/reapproval |
+| `tool_call_legacy_no_receipt_manual_total > 0` | P0 | 高风险 legacy_no_receipt 已被强制转人工，必须升级 capability 或维持 manual/reapproval |
+| `tool_call_backend_contract_unsupported_total > 0` | P1 | ToolCall 命中 backend contract/schema unsupported，需要注册兼容 adapter |
+| `tool_call_backend_accepted_uncertain_total > 0` | P0 | receipt_first 工具已 backend_accepted 但仍 uncertain，必须先 reconcile/人工复核 |
+| `tool_call_transport_sent_uncertain_total > 0` | P1 | 请求可能已发出，禁止盲重试，必须等待 reconcile/backoff |
+| `tool_call_send_intent_orphan_total > 0` 或 `tool_call_safe_retry_after_send_intent_not_found_total > 0` | P2 | Worker 在发送前崩溃或可安全重试增加，需观察进程稳定性并复用 idempotency key |
+| `approval_approve_conflict_total > 0` | P1 | 审批决策命中 stale/supersede/epoch 冲突保护，需刷新 approval lineage |
 | `approval_epoch_conflict_total` 突增 | P1 | 前端审批页面 stale 或 repair/supersede 频繁 |
+| `approval_lineage_lock_wait_ms > 0` | P2 | approval lineage mutation 存在锁等待累积，需观察热点 lineage 与批量任务节奏 |
+| `approval_lineage_lock_skip_total > 0` | P2 | 批量 expire 因锁竞争跳过 lineage，需等待当前 mutation 完成后重跑扫描 |
 | 出现“新 tool_call 已创建但旧 approval 仍 pending” | P0 | replacement 与 supersede 未同事务完成 |
 | `context_decision_build_missing_total > 0` | P1 | LoopObservation 粒度对齐实现错误 |
 | `root_cause_rule_missing_total > 0` | P1 | 新增 reason 未补显式归因规则 |
 | `evidence_volatile_requires_revalidation_total` 异常低 | P1 | EvidenceRef 分类可能漏判 |
 | `tool_call_safe_retry_after_send_intent_not_found_total` 高 | P2 | Worker 在调用前崩溃较多，需看进程稳定性 |
 | `run_migration_blocked_total` 高 | P1 | 下游 contract/schema 演进未提供兼容 adapter |
+| `runtime_snapshot_migration_block_total > 0` | P1 | runtime snapshot 不兼容正在阻断恢复，需部署兼容 runtime metadata 后 resolve |
+| `backend_contract_migration_block_total > 0` | P1 | backend contract adapter 缺失正在阻断 reconcile/resume，需注册兼容 adapter 后 resolve |
+| `checkpoint_freshness_failed_total > 0` | P1 | resume 或 migration resolve 被 freshness gate 阻断，需按 reason 重建证据、权限、runtime snapshot 或 context |
+| `event_replay_gap_total > 0` | P1 | SSE Last-Event-ID replay may miss events; run replay audit before relying on stream continuity |
+| `event_replay_stress_failed_total > 0` | P1 | 高并发重放抽样存在不可重放 run 或无效 cursor，需运行 replay stress audit 定位窗口 |
+| `fault_injection_missing_required_total > 0` | P1 | 生产硬化故障注入 required set 未全量注册，不能声称覆盖率达标 |
+| `fault_injection_coverage_ratio < 1.0` | P1 | required fault cases 覆盖率未达到 100%，需补齐缺失用例后再推进灰度 |
+| `reconcile_backoff_active_total > 0` | P2 | backoff 正在节流 reconcile；未到 next_retry_at 不应强制重复调用下游 |
+| `approval_expire_due_total > 0` | P2 | 存在到期仍 pending 的 approval，需运行 expire process 或检查扫描调度 |
+| `approval_expire_batch_lag_ms > 0` | P2 | 到期 approval 已产生批处理滞后，需检查 expire scanner 调度延迟 |
+| `approval_lineage_hotspot_total > 0` | P1 | 同一 lineage 存在多个到期 pending approval，需暂停相关批量任务并排查 replacement/expire 互斥 |
+| `worker_queue_expired_lease_total > 0` | P1 | lease scanner 或 heartbeat 需要恢复 orphan queue |
+| `worker_queue_duplicate_active_lease_total > 0` | P0 | 同一 ToolCall 存在重复 active claim，暂停相关 worker 并修复队列事实 |
+| `backend_capability_degraded_total > 0` | P1 | operation 仍使用 legacy_reconcile_only 或 legacy_no_receipt，需按 runbook 升级 contract/capability 或转人工复核 |
 
 ---
 
@@ -2730,14 +3802,16 @@ P0/P1 故障注入用例必须覆盖：
 4. idempotency_index_only 工具不得写 backend_accepted；reconcile not_found 需要按 backoff 与工具类型处理。
 5. legacy_no_receipt 高风险工具不得配置自动恢复；必须 manual_intervention 或 require_reapproval。
 6. effect_committed 后崩溃；resume 必须复用 reconcile 结果，不得重放副作用。
-7. approve 与 replacement/supersede 并发；因为 approval_lineage lock/epoch，approve 必须返回 409，不能批准旧 approval。
-8. replacement tool_call 创建与旧 approval supersede 必须同事务；禁止出现新旧 approval 同时 pending。
-9. evidence_refs 中历史 latest sample 已被新 execution_record supersede；replay_policy 只看 active policy refs。
-10. active policy evidence 同时包含 volatile 与 frozen；resolved_replay_policy 必须是 require_revalidation。
-11. Loop 新增 reason 但未配置 RootCause Rule；必须触发 root_cause_rule_missing_total。
-12. 下游旧 schema 不支持；ToolCall 进入 needs_migration，MigrationCoordinator 级联 Run.status=migration_blocked。
-13. 解决 migration block 后，Run 可从 checkpoint 继续，而已 succeeded tool_call 不回滚。
-14. 一个 iteration 多次 context build；LoopObservation 必须绑定 decision_context_build_id。
+7. Tool succeeded 但 tool.effect_committed / tool.completed 写 EventStore 失败；ToolCall 必须保留 effect_committed + output_hash，状态转 uncertain，并要求 reconcile，不得盲目重放或误标 failed。
+8. approve 与 replacement/supersede 并发；因为 approval_lineage lock/epoch，approve 必须返回 409，不能批准旧 approval。
+9. replacement tool_call 创建与旧 approval supersede 必须同事务；禁止出现新旧 approval 同时 pending。
+10. evidence_refs 中历史 latest sample 已被新 execution_record supersede；replay_policy 只看 active policy refs。
+11. active policy evidence 同时包含 volatile 与 frozen；resolved_replay_policy 必须是 require_revalidation。
+12. approve 后执行前权限被撤销；ToolExecutor 必须在后端执行前写入 permission_revoked_before_execution 并阻断。
+13. Loop 新增 reason 但未配置 RootCause Rule；必须触发 root_cause_rule_missing_total。
+14. 下游旧 schema 不支持；ToolCall 进入 needs_migration，MigrationCoordinator 级联 Run.status=migration_blocked。
+15. 解决 migration block 后，Run 可从 checkpoint 继续，而已 succeeded tool_call 不回滚。
+16. 一个 iteration 多次 context build；LoopObservation 必须绑定 decision_context_build_id。
 ```
 
 实施顺序建议：

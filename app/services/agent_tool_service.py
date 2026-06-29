@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import copy
+import logging
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 from fastapi import HTTPException, status
 from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.permissions import ProjectPermission
 from app.core.response import normalize_response_data
-from app.core.sensitive_data import request_fingerprint
+from app.core.sensitive_data import mask_sensitive, request_fingerprint
+from app.models.project import ProjectEnvironment
+from app.models.test_case import TestCase
 from app.models.user import User
+from app.models.websocket_test_case import WebSocketTestCase
 from app.schemas.ai import AIScenarioComposeRequest, AISkillRunRequest
 from app.schemas.scenario import ScenarioRunRead
 from app.schemas.test_case import TestCaseCreateRequest
@@ -27,6 +32,8 @@ AI_DRAFT_OPERATIONS = {
     "websocket-test-case": {"generate", "expand"},
     "scenario-composer": {"compose"},
 }
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -137,10 +144,23 @@ class ResolvedToolPolicy:
 
 class ToolPolicyResolver:
     def resolve(self, *, spec: ToolSpec, evidence_refs: list[dict[str, Any]]) -> ResolvedToolPolicy:
-        active_refs = EvidenceRefResolver().select_policy_refs(evidence_refs)
+        resolver = EvidenceRefResolver()
+        all_refs = resolver.parse(evidence_refs)
+        active_refs = resolver.select_policy_refs(evidence_refs)
+        active_ref_ids = {item.evidence_ref_id for item in active_refs}
         volatile = [
             item for item in active_refs
             if item.mutability_class in {"mutable_current", "ephemeral_latest", "external_uncontrolled"}
+        ]
+        frozen = [
+            item for item in active_refs
+            if item.mutability_class in {"immutable", "versioned"}
+            and (item.content_hash or item.version_id or item.snapshot_id)
+        ]
+        historical_volatile_excluded = [
+            item for item in all_refs
+            if item.evidence_ref_id not in active_ref_ids
+            and item.mutability_class in {"mutable_current", "ephemeral_latest", "external_uncontrolled"}
         ]
         replay_policy = "require_revalidation" if volatile else spec.replay_policy
         approval_required = spec.side_effect_class not in SAFE_SIDE_EFFECT_CLASSES
@@ -152,6 +172,9 @@ class ToolPolicyResolver:
                 "base_replay_policy": spec.replay_policy,
                 "active_policy_ref_count": len(active_refs),
                 "volatile_policy_ref_count": len(volatile),
+                "frozen_policy_ref_count": len(frozen),
+                "historical_volatile_excluded_count": len(historical_volatile_excluded),
+                "mixed_volatile_frozen": bool(volatile and frozen),
                 "approval_required_reason": "unsafe_side_effect" if approval_required else "safe_initial_tool",
             },
         )
@@ -163,35 +186,77 @@ class AgentToolBackend:
         self.permission_service = PermissionService(db)
 
     def execute(self, *, tool_name: str, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        logger.info(
+            "agent_tool_backend_execute_start tool_name=%s project_id=%s user_id=%s",
+            tool_name,
+            payload.get("project_id"),
+            current_user.id,
+        )
         handlers: dict[str, Callable[[dict[str, Any], User], dict[str, Any]]] = {
             "project.read_context": self._project_read_context,
             "ai_skill.run_draft": self._ai_skill_run_draft,
             "scenario.compose_draft": self._scenario_compose_draft,
             "scenario.execute_dry_run": self._scenario_execute_dry_run,
+            "testcase.query_project_cases": self._testcase_query_project_cases,
             "testcase.validate_schema": self._testcase_validate_schema,
             "report.read_summary": self._report_read_summary,
         }
         try:
-            return handlers[tool_name](payload, current_user)
+            result = handlers[tool_name](payload, current_user)
+            logger.info(
+                "agent_tool_backend_execute_done tool_name=%s project_id=%s user_id=%s",
+                tool_name,
+                payload.get("project_id"),
+                current_user.id,
+            )
+            return result
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent tool backend 不存在") from exc
 
     def _project_read_context(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         project_id = _require_int(payload, "project_id")
         project = self.permission_service.require_project_access(current_user, project_id)
+        environments = self._project_environments(project_id)
+        default_environment = self._default_environment(project_id)
         return {
             "project": {
                 "id": project.id,
                 "name": getattr(project, "name", ""),
                 "description": getattr(project, "description", None),
                 "created_by_id": getattr(project, "created_by_id", None),
-            }
+            },
+            "environments": environments,
+            "default_environment": default_environment,
         }
 
     def _scenario_compose_draft(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         project_id = _require_int(payload, "project_id")
-        environment_id = _require_int(payload, "environment_id")
+        environment_id = _optional_int(payload, "environment_id")
+        if environment_id is None:
+            default_environment = self._default_environment(project_id)
+            if default_environment is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={"code": "agent_default_environment_missing", "project_id": project_id},
+                )
+            environment_id = int(default_environment["id"])
+            logger.info(
+                "agent_tool_default_environment_selected tool_name=scenario.compose_draft project_id=%s environment_id=%s",
+                project_id,
+                environment_id,
+            )
         compose_input = payload.get("input") or payload.get("compose_input") or {}
+        compose_input = dict(compose_input)
+        if not compose_input.get("http_test_case_ids") and not compose_input.get("websocket_test_case_ids"):
+            candidate_ids = self._default_candidate_case_ids(project_id=project_id, environment_id=environment_id)
+            compose_input.update(candidate_ids)
+            logger.info(
+                "agent_tool_default_scenario_candidates_selected project_id=%s environment_id=%s http_count=%s websocket_count=%s",
+                project_id,
+                environment_id,
+                len(candidate_ids["http_test_case_ids"]),
+                len(candidate_ids["websocket_test_case_ids"]),
+            )
         request = AISkillRunRequest(
             operation="compose",
             project_id=project_id,
@@ -204,6 +269,140 @@ class AgentToolBackend:
             current_user=current_user,
         )
         return {"draft": normalize_response_data(result)}
+
+    def _project_environments(self, project_id: int) -> list[dict[str, Any]]:
+        environments = list(
+            self.db.scalars(
+                select(ProjectEnvironment)
+                .where(
+                    ProjectEnvironment.project_id == project_id,
+                    ProjectEnvironment.is_deleted.is_(False),
+                )
+                .order_by(ProjectEnvironment.is_default.desc(), ProjectEnvironment.id.asc())
+            ).all()
+        )
+        return [
+            {
+                "id": item.id,
+                "name": item.name,
+                "base_url": item.base_url,
+                "description": item.description,
+                "is_default": item.is_default,
+            }
+            for item in environments
+        ]
+
+    def _default_environment(self, project_id: int) -> dict[str, Any] | None:
+        environments = self._project_environments(project_id)
+        return environments[0] if environments else None
+
+    def _default_candidate_case_ids(self, *, project_id: int, environment_id: int, limit: int = 8) -> dict[str, list[int]]:
+        http_ids = [
+            item.id
+            for item in self.db.scalars(
+                select(TestCase)
+                .where(
+                    TestCase.project_id == project_id,
+                    (TestCase.environment_id == environment_id) | (TestCase.environment_id.is_(None)),
+                )
+                .order_by(TestCase.id.asc())
+                .limit(limit)
+            ).all()
+        ]
+        remaining = max(0, limit - len(http_ids))
+        websocket_ids: list[int] = []
+        if remaining:
+            websocket_ids = [
+                item.id
+                for item in self.db.scalars(
+                    select(WebSocketTestCase)
+                    .where(
+                        WebSocketTestCase.project_id == project_id,
+                        (WebSocketTestCase.environment_id == environment_id)
+                        | (WebSocketTestCase.environment_id.is_(None)),
+                    )
+                    .order_by(WebSocketTestCase.id.asc())
+                    .limit(remaining)
+                ).all()
+            ]
+        return {
+            "http_test_case_ids": http_ids,
+            "websocket_test_case_ids": websocket_ids,
+        }
+
+    def _testcase_query_project_cases(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        environment_id = _optional_int(payload, "environment_id")
+        include_websocket = payload.get("include_websocket", True)
+        if not isinstance(include_websocket, bool):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="include_websocket must be a boolean",
+            )
+        self.permission_service.require_project_permission(
+            current_user,
+            project_id,
+            ProjectPermission.VIEW_CASE.value,
+        )
+        http_query = select(TestCase).where(TestCase.project_id == project_id)
+        if environment_id is not None:
+            http_query = http_query.where(
+                (TestCase.environment_id == environment_id) | (TestCase.environment_id.is_(None))
+            )
+        http_cases = list(self.db.scalars(http_query.order_by(TestCase.id.asc())).all())
+        websocket_cases: list[WebSocketTestCase] = []
+        if include_websocket:
+            websocket_query = select(WebSocketTestCase).where(WebSocketTestCase.project_id == project_id)
+            if environment_id is not None:
+                websocket_query = websocket_query.where(
+                    (WebSocketTestCase.environment_id == environment_id) | (WebSocketTestCase.environment_id.is_(None))
+                )
+            websocket_cases = list(self.db.scalars(websocket_query.order_by(WebSocketTestCase.id.asc())).all())
+        return {
+            "project_id": project_id,
+            "environment_id": environment_id,
+            "http_total": len(http_cases),
+            "websocket_total": len(websocket_cases),
+            "http_test_cases": [self._http_case_payload(item) for item in http_cases],
+            "websocket_test_cases": [self._websocket_case_payload(item) for item in websocket_cases],
+        }
+
+    @staticmethod
+    def _http_case_payload(item: TestCase) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "name": item.name,
+            "description": item.description,
+            "method": item.method,
+            "path": item.path,
+            "environment_id": item.environment_id,
+            "environment_ids": item.environment_ids,
+            "headers": mask_sensitive(item.headers or {}),
+            "query_params": mask_sensitive(item.query_params or {}),
+            "body_type": item.body_type,
+            "body": mask_sensitive(item.body),
+            "assertions": mask_sensitive(item.assertions or []),
+            "extractors": mask_sensitive(item.extractors or []),
+            "last_execution_status": item.last_execution_status,
+        }
+
+    @staticmethod
+    def _websocket_case_payload(item: WebSocketTestCase) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "name": item.name,
+            "description": item.description,
+            "path": item.path,
+            "environment_id": item.environment_id,
+            "environment_ids": item.environment_ids,
+            "headers": mask_sensitive(item.headers or {}),
+            "subprotocols": mask_sensitive(item.subprotocols or []),
+            "messages": mask_sensitive(item.messages or []),
+            "receive_count": item.receive_count,
+            "assertions": mask_sensitive(item.assertions or []),
+            "extractors": mask_sensitive(item.extractors or []),
+            "last_execution_status": item.last_execution_status,
+        }
 
     def _ai_skill_run_draft(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         project_id = _require_int(payload, "project_id")
@@ -337,10 +536,13 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
         },
         "scenario_compose_input": {
             "type": "object",
-            "required": ["project_id", "environment_id", "input"],
+            "required": ["project_id", "input"],
             "properties": {
                 "project_id": {"type": "integer"},
-                "environment_id": {"type": "integer"},
+                "environment_id": {
+                    "type": "integer",
+                    "description": "Optional for Agent; backend selects the project default environment when omitted.",
+                },
                 "input": AIScenarioComposeRequest.model_json_schema(),
             },
         },
@@ -366,6 +568,18 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 "scenario_version": {"type": "integer"},
                 "dataset_ids": {"type": "array", "items": {"type": "string"}},
                 "idempotency_key": {"type": "string"},
+            },
+        },
+        "testcase_query_project_cases_input": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "environment_id": {
+                    "type": "integer",
+                    "description": "Optional environment filter. Omit it to return all project test cases.",
+                },
+                "include_websocket": {"type": "boolean", "default": True},
             },
         },
         "testcase_validate_input": {
@@ -447,6 +661,27 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 backend_contract_version="v1",
                 effect_capability="idempotency_index_only",
                 request_schema_hash=request_fingerprint(schemas["scenario_execute_dry_run_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+        ),
+        "testcase.query_project_cases": ToolSpec(
+            name="testcase.query_project_cases",
+            version="1.0.0",
+            summary=(
+                "Query all HTTP and WebSocket test cases in the current project for scenario composition planning. "
+                "Call this before scenario.compose_draft when the user asks to create or compose a scenario."
+            ),
+            side_effect_class="read_only",
+            replay_policy="reuse_allowed",
+            required_permissions=(ProjectPermission.VIEW_CASE.value,),
+            input_schema=schemas["testcase_query_project_cases_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="testcase-service",
+                backend_operation="query_project_cases",
+                backend_contract_version="v1",
+                effect_capability="receipt_first",
+                request_schema_hash=request_fingerprint(schemas["testcase_query_project_cases_input"]),
                 output_schema_hash=request_fingerprint({"type": "object"}),
             ),
         ),

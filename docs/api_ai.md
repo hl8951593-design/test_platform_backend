@@ -330,6 +330,7 @@ HTTP 用例扩写示例：
 - 实际执行候选用例或自验证场景时，除场景管理权限外，还需要 `test:execute` 权限。
 - skill 会根据候选用例配置和请求/响应样本生成或补充 `assertions`、`extractors`、`_scenario_context.extractions`、`_scenario_context.bindings`。
 - skill 可以生成必要的 `before_actions` / `after_actions`，用于固定变量、随机数据、等待、条件门禁、清理或轻量计算。
+- 如果 AI 返回的 `before_actions` / `after_actions` 漏掉 `kind`，后端会在可确定时根据配置推断为 `fixed_value`、`delay`、`condition`、`random` 或 `script`；无法推断或配置不合法的动作会被丢弃并写入 warnings，避免单个非关键动作导致整个场景草稿校验失败。
 - 后端会二次校验 AI 返回，丢弃非候选引用；如果没有可用节点则返回 `502`。
 - `include_datasets=false` 时会丢弃 AI 返回的数据集草稿。
 - 生成结果必须满足 `ScenarioCreateRequest`，因此可直接作为创建场景请求体使用。

@@ -21,7 +21,7 @@
 | AI 生成测试用例 | 已接入正式 skill 包 | `app/ai_skills/packages/http-test-case/` |
 | AI 扩写测试用例 | 已接入正式 skill 包 | `app/ai_skills/packages/http-test-case/` |
 | WebSocket 用例 AI | 已接入正式 skill 包 | `app/ai_skills/packages/websocket-test-case/` |
-| 智能场景组合 | 已接入正式 skill 包和自验证 | `app/ai_skills/packages/scenario-composer/` |
+| 智能场景组合 | 已接入正式 skill 包、自验证和动作归一化修复 | `app/ai_skills/packages/scenario-composer/` |
 | AI Skill Run | 已接入可观测 run/event/SSE | `app/services/ai_skill_run_service.py` |
 | Thinking 参数 | 已接入基础参数 | `thinking` |
 | Reasoning Effort | 已接入基础参数 | `reasoning_effort` |

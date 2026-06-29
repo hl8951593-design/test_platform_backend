@@ -49,12 +49,14 @@ MinIO 图片附件接口和部署配置见 [媒体存储接口文档](api_media.
 | 缓存/临时状态 | Redis | 保存 token 状态、任务状态、临时变量和限流数据 |
 | 对象存储 | MinIO（S3 兼容） | 私有保存缺陷截图等二进制媒体，MySQL 只保存对象键和元数据 |
 | HTTP 执行引擎 | httpx | 执行接口测试步骤 |
-| AI Provider | DeepSeek OpenAI 兼容接口 | 通过 `AIService` 统一调用，业务能力由 AI Skill Runtime 承载 |
+| AI Provider | DeepSeek OpenAI 兼容接口 | 通过 `AIService` 统一调用，业务能力由 AI Skill Runtime 与 Harness Loop Agent 承载；Agent 使用 `/api/v1/agents/model-health` 做配置与 live stream 探测，使用 `/api/v1/agents/launch-audit` 聚合前端联调/上线准备状态，并使用 `/api/v1/agents/backend-completion-audit` 聚合后端仓库拥有的 Agent 功能完成度，不暴露 API key |
 | 异步任务 | FastAPI BackgroundTasks（当前）/ 独立 Worker（演进目标） | 当前场景手工执行在响应后继续运行；生产可靠性阶段迁移到独立 Worker |
 | 实时事件 | SSE + MySQL 持久化事件表 | 支持鉴权请求头、Last-Event-ID 重放、心跳和终态关闭 |
 | 测试报告 | 自研 | 基于执行记录生成平台内置报告 |
 | 配置管理 | pydantic-settings + .env | 管理环境配置 |
 | 日志 | Python logging 或 loguru | 记录系统日志和执行日志 |
+
+Harness Loop Agent 的业务工具调用走 Codex 式闭环：Runner 组装 run context、ToolRegistry、权限边界和历史上下文后调用 `AIService`，模型只能通过受控 `agent_tool_request` 发起 ToolCall，Harness 执行后把 `tool.result_observed` 回灌给下一轮模型。场景组合是当前强约束 recipe：必须先执行 `testcase.query_project_cases` 获取项目 HTTP/WebSocket 用例，再执行 `scenario.compose_draft`；直接 compose 会被 Runner 以 `scenario_compose_requires_case_query` 阻断并回灌给模型纠正。
 
 ## 3. 架构分层
 

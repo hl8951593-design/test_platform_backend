@@ -323,6 +323,66 @@ class AISkillTests(unittest.TestCase):
         self.assertEqual(assertions[1]["path"], "code")
         self.assertEqual(assertions[1]["expected"], 0)
 
+    def test_scenario_composer_repairs_actions_missing_kind(self):
+        skill = get_ai_skill("scenario-composer")
+        payload = AIScenarioComposeRequest(
+            requirement="查询企业详情前设置企业 ID",
+            scenario_name="企业详情",
+            http_test_case_ids=[10],
+        )
+
+        result = skill.parse_response(
+            json.dumps({
+                "source_summary": "组合企业详情接口",
+                "scenario": {
+                    "name": "企业详情",
+                    "description": "查询企业详情前设置企业 ID",
+                    "nodes": [{
+                        "id": "DETAIL",
+                        "name": "企业详情",
+                        "before_actions": [{
+                            "id": "SET-COMPANY",
+                            "name": "设置企业 ID",
+                            "config": {"output": "companyId", "value": 9527},
+                        }],
+                        "test_case": {
+                            "id": "DETAIL-CASE",
+                            "kind": "api_case",
+                            "reference_id": 10,
+                        },
+                        "after_actions": [{
+                            "id": "WAIT",
+                            "name": "等待同步",
+                            "config": {"duration_ms": 10},
+                        }],
+                    }],
+                },
+                "warnings": [],
+            }, ensure_ascii=False),
+            {
+                "project_id": 1,
+                "environment_id": 2,
+                "payload": payload,
+                "candidate_cases": [],
+                "candidate_index": {
+                    ("api_case", 10): {
+                        "kind": "api_case",
+                        "name": "企业详情",
+                        "method": "GET",
+                        "path": "/companies/9527",
+                        "assertions": [],
+                    },
+                },
+            },
+        )
+
+        node = result.scenario.nodes[0]
+        self.assertEqual(node.before_actions[0].kind, "fixed_value")
+        self.assertEqual(node.before_actions[0].config["output"], "companyId")
+        self.assertEqual(node.after_actions[0].kind, "delay")
+        self.assertEqual(node.after_actions[0].config["duration_ms"], 10)
+        self.assertTrue(any("缺少 kind" in warning for warning in result.warnings))
+
     def test_scenario_composer_drops_unrepairable_assertions(self):
         skill = get_ai_skill("scenario-composer")
         payload = AIScenarioComposeRequest(

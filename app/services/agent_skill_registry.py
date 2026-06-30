@@ -8,6 +8,10 @@ from typing import Any
 
 
 AGENT_SKILL_ROOT = Path(__file__).resolve().parents[1] / "agent_skills"
+AGENT_SKILL_PROMPT_BLOCK_MAX_CHARS = 4000
+AGENT_SKILL_PROMPT_TRUNCATION_MARKER = (
+    "\n\n[agent_skill_prompt_truncated: full SKILL.md body is not injected into model context]"
+)
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(?P<body>.*?)\n---\s*\n?", re.S)
 
 
@@ -28,11 +32,12 @@ class AgentSkill:
         }
 
     def prompt_block(self) -> str:
-        return (
+        block = (
             f"Agent Skill: {self.name}\n"
             f"Description: {self.description}\n\n"
             f"{self.body.strip()}"
         )
+        return _cap_prompt_block(block)
 
 
 class AgentSkillRegistry:
@@ -212,3 +217,11 @@ def _intent_tokens(text: str) -> list[str]:
 
 def _normalize_text(text: str) -> str:
     return (text or "").casefold()
+
+
+def _cap_prompt_block(block: str) -> str:
+    if len(block) <= AGENT_SKILL_PROMPT_BLOCK_MAX_CHARS:
+        return block
+    marker = AGENT_SKILL_PROMPT_TRUNCATION_MARKER
+    prefix_length = max(0, AGENT_SKILL_PROMPT_BLOCK_MAX_CHARS - len(marker))
+    return f"{block[:prefix_length]}{marker}"

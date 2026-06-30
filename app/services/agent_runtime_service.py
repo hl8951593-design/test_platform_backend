@@ -82,6 +82,9 @@ BACKEND_EFFECT_CAPABILITIES = [
 ]
 APPROVAL_STATUSES = ["pending", "approved", "rejected", "expired", "revoked", "superseded"]
 MIGRATION_BLOCK_STATUSES = ["open", "resolved", "cancelled"]
+AGENT_ERROR_MESSAGE_SUMMARY_VERSION = "agent_error_message_summary_v1"
+AGENT_ERROR_MESSAGE_MAX_CHARS = 512
+AGENT_ERROR_MESSAGE_TRUNCATION_MARKER = "[agent_error_message_truncated]"
 
 AGENT_CONVERSATION_SYSTEM_PROMPT = (
     "你是 TestAuto 自动化测试平台的 Harness Loop Agent。"
@@ -135,6 +138,22 @@ AGENT_HISTORY_CONTEXT_FULL_TURNS = 4
 AGENT_HISTORY_CONTEXT_SUMMARY_CHARS = 360
 AGENT_HISTORY_CONTEXT_RECENT_USER_CHARS = 800
 AGENT_HISTORY_CONTEXT_RECENT_ASSISTANT_CHARS = 1200
+AGENT_MEMORY_CONTEXT_MESSAGE_MAX_CHARS = 3000
+AGENT_MEMORY_CONTEXT_TITLE_MAX_CHARS = 180
+AGENT_MEMORY_CONTEXT_CONTENT_MAX_CHARS = 500
+AGENT_MEMORY_CONTEXT_TRUNCATION_MARKER = "[agent_memory_context_truncated]"
+AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_MAX_CHARS = 3000
+AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_TRUNCATION_MARKER = (
+    "\n\n[agent_classifier_prompt_truncated: full private classifier prompt is not injected into model context]"
+)
+AGENT_TOOL_RESULT_CONTEXT_TOTAL_MAX_CHARS = 12000
+AGENT_TOOL_RESULT_CONTEXT_TRUNCATION_MARKER = (
+    "\n\n[agent_tool_result_context_truncated: additional tool results remain available in ToolCall detail]"
+)
+AGENT_REPAIR_CONTEXT_MAX_CHARS = 3000
+AGENT_REPAIR_CONTEXT_TRUNCATION_MARKER = (
+    "\n\n[agent_repair_context_truncated: full previous model content is not injected into repair context]"
+)
 
 
 REQUIRES_TOOL_ROUTING_KEY = "routing_requires_tool"
@@ -476,6 +495,10 @@ class AgentModelHealthService:
             )
             return payload
         except HTTPException as exc:
+            detail = _bounded_agent_error_message(
+                _http_exception_detail(exc),
+                reference="AgentModelHealthService.check.http_exception",
+            )
             payload.update(
                 {
                     "reachable": False,
@@ -483,11 +506,15 @@ class AgentModelHealthService:
                     "first_delta_received": False,
                     "completed": False,
                     "error_code": "deepseek_http_error",
-                    "error_message": _http_exception_detail(exc),
+                    "error_message": detail,
                 }
             )
             return payload
         except Exception as exc:  # noqa: BLE001
+            detail = _bounded_agent_error_message(
+                exc,
+                reference="AgentModelHealthService.check.exception",
+            )
             payload.update(
                 {
                     "reachable": False,
@@ -495,7 +522,7 @@ class AgentModelHealthService:
                     "first_delta_received": False,
                     "completed": False,
                     "error_code": "deepseek_probe_error",
-                    "error_message": str(exc),
+                    "error_message": detail,
                 }
             )
             return payload
@@ -1294,7 +1321,10 @@ class AgentRuntimeService:
     def fail_run(self, run: AgentRun, *, error_code: str, error_message: str, commit: bool = True) -> AgentRun:
         run.status = "failed"
         run.error_code = error_code
-        run.error_message = error_message[:512]
+        run.error_message = _bounded_run_failure_error_message(
+            error_message,
+            error_code=error_code,
+        )
         run.completed_at = _utcnow()
         self.append_event(
             run,
@@ -1432,8 +1462,7 @@ class AgentConversationRunner:
             ).all()
         )
         messages = self._build_chat_messages(run, current_user=user, runtime=runtime)
-        for call in calls:
-            messages.append(AIChatMessage(role="user", content=_tool_result_message(call)))
+        messages.extend(_tool_result_context_messages(calls))
         messages.append(AIChatMessage(
             role="user",
             content="以上工具已完成审批和执行。请基于这些工具结果给用户最终回复，不要再请求工具。",
@@ -1676,7 +1705,7 @@ class AgentConversationRunner:
                         ),
                         commit=True,
                     )
-                messages.append(AIChatMessage(role="user", content=_tool_result_message(call)))
+                _append_tool_result_context_message(messages, call)
 
             self._record_max_iterations_loop_observation(
                 run=run,
@@ -1732,25 +1761,35 @@ class AgentConversationRunner:
             )
             return runtime.complete_run(run, {"message": content, "tool_calls": tool_summaries, **clean_model_payload}, commit=True)
         except HTTPException as exc:
+            error_code = "agent_conversation_model_error"
             detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            bounded_detail = _bounded_run_failure_error_message(detail, error_code=error_code)
             logger.warning(
                 "agent_conversation_failed_http run_id=%s project_id=%s error=%s",
                 run.run_id,
                 run.project_id,
-                detail,
+                bounded_detail,
             )
             return runtime.fail_run(
                 run,
-                error_code="agent_conversation_model_error",
-                error_message=detail,
+                error_code=error_code,
+                error_message=bounded_detail,
                 commit=True,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("agent_conversation_failed_unhandled run_id=%s project_id=%s", run.run_id, run.project_id)
+            error_code = "agent_conversation_unhandled_error"
+            bounded_detail = _bounded_run_failure_error_message(exc, error_code=error_code)
+            logger.error(
+                "agent_conversation_failed_unhandled run_id=%s project_id=%s error_type=%s error=%s",
+                run.run_id,
+                run.project_id,
+                type(exc).__name__,
+                bounded_detail,
+            )
             return runtime.fail_run(
                 run,
-                error_code="agent_conversation_unhandled_error",
-                error_message=str(exc),
+                error_code=error_code,
+                error_message=bounded_detail,
                 commit=True,
             )
 
@@ -1936,7 +1975,7 @@ class AgentConversationRunner:
         )
         repair_messages = [
             *messages,
-            AIChatMessage(role="assistant", content=invalid_content),
+            AIChatMessage(role="assistant", content=_bounded_repair_context(invalid_content)),
             AIChatMessage(
                 role="user",
                 content=(
@@ -1966,6 +2005,10 @@ class AgentConversationRunner:
         try:
             tool_request = self._parse_tool_request(repaired_content)
         except HTTPException as exc:
+            repair_error_message = _bounded_agent_error_message(
+                _http_exception_detail(exc),
+                reference="AgentConversationRunner.model.required_tool_repair_failed",
+            )
             runtime.append_event(
                 run,
                 "model.required_tool_repair_failed",
@@ -1973,7 +2016,7 @@ class AgentConversationRunner:
                     "iteration": iteration,
                     "after_tool": required_followup.after_tool,
                     "required_tool": required_followup.required_tool,
-                    "error_message": _http_exception_detail(exc),
+                    "error_message": repair_error_message,
                     "content_preview": repaired_content[:500],
                 },
                 commit=True,
@@ -2252,6 +2295,7 @@ class AgentConversationRunner:
         last_delta_flush_at = time.monotonic()
         last_cancel_check_at = 0.0
         tool_request_marker_seen = False
+        visible_deltas_retracted = False
         stream_interrupted = False
 
         def should_stop_stream(*, force: bool = False) -> bool:
@@ -2312,6 +2356,10 @@ class AgentConversationRunner:
                 if should_stop_stream():
                     break
                 if item.get("type") == "retry":
+                    error_message = _bounded_agent_error_message(
+                        item.get("error_message"),
+                        reference="AgentConversationRunner.model.stream_retrying",
+                    )
                     retry_payload = {
                         "provider": AIService.provider,
                         "iteration": iteration,
@@ -2320,7 +2368,7 @@ class AgentConversationRunner:
                         "attempt": item.get("attempt"),
                         "max_retries": item.get("max_retries"),
                         "delay_seconds": item.get("delay_seconds"),
-                        "error_message": item.get("error_message"),
+                        "error_message": error_message,
                         **trace_payload,
                     }
                     runtime.append_event(run, "model.stream_retrying", retry_payload, commit=True)
@@ -2331,7 +2379,7 @@ class AgentConversationRunner:
                         final_summary,
                         item.get("attempt"),
                         item.get("max_retries"),
-                        item.get("error_message"),
+                        error_message,
                     )
                     continue
                 if item.get("type") == "delta":
@@ -2343,6 +2391,22 @@ class AgentConversationRunner:
                             tool_request_marker_seen = True
                             pending_visible_deltas.clear()
                             pending_visible_chars = 0
+                            if deltas_emitted and not visible_deltas_retracted:
+                                runtime.append_event(
+                                    run,
+                                    "model.markdown_normalized",
+                                    {
+                                        "iteration": iteration,
+                                        "final_summary": final_summary,
+                                        "repair_attempt": repair_attempt,
+                                        "content": "",
+                                        "replace_content": True,
+                                        "normalization_reason": "tool_request_stream_suppressed",
+                                        **trace_payload,
+                                    },
+                                    commit=True,
+                                )
+                                visible_deltas_retracted = True
                             continue
                         if suppress_visible_deltas:
                             continue
@@ -2364,7 +2428,10 @@ class AgentConversationRunner:
             if not content_parts:
                 raise
             stream_interrupted = True
-            detail = _http_exception_detail(exc)
+            detail = _bounded_agent_error_message(
+                _http_exception_detail(exc),
+                reference="AgentConversationRunner.model.stream_interrupted",
+            )
             model_payload = {
                 **trace_payload,
                 "provider": AIService.provider,
@@ -2562,6 +2629,10 @@ class AgentConversationRunner:
         runtime: AgentRuntimeService,
         iteration: int,
     ) -> tuple[str, list[str], dict[str, Any], AgentToolRequest | None]:
+        error_message = _bounded_agent_error_message(
+            error_message,
+            reference="AgentConversationRunner.model.tool_request_invalid",
+        )
         runtime.append_event(
             run,
             "model.tool_request_invalid",
@@ -2599,7 +2670,7 @@ class AgentConversationRunner:
 
         repair_messages = [
             *messages,
-            AIChatMessage(role="assistant", content=invalid_content),
+            AIChatMessage(role="assistant", content=_bounded_repair_context(invalid_content)),
             AIChatMessage(
                 role="user",
                 content=(
@@ -2625,12 +2696,16 @@ class AgentConversationRunner:
         try:
             tool_request = self._parse_tool_request(repaired_content)
         except HTTPException as exc:
+            repair_error_message = _bounded_agent_error_message(
+                _http_exception_detail(exc),
+                reference="AgentConversationRunner.model.tool_request_repair_failed",
+            )
             runtime.append_event(
                 run,
                 "model.tool_request_repair_failed",
                 {
                     "iteration": iteration,
-                    "error_message": _http_exception_detail(exc),
+                    "error_message": repair_error_message,
                     "content_preview": repaired_content[:500],
                     **_model_trace_from_payload(clean_payload),
                 },
@@ -3504,6 +3579,7 @@ class ToolExecutor:
             call.output_hash = request_fingerprint(output)
             call.status = "succeeded"
             call.execution_phase = "completed"
+            call.policy_reason_json = _policy_reason_with_dispatch_trace(call)
             call.policy_reason_json = _policy_reason_with_execution_context(
                 call,
                 worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
@@ -3521,8 +3597,12 @@ class ToolExecutor:
         except Exception as exc:  # noqa: BLE001
             call.status = "failed"
             call.error_code = "tool_execution_failed"
-            call.error_message = str(exc)[:512]
+            call.error_message = _bounded_agent_error_message(
+                exc,
+                reference="ToolExecutor.execute_tool_call.tool_execution_failed",
+            )
             call.recovery_decision = "tool_execution_failed_repair_required"
+            call.policy_reason_json = _policy_reason_with_dispatch_trace(call)
             call.policy_reason_json = _policy_reason_with_execution_context(
                 call,
                 worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
@@ -3550,8 +3630,12 @@ class ToolExecutor:
         call.status = "uncertain"
         call.execution_phase = "completed"
         call.error_code = "eventstore_write_failed_after_effect"
-        call.error_message = str(exc)[:512]
+        call.error_message = _bounded_agent_error_message(
+            exc,
+            reference="ToolExecutor.execute_tool_call.eventstore_write_failed_after_effect",
+        )
         call.recovery_decision = "reconcile_required_after_eventstore_failure"
+        call.policy_reason_json = _policy_reason_with_dispatch_trace(call)
         call.policy_reason_json = _policy_reason_with_execution_context(
             call,
             worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
@@ -3561,6 +3645,35 @@ class ToolExecutor:
         self.db.commit()
         self.db.refresh(call)
         return call
+
+
+def _policy_reason_with_dispatch_trace(call: AgentToolCall) -> dict[str, Any]:
+    spec = ToolRegistry().get(call.tool_name)
+    dispatch_trace = {
+        "dispatch_trace_version_hash": "agent-tool-dispatch-v1",
+        "tool_call_id": call.tool_call_id,
+        "run_id": call.run_id,
+        "runtime_snapshot_id": call.runtime_snapshot_id,
+        "tool_name": call.tool_name,
+        "tool_version": call.tool_version,
+        "schema_hash": call.schema_hash,
+        "manifest_hash": call.manifest_hash,
+        "router": "AgentToolRouter.resolve",
+        "runtime": "AgentToolRuntime.execute",
+        "backend_handler": spec.backend_handler,
+        "backend_name": call.backend_name,
+        "backend_operation": call.backend_operation,
+        "backend_contract_version": call.backend_contract_version,
+        "resolved_side_effect_class": call.resolved_side_effect_class,
+        "resolved_replay_policy": call.resolved_replay_policy,
+        "status": call.status,
+        "effect_submission_state": call.effect_submission_state,
+    }
+    dispatch_trace["dispatch_trace_hash"] = request_fingerprint(dispatch_trace)
+    return {
+        **(call.policy_reason_json or {}),
+        "dispatch_trace": dispatch_trace,
+    }
 
 
 def _policy_reason_with_execution_context(call: AgentToolCall, *, worker_id: str | None) -> dict[str, Any]:
@@ -3681,24 +3794,61 @@ def _tool_result_message(call: AgentToolCall) -> str:
     return build_tool_result_message(call)
 
 
+def _tool_result_context_messages(calls: list[AgentToolCall]) -> list[AIChatMessage]:
+    messages: list[AIChatMessage] = []
+    for call in calls:
+        _append_tool_result_context_message(messages, call)
+    return messages
+
+
+def _append_tool_result_context_message(messages: list[AIChatMessage], call: AgentToolCall) -> None:
+    if any(AGENT_TOOL_RESULT_CONTEXT_TRUNCATION_MARKER in (message.content or "") for message in messages):
+        return
+    used_chars = sum(
+        len(message.content or "")
+        for message in messages
+        if _is_tool_result_context_message(message)
+    )
+    remaining_chars = AGENT_TOOL_RESULT_CONTEXT_TOTAL_MAX_CHARS - used_chars
+    if remaining_chars <= 0:
+        return
+    content = _cap_tool_result_context_message(_tool_result_message(call), remaining_chars)
+    messages.append(AIChatMessage(role="user", content=content))
+
+
+def _is_tool_result_context_message(message: AIChatMessage) -> bool:
+    content = message.content or ""
+    return (
+        content.startswith("工具执行结果如下")
+        or AGENT_TOOL_RESULT_CONTEXT_TRUNCATION_MARKER in content
+    )
+
+
+def _cap_tool_result_context_message(message: str, max_chars: int) -> str:
+    if len(message) <= max_chars:
+        return message
+    marker = AGENT_TOOL_RESULT_CONTEXT_TRUNCATION_MARKER
+    prefix_length = max(0, max_chars - len(marker))
+    return f"{message[:prefix_length]}{marker}"
+
+
 def _format_memory_context(candidates: list[MemoryCandidate]) -> str:
     lines = [
         "项目记忆上下文（用于辅助理解当前请求，不等同于实时证据；涉及高风险工具或副作用时仍需 EvidenceRef/审批/工具结果确认）："
     ]
     for index, candidate in enumerate(candidates, start=1):
-        content = " ".join(candidate.content.split())
-        if len(content) > 500:
-            content = f"{content[:500]}..."
+        title = _truncate_memory_context_text(candidate.title, AGENT_MEMORY_CONTEXT_TITLE_MAX_CHARS)
+        content = _truncate_memory_context_text(candidate.content, AGENT_MEMORY_CONTEXT_CONTENT_MAX_CHARS)
         lines.append(
             (
                 f"{index}. memory_id={candidate.memory_id}, version={candidate.memory_version}, "
                 f"profile={candidate.retrieval_profile}, score={candidate.retrieval_score:.4f}, "
                 f"confidence={candidate.confidence:.2f}, stale_score={candidate.stale_score:.2f}, "
-                f"title={candidate.title}\n"
+                f"title={title}\n"
                 f"   content={content}"
             )
         )
-    return "\n".join(lines)
+    return _cap_memory_context_message("\n".join(lines))
 
 
 def _format_run_context(run: AgentRun) -> str:
@@ -3780,7 +3930,10 @@ def _intent_matches_unsupported_capability_guard(
 
 
 def _unsupported_capability_classifier_prompt(guard: UnsupportedCapabilityGuard) -> str | None:
-    return AgentSkillRegistry().private_resource_text(guard.skill_name, guard.classifier_prompt_key)
+    prompt = AgentSkillRegistry().private_resource_text(guard.skill_name, guard.classifier_prompt_key)
+    if prompt is None:
+        return None
+    return _cap_unsupported_capability_classifier_prompt(prompt)
 
 
 def _unsupported_capability_message(guard: UnsupportedCapabilityGuard) -> str | None:
@@ -4108,10 +4261,66 @@ def _truncate_history_text(value: str, max_chars: int) -> str:
     return f"{normalized[: max(0, max_chars - 3)]}..."
 
 
+def _truncate_memory_context_text(value: str, max_chars: int) -> str:
+    normalized = " ".join((value or "").split())
+    if len(normalized) <= max_chars:
+        return normalized
+    marker = f"... {AGENT_MEMORY_CONTEXT_TRUNCATION_MARKER}"
+    prefix_length = max(0, max_chars - len(marker))
+    return f"{normalized[:prefix_length]}{marker}"
+
+
+def _cap_memory_context_message(value: str) -> str:
+    if len(value) <= AGENT_MEMORY_CONTEXT_MESSAGE_MAX_CHARS:
+        return value
+    marker = f"\n\n{AGENT_MEMORY_CONTEXT_TRUNCATION_MARKER}"
+    prefix_length = max(0, AGENT_MEMORY_CONTEXT_MESSAGE_MAX_CHARS - len(marker))
+    return f"{value[:prefix_length]}{marker}"
+
+
+def _cap_unsupported_capability_classifier_prompt(value: str) -> str:
+    if len(value) <= AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_MAX_CHARS:
+        return value
+    marker = AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_TRUNCATION_MARKER
+    prefix_length = max(0, AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_MAX_CHARS - len(marker))
+    return f"{value[:prefix_length]}{marker}"
+
+
+def _bounded_repair_context(value: str) -> str:
+    text = value or ""
+    if len(text) <= AGENT_REPAIR_CONTEXT_MAX_CHARS:
+        return text
+    marker = AGENT_REPAIR_CONTEXT_TRUNCATION_MARKER
+    prefix_length = max(0, AGENT_REPAIR_CONTEXT_MAX_CHARS - len(marker))
+    return f"{text[:prefix_length]}{marker}"
+
+
 def _http_exception_detail(exc: HTTPException) -> str:
     if isinstance(exc.detail, str):
         return exc.detail
     return json.dumps(exc.detail, ensure_ascii=False, default=str)
+
+
+def _bounded_agent_error_message(error: Any, *, reference: str) -> str:
+    message = str(error or "")
+    if len(message) <= AGENT_ERROR_MESSAGE_MAX_CHARS:
+        return message
+    suffix = (
+        f"{AGENT_ERROR_MESSAGE_TRUNCATION_MARKER} "
+        f"error_summary_version={AGENT_ERROR_MESSAGE_SUMMARY_VERSION} "
+        f"error_size_chars={len(message)} "
+        f"error_hash={request_fingerprint({'error_message': message})} "
+        f"full_error_reference={reference}"
+    )
+    preview_max_chars = max(0, AGENT_ERROR_MESSAGE_MAX_CHARS - len(suffix))
+    return f"{message[:preview_max_chars]}{suffix}"
+
+
+def _bounded_run_failure_error_message(error: Any, *, error_code: str) -> str:
+    return _bounded_agent_error_message(
+        error,
+        reference=f"AgentRuntimeService.fail_run.{error_code}",
+    )
 
 
 def _conversation_title(intent: str) -> str:

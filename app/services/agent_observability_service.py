@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from app.core.sensitive_data import request_fingerprint
 from app.models.agent import (
     AgentApproval,
     AgentApprovalMutationLog,
@@ -27,6 +28,11 @@ from app.models.agent import (
 
 
 OutboxPublisherCallback = Callable[[AgentEvent], None]
+
+
+AGENT_ERROR_MESSAGE_SUMMARY_VERSION = "agent_error_message_summary_v1"
+AGENT_ERROR_MESSAGE_MAX_CHARS = 512
+AGENT_ERROR_MESSAGE_TRUNCATION_MARKER = "[agent_error_message_truncated]"
 
 
 METRICS_SNAPSHOT_FIELDS = (
@@ -241,28 +247,6 @@ AGENT_BACKEND_COMPLETION_AUDIT_CHECK_NAMES = (
     "backend_delivery_docs_synced",
     "live_e2e_diagnostic_available",
     "behavior_evaluation_suite_available",
-)
-AGENT_BEHAVIOR_EVALUATION_CASE_IDS = (
-    "T01",
-    "T02",
-    "T03",
-    "T04",
-    "T05",
-    "T06",
-    "T07",
-    "T08",
-)
-AGENT_BEHAVIOR_EVALUATION_ASSERTIONS = (
-    "general_answer_no_tool",
-    "conversation_context_no_object_creation",
-    "project_context_tool_use",
-    "query_first_tool_order",
-    "tool_result_repair_loop",
-    "unsupported_save_boundary",
-    "dataset_parameterization",
-    "domain_boundary",
-    "model_call_trace",
-    "sse_high_cursor_replay",
 )
 FAULT_INJECTION_COVERAGE_FIELDS = (
     "generated_at",
@@ -830,7 +814,10 @@ class AgentOutboxPublisher:
                     raise RuntimeError("agent event missing for outbox item")
                 self.publisher(event)
             except Exception as exc:  # noqa: BLE001
-                item.last_error = str(exc)[:512]
+                item.last_error = _bounded_agent_error_message(
+                    exc,
+                    reference="AgentOutboxPublisher.publish_pending",
+                )
                 if item.publish_attempts >= self.max_attempts:
                     item.status = "dead_letter"
                     item.next_retry_at = None
@@ -874,6 +861,21 @@ class AgentOutboxPublisher:
     @staticmethod
     def _noop_publish(event: AgentEvent) -> None:
         _ = event
+
+
+def _bounded_agent_error_message(error: Any, *, reference: str) -> str:
+    message = str(error or "")
+    if len(message) <= AGENT_ERROR_MESSAGE_MAX_CHARS:
+        return message
+    suffix = (
+        f"{AGENT_ERROR_MESSAGE_TRUNCATION_MARKER} "
+        f"error_summary_version={AGENT_ERROR_MESSAGE_SUMMARY_VERSION} "
+        f"error_size_chars={len(message)} "
+        f"error_hash={request_fingerprint({'error_message': message})} "
+        f"full_error_reference={reference}"
+    )
+    preview_max_chars = max(0, AGENT_ERROR_MESSAGE_MAX_CHARS - len(suffix))
+    return f"{message[:preview_max_chars]}{suffix}"
 
 
 class AgentMetricsService:
@@ -2145,7 +2147,10 @@ class AgentBackendCompletionAuditService:
         self.db = db
 
     def audit(self, *, project_id: int | None = None) -> dict[str, Any]:
-        from app.services.agent_runbook_service import RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS
+        from app.services.agent_runbook_service import (
+            RUNBOOK_DISPATCH_TRACE_SUMMARY_FIELDS,
+            RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS,
+        )
 
         launch_audit = AgentLaunchAuditService(self.db).audit(project_id=project_id)
         launch_checks = {item["name"]: item for item in launch_audit["checks"]}
@@ -2153,6 +2158,17 @@ class AgentBackendCompletionAuditService:
         model_check = launch_checks["model_provider_configured"]
         dashboard_check = launch_checks["dashboard_readiness_not_blocked"]
         backend_delivery_check = launch_checks["backend_repository_delivery_complete"]
+        behavior_evaluation_case_ids = _behavior_evaluation_case_ids()
+        behavior_evaluation_assertions = _behavior_evaluation_assertions()
+        behavior_evaluation_assertion_coverage = _behavior_evaluation_assertion_coverage()
+        behavior_evaluation_undeclared_case_assertions = _behavior_evaluation_undeclared_case_assertions()
+        behavior_evaluation_uncovered_assertion_ids = _behavior_evaluation_uncovered_assertion_ids()
+        behavior_evaluation_assertion_metadata_complete = (
+            not behavior_evaluation_undeclared_case_assertions
+            and not behavior_evaluation_uncovered_assertion_ids
+        )
+        behavior_evaluation_runbook = _behavior_evaluation_runbook()
+        behavior_evaluation_latest_report = _behavior_evaluation_latest_report()
         checks = [
             self._check(
                 name="model_provider_configured",
@@ -2241,8 +2257,11 @@ class AgentBackendCompletionAuditService:
                     "promotion_decision": launch_audit["promotion"]["decision"],
                     "promotion_is_production_gate": True,
                     "tool_execution_context_source": "AgentToolCall.policy_reason_json.execution_context",
+                    "tool_dispatch_trace_source": "AgentToolCall.policy_reason_json.dispatch_trace",
                     "runbook_execution_context_summary": "AgentRunbookRecommendation.details.execution_context",
                     "runbook_execution_context_summary_fields": list(RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS),
+                    "runbook_dispatch_trace_summary": "AgentRunbookRecommendation.details.dispatch_trace",
+                    "runbook_dispatch_trace_summary_fields": list(RUNBOOK_DISPATCH_TRACE_SUMMARY_FIELDS),
                 },
             ),
             self._check(
@@ -2280,14 +2299,23 @@ class AgentBackendCompletionAuditService:
             ),
             self._check(
                 name="behavior_evaluation_suite_available",
-                status="pass",
+                status="pass" if behavior_evaluation_assertion_metadata_complete else "attention",
                 severity="P1",
                 summary="Maintainers have a repeatable multi-case behavior evaluation for Agent loop, repair and tool boundaries",
                 details={
                     "script": "scripts/agent_behavior_evaluation.py",
-                    "case_ids": list(AGENT_BEHAVIOR_EVALUATION_CASE_IDS),
-                    "case_count": len(AGENT_BEHAVIOR_EVALUATION_CASE_IDS),
-                    "assertions": list(AGENT_BEHAVIOR_EVALUATION_ASSERTIONS),
+                    "case_ids": behavior_evaluation_case_ids,
+                    "case_count": len(behavior_evaluation_case_ids),
+                    "assertions": behavior_evaluation_assertions,
+                    "assertion_coverage": behavior_evaluation_assertion_coverage,
+                    "undeclared_case_assertions": behavior_evaluation_undeclared_case_assertions,
+                    "uncovered_assertion_ids": behavior_evaluation_uncovered_assertion_ids,
+                    "assertion_metadata_complete": behavior_evaluation_assertion_metadata_complete,
+                    "model_call_trace_fields": _behavior_evaluation_model_call_trace_fields(),
+                    "markdown_sections": _behavior_evaluation_markdown_sections(),
+                    "latest_report_fields": _behavior_evaluation_latest_report_fields(),
+                    "runbook": behavior_evaluation_runbook,
+                    "latest_report": behavior_evaluation_latest_report,
                     "output_prefix": "reports/woagent_behavior_eval_{timestamp}",
                     "artifacts": [
                         "reports/woagent_behavior_eval_*.json",
@@ -2326,8 +2354,11 @@ class AgentBackendCompletionAuditService:
                 "transcript": "GET /api/v1/agents/conversations/{conversation_id}/transcript",
                 "export": "GET /api/v1/agents/conversations/{conversation_id}/export",
                 "tool_execution_context": "AgentToolCall.policy_reason_json.execution_context",
+                "tool_dispatch_trace": "AgentToolCall.policy_reason_json.dispatch_trace",
                 "runbook_execution_context_summary": "AgentRunbookRecommendation.details.execution_context",
                 "runbook_execution_context_summary_fields": list(RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS),
+                "runbook_dispatch_trace_summary": "AgentRunbookRecommendation.details.dispatch_trace",
+                "runbook_dispatch_trace_summary_fields": list(RUNBOOK_DISPATCH_TRACE_SUMMARY_FIELDS),
             },
             "diagnostics": {
                 "model_health": "GET /api/v1/agents/model-health",
@@ -2345,6 +2376,16 @@ class AgentBackendCompletionAuditService:
                 "readiness_dashboard": "AgentReadinessDashboardService.snapshot",
                 "release_gate": "AgentReleaseGateService.promotion_assessment",
                 "behavior_evaluation_suite": "scripts.agent_behavior_evaluation.CASES",
+                "behavior_evaluation_cases": "scripts.agent_behavior_evaluation.CASES",
+                "behavior_evaluation_assertions": "scripts.agent_behavior_evaluation.ASSERTIONS",
+                "behavior_evaluation_assertion_coverage": "scripts.agent_behavior_evaluation.assertion_coverage",
+                "behavior_evaluation_undeclared_case_assertions": "scripts.agent_behavior_evaluation.undeclared_case_assertions",
+                "behavior_evaluation_uncovered_assertions": "scripts.agent_behavior_evaluation.uncovered_assertion_ids",
+                "behavior_evaluation_runbook": "scripts.agent_behavior_evaluation.behavior_evaluation_runbook",
+                "behavior_evaluation_latest_report": "scripts.agent_behavior_evaluation.latest_report_summary",
+                "behavior_evaluation_latest_report_fields": "scripts.agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS",
+                "behavior_evaluation_model_call_trace_fields": "scripts.agent_behavior_evaluation.MODEL_CALL_TRACE_FIELDS",
+                "behavior_evaluation_markdown_sections": "scripts.agent_behavior_evaluation.MARKDOWN_REPORT_SECTIONS",
             },
         }
         return {field: snapshot[field] for field in AGENT_BACKEND_COMPLETION_AUDIT_FIELDS}
@@ -2371,3 +2412,63 @@ class AgentBackendCompletionAuditService:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _behavior_evaluation_case_ids() -> list[str]:
+    from scripts.agent_behavior_evaluation import CASES
+
+    return [case.case_id for case in CASES]
+
+
+def _behavior_evaluation_assertions() -> list[str]:
+    from scripts.agent_behavior_evaluation import ASSERTIONS
+
+    return list(ASSERTIONS)
+
+
+def _behavior_evaluation_assertion_coverage() -> dict[str, list[str]]:
+    from scripts.agent_behavior_evaluation import assertion_coverage
+
+    return assertion_coverage()
+
+
+def _behavior_evaluation_undeclared_case_assertions() -> dict[str, list[str]]:
+    from scripts.agent_behavior_evaluation import undeclared_case_assertions
+
+    return undeclared_case_assertions()
+
+
+def _behavior_evaluation_uncovered_assertion_ids() -> list[str]:
+    from scripts.agent_behavior_evaluation import uncovered_assertion_ids
+
+    return uncovered_assertion_ids()
+
+
+def _behavior_evaluation_model_call_trace_fields() -> list[str]:
+    from scripts.agent_behavior_evaluation import MODEL_CALL_TRACE_FIELDS
+
+    return list(MODEL_CALL_TRACE_FIELDS)
+
+
+def _behavior_evaluation_markdown_sections() -> list[str]:
+    from scripts.agent_behavior_evaluation import MARKDOWN_REPORT_SECTIONS
+
+    return list(MARKDOWN_REPORT_SECTIONS)
+
+
+def _behavior_evaluation_latest_report_fields() -> list[str]:
+    from scripts.agent_behavior_evaluation import LATEST_REPORT_SUMMARY_FIELDS
+
+    return list(LATEST_REPORT_SUMMARY_FIELDS)
+
+
+def _behavior_evaluation_runbook() -> dict[str, Any]:
+    from scripts.agent_behavior_evaluation import behavior_evaluation_runbook
+
+    return behavior_evaluation_runbook()
+
+
+def _behavior_evaluation_latest_report() -> dict[str, Any]:
+    from scripts.agent_behavior_evaluation import latest_report_summary
+
+    return latest_report_summary()

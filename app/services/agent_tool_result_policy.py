@@ -123,6 +123,11 @@ FINAL_RESPONSE_BUDGET_INSTRUCTION = (
 DEFAULT_TOOL_RESULT_REPAIR_GUIDANCE = (
     "优先选择当前可用的 read/query/draft/validate 类安全工具补齐上下文、生成修复版或再次验证；不要编造缺失事实或私密凭据。"
 )
+TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS = 6000
+TOOL_RESULT_OUTPUT_PREVIEW_MAX_CHARS = 2400
+TOOL_RESULT_MODEL_MESSAGE_TRUNCATION_MARKER = (
+    "\n\n[tool_result_model_context_truncated: full output remains available in ToolCall.output_json_redacted]"
+)
 
 
 class ToolResultPolicy:
@@ -157,17 +162,9 @@ class ToolResultPolicy:
         )
 
     def build_message(self, call: Any) -> str:
-        payload = {
-            "tool_call_id": getattr(call, "tool_call_id", None),
-            "tool_name": getattr(call, "tool_name", None),
-            "status": getattr(call, "status", None),
-            "approval_required": getattr(call, "approval_required", None),
-            "output": getattr(call, "output_json_redacted", None),
-            "error_code": getattr(call, "error_code", None),
-            "error_message": getattr(call, "error_message", None),
-        }
+        payload = self.model_payload(call)
         decision = self.evaluate(call)
-        return (
+        message = (
             "工具执行结果如下。请根据这个结果继续完成用户请求；"
             "如果工具失败，请先判断是否属于可修复的输入、schema、validation、草稿结构或字段绑定问题；"
             "可修复时必须优先修复并重试安全工具，不要再次声明已经执行成功。"
@@ -175,6 +172,54 @@ class ToolResultPolicy:
             f"\n\n{FINAL_RESPONSE_BUDGET_INSTRUCTION}\n"
             f"{json.dumps(payload, ensure_ascii=False, default=str)}"
         )
+        return self.cap_model_message(message)
+
+    def model_payload(self, call: Any) -> dict[str, Any]:
+        output_view = self.model_output_view(getattr(call, "output_json_redacted", None))
+        payload: dict[str, Any] = {
+            "tool_call_id": getattr(call, "tool_call_id", None),
+            "tool_name": getattr(call, "tool_name", None),
+            "status": getattr(call, "status", None),
+            "approval_required": getattr(call, "approval_required", None),
+            "output": output_view["output"],
+            "output_truncated": output_view["truncated"],
+            "output_size_chars": output_view["size_chars"],
+            "output_preview_chars": output_view["preview_chars"],
+            "output_hash": getattr(call, "output_hash", None),
+            "error_code": getattr(call, "error_code", None),
+            "error_message": getattr(call, "error_message", None),
+        }
+        if output_view["truncated"]:
+            payload["output_preview"] = output_view["preview"]
+            payload["full_output_reference"] = "ToolCall.output_json_redacted"
+        return payload
+
+    def model_output_view(self, output: Any) -> dict[str, Any]:
+        output_json = json.dumps(output, ensure_ascii=False, default=str)
+        size_chars = len(output_json)
+        if size_chars <= TOOL_RESULT_OUTPUT_PREVIEW_MAX_CHARS:
+            return {
+                "output": output,
+                "preview": None,
+                "truncated": False,
+                "size_chars": size_chars,
+                "preview_chars": size_chars,
+            }
+        return {
+            "output": None,
+            "preview": f"{output_json[:TOOL_RESULT_OUTPUT_PREVIEW_MAX_CHARS]}...",
+            "truncated": True,
+            "size_chars": size_chars,
+            "preview_chars": TOOL_RESULT_OUTPUT_PREVIEW_MAX_CHARS,
+        }
+
+    @staticmethod
+    def cap_model_message(message: str) -> str:
+        if len(message) <= TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS:
+            return message
+        marker = TOOL_RESULT_MODEL_MESSAGE_TRUNCATION_MARKER
+        prefix_length = max(0, TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS - len(marker))
+        return f"{message[:prefix_length]}{marker}"
 
     def followup_instruction(
         self,

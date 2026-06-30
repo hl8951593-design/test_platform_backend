@@ -1,9 +1,12 @@
+import json
+import math
+import os
 import unittest
 import tempfile
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
 from sqlalchemy import create_engine, func, inspect, select
@@ -167,6 +170,7 @@ from app.services.agent_memory_service import (
     MemoryFeedbackWorker,
     MemoryMaintenanceWorker,
     MemoryManager,
+    MemoryCandidate,
     MemoryRetrievalProfileResolver,
     MemorySourceProfileResolver,
     MemoryStalenessWorker,
@@ -290,6 +294,9 @@ from app.services.agent_release_gate_service import (
 from app.services.agent_resume_service import AgentRunResumeService
 from app.services.agent_runbook_service import (
     CHECKPOINT_FRESHNESS_SAFE_ACTIONS,
+    RUNBOOK_EVENT_PAYLOAD_PREVIEW_MAX_CHARS,
+    RUNBOOK_EVENT_PAYLOAD_TRUNCATION_MARKER,
+    RUNBOOK_DISPATCH_TRACE_SUMMARY_FIELDS,
     RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS,
     RUNBOOK_DIAGNOSIS_FIELDS,
     RUNBOOK_DIAGNOSIS_RECOMMENDATION_RUNBOOK_IDS,
@@ -302,6 +309,7 @@ from app.services.agent_runbook_service import (
 from app.services.agent_tool_result_policy import (
     DEFAULT_TOOL_RESULT_REPAIR_GUIDANCE,
     FINAL_RESPONSE_BUDGET_INSTRUCTION,
+    TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS,
     ToolResultPolicy,
 )
 from app.services.agent_runtime_service import (
@@ -316,6 +324,10 @@ from app.services.agent_runtime_service import (
     AGENT_RUN_EVENT_SNAPSHOT_FIELDS,
     AGENT_RUN_FIELDS,
     AGENT_RUN_SUMMARY_FIELDS,
+    AGENT_MEMORY_CONTEXT_MESSAGE_MAX_CHARS,
+    AGENT_REPAIR_CONTEXT_MAX_CHARS,
+    AGENT_TOOL_RESULT_CONTEXT_TOTAL_MAX_CHARS,
+    AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_MAX_CHARS,
     RUNTIME_SNAPSHOT_FIELDS,
     TOOL_CALL_FIELDS,
     AgentConversationRunner,
@@ -324,7 +336,9 @@ from app.services.agent_runtime_service import (
     AgentWorkerQueueService,
     ExecutionLedgerService,
     ToolExecutor,
+    UnsupportedCapabilityGuard,
     _conversation_system_prompt,
+    _format_memory_context,
     _intent_likely_requires_agent_tool,
     _required_tool_followup_rules_for_intent,
     _unsupported_capability_classifier_prompt,
@@ -560,6 +574,89 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(retry_event.payload_json["delay_seconds"], 0.25)
         self.assertEqual(retry_event.payload_json["error_message"], "temporary EOF")
         self.assertEqual(retry_event.payload_json["loop_step"], "assistant_response")
+
+    def test_conversation_runner_bounds_model_stream_retrying_error_message(self):
+        from app.services.agent_runtime_service import (
+            AGENT_ERROR_MESSAGE_MAX_CHARS,
+            AGENT_ERROR_MESSAGE_TRUNCATION_MARKER,
+        )
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="retry with long provider body"),
+            current_user=self.owner,
+        )
+        hidden_tail = "STREAM_RETRY_ERROR_TAIL_SHOULD_NOT_APPEAR"
+        long_error = "retry provider failed " + ("x" * (AGENT_ERROR_MESSAGE_MAX_CHARS * 3)) + hidden_tail
+        stream_events = [
+            {
+                "type": "retry",
+                "attempt": 1,
+                "max_retries": 2,
+                "delay_seconds": 0.25,
+                "error_message": long_error,
+            },
+            {"type": "delta", "content": "ok"},
+            {"type": "done", "finish_reason": "stop", "model": "deepseek-test"},
+        ]
+
+        with self.assertLogs("app.services.agent_runtime_service", level="WARNING") as captured_logs:
+            with patch("app.services.agent_runtime_service.AIService.chat_stream", return_value=iter(stream_events)):
+                completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        retry_event = next(item for item in events if item.event_type == "model.stream_retrying")
+        log_output = "\n".join(captured_logs.output)
+
+        self.assertEqual(completed.status, "completed")
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, retry_event.payload_json["error_message"])
+        self.assertIn("error_hash=", retry_event.payload_json["error_message"])
+        self.assertLessEqual(len(retry_event.payload_json["error_message"]), AGENT_ERROR_MESSAGE_MAX_CHARS)
+        self.assertNotIn(hidden_tail, retry_event.payload_json["error_message"])
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, log_output)
+        self.assertNotIn(hidden_tail, log_output)
+
+    def test_conversation_runner_bounds_model_stream_interrupted_error_message(self):
+        from app.services.agent_runtime_service import (
+            AGENT_ERROR_MESSAGE_MAX_CHARS,
+            AGENT_ERROR_MESSAGE_TRUNCATION_MARKER,
+        )
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="partial stream interrupted"),
+            current_user=self.owner,
+        )
+        hidden_tail = "STREAM_INTERRUPTED_ERROR_TAIL_SHOULD_NOT_APPEAR"
+        long_error = "stream interrupted failed " + ("x" * (AGENT_ERROR_MESSAGE_MAX_CHARS * 3)) + hidden_tail
+
+        def fake_stream(_self, _request):
+            yield {"type": "delta", "content": "partial reply"}
+            raise HTTPException(status_code=503, detail=long_error)
+
+        with self.assertLogs("app.services.agent_runtime_service", level="WARNING") as captured_logs:
+            with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+                completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        interrupted_event = next(item for item in events if item.event_type == "model.stream_interrupted")
+        completed_event = next(item for item in events if item.event_type == "model.completed")
+        log_output = "\n".join(captured_logs.output)
+
+        self.assertEqual(completed.status, "completed")
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, interrupted_event.payload_json["error_message"])
+        self.assertIn("error_hash=", interrupted_event.payload_json["error_message"])
+        self.assertLessEqual(len(interrupted_event.payload_json["error_message"]), AGENT_ERROR_MESSAGE_MAX_CHARS)
+        self.assertNotIn(hidden_tail, interrupted_event.payload_json["error_message"])
+        self.assertEqual(completed_event.payload_json["error_message"], interrupted_event.payload_json["error_message"])
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, log_output)
+        self.assertNotIn(hidden_tail, log_output)
 
     def test_conversation_runner_allows_software_testing_general_answers_without_tools(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -1002,6 +1099,31 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("通用工具结果质量闭环", decision.followup_instruction)
         self.assertIn(FINAL_RESPONSE_BUDGET_INSTRUCTION, message)
 
+    def test_tool_result_policy_bounds_large_outputs_for_model_context(self):
+        large_blob = "x" * 5000
+        full_output = {
+            "summary": "large tool output should stay available in ToolCall details",
+            "rows": [{"id": index, "body": large_blob} for index in range(5)],
+        }
+        call = SimpleNamespace(
+            tool_call_id="tool-large",
+            tool_name="project.read_context",
+            status="succeeded",
+            approval_required=False,
+            output_json_redacted=full_output,
+            output_hash="hash-large-output",
+            error_code=None,
+            error_message=None,
+        )
+
+        message = ToolResultPolicy().build_message(call)
+
+        self.assertLessEqual(len(message), TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS)
+        self.assertIn('"output_truncated": true', message)
+        self.assertIn('"output_hash": "hash-large-output"', message)
+        self.assertIn("ToolCall.output_json_redacted", message)
+        self.assertNotIn(large_blob, message)
+
     def test_tool_result_policy_retries_fixable_failed_tool_inputs(self):
         call = SimpleNamespace(
             tool_call_id="tool-2",
@@ -1095,6 +1217,37 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertFalse(health["reachable"])
         self.assertEqual(health["error_code"], "deepseek_api_key_missing")
         chat_stream.assert_not_called()
+
+    def test_agent_model_health_live_probe_bounds_unhandled_error_message(self):
+        from app.services.agent_runtime_service import (
+            AGENT_ERROR_MESSAGE_MAX_CHARS,
+            AGENT_ERROR_MESSAGE_TRUNCATION_MARKER,
+        )
+
+        provider = SimpleNamespace(
+            provider="deepseek",
+            base_url="https://api.deepseek.test",
+            default_model="deepseek-test",
+            configured=True,
+        )
+        hidden_tail = "MODEL_HEALTH_ERROR_TAIL_SHOULD_NOT_APPEAR"
+        long_error = "provider stream failed " + ("x" * (AGENT_ERROR_MESSAGE_MAX_CHARS * 3)) + hidden_tail
+
+        def raise_unhandled(self, payload):
+            raise RuntimeError(long_error)
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.provider_config", return_value=provider),
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=raise_unhandled),
+        ):
+            health = AgentModelHealthService().check(live=True)
+
+        self.assertFalse(health["reachable"])
+        self.assertEqual(health["error_code"], "deepseek_probe_error")
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, health["error_message"])
+        self.assertIn("error_hash=", health["error_message"])
+        self.assertLessEqual(len(health["error_message"]), AGENT_ERROR_MESSAGE_MAX_CHARS)
+        self.assertNotIn(hidden_tail, health["error_message"])
 
     def test_agent_model_health_route_allows_config_check_but_admin_only_live_probe(self):
         from app.api.v1.routers.agents import get_agent_model_health
@@ -1192,6 +1345,62 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(failed.error_code, "agent_conversation_model_error")
         self.assertEqual(events[-1].event_type, "run.failed")
         self.assertEqual(events[-1].payload_json["error_message"], "model unavailable")
+
+    def test_conversation_runner_bounds_long_failure_error_message(self):
+        from app.services.agent_runtime_service import (
+            AGENT_ERROR_MESSAGE_MAX_CHARS,
+            AGENT_ERROR_MESSAGE_TRUNCATION_MARKER,
+        )
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="触发超长模型异常"),
+            current_user=self.owner,
+        )
+        hidden_tail = "RUN_FAILURE_ERROR_TAIL_SHOULD_NOT_APPEAR"
+        long_error = "agent runner failed " + ("x" * (AGENT_ERROR_MESSAGE_MAX_CHARS * 3)) + hidden_tail
+
+        with patch(
+            "app.services.agent_runtime_service.AIService.chat_stream",
+            side_effect=RuntimeError(long_error),
+        ):
+            failed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(self.db.scalars(
+            select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+        ).all())
+        failed_events = [event for event in events if event.event_type == "run.failed"]
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(failed.error_code, "agent_conversation_unhandled_error")
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, failed.error_message)
+        self.assertIn("error_hash=", failed.error_message)
+        self.assertLessEqual(len(failed.error_message), AGENT_ERROR_MESSAGE_MAX_CHARS)
+        self.assertNotIn(hidden_tail, failed.error_message)
+        self.assertEqual(failed_events[-1].payload_json["error_message"], failed.error_message)
+
+    def test_conversation_runner_bounds_long_failure_error_log(self):
+        from app.services.agent_runtime_service import (
+            AGENT_ERROR_MESSAGE_MAX_CHARS,
+            AGENT_ERROR_MESSAGE_TRUNCATION_MARKER,
+        )
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="触发超长模型异常日志"),
+            current_user=self.owner,
+        )
+        hidden_tail = "RUN_FAILURE_LOG_TAIL_SHOULD_NOT_APPEAR"
+        long_error = "agent runner log failed " + ("x" * (AGENT_ERROR_MESSAGE_MAX_CHARS * 3)) + hidden_tail
+
+        with self.assertLogs("app.services.agent_runtime_service", level="ERROR") as captured_logs:
+            with patch(
+                "app.services.agent_runtime_service.AIService.chat_stream",
+                side_effect=RuntimeError(long_error),
+            ):
+                AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, log_output)
+        self.assertIn("error_hash=", log_output)
+        self.assertNotIn(hidden_tail, log_output)
 
     def test_create_run_generates_conversation_id_and_lists_history(self):
         runtime = AgentRuntimeService(self.db)
@@ -1328,6 +1537,28 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("登录接口测试偏好", memory_messages[0])
         self.assertIn("token 过期", memory_messages[0])
         self.assertEqual(captured_messages[-1].content, "请继续设计登录接口测试")
+
+    def test_memory_context_message_is_bounded_for_model_context(self):
+        tail_marker = "TAIL_SHOULD_NOT_ENTER_MEMORY_CONTEXT"
+        candidate = MemoryCandidate(
+            memory_id=1,
+            memory_version=1,
+            title=("超长标题" * 800) + tail_marker,
+            content=("超长记忆内容 " * 800) + tail_marker,
+            source_type="user_confirmed",
+            confidence=0.9,
+            stale_score=0.1,
+            retrieval_score=0.99,
+            retrieval_profile="normal_plan_v1",
+            evidence_ref={"memory_id": 1},
+            allowed_usage="conversation_context",
+        )
+
+        message = _format_memory_context([candidate])
+
+        self.assertLessEqual(len(message), AGENT_MEMORY_CONTEXT_MESSAGE_MAX_CHARS)
+        self.assertIn("agent_memory_context_truncated", message)
+        self.assertNotIn(tail_marker, message)
 
     def test_parse_tool_request_returns_structured_envelope(self):
         request = AgentConversationRunner(self.db)._parse_tool_request(
@@ -2450,6 +2681,126 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("格式无效", captured_messages[1][-1].content)
         self.assertIn("工具执行结果如下", captured_messages[2][-1].content)
 
+    def test_conversation_runner_bounds_invalid_tool_request_repair_context(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="读取项目上下文后再回答"),
+            current_user=self.owner,
+        )
+        captured_messages = []
+        large_invalid_fragment = "x" * 8000
+        tail_marker = "TAIL_SHOULD_NOT_ENTER_REPAIR_CONTEXT"
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{},"reason":"'
+                        f'{large_invalid_fragment}{tail_marker}",'
+                        '"evidence_refs":{}}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {
+                "type": "delta",
+                "content": (
+                    "```agent_tool_request\n"
+                    '{"tool_name":"project.read_context","input":{},"reason":"需要项目上下文","evidence_refs":[]}'
+                    "\n```"
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_runtime_service.AgentToolBackend.execute",
+                return_value={"project": {"id": 10, "name": "TestAuto"}},
+            ),
+        ):
+            AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        repair_context = captured_messages[1][-2].content
+        self.assertLessEqual(len(repair_context), AGENT_REPAIR_CONTEXT_MAX_CHARS)
+        self.assertIn("agent_repair_context_truncated", repair_context)
+        self.assertNotIn(tail_marker, repair_context)
+
+    def test_conversation_runner_bounds_invalid_tool_request_error_messages(self):
+        from app.services.agent_runtime_service import (
+            AGENT_ERROR_MESSAGE_MAX_CHARS,
+            AGENT_ERROR_MESSAGE_TRUNCATION_MARKER,
+        )
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="读取项目上下文后再回答"),
+            current_user=self.owner,
+        )
+        captured_messages = []
+        invalid_tail = "INVALID_TOOL_REQUEST_SECRET_TAIL"
+        repair_tail = "REPAIR_FAILED_SECRET_TAIL"
+        invalid_error = f"invalid tool request parse failed: {'x' * 900}{invalid_tail}"
+        repair_error = f"repair tool request parse failed: {'y' * 900}{repair_tail}"
+        parse_results = [
+            HTTPException(status_code=422, detail=invalid_error),
+            HTTPException(status_code=422, detail=repair_error),
+        ]
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {"type": "delta", "content": "bad tool request"}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "still bad tool request"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def fake_parse(self, content, **kwargs):
+            _ = content, kwargs
+            result = parse_results.pop(0)
+            raise result
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch.object(AgentConversationRunner, "_parse_tool_request", new=fake_parse),
+        ):
+            failed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        invalid_event = next(item for item in events if item.event_type == "model.tool_request_invalid")
+        repair_failed_event = next(item for item in events if item.event_type == "model.tool_request_repair_failed")
+        observation = self.db.scalar(
+            select(AgentLoopObservation).where(AgentLoopObservation.run_id == run.run_id)
+        )
+        invalid_message = invalid_event.payload_json["error_message"]
+        repair_failed_message = repair_failed_event.payload_json["error_message"]
+
+        self.assertEqual(failed.status, "failed")
+        self.assertLessEqual(len(invalid_message), AGENT_ERROR_MESSAGE_MAX_CHARS)
+        self.assertLessEqual(len(repair_failed_message), AGENT_ERROR_MESSAGE_MAX_CHARS)
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, invalid_message)
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, repair_failed_message)
+        self.assertIn("error_summary_version=agent_error_message_summary_v1", invalid_message)
+        self.assertIn("error_summary_version=agent_error_message_summary_v1", repair_failed_message)
+        self.assertIn("error_hash=", invalid_message)
+        self.assertIn("error_hash=", repair_failed_message)
+        self.assertIn("full_error_reference=AgentConversationRunner.model.tool_request_invalid", invalid_message)
+        self.assertIn(
+            "full_error_reference=AgentConversationRunner.model.tool_request_repair_failed",
+            repair_failed_message,
+        )
+        self.assertNotIn(invalid_tail, invalid_message)
+        self.assertNotIn(repair_tail, repair_failed_message)
+        self.assertNotIn(invalid_tail, captured_messages[1][-1].content)
+        self.assertEqual(observation.observation_json["error_message"], invalid_message)
+
     def test_conversation_runner_salvages_mixed_tool_block_without_extra_repair_call(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="读取项目上下文并继续回答"),
@@ -2507,6 +2858,71 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual([call.tool_name for call in calls], ["project.read_context"])
         self.assertEqual(calls[0].policy_evidence_refs_json, [])
         self.assertNotIn("agent_tool_request", visible_content)
+
+    def test_conversation_runner_retracts_visible_preamble_when_tool_block_arrives_late(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="Read project context before answering"),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {"type": "delta", "content": "I will inspect the project first.\n\n"}
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{},'
+                        '"reason":"Need project context","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "Project context has been read."}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_runtime_service.AgentToolBackend.execute",
+                return_value={"project": {"id": 10, "name": "TestAuto"}},
+            ),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        visible_preamble = next(
+            item
+            for item in events
+            if item.event_type == "model.delta"
+            and item.payload_json.get("content") == "I will inspect the project first.\n\n"
+        )
+        retraction = next(
+            item
+            for item in events
+            if item.event_type == "model.markdown_normalized"
+            and item.payload_json.get("normalization_reason") == "tool_request_stream_suppressed"
+        )
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(completed.result_json["message"], "Project context has been read.")
+        self.assertIn("model.tool_request_stream_suppressed", event_types)
+        self.assertEqual(retraction.payload_json["content"], "")
+        self.assertTrue(retraction.payload_json["replace_content"])
+        self.assertEqual(retraction.payload_json["model_call_id"], visible_preamble.payload_json["model_call_id"])
+        self.assertLess(visible_preamble.event_seq, retraction.event_seq)
+        self.assertLess(
+            retraction.event_seq,
+            next(item.event_seq for item in events if item.event_type == "model.tool_request_detected"),
+        )
 
     def test_conversation_runner_short_circuits_unsupported_scenario_save(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -2799,6 +3215,109 @@ class AgentRuntimeTests(unittest.TestCase):
                 for item in metadata["matched_agent_skill_routing_rules"]
             ],
         )
+
+    def test_conversation_runner_bounds_required_tool_repair_failed_error_message(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+        from app.services.agent_runtime_service import (
+            AGENT_ERROR_MESSAGE_MAX_CHARS,
+            AGENT_ERROR_MESSAGE_TRUNCATION_MARKER,
+        )
+
+        environment = ProjectEnvironment(
+            id=106,
+            project_id=10,
+            name="default",
+            base_url="https://api.example.test",
+            description="default env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        case = TestCase(
+            id=206,
+            project_id=10,
+            environment_id=106,
+            name="Enterprise Company List",
+            description="query companies",
+            method="GET",
+            path="/companies",
+            headers={},
+            query_params={},
+            body_type="json",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, case])
+        self.db.commit()
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="请基于已有用例生成企业场景草稿。",
+                max_iterations=3,
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+        hidden_tail = "REQUIRED_TOOL_REPAIR_SECRET_TAIL"
+        long_error = f"required tool repair parse failed: {'z' * 900}{hidden_tail}"
+        original_parse = AgentConversationRunner._parse_tool_request
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"testcase.query_project_cases","input":{"project_id":10},'
+                        '"reason":"查询用例","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 2:
+                yield {"type": "delta", "content": "我已经分析完候选用例，企业列表可作为第一步。"}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "still invalid required repair"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def fake_parse(self, content, **kwargs):
+            if content == "still invalid required repair":
+                raise HTTPException(status_code=422, detail=long_error)
+            return original_parse(self, content, **kwargs)
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch.object(AgentConversationRunner, "_parse_tool_request", new=fake_parse),
+        ):
+            failed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        repair_failed = next(item for item in events if item.event_type == "model.required_tool_repair_failed")
+        error_message = repair_failed.payload_json["error_message"]
+
+        self.assertEqual(failed.status, "failed")
+        self.assertIn("model.required_tool_missing", event_types)
+        self.assertLessEqual(len(error_message), AGENT_ERROR_MESSAGE_MAX_CHARS)
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, error_message)
+        self.assertIn("error_summary_version=agent_error_message_summary_v1", error_message)
+        self.assertIn("error_hash=", error_message)
+        self.assertIn(
+            "full_error_reference=AgentConversationRunner.model.required_tool_repair_failed",
+            error_message,
+        )
+        self.assertNotIn(hidden_tail, error_message)
 
     def test_conversation_runner_retries_fixable_failed_compose_tool(self):
         from app.models.project import ProjectEnvironment
@@ -4242,6 +4761,32 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("requires_scenario_persistence", _unsupported_capability_classifier_prompt(guards[0]) or "")
         self.assertIn("没有“保存正式场景”的后端工具", _unsupported_capability_message(guards[0]) or "")
 
+    def test_unsupported_capability_classifier_prompt_is_bounded_for_model_context(self):
+        tail_marker = "TAIL_SHOULD_NOT_ENTER_CLASSIFIER_CONTEXT"
+        long_prompt = ("classifier prompt " * 500) + tail_marker
+        guard = UnsupportedCapabilityGuard(
+            skill_name="custom-skill",
+            name="custom_guard",
+            intent_key="guard_intent",
+            subject_key="guard_subject",
+            unavailable_tools=("custom.publish",),
+            classifier_prompt_key="guard_classifier",
+            requires_field="requires_custom_publish",
+            completion_source="unsupported_custom_publish_guard",
+            message_key="guard_message",
+            synthetic_reason="Custom publish is not available.",
+        )
+
+        fake_registry = MagicMock()
+        fake_registry.private_resource_text.return_value = long_prompt
+        with patch("app.services.agent_runtime_service.AgentSkillRegistry", return_value=fake_registry):
+            prompt = _unsupported_capability_classifier_prompt(guard)
+
+        self.assertIsNotNone(prompt)
+        self.assertLessEqual(len(prompt or ""), AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_MAX_CHARS)
+        self.assertIn("agent_classifier_prompt_truncated", prompt or "")
+        self.assertNotIn(tail_marker, prompt or "")
+
     def test_agent_skill_registry_loads_custom_skill_triggers_from_frontmatter(self):
         from app.services.agent_skill_registry import AgentSkillRegistry
 
@@ -4304,6 +4849,36 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn("私有分类提示词", selected[0].prompt_block())
         self.assertNotIn("私有完成消息", selected[0].prompt_block())
 
+    def test_agent_skill_prompt_block_is_bounded_for_model_context(self):
+        from app.services.agent_skill_registry import AGENT_SKILL_PROMPT_BLOCK_MAX_CHARS, AgentSkillRegistry
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = Path(temp_dir) / "long-skill"
+            skill_dir.mkdir()
+            long_body = "\n".join([
+                "## Rules",
+                "x" * 6000,
+                "TAIL_SHOULD_NOT_ENTER_MODEL_CONTEXT",
+            ])
+            (skill_dir / "SKILL.md").write_text(
+                "\n".join([
+                    "---",
+                    "name: long-skill",
+                    "description: Use when the user asks for long skill context.",
+                    "triggers:",
+                    "  - long skill",
+                    "---",
+                    long_body,
+                ]),
+                encoding="utf-8",
+            )
+
+            prompt = AgentSkillRegistry(root=Path(temp_dir)).select_for_intent("long skill please")[0].prompt_block()
+
+        self.assertLessEqual(len(prompt), AGENT_SKILL_PROMPT_BLOCK_MAX_CHARS)
+        self.assertIn("agent_skill_prompt_truncated", prompt)
+        self.assertNotIn("TAIL_SHOULD_NOT_ENTER_MODEL_CONTEXT", prompt)
+
     def test_tool_call_idempotency_reuses_existing_call(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="读取项目上下文"),
@@ -4362,6 +4937,37 @@ class AgentRuntimeTests(unittest.TestCase):
             1,
         )
         self.assertEqual(run.run_id, self.db.scalar(select(AgentEvent.run_id).limit(1)))
+
+    def test_outbox_publisher_bounds_long_last_error_message(self):
+        AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="outbox long error", auto_complete=True),
+            current_user=self.owner,
+        )
+        now = datetime.now(UTC).replace(tzinfo=None)
+        hidden_tail = "OUTBOX_PROVIDER_SECRET_TAIL"
+
+        def fail_publish(event):
+            raise RuntimeError(f"publish failed: {'x' * 700}{hidden_tail}")
+
+        summary = AgentOutboxPublisher(
+            self.db,
+            publisher=fail_publish,
+            max_attempts=1,
+            base_retry_seconds=1,
+        ).publish_pending(limit=1, now=now)
+
+        dead_letter = self.db.scalar(select(AgentOutbox).where(AgentOutbox.status == "dead_letter"))
+        self.assertEqual(summary["attempted"], 1)
+        self.assertEqual(summary["dead_letter"], 1)
+        self.assertIsNotNone(dead_letter)
+        self.assertIsNotNone(dead_letter.last_error)
+        self.assertLessEqual(len(dead_letter.last_error), 512)
+        self.assertIn("[agent_error_message_truncated]", dead_letter.last_error)
+        self.assertIn("error_summary_version=agent_error_message_summary_v1", dead_letter.last_error)
+        self.assertIn("error_size_chars=", dead_letter.last_error)
+        self.assertIn("error_hash=", dead_letter.last_error)
+        self.assertIn("full_error_reference=AgentOutboxPublisher.publish_pending", dead_letter.last_error)
+        self.assertNotIn(hidden_tail, dead_letter.last_error)
 
     def test_outbox_publish_lag_alert_affects_dashboard_readiness(self):
         AgentRuntimeService(self.db).create_run(
@@ -6012,7 +6618,10 @@ class AgentRuntimeTests(unittest.TestCase):
 
     def test_backend_completion_audit_summarizes_agent_backend_delivery(self):
         from app.api.v1.routers.agents import get_agent_backend_completion_audit
-        from scripts.agent_behavior_evaluation import CASES as AGENT_BEHAVIOR_EVALUATION_CASES
+        from scripts.agent_behavior_evaluation import (
+            CASES as AGENT_BEHAVIOR_EVALUATION_CASES,
+            LATEST_REPORT_SUMMARY_FIELDS,
+        )
 
         provider = SimpleNamespace(
             provider="deepseek",
@@ -6050,12 +6659,24 @@ class AgentRuntimeTests(unittest.TestCase):
             "AgentToolCall.policy_reason_json.execution_context",
         )
         self.assertEqual(
+            audit["runtime_contracts"]["tool_dispatch_trace"],
+            "AgentToolCall.policy_reason_json.dispatch_trace",
+        )
+        self.assertEqual(
             audit["runtime_contracts"]["runbook_execution_context_summary"],
             "AgentRunbookRecommendation.details.execution_context",
         )
         self.assertEqual(
             audit["runtime_contracts"]["runbook_execution_context_summary_fields"],
             list(RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS),
+        )
+        self.assertEqual(
+            audit["runtime_contracts"]["runbook_dispatch_trace_summary"],
+            "AgentRunbookRecommendation.details.dispatch_trace",
+        )
+        self.assertEqual(
+            audit["runtime_contracts"]["runbook_dispatch_trace_summary_fields"],
+            list(RUNBOOK_DISPATCH_TRACE_SUMMARY_FIELDS),
         )
         self.assertEqual(audit["diagnostics"]["completion_audit"], "GET /api/v1/agents/backend-completion-audit")
         self.assertEqual(audit["diagnostics"]["tool_call_detail"], "GET /api/v1/agents/tool-calls/{tool_call_id}")
@@ -6067,6 +6688,10 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(
             checks["observability_and_release_gate"]["details"]["runbook_execution_context_summary_fields"],
             list(RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS),
+        )
+        self.assertEqual(
+            checks["observability_and_release_gate"]["details"]["runbook_dispatch_trace_summary_fields"],
+            list(RUNBOOK_DISPATCH_TRACE_SUMMARY_FIELDS),
         )
         self.assertIn("model.delta", checks["conversation_runner_streaming"]["details"]["required_event_types"])
         self.assertIn(
@@ -6090,6 +6715,54 @@ class AgentRuntimeTests(unittest.TestCase):
             "query_first_tool_order",
             checks["behavior_evaluation_suite_available"]["details"]["assertions"],
         )
+        behavior_assertion_coverage = checks["behavior_evaluation_suite_available"]["details"].get(
+            "assertion_coverage"
+        )
+        self.assertIsInstance(behavior_assertion_coverage, dict)
+        self.assertEqual(
+            set(behavior_assertion_coverage),
+            set(checks["behavior_evaluation_suite_available"]["details"]["assertions"]),
+        )
+        self.assertEqual(behavior_assertion_coverage["general_answer_no_tool"], ["T01"])
+        self.assertEqual(behavior_assertion_coverage["query_first_tool_order"], ["T04"])
+        self.assertEqual(behavior_assertion_coverage["tool_result_repair_loop"], ["T04", "T05"])
+        self.assertEqual(behavior_assertion_coverage["domain_boundary"], ["T08"])
+        self.assertEqual(behavior_assertion_coverage["tool_diagnostic_chain"], ["T03", "T04", "T05", "T07"])
+        self.assertEqual(
+            checks["behavior_evaluation_suite_available"]["details"]["undeclared_case_assertions"],
+            {},
+        )
+        self.assertTrue(checks["behavior_evaluation_suite_available"]["details"]["assertion_metadata_complete"])
+        self.assertEqual(
+            checks["behavior_evaluation_suite_available"]["details"]["model_call_trace_fields"],
+            [
+                "model_call_id",
+                "iteration_id",
+                "loop_step",
+                "phase",
+                "started_event_seen",
+                "completed_event_seen",
+                "delta_event_count",
+                "stream_retry_count",
+                "stream_interrupted",
+                "final_summary",
+                "repair_attempt",
+                "finish_reason",
+                "model",
+            ],
+        )
+        self.assertEqual(
+            checks["behavior_evaluation_suite_available"]["details"]["markdown_sections"],
+            ["模型调用链摘要", "工具诊断链摘要"],
+        )
+        self.assertEqual(
+            checks["behavior_evaluation_suite_available"]["details"]["latest_report_fields"],
+            list(LATEST_REPORT_SUMMARY_FIELDS),
+        )
+        self.assertEqual(
+            checks["behavior_evaluation_suite_available"]["details"]["runbook"]["report_schema_version"],
+            "agent_behavior_evaluation_report_v2",
+        )
         self.assertEqual(
             audit["diagnostics"]["behavior_evaluation_script"],
             "scripts/agent_behavior_evaluation.py",
@@ -6098,7 +6771,2666 @@ class AgentRuntimeTests(unittest.TestCase):
             audit["diagnostics"]["behavior_evaluation_reports"],
             "reports/woagent_behavior_eval_*.json|md",
         )
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_cases"),
+            "scripts.agent_behavior_evaluation.CASES",
+        )
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_assertions"),
+            "scripts.agent_behavior_evaluation.ASSERTIONS",
+        )
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_assertion_coverage"),
+            "scripts.agent_behavior_evaluation.assertion_coverage",
+        )
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_undeclared_case_assertions"),
+            "scripts.agent_behavior_evaluation.undeclared_case_assertions",
+        )
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_runbook"),
+            "scripts.agent_behavior_evaluation.behavior_evaluation_runbook",
+        )
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_latest_report"),
+            "scripts.agent_behavior_evaluation.latest_report_summary",
+        )
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_model_call_trace_fields"),
+            "scripts.agent_behavior_evaluation.MODEL_CALL_TRACE_FIELDS",
+        )
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_markdown_sections"),
+            "scripts.agent_behavior_evaluation.MARKDOWN_REPORT_SECTIONS",
+        )
         chat_stream.assert_not_called()
+
+    def test_backend_completion_audit_derives_behavior_cases_from_evaluation_script(self):
+        provider = SimpleNamespace(
+            provider="deepseek",
+            base_url="https://api.deepseek.test",
+            default_model="deepseek-test",
+            configured=True,
+        )
+        script_cases = (
+            SimpleNamespace(case_id="TX1"),
+            SimpleNamespace(case_id="TX2"),
+        )
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.provider_config", return_value=provider),
+            patch("scripts.agent_behavior_evaluation.CASES", script_cases),
+        ):
+            audit = AgentBackendCompletionAuditService(self.db).audit(project_id=10)
+
+        checks = {item["name"]: item for item in audit["checks"]}
+        behavior_details = checks["behavior_evaluation_suite_available"]["details"]
+        self.assertEqual(behavior_details["case_ids"], ["TX1", "TX2"])
+        self.assertEqual(behavior_details["case_count"], 2)
+
+    def test_backend_completion_audit_derives_behavior_assertions_from_evaluation_script(self):
+        provider = SimpleNamespace(
+            provider="deepseek",
+            base_url="https://api.deepseek.test",
+            default_model="deepseek-test",
+            configured=True,
+        )
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.provider_config", return_value=provider),
+            patch(
+                "scripts.agent_behavior_evaluation.ASSERTIONS",
+                ("custom_assertion_one", "custom_assertion_two"),
+                create=True,
+            ),
+        ):
+            audit = AgentBackendCompletionAuditService(self.db).audit(project_id=10)
+
+        checks = {item["name"]: item for item in audit["checks"]}
+        behavior_details = checks["behavior_evaluation_suite_available"]["details"]
+        self.assertEqual(behavior_details["assertions"], ["custom_assertion_one", "custom_assertion_two"])
+
+    def test_backend_completion_audit_flags_undeclared_behavior_assertions(self):
+        provider = SimpleNamespace(
+            provider="deepseek",
+            base_url="https://api.deepseek.test",
+            default_model="deepseek-test",
+            configured=True,
+        )
+        script_cases = (
+            SimpleNamespace(case_id="TX1", assertion_ids=("known_assertion", "typo_assertion")),
+            SimpleNamespace(case_id="TX2", assertion_ids=("typo_assertion",)),
+        )
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.provider_config", return_value=provider),
+            patch("scripts.agent_behavior_evaluation.ASSERTIONS", ("known_assertion",), create=True),
+            patch("scripts.agent_behavior_evaluation.CASES", script_cases),
+        ):
+            audit = AgentBackendCompletionAuditService(self.db).audit(project_id=10)
+
+        checks = {item["name"]: item for item in audit["checks"]}
+        behavior_details = checks["behavior_evaluation_suite_available"]["details"]
+        self.assertEqual(behavior_details["assertion_coverage"], {"known_assertion": ["TX1"]})
+        self.assertEqual(behavior_details["undeclared_case_assertions"], {"typo_assertion": ["TX1", "TX2"]})
+        self.assertFalse(behavior_details["assertion_metadata_complete"])
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_undeclared_case_assertions"),
+            "scripts.agent_behavior_evaluation.undeclared_case_assertions",
+        )
+
+    def test_backend_completion_audit_flags_uncovered_behavior_assertions(self):
+        provider = SimpleNamespace(
+            provider="deepseek",
+            base_url="https://api.deepseek.test",
+            default_model="deepseek-test",
+            configured=True,
+        )
+        script_cases = (
+            SimpleNamespace(case_id="TX1", assertion_ids=("known_assertion",)),
+        )
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.provider_config", return_value=provider),
+            patch("scripts.agent_behavior_evaluation.ASSERTIONS", ("known_assertion", "uncovered_assertion"), create=True),
+            patch("scripts.agent_behavior_evaluation.CASES", script_cases),
+        ):
+            audit = AgentBackendCompletionAuditService(self.db).audit(project_id=10)
+
+        checks = {item["name"]: item for item in audit["checks"]}
+        behavior_check = checks["behavior_evaluation_suite_available"]
+        behavior_details = behavior_check["details"]
+        self.assertEqual(
+            behavior_details["assertion_coverage"],
+            {"known_assertion": ["TX1"], "uncovered_assertion": []},
+        )
+        self.assertEqual(behavior_details.get("uncovered_assertion_ids"), ["uncovered_assertion"])
+        self.assertFalse(behavior_details["assertion_metadata_complete"])
+        self.assertEqual(behavior_check["status"], "attention")
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_uncovered_assertions"),
+            "scripts.agent_behavior_evaluation.uncovered_assertion_ids",
+        )
+
+    def test_backend_completion_audit_derives_behavior_runbook_from_evaluation_script(self):
+        provider = SimpleNamespace(
+            provider="deepseek",
+            base_url="https://api.deepseek.test",
+            default_model="deepseek-test",
+            configured=True,
+        )
+        runbook = {
+            "run_command": "custom-eval-command",
+            "required_env": ["CUSTOM_EVAL_PASSWORD"],
+            "optional_env_defaults": {"CUSTOM_EVAL_PROJECT_ID": "42"},
+            "report_schema_version": "custom_report_v1",
+            "secret_safe": True,
+        }
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.provider_config", return_value=provider),
+            patch("scripts.agent_behavior_evaluation.behavior_evaluation_runbook", return_value=runbook, create=True),
+        ):
+            audit = AgentBackendCompletionAuditService(self.db).audit(project_id=10)
+
+        checks = {item["name"]: item for item in audit["checks"]}
+        behavior_details = checks["behavior_evaluation_suite_available"]["details"]
+        self.assertEqual(behavior_details.get("runbook"), runbook)
+
+    def test_backend_completion_audit_exposes_behavior_coverage_and_runbook_sources(self):
+        provider = SimpleNamespace(
+            provider="deepseek",
+            base_url="https://api.deepseek.test",
+            default_model="deepseek-test",
+            configured=True,
+        )
+
+        with patch("app.services.agent_runtime_service.AIService.provider_config", return_value=provider):
+            audit = AgentBackendCompletionAuditService(self.db).audit(project_id=10)
+
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_assertion_coverage"),
+            "scripts.agent_behavior_evaluation.assertion_coverage",
+        )
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_runbook"),
+            "scripts.agent_behavior_evaluation.behavior_evaluation_runbook",
+        )
+
+    def test_behavior_evaluation_assertion_metadata_exposes_undeclared_case_assertions(self):
+        from scripts import agent_behavior_evaluation
+
+        script_cases = (
+            SimpleNamespace(case_id="TX1", assertion_ids=("known_assertion", "typo_assertion")),
+            SimpleNamespace(case_id="TX2", assertion_ids=("typo_assertion", "another_unknown")),
+        )
+
+        with (
+            patch.object(agent_behavior_evaluation, "ASSERTIONS", ("known_assertion",)),
+            patch.object(agent_behavior_evaluation, "CASES", script_cases),
+        ):
+            self.assertEqual(agent_behavior_evaluation.assertion_coverage(), {"known_assertion": ["TX1"]})
+            self.assertEqual(
+                agent_behavior_evaluation.undeclared_case_assertions(),
+                {
+                    "another_unknown": ["TX2"],
+                    "typo_assertion": ["TX1", "TX2"],
+                },
+            )
+
+    def test_behavior_evaluation_assertion_metadata_exposes_uncovered_assertions(self):
+        from scripts import agent_behavior_evaluation
+
+        script_cases = (
+            SimpleNamespace(case_id="TX1", assertion_ids=("known_assertion",)),
+        )
+        uncovered_assertion_ids = getattr(agent_behavior_evaluation, "uncovered_assertion_ids", None)
+
+        with (
+            patch.object(agent_behavior_evaluation, "ASSERTIONS", ("known_assertion", "uncovered_assertion")),
+            patch.object(agent_behavior_evaluation, "CASES", script_cases),
+        ):
+            self.assertTrue(callable(uncovered_assertion_ids))
+            self.assertEqual(
+                agent_behavior_evaluation.assertion_coverage(),
+                {"known_assertion": ["TX1"], "uncovered_assertion": []},
+            )
+            self.assertEqual(agent_behavior_evaluation.uncovered_assertion_ids(), ["uncovered_assertion"])
+
+    def test_behavior_evaluation_summarizes_tool_diagnostic_chain_without_raw_payload(self):
+        from scripts.agent_behavior_evaluation import summarize_tool_calls
+
+        summary = summarize_tool_calls([
+            {
+                "tool_call_id": "agent-tool-call-safe",
+                "tool_name": "project.read_context",
+                "status": "succeeded",
+                "execution_phase": "completed",
+                "resolved_side_effect_class": "read_only",
+                "input_json_redacted": {"project_id": 10},
+                "output_json_redacted": {"summary": "ok"},
+                "policy_reason_json": {
+                    "execution_context": {
+                        "execution_context_hash": "safe-execution-context-hash",
+                        "tool_status": "succeeded",
+                        "runtime_snapshot_id": "agent-runtime-snapshot-safe",
+                        "input_json_redacted": {"secret": "do-not-copy"},
+                    },
+                    "dispatch_trace": {
+                        "dispatch_trace_hash": "safe-dispatch-trace-hash",
+                        "router": "AgentToolRouter.resolve",
+                        "runtime": "AgentToolRuntime.execute",
+                        "backend_handler": "AgentToolRuntime._execute_registered_backend",
+                        "input_json_redacted": {"secret": "do-not-copy"},
+                    },
+                    "private_raw_reason": {"secret": "do-not-copy"},
+                },
+            }
+        ])[0]
+
+        self.assertEqual(summary["diagnostic_chain"]["execution_context_hash"], "safe-execution-context-hash")
+        self.assertEqual(summary["diagnostic_chain"]["dispatch_trace_hash"], "safe-dispatch-trace-hash")
+        self.assertEqual(summary["diagnostic_chain"]["router"], "AgentToolRouter.resolve")
+        self.assertEqual(summary["diagnostic_chain"]["runtime"], "AgentToolRuntime.execute")
+        self.assertEqual(
+            summary["diagnostic_chain"]["backend_handler"],
+            "AgentToolRuntime._execute_registered_backend",
+        )
+        self.assertTrue(summary["diagnostic_chain"]["execution_context_present"])
+        self.assertTrue(summary["diagnostic_chain"]["dispatch_trace_present"])
+        self.assertNotIn("policy_reason_json", summary)
+        self.assertNotIn("private_raw_reason", json.dumps(summary))
+        self.assertNotIn("do-not-copy", json.dumps(summary))
+
+    def test_behavior_evaluation_summarizes_large_tool_input_without_raw_payload(self):
+        from scripts.agent_behavior_evaluation import (
+            TOOL_CALL_INPUT_PREVIEW_MAX_CHARS,
+            TOOL_CALL_INPUT_TRUNCATION_MARKER,
+            input_has_include_datasets_true,
+            summarize_tool_calls,
+        )
+
+        long_input = "raw-tool-input-" + ("x" * (TOOL_CALL_INPUT_PREVIEW_MAX_CHARS * 3))
+        summary = summarize_tool_calls([
+            {
+                "tool_call_id": "agent-tool-call-large-input",
+                "tool_name": "scenario.compose_draft",
+                "status": "succeeded",
+                "execution_phase": "completed",
+                "resolved_side_effect_class": "read_only",
+                "input_json_redacted": {
+                    "include_datasets": True,
+                    "extra_requirements": long_input,
+                },
+                "output_json_redacted": {"summary": "ok"},
+                "policy_reason_json": {},
+            }
+        ])[0]
+        encoded_summary = json.dumps(summary, ensure_ascii=False)
+        input_summary = summary["input_json_redacted"]
+
+        self.assertEqual(input_summary["input_summary_version"], "agent_behavior_eval_tool_input_summary_v1")
+        self.assertIn("include_datasets", input_summary["input_keys"])
+        self.assertTrue(input_summary["input_boolean_fields"]["include_datasets"])
+        self.assertTrue(input_summary["input_truncated"])
+        self.assertIn(TOOL_CALL_INPUT_TRUNCATION_MARKER, input_summary["input_preview"])
+        self.assertLessEqual(
+            len(input_summary["input_preview"]),
+            TOOL_CALL_INPUT_PREVIEW_MAX_CHARS + len(TOOL_CALL_INPUT_TRUNCATION_MARKER),
+        )
+        self.assertEqual(input_summary["full_input_reference"], "AgentToolCallRead.input_json_redacted")
+        self.assertIn("input_hash", input_summary)
+        self.assertTrue(input_has_include_datasets_true(input_summary))
+        self.assertNotIn(long_input, encoded_summary)
+
+    def test_behavior_evaluation_bounds_report_assistant_message_without_hiding_evaluation_text(self):
+        from scripts import agent_behavior_evaluation
+        from scripts.agent_behavior_evaluation import (
+            ASSISTANT_MESSAGE_REPORT_PREVIEW_MAX_CHARS,
+            ASSISTANT_MESSAGE_REPORT_TRUNCATION_MARKER,
+            CASES,
+        )
+
+        semantic_tail = "边界 等价 登录 接口"
+        full_message = "x" * (ASSISTANT_MESSAGE_REPORT_PREVIEW_MAX_CHARS + 64) + semantic_tail
+
+        class FakeClient:
+            def request_json(self, method, path, payload=None, query=None, timeout=None):
+                if method == "POST" and path == "/agents/runs":
+                    return {"data": {"run_id": "run-report-preview", "conversation_id": "conv-report-preview"}}
+                if method == "GET" and path == "/agents/runs/run-report-preview/events/snapshot":
+                    return {
+                        "data": {
+                            "events": [
+                                {
+                                    "event_type": "model.started",
+                                    "event_seq": 1,
+                                    "payload_json": {
+                                        "model_call_id": "model-call-report-preview",
+                                        "iteration_id": "iter-report-preview",
+                                        "loop_step": "final_response",
+                                        "loop_state": {
+                                            "phase": "model",
+                                            "step": "final_response",
+                                        },
+                                    },
+                                },
+                                {
+                                    "event_type": "model.delta",
+                                    "event_seq": 2,
+                                    "payload_json": {
+                                        "model_call_id": "model-call-report-preview",
+                                        "loop_step": "final_response",
+                                        "content": "x",
+                                    },
+                                },
+                                {
+                                    "event_type": "model.completed",
+                                    "event_seq": 3,
+                                    "payload_json": {
+                                        "model_call_id": "model-call-report-preview",
+                                        "loop_step": "final_response",
+                                        "finish_reason": "stop",
+                                        "model": "deepseek-test",
+                                    },
+                                },
+                            ],
+                            "next_after_sequence": 3,
+                            "latest_event_sequence": 3,
+                            "terminal": True,
+                        }
+                    }
+                if method == "GET" and path == "/agents/runs/run-report-preview/summary":
+                    return {
+                        "data": {
+                            "run": {
+                                "status": "completed",
+                                "created_at": "2026-07-01T00:00:00",
+                                "completed_at": "2026-07-01T00:00:02",
+                                "result_json": {},
+                            },
+                            "terminal": True,
+                            "assistant_visible": True,
+                            "assistant_message": full_message,
+                            "completion_source": "model",
+                            "model": "deepseek-test",
+                            "finish_reason": "stop",
+                            "usage": {"total_tokens": 8},
+                            "event_count": 3,
+                            "latest_event_sequence": 3,
+                        }
+                    }
+                raise AssertionError(f"unexpected request: {method} {path}")
+
+            def request_sse_text(self, path, last_event_id=None, timeout=None):
+                if path != "/agents/runs/run-report-preview/events":
+                    raise AssertionError(f"unexpected sse path: {path}")
+                return "event: model.delta\ndata: {}\n\n"
+
+        with patch.object(agent_behavior_evaluation.time, "sleep", return_value=None):
+            result = agent_behavior_evaluation.run_case(FakeClient(), 10, CASES[0], None)
+
+        self.assertTrue(result["evaluation"]["passed"], result["evaluation"]["issues"])
+        self.assertIn("回答覆盖边界值、等价类和 API 示例", result["evaluation"]["passes"])
+        self.assertEqual(result["assistant_message_length"], len(full_message))
+        self.assertIn(ASSISTANT_MESSAGE_REPORT_TRUNCATION_MARKER, result["assistant_message"])
+        self.assertLessEqual(
+            len(result["assistant_message"]),
+            ASSISTANT_MESSAGE_REPORT_PREVIEW_MAX_CHARS + len(ASSISTANT_MESSAGE_REPORT_TRUNCATION_MARKER),
+        )
+        self.assertNotIn(semantic_tail, result["assistant_message"])
+
+    def test_behavior_evaluation_main_bounds_case_exception_text_in_artifacts(self):
+        from scripts import agent_behavior_evaluation
+        from scripts.agent_behavior_evaluation import (
+            BEHAVIOR_EVALUATION_ERROR_PREVIEW_MAX_CHARS,
+            BEHAVIOR_EVALUATION_ERROR_SUMMARY_VERSION,
+            BEHAVIOR_EVALUATION_ERROR_TRUNCATION_MARKER,
+        )
+
+        class FakeApiClient:
+            def __init__(self, base_url, account, password):
+                self.base_url = base_url
+                self.account = account
+                self.password = password
+
+            def login(self):
+                return {"account": self.account, "user_id": 1}
+
+        script_cases = (
+            SimpleNamespace(
+                case_id="T_LONG_ERROR",
+                name="long error",
+                intent="keep long exception text out of behavior-evaluation artifacts",
+                conversation_key="long-error",
+            ),
+        )
+        hidden_tail = "SECRET_TAIL_SHOULD_NOT_APPEAR_IN_ERROR_ARTIFACTS"
+        long_error = "http failure body " + ("x" * (BEHAVIOR_EVALUATION_ERROR_PREVIEW_MAX_CHARS * 3)) + hidden_tail
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_prefix = Path(temp_dir) / "woagent_behavior_eval_long_error"
+            progress_path = Path(temp_dir) / "woagent_behavior_eval_long_error.progress.log"
+            with (
+                patch.object(agent_behavior_evaluation, "ApiClient", FakeApiClient),
+                patch.object(agent_behavior_evaluation, "CASES", script_cases),
+                patch.object(agent_behavior_evaluation, "run_case", side_effect=RuntimeError(long_error)),
+                patch(
+                    "sys.argv",
+                    [
+                        "agent_behavior_evaluation.py",
+                        "--password",
+                        "secret",
+                        "--output-prefix",
+                        str(output_prefix),
+                        "--progress-file",
+                        str(progress_path),
+                    ],
+                ),
+            ):
+                exit_code = agent_behavior_evaluation.main()
+
+            json_path = output_prefix.with_suffix(".json")
+            markdown_path = output_prefix.with_suffix(".md")
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            markdown = markdown_path.read_text(encoding="utf-8")
+            progress = progress_path.read_text(encoding="utf-8")
+
+        result = payload["results"][0]
+        encoded_payload = json.dumps(payload, ensure_ascii=False)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(result["error_summary_version"], BEHAVIOR_EVALUATION_ERROR_SUMMARY_VERSION)
+        self.assertTrue(result["error_truncated"])
+        self.assertIn(BEHAVIOR_EVALUATION_ERROR_TRUNCATION_MARKER, result["error"])
+        self.assertLessEqual(
+            len(result["error"]),
+            BEHAVIOR_EVALUATION_ERROR_PREVIEW_MAX_CHARS + len(BEHAVIOR_EVALUATION_ERROR_TRUNCATION_MARKER),
+        )
+        self.assertEqual(result["sse_high_cursor_replay"]["error"], result["error"])
+        self.assertEqual(result["evaluation"]["issues"], [result["error"]])
+        self.assertEqual(result["full_error_reference"], "BehaviorEvaluation.exception")
+        self.assertIn("error_hash", result)
+        self.assertNotIn(hidden_tail, encoded_payload)
+        self.assertNotIn(hidden_tail, markdown)
+        self.assertNotIn(hidden_tail, progress)
+
+    def test_behavior_evaluation_run_case_bounds_tool_fetch_and_sse_errors(self):
+        from scripts import agent_behavior_evaluation
+        from scripts.agent_behavior_evaluation import (
+            BEHAVIOR_EVALUATION_ERROR_PREVIEW_MAX_CHARS,
+            BEHAVIOR_EVALUATION_ERROR_TRUNCATION_MARKER,
+            CASES,
+        )
+
+        hidden_tail = "ERROR_TAIL_SHOULD_NOT_APPEAR_IN_RUN_CASE_RESULT"
+        long_fetch_error = "tool detail failed " + ("f" * (BEHAVIOR_EVALUATION_ERROR_PREVIEW_MAX_CHARS * 3)) + hidden_tail
+        long_sse_error = "sse replay failed " + ("s" * (BEHAVIOR_EVALUATION_ERROR_PREVIEW_MAX_CHARS * 3)) + hidden_tail
+        assistant_message = "边界 等价 登录 接口"
+
+        class FakeClient:
+            def request_json(self, method, path, payload=None, query=None, timeout=None):
+                if method == "POST" and path == "/agents/runs":
+                    return {"data": {"run_id": "run-error-preview", "conversation_id": "conv-error-preview"}}
+                if method == "GET" and path == "/agents/runs/run-error-preview/events/snapshot":
+                    return {
+                        "data": {
+                            "events": [
+                                {
+                                    "event_type": "model.started",
+                                    "event_seq": 1,
+                                    "payload_json": {
+                                        "model_call_id": "model-call-error-preview",
+                                        "iteration_id": "iter-error-preview",
+                                        "loop_step": "final_response",
+                                    },
+                                },
+                                {
+                                    "event_type": "model.delta",
+                                    "event_seq": 2,
+                                    "payload_json": {
+                                        "model_call_id": "model-call-error-preview",
+                                        "loop_step": "final_response",
+                                        "content": "x",
+                                    },
+                                },
+                                {
+                                    "event_type": "model.completed",
+                                    "event_seq": 3,
+                                    "payload_json": {
+                                        "model_call_id": "model-call-error-preview",
+                                        "loop_step": "final_response",
+                                    },
+                                },
+                                {
+                                    "event_type": "tool.failed",
+                                    "event_seq": 4,
+                                    "payload_json": {"tool_call_id": "tool-call-error-preview"},
+                                },
+                            ],
+                            "next_after_sequence": 4,
+                            "latest_event_sequence": 4,
+                            "terminal": True,
+                        }
+                    }
+                if method == "GET" and path == "/agents/tool-calls/tool-call-error-preview":
+                    raise RuntimeError(long_fetch_error)
+                if method == "GET" and path == "/agents/runs/run-error-preview/summary":
+                    return {
+                        "data": {
+                            "run": {
+                                "status": "completed",
+                                "created_at": "2026-07-01T00:00:00",
+                                "completed_at": "2026-07-01T00:00:02",
+                                "result_json": {},
+                            },
+                            "terminal": True,
+                            "assistant_visible": True,
+                            "assistant_message": assistant_message,
+                            "event_count": 4,
+                            "latest_event_sequence": 4,
+                        }
+                    }
+                raise AssertionError(f"unexpected request: {method} {path}")
+
+            def request_sse_text(self, path, last_event_id=None, timeout=None):
+                raise RuntimeError(long_sse_error)
+
+        with patch.object(agent_behavior_evaluation.time, "sleep", return_value=None):
+            result = agent_behavior_evaluation.run_case(FakeClient(), 10, CASES[0], None)
+
+        encoded_result = json.dumps(result, ensure_ascii=False)
+        fetch_error = result["tool_calls"][0]["fetch_error"]
+        replay_error = result["sse_high_cursor_replay"]["error"]
+
+        self.assertIn(BEHAVIOR_EVALUATION_ERROR_TRUNCATION_MARKER, fetch_error)
+        self.assertIn(BEHAVIOR_EVALUATION_ERROR_TRUNCATION_MARKER, replay_error)
+        self.assertLessEqual(
+            len(fetch_error),
+            BEHAVIOR_EVALUATION_ERROR_PREVIEW_MAX_CHARS + len(BEHAVIOR_EVALUATION_ERROR_TRUNCATION_MARKER),
+        )
+        self.assertLessEqual(
+            len(replay_error),
+            BEHAVIOR_EVALUATION_ERROR_PREVIEW_MAX_CHARS + len(BEHAVIOR_EVALUATION_ERROR_TRUNCATION_MARKER),
+        )
+        self.assertNotIn(hidden_tail, encoded_result)
+
+    def test_behavior_evaluation_api_client_bounds_http_error_body_before_raising(self):
+        import io
+        from urllib.error import HTTPError
+
+        from scripts import agent_behavior_evaluation
+        from scripts.agent_behavior_evaluation import (
+            ApiClient,
+            BEHAVIOR_EVALUATION_ERROR_PREVIEW_MAX_CHARS,
+            BEHAVIOR_EVALUATION_ERROR_TRUNCATION_MARKER,
+        )
+
+        hidden_tail = "HTTP_ERROR_BODY_TAIL_SHOULD_NOT_APPEAR"
+        long_body = "upstream failure " + ("b" * (BEHAVIOR_EVALUATION_ERROR_PREVIEW_MAX_CHARS * 3)) + hidden_tail
+
+        def raise_http_error(request, timeout=None):
+            raise HTTPError(
+                url=getattr(request, "full_url", "http://example.test"),
+                code=502,
+                msg="bad gateway",
+                hdrs=None,
+                fp=io.BytesIO(long_body.encode("utf-8")),
+            )
+
+        client = ApiClient("http://api.example.test", "admin", "secret")
+        client.access_token = "token"
+        client.token_acquired_at = agent_behavior_evaluation.time.monotonic()
+
+        with patch.object(agent_behavior_evaluation, "urlopen", side_effect=raise_http_error):
+            with self.assertRaises(RuntimeError) as json_error:
+                client.request_json("GET", "/agents/runs/broken/summary")
+            with self.assertRaises(RuntimeError) as sse_error:
+                client.request_sse_text("/agents/runs/broken/events", last_event_id=999999)
+
+        for message in (str(json_error.exception), str(sse_error.exception)):
+            self.assertIn(BEHAVIOR_EVALUATION_ERROR_TRUNCATION_MARKER, message)
+            self.assertIn("error_hash=", message)
+            self.assertNotIn(hidden_tail, message)
+
+    def test_behavior_evaluation_summarizes_model_call_trace_without_raw_payload(self):
+        from scripts.agent_behavior_evaluation import summarize_model_call_trace
+
+        trace = summarize_model_call_trace([
+            {
+                "event_type": "model.started",
+                "event_seq": 1,
+                "payload_json": {
+                    "model_call_id": "agent-run:model-0-tool_planning-safe",
+                    "iteration_id": "agent-run:iter-0",
+                    "loop_step": "tool_planning",
+                    "loop_state": {
+                        "iteration": 0,
+                        "iteration_id": "agent-run:iter-0",
+                        "phase": "model",
+                        "step": "tool_planning",
+                        "model_call_id": "agent-run:model-0-tool_planning-safe",
+                    },
+                    "final_summary": False,
+                    "repair_attempt": False,
+                    "messages": [{"content": "do-not-copy"}],
+                },
+            },
+            {
+                "event_type": "model.delta",
+                "event_seq": 2,
+                "payload_json": {
+                    "model_call_id": "agent-run:model-0-tool_planning-safe",
+                    "content": "do-not-copy",
+                },
+            },
+            {
+                "event_type": "model.stream_retrying",
+                "event_seq": 3,
+                "payload_json": {
+                    "model_call_id": "agent-run:model-0-tool_planning-safe",
+                    "attempt": 1,
+                    "max_retries": 2,
+                    "error_message": "do-not-copy",
+                },
+            },
+            {
+                "event_type": "model.completed",
+                "event_seq": 4,
+                "payload_json": {
+                    "model_call_id": "agent-run:model-0-tool_planning-safe",
+                    "content": "do-not-copy",
+                    "finish_reason": "stop",
+                    "model": "deepseek-test",
+                },
+            },
+        ])
+
+        self.assertEqual(len(trace), 1)
+        summary = trace[0]
+        self.assertEqual(summary["model_call_id"], "agent-run:model-0-tool_planning-safe")
+        self.assertEqual(summary["iteration_id"], "agent-run:iter-0")
+        self.assertEqual(summary["loop_step"], "tool_planning")
+        self.assertEqual(summary["phase"], "model")
+        self.assertTrue(summary["started_event_seen"])
+        self.assertTrue(summary["completed_event_seen"])
+        self.assertEqual(summary["delta_event_count"], 1)
+        self.assertEqual(summary["stream_retry_count"], 1)
+        self.assertFalse(summary["stream_interrupted"])
+        self.assertEqual(summary["finish_reason"], "stop")
+        self.assertEqual(summary["model"], "deepseek-test")
+        self.assertNotIn("messages", json.dumps(summary))
+        self.assertNotIn("content", json.dumps(summary))
+        self.assertNotIn("error_message", json.dumps(summary))
+        self.assertNotIn("do-not-copy", json.dumps(summary))
+
+    def test_behavior_evaluation_tool_cases_require_tool_diagnostic_chain(self):
+        from scripts.agent_behavior_evaluation import evaluate_case
+
+        def _base_result(tool_calls: list[dict[str, object]]) -> dict[str, object]:
+            return {
+                "case_id": "T03",
+                "status": "completed",
+                "terminal": True,
+                "assistant_visible": True,
+                "assistant_message": "当前项目包含测试资源、默认环境和已有用例。",
+                "assistant_message_length": 22,
+                "model_started_count": 1,
+                "model_delta_count": 1,
+                "model_call_count": 1,
+                "tool_names": ["project.read_context"],
+                "tool_calls": tool_calls,
+                "model_call_trace": [
+                    {
+                        "model_call_id": "agent-run:model-0-assistant_response-safe",
+                        "iteration_id": "agent-run:iter-0",
+                        "loop_step": "assistant_response",
+                        "phase": "model",
+                        "started_event_seen": True,
+                        "completed_event_seen": True,
+                        "delta_event_count": 1,
+                    }
+                ],
+                "sse_high_cursor_replay": {
+                    "byte_length": 128,
+                    "event_count": 1,
+                    "non_heartbeat_event_count": 1,
+                    "heartbeat_only": False,
+                    "first_events": ["run.completed"],
+                },
+            }
+
+        missing = evaluate_case(_base_result([
+            {"tool_call_id": "agent-tool-call-missing", "tool_name": "project.read_context"}
+        ]))
+        present = evaluate_case(_base_result([
+            {
+                "tool_call_id": "agent-tool-call-diagnostic",
+                "tool_name": "project.read_context",
+                "diagnostic_chain": {
+                    "execution_context_present": True,
+                    "execution_context_hash": "safe-execution-context-hash",
+                    "dispatch_trace_present": True,
+                    "dispatch_trace_hash": "safe-dispatch-trace-hash",
+                    "router": "AgentToolRouter.resolve",
+                    "runtime": "AgentToolRuntime.execute",
+                    "backend_handler": "AgentToolRuntime._execute_registered_backend",
+                },
+            }
+        ]))
+
+        self.assertFalse(missing["passed"])
+        self.assertIn("ToolCall 诊断链缺少 execution_context/dispatch_trace 摘要", missing["issues"])
+        self.assertTrue(present["passed"])
+        self.assertIn("工具调用携带 execution_context 与 dispatch_trace 诊断摘要", present["passes"])
+
+    def test_behavior_evaluation_tool_cases_reject_weak_tool_diagnostic_chain_metadata(self):
+        from scripts.agent_behavior_evaluation import evaluate_case
+
+        result = {
+            "case_id": "T03",
+            "status": "completed",
+            "terminal": True,
+            "assistant_visible": True,
+            "assistant_message": "当前项目包含测试资源、默认环境和已有用例。",
+            "assistant_message_length": 22,
+            "model_started_count": 1,
+            "model_delta_count": 1,
+            "model_call_count": 1,
+            "tool_names": ["project.read_context"],
+            "tool_calls": [
+                {
+                    "tool_call_id": "agent-tool-call-weak-diagnostic",
+                    "tool_name": "project.read_context",
+                    "diagnostic_chain": {
+                        "execution_context_present": "yes",
+                        "execution_context_hash": 12345,
+                        "dispatch_trace_present": True,
+                        "dispatch_trace_hash": "safe-dispatch-trace-hash",
+                    },
+                }
+            ],
+            "model_call_trace": [
+                {
+                    "model_call_id": "agent-run:model-0-assistant_response-safe",
+                    "iteration_id": "agent-run:iter-0",
+                    "loop_step": "assistant_response",
+                    "phase": "model",
+                    "started_event_seen": True,
+                    "completed_event_seen": True,
+                    "delta_event_count": 1,
+                }
+            ],
+            "sse_high_cursor_replay": {
+                "byte_length": 128,
+                "event_count": 1,
+                "non_heartbeat_event_count": 1,
+                "heartbeat_only": False,
+                "first_events": ["run.completed"],
+            },
+        }
+
+        evaluation = evaluate_case(result)
+
+        self.assertFalse(evaluation["passed"])
+        self.assertIn("ToolCall 诊断链缺少 execution_context/dispatch_trace 摘要", evaluation["issues"])
+
+    def test_behavior_evaluation_common_rejects_boolean_model_call_count(self):
+        from scripts.agent_behavior_evaluation import evaluate_case
+
+        result = {
+            "case_id": "T01",
+            "status": "completed",
+            "terminal": True,
+            "assistant_visible": True,
+            "assistant_message": "边界值分析关注边界，等价类划分关注分类；登录接口 API 示例包含有效和无效输入。",
+            "assistant_message_length": 42,
+            "model_started_count": 1,
+            "model_delta_count": 1,
+            "model_call_count": True,
+            "tool_names": [],
+            "tool_calls": [],
+            "model_call_trace": [
+                {
+                    "model_call_id": "agent-run:model-0-assistant_response-safe",
+                    "iteration_id": "agent-run:iter-0",
+                    "loop_step": "assistant_response",
+                    "phase": "model",
+                    "started_event_seen": True,
+                    "completed_event_seen": True,
+                    "delta_event_count": 1,
+                }
+            ],
+            "sse_high_cursor_replay": {
+                "byte_length": 128,
+                "event_count": 1,
+                "non_heartbeat_event_count": 1,
+                "heartbeat_only": False,
+                "first_events": ["run.completed"],
+            },
+        }
+
+        evaluation = evaluate_case(result)
+
+        self.assertFalse(evaluation["passed"])
+        self.assertNotIn("model.started 事件携带可追踪 model_call_id", evaluation["passes"])
+        self.assertIn("model.started 事件缺少完整 model_call_id 追踪", evaluation["issues"])
+
+    def test_behavior_evaluation_evaluate_case_returns_issues_for_partial_result(self):
+        from scripts.agent_behavior_evaluation import evaluate_case
+
+        evaluation = evaluate_case({"case_id": "T01"})
+
+        self.assertFalse(evaluation["passed"])
+        self.assertEqual(evaluation["score"], 0)
+        self.assertIn("run 未正常 completed，status=<missing> terminal=<missing>", evaluation["issues"])
+        self.assertIn("最终 assistant_message 不可见或为空", evaluation["issues"])
+        self.assertIn("事件链缺少 model.started 或 model.delta", evaluation["issues"])
+        self.assertIn("工具链摘要缺失或类型异常", evaluation["issues"])
+        self.assertIn("最终回复正文缺失或类型异常", evaluation["issues"])
+
+    def test_behavior_evaluation_sse_replay_rejects_error_summary(self):
+        from scripts.agent_behavior_evaluation import evaluate_case
+
+        result = {
+            "case_id": "T01",
+            "status": "completed",
+            "terminal": True,
+            "assistant_visible": True,
+            "assistant_message": "边界值分析关注边界，等价类划分关注分类；登录接口 API 示例包含有效和无效输入。",
+            "assistant_message_length": 42,
+            "model_started_count": 1,
+            "model_delta_count": 1,
+            "model_call_count": 1,
+            "tool_names": [],
+            "tool_calls": [],
+            "model_call_trace": [
+                {
+                    "model_call_id": "agent-run:model-0-assistant_response-safe",
+                    "iteration_id": "agent-run:iter-0",
+                    "loop_step": "assistant_response",
+                    "phase": "model",
+                    "started_event_seen": True,
+                    "completed_event_seen": True,
+                    "delta_event_count": 1,
+                }
+            ],
+            "sse_high_cursor_replay": {
+                "byte_length": 128,
+                "event_count": 1,
+                "non_heartbeat_event_count": 1,
+                "heartbeat_only": False,
+                "error": "HTTP 500",
+            },
+        }
+
+        evaluation = evaluate_case(result)
+
+        self.assertFalse(evaluation["passed"])
+        self.assertFalse(any("SSE 超大 Last-Event-ID 可重放非 heartbeat 事件" in item for item in evaluation["passes"]))
+        self.assertTrue(any("SSE 超大 Last-Event-ID 未重放有效事件" in item for item in evaluation["issues"]))
+
+    def test_behavior_evaluation_skips_optional_diagnostics_when_case_assertions_do_not_require_them(self):
+        from scripts import agent_behavior_evaluation
+
+        script_cases = (
+            SimpleNamespace(case_id="TX1", assertion_ids=("domain_boundary",)),
+        )
+        result = {
+            "case_id": "TX1",
+            "status": "completed",
+            "terminal": True,
+            "assistant_visible": True,
+            "assistant_message": "这是领域边界回答。",
+            "assistant_message_length": 9,
+            "model_started_count": 1,
+            "model_delta_count": 1,
+            "model_call_count": 1,
+            "tool_names": [],
+            "tool_calls": [],
+            "model_call_trace": [],
+            "sse_high_cursor_replay": {"non_heartbeat_event_count": 0, "heartbeat_only": True},
+        }
+
+        with patch.object(agent_behavior_evaluation, "CASES", script_cases):
+            evaluation = agent_behavior_evaluation.evaluate_case(result)
+
+        self.assertNotIn("model_call_trace summary missing or incomplete", evaluation["issues"])
+        self.assertFalse(any("SSE 超大 Last-Event-ID 未重放有效事件" in issue for issue in evaluation["issues"]))
+
+    def test_behavior_evaluation_markdown_report_surfaces_tool_diagnostic_chain_without_raw_payload(self):
+        from scripts.agent_behavior_evaluation import markdown_report
+
+        markdown = markdown_report({
+            "generated_at": "2026-06-30T10:00:00",
+            "base_url": "http://127.0.0.1:8000/api/v1",
+            "project_id": 10,
+            "login_user": {"account": "admin", "user_id": 1},
+            "summary": {
+                "case_count": 1,
+                "passed_count": 1,
+                "failed_count": 0,
+                "average_score": 100,
+            },
+            "results": [
+                {
+                    "case_id": "T03",
+                    "name": "读取项目上下文",
+                    "run_id": "agent-run-diagnostic",
+                    "conversation_id": "agent-conversation-diagnostic",
+                    "status": "completed",
+                    "completed_seconds": 1.2,
+                    "first_delta_seconds": 0.3,
+                    "event_count": 8,
+                    "model_delta_count": 2,
+                    "tool_event_count": 2,
+                    "model_call_count": 1,
+                    "tool_request_repair_count": 0,
+                    "required_tool_repair_count": 0,
+                    "context_compaction_count": 0,
+                    "model_call_trace": [
+                        {
+                            "model_call_id": "agent-run-diagnostic:model-0-tool_planning-safe",
+                            "iteration_id": "agent-run-diagnostic:iter-0",
+                            "loop_step": "tool_planning",
+                            "phase": "model",
+                            "started_event_seen": True,
+                            "completed_event_seen": True,
+                            "delta_event_count": 0,
+                            "stream_retry_count": 0,
+                            "stream_interrupted": False,
+                            "final_summary": False,
+                            "repair_attempt": False,
+                        },
+                        {
+                            "model_call_id": "agent-run-diagnostic:model-1-final_summary-safe",
+                            "iteration_id": "agent-run-diagnostic:iter-1",
+                            "loop_step": "final_summary",
+                            "phase": "model",
+                            "started_event_seen": True,
+                            "completed_event_seen": True,
+                            "delta_event_count": 2,
+                            "stream_retry_count": 0,
+                            "stream_interrupted": False,
+                            "final_summary": True,
+                            "repair_attempt": False,
+                        },
+                    ],
+                    "sse_high_cursor_replay": {
+                        "byte_length": 128,
+                        "event_count": 1,
+                        "non_heartbeat_event_count": 1,
+                        "heartbeat_only": False,
+                        "first_events": ["run.completed"],
+                    },
+                    "tool_names": ["project.read_context"],
+                    "assistant_message_snippet": "当前项目包含测试资源。",
+                    "evaluation": {
+                        "score": 100,
+                        "passed": True,
+                        "passes": ["工具调用携带 execution_context 与 dispatch_trace 诊断摘要"],
+                        "issues": [],
+                    },
+                    "tool_calls": [
+                        {
+                            "tool_call_id": "agent-tool-call-diagnostic",
+                            "tool_name": "project.read_context",
+                            "diagnostic_chain": {
+                                "execution_context_present": True,
+                                "execution_context_hash": "safe-execution-context-hash",
+                                "tool_status": "succeeded",
+                                "dispatch_trace_present": True,
+                                "dispatch_trace_hash": "safe-dispatch-trace-hash",
+                                "router": "AgentToolRouter.resolve",
+                                "runtime": "AgentToolRuntime.execute",
+                                "backend_handler": "AgentToolRuntime._execute_registered_backend",
+                                "backend_name": "project_context",
+                                "backend_operation": "read_context",
+                                "status": "succeeded",
+                                "effect_submission_state": "not_applicable",
+                            },
+                            "policy_reason_json": {"private": "do-not-copy"},
+                            "input_json_redacted": {"secret": "do-not-copy"},
+                            "output_warning_snippet": "",
+                        }
+                    ],
+                }
+            ],
+            "json_path": "reports/woagent_behavior_eval_test.json",
+            "markdown_path": "reports/woagent_behavior_eval_test.md",
+        })
+
+        self.assertIn("工具诊断链摘要", markdown)
+        self.assertIn("safe-execution-context-hash", markdown)
+        self.assertIn("safe-dispatch-trace-hash", markdown)
+        self.assertIn("AgentToolRouter.resolve", markdown)
+        self.assertIn("AgentToolRuntime.execute", markdown)
+        self.assertIn("AgentToolRuntime._execute_registered_backend", markdown)
+        self.assertIn("模型调用链摘要", markdown)
+        self.assertIn("agent-run-diagnostic:model-0-tool_planning-safe", markdown)
+        self.assertIn("tool_planning", markdown)
+        self.assertIn("final_summary", markdown)
+        self.assertNotIn("policy_reason_json", markdown)
+        self.assertNotIn("do-not-copy", markdown)
+
+    def test_behavior_evaluation_latest_report_summary_is_safe_and_historical(self):
+        from scripts import agent_behavior_evaluation
+
+        latest_report_summary = getattr(agent_behavior_evaluation, "latest_report_summary", None)
+        self.assertTrue(callable(latest_report_summary))
+        self.assertEqual(agent_behavior_evaluation.REPORT_SCHEMA_VERSION, "agent_behavior_evaluation_report_v2")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            older = reports_dir / "woagent_behavior_eval_20260630_old.json"
+            latest = reports_dir / "woagent_behavior_eval_20260630_latest.json"
+            older.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": "agent_behavior_evaluation_report_v1",
+                        "generated_at": "2026-06-30T08:00:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {"case_id": "T01", "evaluation": {"passed": True, "score": 100}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            latest.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": "agent_behavior_evaluation_report_v2",
+                        "generated_at": "2026-06-30T09:00:00",
+                        "summary": {
+                            "case_count": 3,
+                            "passed_count": 2,
+                            "failed_count": 1,
+                            "average_score": 75.5,
+                        },
+                        "login_user": {"account": "secret-admin"},
+                        "results": [
+                            {
+                                "case_id": "T01",
+                                "run_id": "agent-run-safe",
+                                "assistant_message": "sensitive visible transcript",
+                                "model_call_count": 1,
+                                "model_call_trace": [
+                                    {
+                                        "model_call_id": "agent-run-safe:model-0-assistant_response",
+                                        "loop_step": "assistant_response",
+                                        "started_event_seen": True,
+                                        "content": "do-not-copy",
+                                    }
+                                ],
+                                "sse_high_cursor_replay": {
+                                    "byte_length": 128,
+                                    "event_count": 1,
+                                    "non_heartbeat_event_count": 1,
+                                    "heartbeat_only": False,
+                                    "event_preview": "do-not-copy",
+                                    "first_events": ["run.completed"],
+                                },
+                                "evaluation": {"passed": True, "score": 100},
+                            },
+                            {
+                                "case_id": "T02",
+                                "run_id": "agent-run-failed",
+                                "assistant_message": "another transcript",
+                                "evaluation": {"passed": False, "score": 51},
+                            },
+                            {
+                                "case_id": "T03",
+                                "run_id": "agent-run-tool",
+                                "tool_calls": [
+                                    {
+                                        "tool_call_id": "tool-call-safe",
+                                        "tool_name": "project.read_context",
+                                        "policy_reason_json": {"raw": "do-not-copy"},
+                                        "diagnostic_chain": {
+                                            "execution_context_present": True,
+                                            "execution_context_hash": "exec-hash-safe",
+                                            "dispatch_trace_present": True,
+                                            "dispatch_trace_hash": "dispatch-hash-safe",
+                                        },
+                                    }
+                                ],
+                                "evaluation": {"passed": True, "score": 100},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(older, (1, 1))
+            os.utime(latest, (2, 2))
+            latest_markdown = latest.with_suffix(".md")
+            latest_markdown.write_text("# report\n\nsecret markdown do-not-copy", encoding="utf-8")
+
+            summary = latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["historical"])
+        self.assertEqual(summary["path"], str(latest))
+        self.assertEqual(summary.get("markdown_path"), str(latest_markdown))
+        self.assertTrue(summary.get("markdown_available"))
+        self.assertTrue(summary.get("artifact_pair_complete"))
+        self.assertEqual(summary["report_schema_version"], "agent_behavior_evaluation_report_v2")
+        self.assertEqual(summary.get("expected_report_schema_version"), "agent_behavior_evaluation_report_v2")
+        self.assertTrue(summary.get("schema_matches_current"))
+        self.assertEqual(summary["generated_at"], "2026-06-30T09:00:00")
+        self.assertEqual(summary["summary"]["case_count"], 3)
+        self.assertEqual(summary["summary"]["failed_count"], 1)
+        self.assertEqual(summary["failed_case_ids"], ["T02"])
+        self.assertEqual(summary["passed_case_ids"], ["T01", "T03"])
+        self.assertEqual(summary.get("reported_case_ids"), ["T01", "T02", "T03"])
+        self.assertEqual(summary.get("expected_case_ids"), [case.case_id for case in agent_behavior_evaluation.CASES])
+        self.assertEqual(
+            summary.get("missing_case_ids"),
+            [case.case_id for case in agent_behavior_evaluation.CASES if case.case_id not in {"T01", "T02", "T03"}],
+        )
+        self.assertEqual(summary.get("extra_case_ids"), [])
+        self.assertFalse(summary.get("current_case_set_complete"))
+        self.assertEqual(summary.get("model_call_trace_case_ids"), ["T01"])
+        self.assertEqual(
+            summary.get("missing_model_call_trace_case_ids"),
+            [case.case_id for case in agent_behavior_evaluation.CASES if case.case_id != "T01"],
+        )
+        self.assertFalse(summary.get("model_call_trace_complete"))
+        expected_tool_chain_case_ids = agent_behavior_evaluation.tool_diagnostic_chain_expected_case_ids()
+        self.assertEqual(summary.get("tool_diagnostic_chain_case_ids"), ["T03"])
+        self.assertEqual(summary.get("missing_tool_diagnostic_chain_case_ids"), expected_tool_chain_case_ids[1:])
+        self.assertFalse(summary.get("tool_diagnostic_chain_complete"))
+        self.assertEqual(summary.get("sse_high_cursor_replay_case_ids"), ["T01"])
+        self.assertEqual(
+            summary.get("missing_sse_high_cursor_replay_case_ids"),
+            [case.case_id for case in agent_behavior_evaluation.CASES if case.case_id != "T01"],
+        )
+        self.assertFalse(summary.get("sse_high_cursor_replay_complete"))
+        self.assertEqual(list(summary), list(agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS))
+        self.assertNotIn("login_user", summary)
+        self.assertNotIn("assistant_message", json.dumps(summary))
+        self.assertNotIn("do-not-copy", json.dumps(summary))
+
+    def test_behavior_evaluation_latest_report_marks_duplicate_case_ids_incomplete(self):
+        from scripts import agent_behavior_evaluation
+
+        expected_case_ids = [case.case_id for case in agent_behavior_evaluation.CASES]
+        duplicate_case_id = expected_case_ids[0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_duplicate_case.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T02:00:00",
+                        "summary": {
+                            "case_count": len(expected_case_ids) + 1,
+                            "passed_count": len(expected_case_ids) + 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {"case_id": case_id, "evaluation": {"passed": True, "score": 100}}
+                            for case_id in [*expected_case_ids, duplicate_case_id]
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["missing_case_ids"], [])
+        self.assertEqual(summary["extra_case_ids"], [])
+        self.assertEqual(summary.get("duplicate_case_ids"), [duplicate_case_id])
+        self.assertFalse(summary["current_case_set_complete"])
+        self.assertEqual(list(summary), list(agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS))
+
+    def test_behavior_evaluation_latest_report_duplicate_case_ids_make_diagnostics_incomplete(self):
+        from scripts import agent_behavior_evaluation
+
+        expected_case_ids = [case.case_id for case in agent_behavior_evaluation.CASES]
+        duplicate_case_id = expected_case_ids[0]
+        expected_tool_chain_case_ids = set(agent_behavior_evaluation.tool_diagnostic_chain_expected_case_ids())
+
+        def result_for(case_id):
+            result = {
+                "case_id": case_id,
+                "model_call_count": 1,
+                "model_call_trace": [
+                    {
+                        "model_call_id": f"{case_id}:model-0",
+                        "loop_step": "assistant_response",
+                        "started_event_seen": True,
+                    }
+                ],
+                "sse_high_cursor_replay": {
+                    "byte_length": 128,
+                    "event_count": 1,
+                    "non_heartbeat_event_count": 1,
+                    "heartbeat_only": False,
+                    "first_events": ["run.completed"],
+                },
+                "evaluation": {"passed": True, "score": 100},
+            }
+            if case_id in expected_tool_chain_case_ids:
+                result["tool_calls"] = [
+                    {
+                        "tool_call_id": f"{case_id}:tool-0",
+                        "tool_name": "project.read_context",
+                        "diagnostic_chain": {
+                            "execution_context_present": True,
+                            "execution_context_hash": f"{case_id}:exec",
+                            "dispatch_trace_present": True,
+                            "dispatch_trace_hash": f"{case_id}:dispatch",
+                        },
+                    }
+                ]
+            return result
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_duplicate_complete_diagnostics.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T02:15:00",
+                        "summary": {
+                            "case_count": len(expected_case_ids) + 1,
+                            "passed_count": len(expected_case_ids) + 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            result_for(case_id)
+                            for case_id in [*expected_case_ids, duplicate_case_id]
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["missing_case_ids"], [])
+        self.assertEqual(summary["extra_case_ids"], [])
+        self.assertEqual(summary["duplicate_case_ids"], [duplicate_case_id])
+        self.assertFalse(summary["current_case_set_complete"])
+        self.assertEqual(summary["missing_model_call_trace_case_ids"], [])
+        self.assertFalse(summary["model_call_trace_complete"])
+        self.assertEqual(summary["missing_tool_diagnostic_chain_case_ids"], [])
+        self.assertFalse(summary["tool_diagnostic_chain_complete"])
+        self.assertEqual(summary["missing_sse_high_cursor_replay_case_ids"], [])
+        self.assertFalse(summary["sse_high_cursor_replay_complete"])
+        self.assertEqual(list(summary), list(agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS))
+
+    def test_behavior_evaluation_latest_report_schema_mismatch_makes_diagnostics_incomplete(self):
+        from scripts import agent_behavior_evaluation
+
+        expected_case_ids = [case.case_id for case in agent_behavior_evaluation.CASES]
+        expected_tool_chain_case_ids = set(agent_behavior_evaluation.tool_diagnostic_chain_expected_case_ids())
+
+        def result_for(case_id):
+            result = {
+                "case_id": case_id,
+                "model_call_count": 1,
+                "model_call_trace": [
+                    {
+                        "model_call_id": f"{case_id}:model-0",
+                        "loop_step": "assistant_response",
+                        "started_event_seen": True,
+                    }
+                ],
+                "sse_high_cursor_replay": {
+                    "byte_length": 128,
+                    "event_count": 1,
+                    "non_heartbeat_event_count": 1,
+                    "heartbeat_only": False,
+                    "first_events": ["run.completed"],
+                },
+                "evaluation": {"passed": True, "score": 100},
+            }
+            if case_id in expected_tool_chain_case_ids:
+                result["tool_calls"] = [
+                    {
+                        "tool_call_id": f"{case_id}:tool-0",
+                        "tool_name": "project.read_context",
+                        "diagnostic_chain": {
+                            "execution_context_present": True,
+                            "execution_context_hash": f"{case_id}:exec",
+                            "dispatch_trace_present": True,
+                            "dispatch_trace_hash": f"{case_id}:dispatch",
+                        },
+                    }
+                ]
+            return result
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_legacy_complete_diagnostics.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": "legacy_report_v0",
+                        "generated_at": "2026-07-01T02:30:00",
+                        "summary": {
+                            "case_count": len(expected_case_ids),
+                            "passed_count": len(expected_case_ids),
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [result_for(case_id) for case_id in expected_case_ids],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertFalse(summary["schema_matches_current"])
+        self.assertEqual(summary["missing_case_ids"], [])
+        self.assertEqual(summary["extra_case_ids"], [])
+        self.assertEqual(summary["duplicate_case_ids"], [])
+        self.assertTrue(summary["current_case_set_complete"])
+        self.assertEqual(summary["missing_model_call_trace_case_ids"], [])
+        self.assertFalse(summary["model_call_trace_complete"])
+        self.assertEqual(summary["missing_tool_diagnostic_chain_case_ids"], [])
+        self.assertFalse(summary["tool_diagnostic_chain_complete"])
+        self.assertEqual(summary["missing_sse_high_cursor_replay_case_ids"], [])
+        self.assertFalse(summary["sse_high_cursor_replay_complete"])
+        self.assertEqual(list(summary), list(agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS))
+
+    def test_behavior_evaluation_latest_report_summary_marks_missing_markdown_artifact(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_without_markdown.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-06-30T09:20:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {"case_id": "T01", "evaluation": {"passed": True, "score": 100}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["path"], str(report))
+        self.assertEqual(summary["markdown_path"], str(report.with_suffix(".md")))
+        self.assertFalse(summary["markdown_available"])
+        self.assertFalse(summary["artifact_pair_complete"])
+
+    def test_behavior_evaluation_latest_report_marks_summary_count_mismatch(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_summary_count_mismatch.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T02:45:00",
+                        "summary": {
+                            "case_count": 99,
+                            "passed_count": 98,
+                            "failed_count": 1,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {"case_id": "T01", "evaluation": {"passed": True, "score": 100}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["summary"]["case_count"], 99)
+        self.assertIn("summary_counts_match_results", summary)
+        self.assertFalse(summary["summary_counts_match_results"])
+        self.assertEqual(list(summary), list(agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS))
+
+    def test_behavior_evaluation_latest_report_requires_boolean_evaluation_passed_flags(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_non_boolean_passed_flag.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T04:40:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {"case_id": "T01", "evaluation": {"passed": "yes", "score": 100}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["reported_case_ids"], ["T01"])
+        self.assertEqual(summary["passed_case_ids"], [])
+        self.assertEqual(summary["failed_case_ids"], [])
+        self.assertEqual(summary["invalid_evaluation_case_ids"], ["T01"])
+        self.assertFalse(summary["summary_counts_match_results"])
+        self.assertEqual(list(summary), list(agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS))
+
+    def test_behavior_evaluation_latest_report_marks_summary_average_score_mismatch(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_summary_average_score_mismatch.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T03:20:00",
+                        "summary": {
+                            "case_count": 2,
+                            "passed_count": 1,
+                            "failed_count": 1,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {"case_id": "T01", "evaluation": {"passed": True, "score": 100}},
+                            {"case_id": "T02", "evaluation": {"passed": False, "score": 50}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertTrue(summary["summary_counts_match_results"])
+        self.assertIn("summary_average_score_matches_results", summary)
+        self.assertFalse(summary["summary_average_score_matches_results"])
+        self.assertEqual(list(summary), list(agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS))
+
+    def test_behavior_evaluation_latest_report_requires_numeric_evaluation_scores_for_average(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_missing_result_score.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T04:55:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 0,
+                        },
+                        "results": [
+                            {"case_id": "T01", "evaluation": {"passed": True}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertTrue(summary["summary_counts_match_results"])
+        self.assertEqual(summary["invalid_evaluation_case_ids"], ["T01"])
+        self.assertFalse(summary["summary_average_score_matches_results"])
+        self.assertEqual(list(summary), list(agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS))
+
+    def test_behavior_evaluation_latest_report_rejects_non_finite_evaluation_scores(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_non_finite_result_score.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T07:05:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 0,
+                        },
+                        "results": [
+                            {"case_id": "T01", "evaluation": {"passed": True, "score": float("nan")}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertFalse(summary["available"])
+        self.assertEqual(summary["path"], str(report))
+        self.assertEqual(summary.get("error"), "NonStandardJsonConstantError")
+        self.assertEqual(
+            list(summary),
+            list(agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS) + ["error"],
+        )
+
+    def test_behavior_evaluation_latest_report_summary_marks_missing_model_call_trace_for_current_schema(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_current_without_trace.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-06-30T09:30:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {"case_id": "T01", "evaluation": {"passed": True, "score": 100}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["reported_case_ids"], ["T01"])
+        self.assertEqual(summary["model_call_trace_case_ids"], [])
+        self.assertEqual(
+            summary["missing_model_call_trace_case_ids"],
+            [case.case_id for case in agent_behavior_evaluation.CASES],
+        )
+        self.assertFalse(summary["model_call_trace_complete"])
+
+    def test_behavior_evaluation_latest_report_requires_complete_model_call_trace_summary(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_incomplete_model_trace.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T01:00:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {
+                                "case_id": "T01",
+                                "model_call_count": 1,
+                                "model_call_trace": [
+                                    {
+                                        "model_call_id": "agent-run-safe:model-0-assistant_response",
+                                    }
+                                ],
+                                "evaluation": {"passed": True, "score": 100},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["reported_case_ids"], ["T01"])
+        self.assertEqual(summary["model_call_trace_case_ids"], [])
+        self.assertEqual(
+            summary["missing_model_call_trace_case_ids"],
+            agent_behavior_evaluation.model_call_trace_expected_case_ids(),
+        )
+        self.assertFalse(summary["model_call_trace_complete"])
+
+    def test_behavior_evaluation_latest_report_requires_boolean_model_call_trace_started_event(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_non_boolean_model_trace_started.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T03:40:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {
+                                "case_id": "T01",
+                                "model_call_count": 1,
+                                "model_call_trace": [
+                                    {
+                                        "model_call_id": "agent-run-safe:model-0-assistant_response",
+                                        "loop_step": "assistant_response",
+                                        "started_event_seen": "yes",
+                                    }
+                                ],
+                                "evaluation": {"passed": True, "score": 100},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["model_call_trace_case_ids"], [])
+        self.assertIn("T01", summary["missing_model_call_trace_case_ids"])
+        self.assertFalse(summary["model_call_trace_complete"])
+
+    def test_behavior_evaluation_latest_report_requires_integer_model_call_count(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_bool_model_call_count.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T03:50:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {
+                                "case_id": "T01",
+                                "model_call_count": True,
+                                "model_call_trace": [
+                                    {
+                                        "model_call_id": "agent-run-safe:model-0-assistant_response",
+                                        "loop_step": "assistant_response",
+                                        "started_event_seen": True,
+                                    }
+                                ],
+                                "evaluation": {"passed": True, "score": 100},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["model_call_trace_case_ids"], [])
+        self.assertIn("T01", summary["missing_model_call_trace_case_ids"])
+        self.assertFalse(summary["model_call_trace_complete"])
+
+    def test_behavior_evaluation_model_call_trace_expected_cases_follow_case_assertions(self):
+        from scripts import agent_behavior_evaluation
+
+        script_cases = (
+            SimpleNamespace(case_id="TX1", assertion_ids=("model_call_trace",)),
+            SimpleNamespace(case_id="TX2", assertion_ids=("domain_boundary",)),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_custom_trace_assertions.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T00:30:00",
+                        "summary": {
+                            "case_count": 2,
+                            "passed_count": 2,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {"case_id": "TX1", "evaluation": {"passed": True, "score": 100}},
+                            {"case_id": "TX2", "evaluation": {"passed": True, "score": 100}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(agent_behavior_evaluation, "CASES", script_cases):
+                summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertEqual(summary["expected_case_ids"], ["TX1", "TX2"])
+        self.assertEqual(summary["model_call_trace_case_ids"], [])
+        self.assertEqual(summary["missing_model_call_trace_case_ids"], ["TX1"])
+        self.assertFalse(summary["model_call_trace_complete"])
+
+        with patch.object(agent_behavior_evaluation, "CASES", script_cases):
+            self.assertEqual(agent_behavior_evaluation.model_call_trace_expected_case_ids(), ["TX1"])
+
+    def test_behavior_evaluation_latest_report_summary_marks_missing_tool_diagnostic_chain_for_current_schema(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_current_without_tool_diagnostic_chain.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-06-30T09:35:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {
+                                "case_id": "T03",
+                                "tool_calls": [
+                                    {
+                                        "tool_call_id": "tool-call-missing-chain",
+                                        "tool_name": "project.read_context",
+                                    }
+                                ],
+                                "evaluation": {"passed": True, "score": 100},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        expected_tool_chain_case_ids = agent_behavior_evaluation.tool_diagnostic_chain_expected_case_ids()
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["reported_case_ids"], ["T03"])
+        self.assertEqual(summary["tool_diagnostic_chain_case_ids"], [])
+        self.assertEqual(summary["missing_tool_diagnostic_chain_case_ids"], expected_tool_chain_case_ids)
+        self.assertFalse(summary["tool_diagnostic_chain_complete"])
+
+    def test_behavior_evaluation_latest_report_requires_every_tool_call_diagnostic_chain(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_partial_tool_diagnostic_chain.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T01:00:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {
+                                "case_id": "T03",
+                                "tool_calls": [
+                                    {
+                                        "tool_call_id": "tool-call-complete-chain",
+                                        "tool_name": "project.read_context",
+                                        "diagnostic_chain": {
+                                            "execution_context_present": True,
+                                            "execution_context_hash": "exec-hash-safe",
+                                            "dispatch_trace_present": True,
+                                            "dispatch_trace_hash": "dispatch-hash-safe",
+                                        },
+                                    },
+                                    {
+                                        "tool_call_id": "tool-call-missing-chain",
+                                        "tool_name": "testcase.query_project_cases",
+                                    },
+                                ],
+                                "evaluation": {"passed": True, "score": 100},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        expected_tool_chain_case_ids = agent_behavior_evaluation.tool_diagnostic_chain_expected_case_ids()
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["reported_case_ids"], ["T03"])
+        self.assertEqual(summary["tool_diagnostic_chain_case_ids"], [])
+        self.assertEqual(summary["missing_tool_diagnostic_chain_case_ids"], expected_tool_chain_case_ids)
+        self.assertFalse(summary["tool_diagnostic_chain_complete"])
+
+    def test_behavior_evaluation_latest_report_requires_boolean_tool_diagnostic_presence_flags(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_non_boolean_tool_diagnostic_flag.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T04:10:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {
+                                "case_id": "T03",
+                                "tool_calls": [
+                                    {
+                                        "tool_call_id": "tool-call-weak-chain",
+                                        "tool_name": "project.read_context",
+                                        "diagnostic_chain": {
+                                            "execution_context_present": "yes",
+                                            "execution_context_hash": "exec-hash-safe",
+                                            "dispatch_trace_present": True,
+                                            "dispatch_trace_hash": "dispatch-hash-safe",
+                                        },
+                                    },
+                                ],
+                                "evaluation": {"passed": True, "score": 100},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        expected_tool_chain_case_ids = agent_behavior_evaluation.tool_diagnostic_chain_expected_case_ids()
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["tool_diagnostic_chain_case_ids"], [])
+        self.assertEqual(summary["missing_tool_diagnostic_chain_case_ids"], expected_tool_chain_case_ids)
+        self.assertFalse(summary["tool_diagnostic_chain_complete"])
+
+    def test_behavior_evaluation_latest_report_requires_string_tool_diagnostic_hashes(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_non_string_tool_diagnostic_hash.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T04:20:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {
+                                "case_id": "T03",
+                                "tool_calls": [
+                                    {
+                                        "tool_call_id": "tool-call-numeric-hash",
+                                        "tool_name": "project.read_context",
+                                        "diagnostic_chain": {
+                                            "execution_context_present": True,
+                                            "execution_context_hash": 12345,
+                                            "dispatch_trace_present": True,
+                                            "dispatch_trace_hash": "dispatch-hash-safe",
+                                        },
+                                    },
+                                ],
+                                "evaluation": {"passed": True, "score": 100},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        expected_tool_chain_case_ids = agent_behavior_evaluation.tool_diagnostic_chain_expected_case_ids()
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["tool_diagnostic_chain_case_ids"], [])
+        self.assertEqual(summary["missing_tool_diagnostic_chain_case_ids"], expected_tool_chain_case_ids)
+        self.assertFalse(summary["tool_diagnostic_chain_complete"])
+
+    def test_behavior_evaluation_tool_diagnostic_chain_expected_cases_follow_case_assertions(self):
+        from scripts import agent_behavior_evaluation
+
+        script_cases = (
+            SimpleNamespace(case_id="TX1", assertion_ids=("tool_diagnostic_chain",)),
+            SimpleNamespace(case_id="TX2", assertion_ids=("model_call_trace",)),
+        )
+
+        with patch.object(agent_behavior_evaluation, "CASES", script_cases):
+            self.assertEqual(agent_behavior_evaluation.tool_diagnostic_chain_expected_case_ids(), ["TX1"])
+
+    def test_behavior_evaluation_latest_report_summary_marks_missing_sse_replay_for_current_schema(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_current_without_sse_replay.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-06-30T09:40:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {"case_id": "T01", "evaluation": {"passed": True, "score": 100}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["reported_case_ids"], ["T01"])
+        self.assertEqual(summary["sse_high_cursor_replay_case_ids"], [])
+        self.assertEqual(
+            summary["missing_sse_high_cursor_replay_case_ids"],
+            [case.case_id for case in agent_behavior_evaluation.CASES],
+        )
+        self.assertFalse(summary["sse_high_cursor_replay_complete"])
+
+    def test_behavior_evaluation_latest_report_rejects_error_sse_replay_summary(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_error_sse_replay.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": agent_behavior_evaluation.REPORT_SCHEMA_VERSION,
+                        "generated_at": "2026-07-01T01:30:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {
+                                "case_id": "T01",
+                                "sse_high_cursor_replay": {
+                                    "byte_length": 128,
+                                    "event_count": 1,
+                                    "non_heartbeat_event_count": 1,
+                                    "heartbeat_only": False,
+                                    "error": "HTTP 500",
+                                },
+                                "evaluation": {"passed": True, "score": 100},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        expected_sse_case_ids = agent_behavior_evaluation.sse_high_cursor_replay_expected_case_ids()
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["schema_matches_current"])
+        self.assertEqual(summary["reported_case_ids"], ["T01"])
+        self.assertEqual(summary["sse_high_cursor_replay_case_ids"], [])
+        self.assertEqual(summary["missing_sse_high_cursor_replay_case_ids"], expected_sse_case_ids)
+        self.assertFalse(summary["sse_high_cursor_replay_complete"])
+
+    def test_behavior_evaluation_latest_report_summary_marks_schema_mismatch(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_legacy.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "report_schema_version": "legacy_report_v0",
+                        "generated_at": "2026-06-30T07:00:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {"case_id": "T01", "evaluation": {"passed": True, "score": 100}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["report_schema_version"], "legacy_report_v0")
+        self.assertEqual(summary.get("expected_report_schema_version"), agent_behavior_evaluation.REPORT_SCHEMA_VERSION)
+        self.assertFalse(summary.get("schema_matches_current"))
+
+    def test_behavior_evaluation_latest_report_summary_marks_missing_schema_as_mismatch(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            report = reports_dir / "woagent_behavior_eval_missing_schema.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-06-30T07:30:00",
+                        "summary": {
+                            "case_count": 1,
+                            "passed_count": 1,
+                            "failed_count": 0,
+                            "average_score": 100,
+                        },
+                        "results": [
+                            {"case_id": "T01", "evaluation": {"passed": True, "score": 100}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = agent_behavior_evaluation.latest_report_summary(reports_dir=reports_dir)
+
+        self.assertTrue(summary["available"])
+        self.assertIsNone(summary["report_schema_version"])
+        self.assertEqual(summary.get("expected_report_schema_version"), agent_behavior_evaluation.REPORT_SCHEMA_VERSION)
+        self.assertFalse(summary.get("schema_matches_current"))
+
+    def test_behavior_evaluation_latest_report_summary_keeps_case_set_contract_when_unavailable(self):
+        from scripts import agent_behavior_evaluation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            empty_summary = agent_behavior_evaluation.latest_report_summary(reports_dir=Path(temp_dir))
+
+            broken = Path(temp_dir) / "woagent_behavior_eval_broken.json"
+            broken.write_text("{not valid json", encoding="utf-8")
+            broken_summary = agent_behavior_evaluation.latest_report_summary(reports_dir=Path(temp_dir))
+
+            non_standard = Path(temp_dir) / "woagent_behavior_eval_non_standard_constant.json"
+            non_standard.write_text(
+                (
+                    '{"report_schema_version":"'
+                    + agent_behavior_evaluation.REPORT_SCHEMA_VERSION
+                    + '","summary":{"case_count":1,"passed_count":1,'
+                    + '"failed_count":0,"average_score":NaN},'
+                    + '"results":[{"case_id":"T01","evaluation":{"passed":true,"score":NaN}}]}'
+                ),
+                encoding="utf-8",
+            )
+            non_standard_summary = agent_behavior_evaluation.latest_report_summary(reports_dir=Path(temp_dir))
+
+        expected_case_ids = [case.case_id for case in agent_behavior_evaluation.CASES]
+        self.assertEqual(list(empty_summary), list(agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS))
+        for unavailable in (broken_summary, non_standard_summary):
+            self.assertEqual(
+                list(unavailable),
+                list(agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS) + ["error"],
+            )
+        for summary in (empty_summary, broken_summary, non_standard_summary):
+            self.assertFalse(summary["available"])
+            self.assertTrue(summary["historical"])
+            self.assertIsNone(summary["generated_at"])
+            self.assertIsNone(summary.get("report_schema_version"))
+            self.assertEqual(summary.get("expected_report_schema_version"), agent_behavior_evaluation.REPORT_SCHEMA_VERSION)
+            self.assertFalse(summary.get("schema_matches_current"))
+            self.assertEqual(summary.get("reported_case_ids"), [])
+            self.assertEqual(summary.get("expected_case_ids"), expected_case_ids)
+            self.assertEqual(summary.get("missing_case_ids"), expected_case_ids)
+            self.assertEqual(summary.get("extra_case_ids"), [])
+            self.assertFalse(summary.get("current_case_set_complete"))
+            expected_markdown_path = None if summary["path"] is None else str(Path(summary["path"]).with_suffix(".md"))
+            self.assertEqual(summary.get("markdown_path"), expected_markdown_path)
+            self.assertFalse(summary.get("markdown_available"))
+            self.assertFalse(summary.get("artifact_pair_complete"))
+            expected_tool_chain_case_ids = agent_behavior_evaluation.tool_diagnostic_chain_expected_case_ids()
+            self.assertEqual(summary.get("tool_diagnostic_chain_case_ids"), [])
+            self.assertEqual(summary.get("missing_tool_diagnostic_chain_case_ids"), expected_tool_chain_case_ids)
+            self.assertFalse(summary.get("tool_diagnostic_chain_complete"))
+            self.assertEqual(summary.get("sse_high_cursor_replay_case_ids"), [])
+            self.assertEqual(summary.get("missing_sse_high_cursor_replay_case_ids"), expected_case_ids)
+            self.assertFalse(summary.get("sse_high_cursor_replay_complete"))
+            self.assertNotIn("login_user", summary)
+            self.assertNotIn("assistant_message", json.dumps(summary))
+        self.assertIsNone(empty_summary["path"])
+        self.assertEqual(broken_summary["path"], str(broken))
+        self.assertEqual(broken_summary["error"], "JSONDecodeError")
+        self.assertEqual(non_standard_summary["path"], str(non_standard))
+        self.assertEqual(non_standard_summary["error"], "NonStandardJsonConstantError")
+
+    def test_behavior_evaluation_main_writes_report_for_invalid_evaluation_row(self):
+        from scripts import agent_behavior_evaluation
+
+        class FakeApiClient:
+            def __init__(self, base_url, account, password):
+                self.base_url = base_url
+                self.account = account
+                self.password = password
+
+            def login(self):
+                return {"account": self.account, "user_id": 1}
+
+        script_cases = (
+            SimpleNamespace(
+                case_id="T_BAD",
+                name="畸形评估结果",
+                intent="验证行为评估脚本对畸形 evaluation 行保持可审计输出",
+                conversation_key="invalid-evaluation",
+            ),
+        )
+        malformed_result = {
+            "case_id": "T_BAD",
+            "name": "畸形评估结果",
+            "intent": "验证行为评估脚本对畸形 evaluation 行保持可审计输出",
+            "run_id": "agent-run-invalid-evaluation",
+            "conversation_id": "conv-invalid-evaluation",
+            "status": "completed",
+            "completed_seconds": 1.0,
+            "first_delta_seconds": 0.1,
+            "event_count": 3,
+            "model_delta_count": 1,
+            "tool_event_count": 0,
+            "model_call_count": 1,
+            "tool_request_repair_count": 0,
+            "required_tool_repair_count": 0,
+            "context_compaction_count": 0,
+            "sse_high_cursor_replay": {
+                "non_heartbeat_event_count": 1,
+                "heartbeat_only": False,
+            },
+            "tool_names": [],
+            "assistant_message_snippet": "报告仍然可写出。",
+            "tool_calls": [],
+            "evaluation": {
+                "score": "100",
+                "passed": "yes",
+                "passes": [],
+                "issues": ["evaluation 字段类型异常"],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_prefix = Path(temp_dir) / "woagent_behavior_eval_invalid_evaluation"
+            with (
+                patch.object(agent_behavior_evaluation, "ApiClient", FakeApiClient),
+                patch.object(agent_behavior_evaluation, "CASES", script_cases),
+                patch.object(agent_behavior_evaluation, "run_case", return_value=malformed_result),
+                patch(
+                    "sys.argv",
+                    [
+                        "agent_behavior_evaluation.py",
+                        "--password",
+                        "secret",
+                        "--output-prefix",
+                        str(output_prefix),
+                    ],
+                ),
+            ):
+                exit_code = agent_behavior_evaluation.main()
+
+            json_path = output_prefix.with_suffix(".json")
+            markdown_path = output_prefix.with_suffix(".md")
+            json_exists = json_path.exists()
+            markdown_exists = markdown_path.exists()
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            latest_summary = agent_behavior_evaluation.latest_report_summary(reports_dir=Path(temp_dir))
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(json_exists)
+        self.assertTrue(markdown_exists)
+        self.assertEqual(payload["summary"]["case_count"], 1)
+        self.assertEqual(payload["summary"]["passed_count"], 0)
+        self.assertEqual(payload["summary"]["failed_count"], 1)
+        self.assertEqual(payload["summary"]["average_score"], 0.0)
+        self.assertEqual(payload["results"][0]["evaluation"]["passed"], "yes")
+        self.assertEqual(payload["results"][0]["evaluation"]["score"], "100")
+        self.assertEqual(latest_summary["invalid_evaluation_case_ids"], ["T_BAD"])
+        self.assertFalse(latest_summary["summary_counts_match_results"])
+        self.assertFalse(latest_summary["summary_average_score_matches_results"])
+
+    def test_behavior_evaluation_main_writes_single_report_row_when_score_missing(self):
+        from scripts import agent_behavior_evaluation
+
+        class FakeApiClient:
+            def __init__(self, base_url, account, password):
+                self.base_url = base_url
+                self.account = account
+                self.password = password
+
+            def login(self):
+                return {"account": self.account, "user_id": 1}
+
+        script_cases = (
+            SimpleNamespace(
+                case_id="T_MISSING_SCORE",
+                name="缺失分数字段",
+                intent="验证缺失 score 的 evaluation 仍然生成单条可审计报告",
+                conversation_key="missing-score",
+            ),
+        )
+        malformed_result = {
+            "case_id": "T_MISSING_SCORE",
+            "name": "缺失分数字段",
+            "intent": "验证缺失 score 的 evaluation 仍然生成单条可审计报告",
+            "run_id": "agent-run-missing-score",
+            "conversation_id": "conv-missing-score",
+            "status": "completed",
+            "completed_seconds": 1.0,
+            "first_delta_seconds": 0.1,
+            "event_count": 3,
+            "model_delta_count": 1,
+            "tool_event_count": 0,
+            "model_call_count": 1,
+            "tool_request_repair_count": 0,
+            "required_tool_repair_count": 0,
+            "context_compaction_count": 0,
+            "sse_high_cursor_replay": {
+                "non_heartbeat_event_count": 1,
+                "heartbeat_only": False,
+            },
+            "tool_names": [],
+            "assistant_message_snippet": "报告仍然可写出。",
+            "tool_calls": [],
+            "evaluation": {
+                "passed": True,
+                "passes": ["其它检查通过"],
+                "issues": [],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_prefix = Path(temp_dir) / "woagent_behavior_eval_missing_score"
+            with (
+                patch.object(agent_behavior_evaluation, "ApiClient", FakeApiClient),
+                patch.object(agent_behavior_evaluation, "CASES", script_cases),
+                patch.object(agent_behavior_evaluation, "run_case", return_value=malformed_result),
+                patch(
+                    "sys.argv",
+                    [
+                        "agent_behavior_evaluation.py",
+                        "--password",
+                        "secret",
+                        "--output-prefix",
+                        str(output_prefix),
+                    ],
+                ),
+            ):
+                exit_code = agent_behavior_evaluation.main()
+
+            json_path = output_prefix.with_suffix(".json")
+            markdown_path = output_prefix.with_suffix(".md")
+            json_exists = json_path.exists()
+            markdown_exists = markdown_path.exists()
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            latest_summary = agent_behavior_evaluation.latest_report_summary(reports_dir=Path(temp_dir))
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(json_exists)
+        self.assertTrue(markdown_exists)
+        self.assertEqual(payload["summary"]["case_count"], 1)
+        self.assertEqual(payload["summary"]["passed_count"], 0)
+        self.assertEqual(payload["summary"]["failed_count"], 1)
+        self.assertEqual(payload["summary"]["average_score"], 0.0)
+        self.assertEqual(len(payload["results"]), 1)
+        self.assertNotIn("score", payload["results"][0]["evaluation"])
+        self.assertEqual(latest_summary["invalid_evaluation_case_ids"], ["T_MISSING_SCORE"])
+        self.assertFalse(latest_summary["summary_counts_match_results"])
+        self.assertFalse(latest_summary["summary_average_score_matches_results"])
+
+    def test_behavior_evaluation_main_writes_standard_json_for_non_finite_scores(self):
+        from scripts import agent_behavior_evaluation
+
+        class FakeApiClient:
+            def __init__(self, base_url, account, password):
+                self.base_url = base_url
+                self.account = account
+                self.password = password
+
+            def login(self):
+                return {"account": self.account, "user_id": 1}
+
+        script_cases = (
+            SimpleNamespace(
+                case_id="T_NAN_SCORE",
+                name="non-finite score",
+                intent="keep behavior-evaluation JSON standards-compliant when score is NaN",
+                conversation_key="nan-score",
+            ),
+        )
+        malformed_result = {
+            "case_id": "T_NAN_SCORE",
+            "name": "non-finite score",
+            "intent": "keep behavior-evaluation JSON standards-compliant when score is NaN",
+            "evaluation": {
+                "passed": True,
+                "score": float("nan"),
+                "passes": [],
+                "issues": [],
+            },
+        }
+
+        def reject_json_constant(value: str):
+            self.fail(f"non-standard JSON constant written: {value}")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_prefix = Path(temp_dir) / "woagent_behavior_eval_nan_score"
+            progress_path = Path(temp_dir) / "woagent_behavior_eval_nan_score.progress.log"
+            with (
+                patch.object(agent_behavior_evaluation, "ApiClient", FakeApiClient),
+                patch.object(agent_behavior_evaluation, "CASES", script_cases),
+                patch.object(agent_behavior_evaluation, "run_case", return_value=malformed_result),
+                patch(
+                    "sys.argv",
+                    [
+                        "agent_behavior_evaluation.py",
+                        "--password",
+                        "secret",
+                        "--output-prefix",
+                        str(output_prefix),
+                        "--progress-file",
+                        str(progress_path),
+                    ],
+                ),
+            ):
+                exit_code = agent_behavior_evaluation.main()
+
+            json_path = output_prefix.with_suffix(".json")
+            markdown_path = output_prefix.with_suffix(".md")
+            markdown_exists = markdown_path.exists()
+            json_text = json_path.read_text(encoding="utf-8")
+            markdown_text = markdown_path.read_text(encoding="utf-8")
+            progress_text = progress_path.read_text(encoding="utf-8")
+            payload = json.loads(json_text, parse_constant=reject_json_constant)
+            latest_summary = agent_behavior_evaluation.latest_report_summary(reports_dir=Path(temp_dir))
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(markdown_exists)
+        self.assertIn("<non-finite-number:nan>", json_text)
+        self.assertIn("<non-finite-number:nan>", markdown_text)
+        self.assertIn("score=<non-finite-number:nan>", progress_text)
+        self.assertEqual(payload["summary"]["average_score"], 0.0)
+        self.assertEqual(payload["summary"]["passed_count"], 0)
+        self.assertEqual(payload["results"][0]["evaluation"]["score"], "<non-finite-number:nan>")
+        self.assertEqual(latest_summary["invalid_evaluation_case_ids"], ["T_NAN_SCORE"])
+        self.assertFalse(latest_summary["summary_average_score_matches_results"])
+
+    def test_behavior_evaluation_main_writes_report_when_case_raises(self):
+        from scripts import agent_behavior_evaluation
+
+        class FakeApiClient:
+            def __init__(self, base_url, account, password):
+                self.base_url = base_url
+                self.account = account
+                self.password = password
+
+            def login(self):
+                return {"account": self.account, "user_id": 1}
+
+        script_cases = (
+            SimpleNamespace(
+                case_id="T_RAISE",
+                name="case raises",
+                intent="keep report artifact when case execution fails",
+                conversation_key="case-raises",
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_prefix = Path(temp_dir) / "woagent_behavior_eval_case_raises"
+            with (
+                patch.object(agent_behavior_evaluation, "ApiClient", FakeApiClient),
+                patch.object(agent_behavior_evaluation, "CASES", script_cases),
+                patch.object(agent_behavior_evaluation, "run_case", side_effect=RuntimeError("boom from case")),
+                patch(
+                    "sys.argv",
+                    [
+                        "agent_behavior_evaluation.py",
+                        "--password",
+                        "secret",
+                        "--output-prefix",
+                        str(output_prefix),
+                    ],
+                ),
+            ):
+                exit_code = agent_behavior_evaluation.main()
+
+            json_path = output_prefix.with_suffix(".json")
+            markdown_path = output_prefix.with_suffix(".md")
+            json_exists = json_path.exists()
+            markdown_exists = markdown_path.exists()
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            markdown = markdown_path.read_text(encoding="utf-8")
+            latest_summary = agent_behavior_evaluation.latest_report_summary(reports_dir=Path(temp_dir))
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(json_exists)
+        self.assertTrue(markdown_exists)
+        self.assertEqual(payload["summary"]["case_count"], 1)
+        self.assertEqual(payload["summary"]["passed_count"], 0)
+        self.assertEqual(payload["summary"]["failed_count"], 1)
+        self.assertEqual(len(payload["results"]), 1)
+        self.assertEqual(payload["results"][0]["case_id"], "T_RAISE")
+        self.assertEqual(payload["results"][0]["error"], "boom from case")
+        self.assertEqual(payload["results"][0]["evaluation"]["score"], 0)
+        self.assertFalse(payload["results"][0]["evaluation"]["passed"])
+        self.assertIn("boom from case", markdown)
+        self.assertEqual(latest_summary["failed_case_ids"], ["T_RAISE"])
+        self.assertTrue(latest_summary["summary_counts_match_results"])
+        self.assertTrue(latest_summary["summary_average_score_matches_results"])
+
+    def test_behavior_evaluation_main_writes_report_for_partial_result_row(self):
+        from scripts import agent_behavior_evaluation
+
+        class FakeApiClient:
+            def __init__(self, base_url, account, password):
+                self.base_url = base_url
+                self.account = account
+                self.password = password
+
+            def login(self):
+                return {"account": self.account, "user_id": 1}
+
+        script_cases = (
+            SimpleNamespace(
+                case_id="T_PARTIAL",
+                name="partial result",
+                intent="keep report artifact when result row misses runtime fields",
+                conversation_key="partial-result",
+            ),
+        )
+        partial_result = {
+            "case_id": "T_PARTIAL",
+            "name": "partial result",
+            "intent": "keep report artifact when result row misses runtime fields",
+            "evaluation": {
+                "score": 0,
+                "passed": False,
+                "passes": [],
+                "issues": ["runtime fields missing"],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_prefix = Path(temp_dir) / "woagent_behavior_eval_partial_result"
+            with (
+                patch.object(agent_behavior_evaluation, "ApiClient", FakeApiClient),
+                patch.object(agent_behavior_evaluation, "CASES", script_cases),
+                patch.object(agent_behavior_evaluation, "run_case", return_value=partial_result),
+                patch(
+                    "sys.argv",
+                    [
+                        "agent_behavior_evaluation.py",
+                        "--password",
+                        "secret",
+                        "--output-prefix",
+                        str(output_prefix),
+                    ],
+                ),
+            ):
+                exit_code = agent_behavior_evaluation.main()
+
+            json_path = output_prefix.with_suffix(".json")
+            markdown_path = output_prefix.with_suffix(".md")
+            json_exists = json_path.exists()
+            markdown_exists = markdown_path.exists()
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            markdown = markdown_path.read_text(encoding="utf-8")
+            latest_summary = agent_behavior_evaluation.latest_report_summary(reports_dir=Path(temp_dir))
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(json_exists)
+        self.assertTrue(markdown_exists)
+        self.assertEqual(payload["summary"]["case_count"], 1)
+        self.assertEqual(payload["summary"]["passed_count"], 0)
+        self.assertEqual(payload["summary"]["failed_count"], 1)
+        self.assertEqual(len(payload["results"]), 1)
+        self.assertNotIn("run_id", payload["results"][0])
+        self.assertIn("runtime fields missing", markdown)
+        self.assertIn("<missing>", markdown)
+        self.assertEqual(latest_summary["failed_case_ids"], ["T_PARTIAL"])
+        self.assertTrue(latest_summary["summary_counts_match_results"])
+        self.assertTrue(latest_summary["summary_average_score_matches_results"])
+
+    def test_backend_completion_audit_derives_behavior_latest_report_from_evaluation_script(self):
+        provider = SimpleNamespace(
+            provider="deepseek",
+            base_url="https://api.deepseek.test",
+            default_model="deepseek-test",
+            configured=True,
+        )
+        latest_report = {
+            "available": True,
+            "historical": True,
+            "path": "reports/woagent_behavior_eval_custom.json",
+            "report_schema_version": "agent_behavior_evaluation_report_v1",
+            "summary": {"case_count": 8, "passed_count": 7, "failed_count": 1, "average_score": 91.2},
+            "failed_case_ids": ["T07"],
+            "passed_case_ids": ["T01", "T02"],
+            "reported_case_ids": ["T01", "T02", "T07"],
+            "expected_case_ids": ["T01", "T02", "T03"],
+            "missing_case_ids": ["T03"],
+            "extra_case_ids": ["T07"],
+            "current_case_set_complete": False,
+        }
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.provider_config", return_value=provider),
+            patch("scripts.agent_behavior_evaluation.latest_report_summary", return_value=latest_report, create=True),
+        ):
+            audit = AgentBackendCompletionAuditService(self.db).audit(project_id=10)
+
+        checks = {item["name"]: item for item in audit["checks"]}
+        behavior_details = checks["behavior_evaluation_suite_available"]["details"]
+        self.assertEqual(behavior_details.get("latest_report"), latest_report)
+
+    def test_backend_completion_audit_exposes_behavior_latest_report_fields_from_evaluation_script(self):
+        from scripts import agent_behavior_evaluation
+
+        provider = SimpleNamespace(
+            provider="deepseek",
+            base_url="https://api.deepseek.test",
+            default_model="deepseek-test",
+            configured=True,
+        )
+        expected_fields = list(agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS)
+
+        with patch("app.services.agent_runtime_service.AIService.provider_config", return_value=provider):
+            audit = AgentBackendCompletionAuditService(self.db).audit(project_id=10)
+
+        checks = {item["name"]: item for item in audit["checks"]}
+        behavior_details = checks["behavior_evaluation_suite_available"]["details"]
+        self.assertEqual(behavior_details["latest_report_fields"], expected_fields)
+        self.assertEqual(
+            audit["derived_from"].get("behavior_evaluation_latest_report_fields"),
+            "scripts.agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS",
+        )
 
     def test_backend_completion_audit_blocks_when_model_provider_is_unconfigured(self):
         provider = SimpleNamespace(
@@ -6142,8 +9474,12 @@ class AgentRuntimeTests(unittest.TestCase):
                         "runtime_contract_keys",
                         "diagnostic_keys",
                         "runbook_execution_context_summary_fields",
+                        "runbook_dispatch_trace_summary_fields",
                         "behavior_evaluation_case_ids",
                         "behavior_evaluation_assertions",
+                        "behavior_evaluation_model_call_trace_fields",
+                        "behavior_evaluation_markdown_sections",
+                        "behavior_evaluation_latest_report_fields",
                     }
                     else value
                 )
@@ -6204,6 +9540,12 @@ class AgentRuntimeTests(unittest.TestCase):
                         "runtime_contract_keys",
                         "diagnostic_keys",
                         "runbook_execution_context_summary_fields",
+                        "runbook_dispatch_trace_summary_fields",
+                        "behavior_evaluation_case_ids",
+                        "behavior_evaluation_assertions",
+                        "behavior_evaluation_model_call_trace_fields",
+                        "behavior_evaluation_markdown_sections",
+                        "behavior_evaluation_latest_report_fields",
                     }
                     else value
                 )
@@ -6239,6 +9581,10 @@ class AgentRuntimeTests(unittest.TestCase):
                 contract["runbook_execution_context_summary_fields"],
                 list(RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS),
             )
+            self.assertEqual(
+                contract["runbook_dispatch_trace_summary_fields"],
+                list(RUNBOOK_DISPATCH_TRACE_SUMMARY_FIELDS),
+            )
             behavior_check = {
                 item["name"]: item for item in snapshot["checks"]
             }["behavior_evaluation_suite_available"]
@@ -6249,6 +9595,42 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(
                 contract["behavior_evaluation_assertions"],
                 behavior_check["details"]["assertions"],
+            )
+            self.assertEqual(
+                contract["behavior_evaluation_assertion_coverage_source"],
+                "scripts.agent_behavior_evaluation.assertion_coverage",
+            )
+            self.assertEqual(
+                contract["behavior_evaluation_undeclared_case_assertions_source"],
+                "scripts.agent_behavior_evaluation.undeclared_case_assertions",
+            )
+            self.assertEqual(
+                contract.get("behavior_evaluation_uncovered_assertions_source"),
+                "scripts.agent_behavior_evaluation.uncovered_assertion_ids",
+            )
+            self.assertEqual(
+                contract["behavior_evaluation_assertion_metadata_complete"],
+                str(behavior_check["details"]["assertion_metadata_complete"]).lower(),
+            )
+            self.assertEqual(
+                contract["behavior_evaluation_runbook_source"],
+                "scripts.agent_behavior_evaluation.behavior_evaluation_runbook",
+            )
+            self.assertEqual(
+                contract["behavior_evaluation_model_call_trace_fields"],
+                behavior_check["details"]["model_call_trace_fields"],
+            )
+            self.assertEqual(
+                contract["behavior_evaluation_markdown_sections"],
+                behavior_check["details"]["markdown_sections"],
+            )
+            self.assertEqual(
+                contract["behavior_evaluation_latest_report_fields"],
+                behavior_check["details"]["latest_report_fields"],
+            )
+            self.assertEqual(
+                contract["behavior_evaluation_latest_report_fields_source"],
+                "scripts.agent_behavior_evaluation.LATEST_REPORT_SUMMARY_FIELDS",
             )
             self.assertEqual(contract["source"], "AgentBackendCompletionAuditService.audit")
         self.assertEqual(list(AgentBackendCompletionAuditRead.model_fields), list(AGENT_BACKEND_COMPLETION_AUDIT_FIELDS))
@@ -8030,6 +11412,169 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn("output_json_redacted", execution_context)
         self.assertNotIn("evidence_refs_json", execution_context)
 
+    def test_executor_records_tool_dispatch_trace_after_backend_routing(self):
+        from app.core.sensitive_data import request_fingerprint
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="tool dispatch trace"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        result = ToolExecutor(self.db).execute_next(worker_id="worker-dispatch")
+
+        dispatch_trace = result.policy_reason_json["dispatch_trace"]
+        expected_trace = {
+            "dispatch_trace_version_hash": "agent-tool-dispatch-v1",
+            "tool_call_id": call.tool_call_id,
+            "run_id": run.run_id,
+            "runtime_snapshot_id": call.runtime_snapshot_id,
+            "tool_name": "project.read_context",
+            "tool_version": "1.0.0",
+            "schema_hash": call.schema_hash,
+            "manifest_hash": call.manifest_hash,
+            "router": "AgentToolRouter.resolve",
+            "runtime": "AgentToolRuntime.execute",
+            "backend_handler": "_project_read_context",
+            "backend_name": "project-service",
+            "backend_operation": "read_context",
+            "backend_contract_version": "v1",
+            "resolved_side_effect_class": "read_only",
+            "resolved_replay_policy": call.resolved_replay_policy,
+            "status": "succeeded",
+            "effect_submission_state": "effect_committed",
+        }
+
+        self.assertEqual(
+            {key: dispatch_trace[key] for key in expected_trace},
+            expected_trace,
+        )
+        self.assertEqual(
+            dispatch_trace["dispatch_trace_hash"],
+            request_fingerprint(expected_trace),
+        )
+        self.assertNotIn("input_json_redacted", dispatch_trace)
+        self.assertNotIn("output_json_redacted", dispatch_trace)
+        self.assertNotIn("evidence_refs_json", dispatch_trace)
+
+    def test_executor_records_dispatch_trace_when_eventstore_fails_after_effect(self):
+        from app.core.sensitive_data import request_fingerprint
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="eventstore recovery dispatch trace"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        class FailingEventRuntime(AgentRuntimeService):
+            def append_event(self, run, event_type, payload, *, commit=True):
+                if event_type == "tool.effect_committed":
+                    raise RuntimeError("eventstore write failed with secret-token")
+                return super().append_event(run, event_type, payload, commit=commit)
+
+        result = ToolExecutor(
+            self.db,
+            runtime_factory=lambda db: FailingEventRuntime(db),
+        ).execute_next(worker_id="worker-eventstore-dispatch")
+
+        dispatch_trace = result.policy_reason_json["dispatch_trace"]
+        expected_trace = {
+            "dispatch_trace_version_hash": "agent-tool-dispatch-v1",
+            "tool_call_id": call.tool_call_id,
+            "run_id": run.run_id,
+            "runtime_snapshot_id": call.runtime_snapshot_id,
+            "tool_name": "project.read_context",
+            "tool_version": "1.0.0",
+            "schema_hash": call.schema_hash,
+            "manifest_hash": call.manifest_hash,
+            "router": "AgentToolRouter.resolve",
+            "runtime": "AgentToolRuntime.execute",
+            "backend_handler": "_project_read_context",
+            "backend_name": "project-service",
+            "backend_operation": "read_context",
+            "backend_contract_version": "v1",
+            "resolved_side_effect_class": "read_only",
+            "resolved_replay_policy": call.resolved_replay_policy,
+            "status": "uncertain",
+            "effect_submission_state": "effect_committed",
+        }
+
+        self.assertEqual(result.status, "uncertain")
+        self.assertEqual(result.error_code, "eventstore_write_failed_after_effect")
+        self.assertEqual(
+            {key: dispatch_trace[key] for key in expected_trace},
+            expected_trace,
+        )
+        self.assertEqual(
+            dispatch_trace["dispatch_trace_hash"],
+            request_fingerprint(expected_trace),
+        )
+        self.assertNotIn("input_json_redacted", dispatch_trace)
+        self.assertNotIn("output_json_redacted", dispatch_trace)
+        self.assertNotIn("evidence_refs_json", dispatch_trace)
+
+    def test_executor_bounds_eventstore_failure_error_message_after_effect(self):
+        from app.core.sensitive_data import request_fingerprint
+        from app.services.agent_runtime_service import (
+            AGENT_ERROR_MESSAGE_MAX_CHARS,
+            AGENT_ERROR_MESSAGE_TRUNCATION_MARKER,
+        )
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="eventstore long error summary"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        hidden_tail = "EVENTSTORE_FAILURE_TAIL_SHOULD_NOT_APPEAR"
+        long_error = "eventstore write failed " + ("x" * (AGENT_ERROR_MESSAGE_MAX_CHARS * 3)) + hidden_tail
+
+        class FailingEventRuntime(AgentRuntimeService):
+            def append_event(self, run, event_type, payload, *, commit=True):
+                if event_type == "tool.effect_committed":
+                    raise RuntimeError(long_error)
+                return super().append_event(run, event_type, payload, commit=commit)
+
+        result = ToolExecutor(
+            self.db,
+            runtime_factory=lambda db: FailingEventRuntime(db),
+        ).execute_next(worker_id="worker-eventstore-long-error")
+
+        execution_context = result.policy_reason_json["execution_context"]
+        self.assertEqual(result.status, "uncertain")
+        self.assertEqual(result.error_code, "eventstore_write_failed_after_effect")
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, result.error_message)
+        self.assertIn("error_hash=", result.error_message)
+        self.assertLessEqual(len(result.error_message), AGENT_ERROR_MESSAGE_MAX_CHARS)
+        self.assertNotIn(hidden_tail, result.error_message)
+        self.assertEqual(
+            execution_context["error_message_hash"],
+            request_fingerprint({"error_message": result.error_message}),
+        )
+
     def test_executor_records_recovery_execution_context_on_backend_failure(self):
         from app.core.sensitive_data import request_fingerprint
 
@@ -8110,6 +11655,61 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn("input_json_redacted", execution_context)
         self.assertNotIn("output_json_redacted", execution_context)
         self.assertNotIn("evidence_refs_json", execution_context)
+
+    def test_executor_bounds_backend_failure_error_message(self):
+        from app.core.sensitive_data import request_fingerprint
+        from app.services.agent_runtime_service import (
+            AGENT_ERROR_MESSAGE_MAX_CHARS,
+            AGENT_ERROR_MESSAGE_TRUNCATION_MARKER,
+        )
+
+        run = self._create_run("backend long failure error summary")
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        hidden_tail = "TOOL_BACKEND_FAILURE_TAIL_SHOULD_NOT_APPEAR"
+        long_error = "backend adapter exploded " + ("x" * (AGENT_ERROR_MESSAGE_MAX_CHARS * 3)) + hidden_tail
+
+        class FailingToolRuntime:
+            def __init__(self, db, *, backend_factory):
+                self.db = db
+                self.backend_factory = backend_factory
+
+            def execute(self, *, call, current_user):
+                raise RuntimeError(long_error)
+
+        result = ToolExecutor(
+            self.db,
+            tool_runtime_factory=lambda db, backend_factory: FailingToolRuntime(
+                db,
+                backend_factory=backend_factory,
+            ),
+        ).execute_next(worker_id="worker-backend-long-error")
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        failed_event = next(item for item in events if item.event_type == "tool.failed")
+        execution_context = result.policy_reason_json["execution_context"]
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error_code, "tool_execution_failed")
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, result.error_message)
+        self.assertIn("error_hash=", result.error_message)
+        self.assertLessEqual(len(result.error_message), AGENT_ERROR_MESSAGE_MAX_CHARS)
+        self.assertNotIn(hidden_tail, result.error_message)
+        self.assertEqual(failed_event.payload_json["error_message"], result.error_message)
+        self.assertEqual(
+            execution_context["error_message_hash"],
+            request_fingerprint({"error_message": result.error_message}),
+        )
 
     def test_executor_delegates_backend_call_to_tool_runtime(self):
         run = self._create_run("runtime delegates backend execution")
@@ -9179,6 +12779,30 @@ class AgentRuntimeTests(unittest.TestCase):
                 "output_json_redacted": {"secret": "do-not-copy"},
                 "evidence_refs_json": [{"ref_id": "do-not-copy"}],
             },
+            "dispatch_trace": {
+                "dispatch_trace_version_hash": "agent-tool-dispatch-v1",
+                "tool_call_id": call.tool_call_id,
+                "run_id": run.run_id,
+                "runtime_snapshot_id": call.runtime_snapshot_id,
+                "tool_name": call.tool_name,
+                "tool_version": call.tool_version,
+                "schema_hash": call.schema_hash,
+                "manifest_hash": call.manifest_hash,
+                "router": "AgentToolRouter.resolve",
+                "runtime": "AgentToolRuntime.execute",
+                "backend_handler": "AgentToolRuntime._execute_registered_backend",
+                "backend_name": call.backend_name,
+                "backend_operation": call.backend_operation,
+                "backend_contract_version": call.backend_contract_version,
+                "resolved_side_effect_class": call.resolved_side_effect_class,
+                "resolved_replay_policy": call.resolved_replay_policy,
+                "status": "uncertain",
+                "effect_submission_state": "transport_sent_observed",
+                "dispatch_trace_hash": "safe-dispatch-trace-hash",
+                "input_json_redacted": {"token": "do-not-copy"},
+                "output_json_redacted": {"secret": "do-not-copy"},
+                "evidence_refs_json": [{"ref_id": "do-not-copy"}],
+            },
         }
         run.last_checkpoint_id = None
         self.db.add(
@@ -9274,6 +12898,18 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertNotIn("input_json_redacted", execution_context)
             self.assertNotIn("output_json_redacted", execution_context)
             self.assertNotIn("evidence_refs_json", execution_context)
+            dispatch_trace = recommendation["details"]["dispatch_trace"]
+            self.assertEqual(set(dispatch_trace), set(RUNBOOK_DISPATCH_TRACE_SUMMARY_FIELDS))
+            self.assertEqual(dispatch_trace["dispatch_trace_hash"], "safe-dispatch-trace-hash")
+            self.assertEqual(dispatch_trace["router"], "AgentToolRouter.resolve")
+            self.assertEqual(dispatch_trace["runtime"], "AgentToolRuntime.execute")
+            self.assertEqual(dispatch_trace["backend_handler"], "AgentToolRuntime._execute_registered_backend")
+            self.assertEqual(dispatch_trace["status"], "uncertain")
+            self.assertEqual(dispatch_trace["effect_submission_state"], "transport_sent_observed")
+            self.assertEqual(dispatch_trace["runtime_snapshot_id"], call.runtime_snapshot_id)
+            self.assertNotIn("input_json_redacted", dispatch_trace)
+            self.assertNotIn("output_json_redacted", dispatch_trace)
+            self.assertNotIn("evidence_refs_json", dispatch_trace)
         memory_recommendation = next(
             item
             for item in diagnosis["recommendations"]
@@ -9469,6 +13105,8 @@ class AgentRuntimeTests(unittest.TestCase):
             "recommendation_required_fields": RUNBOOK_RECOMMENDATION_REQUIRED_FIELDS,
             "recommendation_optional_fields": RUNBOOK_RECOMMENDATION_OPTIONAL_FIELDS,
             "recommendation_runbook_ids": RUNBOOK_DIAGNOSIS_RECOMMENDATION_RUNBOOK_IDS,
+            "execution_context_summary_fields": set(RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS),
+            "dispatch_trace_summary_fields": set(RUNBOOK_DISPATCH_TRACE_SUMMARY_FIELDS),
             "recommendation_action_contract": "openapi_agent_route",
             "recommendation_severity_source": "runbook_catalog",
             "checkpoint_freshness_safe_actions": CHECKPOINT_FRESHNESS_SAFE_ACTIONS,
@@ -9577,6 +13215,62 @@ class AgentRuntimeTests(unittest.TestCase):
             "project.create_business_record",
         )
 
+    def test_runbook_diagnosis_summarizes_large_event_payloads(self):
+        run = self._create_run("runbook event payload summary")
+        long_payload = "raw-event-payload-" + ("x" * (RUNBOOK_EVENT_PAYLOAD_PREVIEW_MAX_CHARS * 3))
+        AgentRuntimeService(self.db).append_event(
+            run,
+            "approval.approve_conflict",
+            {
+                "tool_call_id": "tool-call-large-payload",
+                "error_code": "approval_epoch_conflict",
+                "transcript": long_payload,
+            },
+        )
+        AgentRuntimeService(self.db).append_event(
+            run,
+            "memory.bypassed_evidence_ref",
+            {
+                "error_code": "memory_bypassed_evidence_ref",
+                "memory_snapshot": long_payload,
+            },
+        )
+        self.db.commit()
+
+        diagnosis = AgentRunbookService(self.db).diagnose_run(
+            run_id=run.run_id,
+            current_user=self.owner,
+        )
+        approval_recommendation = next(
+            item
+            for item in diagnosis["recommendations"]
+            if item["reason"] == "approval_conflict_event_seen"
+        )
+        memory_recommendation = next(
+            item
+            for item in diagnosis["recommendations"]
+            if item["reason"] == "memory_bypassed_evidence_ref_event_seen"
+        )
+        encoded_diagnosis = json.dumps(diagnosis, ensure_ascii=False)
+
+        self.assertEqual(approval_recommendation["tool_call_id"], "tool-call-large-payload")
+        for recommendation in (approval_recommendation, memory_recommendation):
+            details = recommendation["details"]
+            self.assertIn("event_id", details)
+            self.assertIn("event_seq", details)
+            self.assertEqual(details["payload_summary_version"], "runbook_event_payload_summary_v1")
+            self.assertTrue(details["payload_truncated"])
+            self.assertIn(RUNBOOK_EVENT_PAYLOAD_TRUNCATION_MARKER, details["payload_preview"])
+            self.assertLessEqual(
+                len(details["payload_preview"]),
+                RUNBOOK_EVENT_PAYLOAD_PREVIEW_MAX_CHARS + len(RUNBOOK_EVENT_PAYLOAD_TRUNCATION_MARKER),
+            )
+            self.assertEqual(details["full_payload_reference"], "AgentEvent.payload_json")
+            self.assertIn("payload_hash", details)
+            self.assertNotIn(long_payload, encoded_diagnosis)
+        self.assertIn("transcript", approval_recommendation["details"]["payload_keys"])
+        self.assertIn("memory_snapshot", memory_recommendation["details"]["payload_keys"])
+
     def test_resume_run_continues_when_checkpoint_is_fresh(self):
         run = self._create_run("resume fresh")
         run.status = "paused"
@@ -9642,6 +13336,65 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("run.completed", events)
         self.assertIn("工具执行结果如下", captured_messages[-2].content)
         self.assertEqual(captured_messages[-1].content, "以上工具已完成审批和执行。请基于这些工具结果给用户最终回复，不要再请求工具。")
+
+    def test_complete_after_tool_results_bounds_aggregate_tool_result_model_context(self):
+        from app.core.sensitive_data import request_fingerprint
+
+        run = self._create_run("aggregate tool result context")
+        tail_marker = "TAIL_SHOULD_NOT_ENTER_AGGREGATE_TOOL_CONTEXT"
+        calls = []
+        for index in range(4):
+            call = ExecutionLedgerService(self.db).create_tool_call(
+                payload=AgentToolCallCreateRequest(
+                    run_id=run.run_id,
+                    tool_name="project.read_context",
+                    input={"project_id": 10, "index": index},
+                    step_index=index,
+                ),
+                current_user=self.owner,
+                enqueue=False,
+            )
+            output = {
+                "index": index,
+                "large_blob": "x" * 7000,
+                "tail": tail_marker if index == 3 else "",
+            }
+            call.status = "succeeded"
+            call.output_json_redacted = output
+            call.output_hash = request_fingerprint(output)
+            calls.append(call)
+        self.db.commit()
+
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.extend(payload.messages)
+            yield {"type": "delta", "content": "已汇总工具结果。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).complete_after_tool_results(
+                run_id=run.run_id,
+                user_id=self.owner.id,
+                tool_call_ids=[call.tool_call_id for call in calls],
+            )
+
+        tool_context = "\n".join(
+            message.content
+            for message in captured_messages
+            if "工具执行结果如下" in message.content
+            or "agent_tool_result_context_truncated" in message.content
+        )
+        tool_context_size = sum(
+            len(message.content)
+            for message in captured_messages
+            if "工具执行结果如下" in message.content
+            or "agent_tool_result_context_truncated" in message.content
+        )
+
+        self.assertLessEqual(tool_context_size, AGENT_TOOL_RESULT_CONTEXT_TOTAL_MAX_CHARS)
+        self.assertIn("agent_tool_result_context_truncated", tool_context)
+        self.assertNotIn(tail_marker, tool_context)
 
     def test_resume_run_blocks_when_migration_block_open(self):
         run, _, _ = self._create_migration_block()

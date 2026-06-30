@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -267,6 +269,31 @@ RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS = (
     "error_code",
     "error_message_hash",
 )
+RUNBOOK_DISPATCH_TRACE_SUMMARY_FIELDS = (
+    "dispatch_trace_version_hash",
+    "dispatch_trace_hash",
+    "tool_call_id",
+    "run_id",
+    "runtime_snapshot_id",
+    "tool_name",
+    "tool_version",
+    "schema_hash",
+    "manifest_hash",
+    "router",
+    "runtime",
+    "backend_handler",
+    "backend_name",
+    "backend_operation",
+    "backend_contract_version",
+    "resolved_side_effect_class",
+    "resolved_replay_policy",
+    "status",
+    "effect_submission_state",
+)
+RUNBOOK_EVENT_PAYLOAD_SUMMARY_VERSION = "runbook_event_payload_summary_v1"
+RUNBOOK_EVENT_PAYLOAD_PREVIEW_MAX_CHARS = 1000
+RUNBOOK_EVENT_PAYLOAD_TRUNCATION_MARKER = "[runbook_event_payload_truncated]"
+RUNBOOK_EVENT_PAYLOAD_KEY_LIMIT = 40
 RUNTIME_LOOP_REPAIR_STOP_REASONS = {
     "tool_prerequisite_missing",
     "tool_request_format_invalid",
@@ -355,15 +382,59 @@ class AgentRunbookService:
         }
         return summary or None
 
+    @staticmethod
+    def _dispatch_trace_summary(call: AgentToolCall) -> dict[str, Any] | None:
+        dispatch_trace = (call.policy_reason_json or {}).get("dispatch_trace")
+        if not isinstance(dispatch_trace, dict):
+            return None
+        summary = {
+            field: dispatch_trace[field]
+            for field in RUNBOOK_DISPATCH_TRACE_SUMMARY_FIELDS
+            if field in dispatch_trace
+        }
+        return summary or None
+
     def _details_with_execution_context(
         self,
         call: AgentToolCall,
         details: dict[str, Any],
     ) -> dict[str, Any]:
         execution_context = self._execution_context_summary(call)
-        if execution_context is None:
+        dispatch_trace = self._dispatch_trace_summary(call)
+        if execution_context is None and dispatch_trace is None:
             return details
-        return {**details, "execution_context": execution_context}
+        enriched = dict(details)
+        if execution_context is not None:
+            enriched["execution_context"] = execution_context
+        if dispatch_trace is not None:
+            enriched["dispatch_trace"] = dispatch_trace
+        return enriched
+
+    @staticmethod
+    def _event_payload_details(event: AgentEvent) -> dict[str, Any]:
+        payload = event.payload_json if isinstance(event.payload_json, dict) else {}
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            default=str,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        payload_preview = payload_json[:RUNBOOK_EVENT_PAYLOAD_PREVIEW_MAX_CHARS]
+        payload_truncated = len(payload_json) > RUNBOOK_EVENT_PAYLOAD_PREVIEW_MAX_CHARS
+        if payload_truncated:
+            payload_preview += RUNBOOK_EVENT_PAYLOAD_TRUNCATION_MARKER
+        return {
+            "event_id": event.id,
+            "event_seq": event.event_seq,
+            "payload_summary_version": RUNBOOK_EVENT_PAYLOAD_SUMMARY_VERSION,
+            "payload_keys": sorted(str(key) for key in payload)[:RUNBOOK_EVENT_PAYLOAD_KEY_LIMIT],
+            "payload_preview": payload_preview,
+            "payload_truncated": payload_truncated,
+            "payload_size_chars": len(payload_json),
+            "payload_hash": hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+            "full_payload_reference": "AgentEvent.payload_json",
+        }
 
     def _uncertain_recommendations(self, run: AgentRun) -> list[dict[str, Any]]:
         calls = list(
@@ -465,7 +536,7 @@ class AgentRunbookService:
                 "severity": RUNBOOKS["approval_stale"]["severity"],
                 "action": "GET /api/v1/agents/tool-calls/{tool_call_id}",
                 "tool_call_id": (event.payload_json or {}).get("tool_call_id"),
-                "details": event.payload_json,
+                "details": self._event_payload_details(event),
             })
         return recommendations
 
@@ -628,11 +699,7 @@ class AgentRunbookService:
                 "reason": "memory_bypassed_evidence_ref_event_seen",
                 "severity": RUNBOOKS["memory_evidence_ref_violation"]["severity"],
                 "action": "GET /api/v1/agents/memories",
-                "details": {
-                    "event_id": event.id,
-                    "event_seq": event.event_seq,
-                    "payload": event.payload_json,
-                },
+                "details": self._event_payload_details(event),
             }
             for event in events[:5]
         ]

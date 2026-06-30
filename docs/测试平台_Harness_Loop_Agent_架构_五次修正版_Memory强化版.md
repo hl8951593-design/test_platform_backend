@@ -2,7 +2,7 @@
 
 ## 1. 执行摘要
 
-这套系统的目标是建设一个**生产级测试平台 Agent**，而不是建设一个通用聊天助手，也不是为了“替代 LangGraph”而做自研。Agent 的成立标准不是是否使用 LangGraph，而是系统是否具备以下能力：
+这套系统的目标是建设一个**生产级测试平台 Agent**，而不是建设一个无限制通用聊天助手，也不是为了“替代 LangGraph”而做自研。它必须具备软件测试领域的通用回答能力，但回答范围限定在测试理论、测试自动化、接口/WebSocket 测试、缺陷定位、回归策略、CI、报告解读和 TestAuto 平台使用建议等测试相关问题。Agent 的成立标准不是是否使用 LangGraph，而是系统是否具备以下能力：
 
 ```text
 Plan      能根据目标规划下一步
@@ -20,9 +20,17 @@ Recovery  能从中断、超时、未知提交状态中恢复
 
 这套 Agent 应建立在现有平台的 `AIService / AISkillRunner / Skill 包 / Run-Event-SSE / Scenario / Flow / Execution Records / Reports / Project Permissions` 之上。Agent 不直接改数据库、不直接调用模型 HTTP、不直接绕过权限体系。Agent 的职责是理解用户目标、规划动作、选择工具、观察结果、循环纠错、输出可审计结果；真实业务副作用全部通过现有平台 Service 和 Skill 发起。
 
-当前后端对话执行由 `AgentConversationRunner` 承担模型规划和结果回灌层：它在模型调用前用 `normal_plan_v1` 检索项目 Memory，以 `usage_role=conversation_context` 注入非 policy 上下文，写入 `memory.context_injected` 和 `AgentMemoryUsageEvent(active_for_policy=false)`；随后把 ToolRegistry 以受控协议暴露给模型，模型只能输出 `agent_tool_request` JSON 请求。后端解析工具请求后必须先写 `model.tool_request_detected`，再通过 `ExecutionLedgerService.create_tool_call(enqueue=False)` 进入 ToolCall 事实账本，并复用 `ToolExecutor.execute_tool_call` 完成权限、审批、策略和后端 adapter 校验。工具结果通过 `tool.result_observed` 进入下一轮模型上下文，最终自然语言回复由 `model.delta`、`model.completed.content` 和 `run.completed.result.message` 输出给前端，且必须是 GitHub Flavored Markdown；若模型流式内容存在表格换行等格式问题，Runner 在完成前写入 `model.markdown_normalized(replace_content=true)` 并用规范化 Markdown 覆盖最终 summary。该闭环不允许绕过 ExecutionLedger，也不允许把 Memory 或模型工具请求 JSON 当成用户可见回复；高风险动作仍必须依赖 EvidenceRef、审批和工具结果，而不是 conversation Memory。
+当前后端对话执行由 `AgentConversationRunner` 承担模型规划和结果回灌层：它在模型调用前用 `normal_plan_v1` 检索项目 Memory，以 `usage_role=conversation_context` 注入非 policy 上下文，写入 `memory.context_injected` 和 `AgentMemoryUsageEvent(active_for_policy=false)`；随后把 ToolRegistry 以受控协议暴露给模型。软件测试领域的通用问答、解释和建议如果不需要读取项目实时事实或创建/保存平台对象，可以直接以自然语言回答；需要真实项目资源、草稿生成、保存动作或其他平台副作用时，模型只能输出 `agent_tool_request` JSON 请求。后端解析工具请求后必须先写 `model.tool_request_detected`，再通过 `ExecutionLedgerService.create_tool_call(enqueue=False)` 进入 ToolCall 事实账本，并复用 `ToolExecutor.execute_tool_call` 完成权限、审批、策略和后端 adapter 校验。工具结果通过 `tool.result_observed` 进入下一轮模型上下文，`ToolResultPolicy` 负责抽取 warning/issue/error、拆分可自动修复项与用户阻断项，并从对应 `ToolSpec.tool_result_repair_guidance` 后端私有字段读取按工具的安全修复路径，策略层只保留通用 fallback；最终用户回复默认只输出已完成、已修复/验证、剩余阻断项和下一步，完整草稿结构、长 JSON 和原始工具输出保留在 ToolCall、summary 或报告详情中。最终自然语言回复由 `model.delta`、`model.completed.content` 和 `run.completed.result.message` 输出给前端，且必须是 GitHub Flavored Markdown。`model.delta` 走低延迟 EventStore/SSE 策略：首个普通自然语言可见 delta 立即落库，后续小碎片按短时间窗口或字符阈值微批提交；工具规划轮会先静默收流并解析，若最终是普通文本则只补发一个合并后的可见 `model.delta`，避免长文本逐 token 回放；混合自然语言与单个 `agent_tool_request` fenced block 的输出优先本地挽救并规范化轻微 schema 偏差，其他非法格式再进入一次 LLM 修复流程，避免工具 JSON 泄露给前端；SSE 对 `queued/running` run 使用短轮询，前端只依赖 delta content 的顺序追加语义。`Last-Event-ID/after_sequence` 必须按 run 维度解释，后端在 cursor 大于当前 run 最新事件序号时重置为 0 并重放当前事件，避免跨 run cursor 污染造成 heartbeat-only。若后台 worker 崩溃、进程重启或连接恢复期间错过终态，读路径必须用最新 EventStore 事件时间识别超过 `AGENT_RUN_STALE_TIMEOUT_SECONDS` 的 active run，并写入 `run.failed(agent_run_stale_worker_lost)`，避免 UI 无限停留在 pending assistant 气泡；若 DeepSeek 已产生 partial content 后断流，Runner 写入 `model.stream_interrupted` 并尽量继续解析或完成。若模型流式内容存在表格换行等格式问题，Runner 在完成前写入 `model.markdown_normalized(replace_content=true)` 并用规范化 Markdown 覆盖最终 summary。同一个用户问题内可能经历多次模型调用，每次调用都必须以 `iteration_id`、`model_call_id` 和 `loop_step` 标识为 assistant response、tool planning、repair、final summary 或 intent guard；工具审计事件在可得时携带 `tool_call_id` 与 `decision_reason`，使 Codex 式 Plan/Act/Observe/Repair 循环可被前端、评测脚本和 Runbook 解释，而不是只看 `model.started` 次数。该闭环不允许绕过 ExecutionLedger，也不允许把 Memory 或模型工具请求 JSON 当成用户可见回复；高风险动作仍必须依赖 EvidenceRef、审批和工具结果，而不是 conversation Memory。
 
-场景组合是该闭环的首个 query-first 业务 recipe：用户要求创建、生成或组合测试场景时，模型必须先调用 `testcase.query_project_cases` 获取当前项目全量 HTTP/WebSocket 用例，再基于返回的真实 case id 调用 `scenario.compose_draft`。如果模型在没有成功 query 结果的同一 run 内直接请求 `scenario.compose_draft`，Harness 不执行下游 AISkill，而是创建可审计 ToolCall、写入 `tool.failed` / `tool.result_observed` 与 `scenario_compose_requires_case_query`，把失败结果回灌给模型继续规划，直到 query -> compose -> final answer 或达到迭代上限。
+场景组合是该闭环的首个 query-first 业务 recipe：用户要求创建、生成或组合测试场景时，模型必须先调用 `testcase.query_project_cases` 获取当前项目全量 HTTP/WebSocket 用例，再基于返回的真实 case id 调用 `scenario.compose_draft`。该 recipe 的可扩展配置分两层：`scenario-composition/SKILL.md` 的私有 `routing_required_tool_after_success` 负责 query 成功后漏 compose 的静默修复，`scenario.compose_draft` 的 ToolSpec 私有 `required_successful_tool_before` 负责执行前顺序校验。如果模型在没有成功 query 结果的同一 run 内直接请求 `scenario.compose_draft`，Harness 不执行下游 AISkill，而是创建可审计 ToolCall、写入 `tool.failed` / `tool.result_observed` 与 `scenario_compose_requires_case_query`，把失败结果回灌给模型继续规划；如果 query 已成功且存在候选用例但模型只输出分析没有 compose，Harness 写入 `model.required_tool_missing(after_tool, required_tool)` 并静默修复为 `scenario.compose_draft` 请求，直到 query -> compose -> final answer 或达到迭代上限；若达到上限后仍需最终总结，Runner 必须在 `final_summary` 前写入 stop 用 ContextBuild 与 `loop.observed(RC_MAX_ITERATIONS)`，把 `max_iterations` 记录为 Resource / Limit RootCause。保存/持久化是独立副作用 guardrail：疑似保存请求会先经结构化语义分类，只有确认用户要把草稿持久化为正式实体且 ToolRegistry 尚无保存工具时，Runner 才直接说明不能保存并完成 run；“不要保存/仅生成草稿”的请求继续走 query-first 组合，不被保存 guard 短路。
+
+为贴近成熟 agent loop 的高频多轮调用模式，Runner 构造系统提示时必须保持 prompt cache 友好的稳定前缀：ToolRegistry 清单按工具名排序，工具 JSON 使用固定字段排序和紧凑分隔符序列化；同一 runtime hash 下重复构建的系统提示字符串应保持一致。
+
+Agent 领域规则采用 Codex-style SkillRegistry 渐进加载：`app/agent_skills/*/SKILL.md` 是可复用业务提示单元，frontmatter 的 `name`、`description` 进入稳定 Skill catalog，后端私有 `triggers` 负责 intent 匹配，后端私有 `guard_*` / `routing_*` 可服务窄 guard 预检查、unsupported capability guard（例如 `guard_unsupported_capability`）、需要工具的私有路由（例如 `routing_requires_tool`）和成功工具后的必需 follow-up（例如 `routing_required_tool_after_success`），正文保存工具顺序、业务边界和输出约束；同目录私有资源文件可承载 guard/classifier 长 prompt 和 guard 最终用户回复。`AgentConversationRunner` 的系统提示只暴露 catalog 和工具协议，每个 run 再由 `AgentSkillRegistry.select_for_intent(intent)` 注入相关 Skill 正文；`GET /api/v1/agents/skills` 只返回 `{name,description}` 元数据，前端不得读取或展示 `SKILL.md` 正文、私有资源、`triggers`、`routing_requires_tool` 或 guard/routing hints。新增项目上下文、场景组合、报告解读、通用测试问答或暂不支持能力边界时，应优先扩展 Skill，而不是继续膨胀 Runner 主 prompt 或 Python 路由表。
+
+Runner 构造同一 conversation 历史上下文时必须受预算控制：长历史超过估算 token 预算后，较早轮次压缩为 system 摘要，最近若干轮保留截断后的 user/assistant 内容，并写入 `context.history_compacted` 审计事件。该事件用于解释上下文降级，不作为用户可见 assistant 回复。
+
+工具结果中的 warnings/issues/diagnostics 不是默认交给用户的最终建议。Runner 在 `tool.result_observed` 后会扫描成功 ToolCall 输出里的 `warnings`、`issues`、`diagnostics`、`errors` 和 `valid=false`，并拆成三类：硬编码业务字段、未动态绑定、提取器路径、断言 expected、数据集变量、schema/type/format 校验等可由平台数据、响应样本、草稿结构或安全工具再次执行推断的项，必须优先让模型调用合适的 read/query/draft/validate/dry-run 工具生成修复版或再次验证；鉴权令牌、账号密码、密钥、审批或没有平台来源的私有输入，才作为阻断项交给用户；无法仅靠关键词确定的项会被标记为待模型继续判断。这样 Agent 从“工具成功后提示风险”推进为“生成、分析、可修复项再编排、验证、只暴露剩余阻断项”的通用闭环。
 
 审批恢复同样必须走同一事实源：当模型规划出的 ToolCall 需要人工确认时，Run 进入 `needs_human` 并记录 `blocking_tool_call_ids_json`；approve 只负责固定 approval lineage/epoch 和释放 queue，不直接伪造完成结果。`POST /api/v1/agents/runs/{run_id}/resume` 先运行 Checkpoint Freshness Gate，通过后执行已批准的 blocking ToolCall，写入 `tool.result_observed(resumed_after_approval=true)`，清理已成功的 blocking id，并调用 `AgentConversationRunner.complete_after_tool_results` 基于工具输出生成最终回复。resume payload 使用 `executed_tool_call_ids` 告知前端哪些阻断工具已在恢复过程中执行。
 
@@ -201,7 +209,7 @@ source=AgentConversationSmokeRead
 | ContextBuilder | 组装当前轮模型输入，并记录 context_build_id | 不绕过 ContextBudget |
 | ContextBudget | 管理单次 run 内 token 预算、压缩、降级记录 | 不静默丢弃证据 |
 | EvidenceRefResolver | 解析 evidence_refs，判断资源可变性、冻结条件、freshness policy，并筛选 active policy refs | 不让历史追溯证据永久污染 replay_policy |
-| ToolRegistry | 生成 ToolSpec 候选集合 | 不在历史 run 中动态读取最新 tool 定义 |
+| ToolRegistry | 生成 ToolSpec 候选集合，并为内置工具声明后端私有 `backend_handler` 供 `AgentToolBackend` 分发；需要顺序校验的工具可声明 `required_successful_tool_before`；需要工具结果质量闭环差异化建议的工具可声明 `tool_result_repair_guidance` | 不在历史 run 中动态读取最新 tool 定义；不把 `backend_handler`、前置工具或结果修复 guidance 私有字段暴露给模型初始工具清单或前端契约 |
 | ExecutionLedger | 记录每次 tool call 的幂等键、状态、effect submission state、结果 | 不承担 UI 展示 |
 | WorkerQueue | 负责排队、租约、心跳、孤儿扫描 | 不做业务事实源 |
 | ToolExecutor | 执行 tool、回写 ledger、写 event | 不跳过 execute-time 权限校验 |
@@ -1941,6 +1949,9 @@ CREATE TABLE ai_agent_loop_observations (
 | `RC_EVIDENCE_INCOMPLETE` | 存在 `evidence_incomplete_for_high_risk_action` 且 degradation 非 heavy | `evidence_incomplete_for_high_risk_action` | `evidence_incomplete -> unsafe_to_continue` | `fetch_required_evidence` | 20 |
 | `RC_MEMORY_CONTRADICTION` | `memory_contradiction_delta > 0` 且 same failure 出现 | `memory_contradiction` | `memory_used -> contradiction_detected -> repair_failed` | `demote_memory_and_replan` | 30 |
 | `RC_POLICY_LOOP` | `policy_loop` 命中 | `policy_loop` | `same_action -> policy_rejected -> repeated_attempt` | `change_plan_or_require_human` | 18 |
+| `RC_TOOL_PREREQUISITE_MISSING` | `tool_prerequisite_missing` 命中 | `tool_prerequisite_missing` | `tool_order_invalid -> required_prerequisite_missing -> harness_blocked_execution` | `call_required_prerequisite_tool` | 50 |
+| `RC_TOOL_REQUEST_FORMAT_INVALID` | `tool_request_format_invalid` 命中 | `tool_request_format_invalid` | `model_output_invalid -> tool_request_schema_violation -> repair_prompt_required` | `repair_tool_request_format` | 52 |
+| `RC_REQUIRED_TOOL_FOLLOWUP_MISSING` | `required_tool_followup_missing` 命中 | `required_tool_followup_missing` | `required_followup_rule_matched -> model_stopped_early -> repair_prompt_required` | `repair_required_tool_followup` | 54 |
 | `RC_REPAIR_REGRESSION` | `repair_regression` 或 `new_failures_outside_scope` 命中 | `repair_regression` | `patch_applied -> new_failure -> regression` | `rollback_patch_or_human_review` | 65 |
 | `RC_NO_PROGRESS_PURE` | `same_failure_no_progress` 且无 context/evidence/memory/policy 信号 | `same_failure_no_progress` | `repair_attempt -> same_failure` | `stop_or_escalate_repair_strategy` | 60 |
 | `RC_RESOURCE_LIMIT` | `cost_budget_exceeded` 或 `context_budget_exhausted` 命中 | `resource_limit` | `budget_exhausted -> cannot_continue` | `pause_or_request_budget` | 85 |
@@ -1974,7 +1985,7 @@ Required RootCause rule authoring contract:
 
 ```text
 priority_bands=safety:1-19,evidence_context:20-39,recovery:40-59,repair_quality:60-79,resource_limit:80-89,fallback:900-999
-default_rules=RC_CONTEXT_OMITTED_HIGH_RISK:safety:10,RC_PERMISSION_REVOKED:safety:15,RC_POLICY_LOOP:safety:18,RC_EVIDENCE_INCOMPLETE:evidence_context:20,RC_MEMORY_CONTRADICTION:evidence_context:30,RC_APPROVAL_PENDING:recovery:40,RC_BACKEND_CAPABILITY_DEGRADED:recovery:45,RC_NO_PROGRESS_PURE:repair_quality:60,RC_REPAIR_REGRESSION:repair_quality:65,RC_MAX_ITERATIONS:resource_limit:80,RC_RESOURCE_LIMIT:resource_limit:85,RC_UNKNOWN:fallback:900,RC_RULE_MISSING:fallback:999
+default_rules=RC_CONTEXT_OMITTED_HIGH_RISK:safety:10,RC_PERMISSION_REVOKED:safety:15,RC_POLICY_LOOP:safety:18,RC_EVIDENCE_INCOMPLETE:evidence_context:20,RC_MEMORY_CONTRADICTION:evidence_context:30,RC_APPROVAL_PENDING:recovery:40,RC_BACKEND_CAPABILITY_DEGRADED:recovery:45,RC_TOOL_PREREQUISITE_MISSING:recovery:50,RC_TOOL_REQUEST_FORMAT_INVALID:recovery:52,RC_REQUIRED_TOOL_FOLLOWUP_MISSING:recovery:54,RC_NO_PROGRESS_PURE:repair_quality:60,RC_REPAIR_REGRESSION:repair_quality:65,RC_MAX_ITERATIONS:resource_limit:80,RC_RESOURCE_LIMIT:resource_limit:85,RC_UNKNOWN:fallback:900,RC_RULE_MISSING:fallback:999
 governance_fields=priority_bands,violations,violation_count,governance_pass
 new_rule_required_fixtures=3
 fallback_rule_id=RC_RULE_MISSING
@@ -1984,7 +1995,7 @@ missing_rule_metric=root_cause_rule_missing_total
 
 RootCause Rule 新增规范必须和 `RootCauseRuleEngine.audit_rule_governance()` 保持一致：新增 rule 先选 priority band，再写 rule_id、reason_key、match expression、root_cause_primary、causal_chain、mitigation_action 和至少 3 个测试夹具；无法分类但已接受的原因必须显式命中 `RC_UNKNOWN`，未登记的新 reason 必须落到 `RC_RULE_MISSING` 并触发 `root_cause_rule_missing_total`，不能通过新增黑盒推断函数绕过规则表。
 
-后端实现必须提供 `RootCauseRuleEngine.audit_rule_governance()`，返回 priority band 范围、违规规则列表和 `governance_pass`，并通过管理员只读接口 `GET /api/v1/agents/root-cause-rules/audit` 暴露给运营、CI 和发布门禁使用。默认规则也必须通过该审计：`RC_PERMISSION_REVOKED` 使用 Safety / Policy band 内的 priority=15，`RC_POLICY_LOOP` 使用 Safety / Policy band 内的 priority=18，`RC_EVIDENCE_INCOMPLETE` 使用 Evidence / Context band 内的 priority=20，`RC_MEMORY_CONTRADICTION` 使用 Evidence / Context band 内的 priority=30，`RC_BACKEND_CAPABILITY_DEGRADED` 使用 Backend / Recovery band 内的 priority=45，`RC_NO_PROGRESS_PURE` 使用 Repair Quality band 内的 priority=60，`RC_REPAIR_REGRESSION` 使用 Repair Quality band 内的 priority=65，`RC_MAX_ITERATIONS` 使用 Resource / Limit band 内的 priority=80，`RC_RESOURCE_LIMIT` 使用 Resource / Limit band 内的 priority=85，`RC_UNKNOWN` 使用 Fallback band 内的 priority=900，`RC_RULE_MISSING` 使用 Fallback band 内的 priority=999。任何 priority 超出 band 或未知 band 的规则都必须被审计为 violation，不能只依赖人工 review 发现。
+后端实现必须提供 `RootCauseRuleEngine.audit_rule_governance()`，返回 priority band 范围、违规规则列表和 `governance_pass`，并通过管理员只读接口 `GET /api/v1/agents/root-cause-rules/audit` 暴露给运营、CI 和发布门禁使用。默认规则也必须通过该审计：`RC_PERMISSION_REVOKED` 使用 Safety / Policy band 内的 priority=15，`RC_POLICY_LOOP` 使用 Safety / Policy band 内的 priority=18，`RC_EVIDENCE_INCOMPLETE` 使用 Evidence / Context band 内的 priority=20，`RC_MEMORY_CONTRADICTION` 使用 Evidence / Context band 内的 priority=30，`RC_BACKEND_CAPABILITY_DEGRADED` 使用 Backend / Recovery band 内的 priority=45，`RC_TOOL_PREREQUISITE_MISSING` 使用 Backend / Recovery band 内的 priority=50，`RC_TOOL_REQUEST_FORMAT_INVALID` 使用 Backend / Recovery band 内的 priority=52，`RC_REQUIRED_TOOL_FOLLOWUP_MISSING` 使用 Backend / Recovery band 内的 priority=54，`RC_NO_PROGRESS_PURE` 使用 Repair Quality band 内的 priority=60，`RC_REPAIR_REGRESSION` 使用 Repair Quality band 内的 priority=65，`RC_MAX_ITERATIONS` 使用 Resource / Limit band 内的 priority=80，`RC_RESOURCE_LIMIT` 使用 Resource / Limit band 内的 priority=85，`RC_UNKNOWN` 使用 Fallback band 内的 priority=900，`RC_RULE_MISSING` 使用 Fallback band 内的 priority=999。任何 priority 超出 band 或未知 band 的规则都必须被审计为 violation，不能只依赖人工 review 发现。
 
 新增规则流程：
 
@@ -2894,6 +2905,10 @@ fields=tool_call_id,run_id,step_index,attempt_index,runtime_snapshot_id,tool_nam
 source=AgentToolCallRead
 ```
 
+`policy_reason_json.policy_context` 是 ToolCall 级策略上下文 envelope，必须包含 `policy_version_hash`、`tool_name`、`tool_version`、`base_side_effect_class`、`resolved_side_effect_class`、`base_replay_policy`、`resolved_replay_policy`、`approval_policy`、`approval_required`、`approval_required_reason`、active/volatile/frozen policy evidence 计数、`historical_volatile_excluded_count`、`mixed_volatile_frozen` 与 `policy_hash`。该 envelope 用于解释 replay policy、审批和 evidence 策略判定；不得写入原始 evidence 内容、完整模型输入或未脱敏业务 payload。
+
+`policy_reason_json.execution_context` 是 ToolCall 级执行/恢复上下文 envelope，必须包含 `execution_context_version_hash`、`tool_call_id`、`run_id`、`runtime_snapshot_id`、tool name/version、worker id、`tool_status`、execution/effect state、effect boundary 标记、backend contract/schema hash/effect capability、resolved side effect/replay policy、approval state/lineage/epoch/approved approval、input/output hash、`recovery_decision`、`error_code`、`error_message_hash` 与 `execution_context_hash`。该 envelope 用于解释已执行、失败、manual intervention 或 uncertain recovery ToolCall 的审批 lineage、后端契约、效果提交状态和恢复原因；不得写入原始 input/output/evidence/error message 内容或未脱敏业务 payload。Runbook 诊断只能把该 envelope 的白名单摘要放入恢复类 recommendation 的 `details.execution_context`，不得把完整 `policy_reason_json`、原始 input/output/evidence 或 error message 复制到 Runbook。
+
 `GET /api/v1/agents/runs/{run_id}/summary`、`GET/POST /api/v1/agents/runs/{run_id}/context-builds`、`GET/POST /api/v1/agents/runs/{run_id}/loop-observations`、`GET /api/v1/agents/runs/{run_id}/approvals`、`GET /api/v1/agents/runs/{run_id}/migration-blocks` 与 `POST /api/v1/agents/runs/{run_id}/migration-blocks/{block_id}/resolve` 属于 run-derived resource API；路由层或服务层必须通过 `AgentRuntimeService.get_run` / `PolicyManager.require_run_access` / `MigrationCoordinator` 等等价路径先校验 run 所属项目访问权限，项目外用户必须 403，避免 Summary、ContextBuild、LoopObservation、Approval 与 MigrationBlock 被跨项目枚举或操作。
 
 Required ContextBuild entity payload contract:
@@ -2902,6 +2917,8 @@ Required ContextBuild entity payload contract:
 fields=context_build_id,run_id,iteration,step_index,build_seq,build_purpose,model_name,token_budget,estimated_input_tokens,context_degradation_level,compressed_sections_json,omitted_evidence_refs_json,required_evidence_refs_json,required_evidence_complete,decision_quality_risk,prompt_object_key,prompt_hash,build_metadata_json,created_at
 source=AgentContextBuildRead
 ```
+
+`ContextBuilder.build_metadata_json` 必须保留 active `policy_refs`，并补充本轮 Codex-style Agent Skill 决策摘要、RuntimeSnapshot 摘要与 permission context 摘要：`selected_agent_skills` 只包含 Skill `name` 与 `skill_hash`；`matched_agent_skill_routing_rules` 只包含命中的 routing rule 摘要，例如 `skill_name`、`routing_key`、`after_tool`、`required_tool`、`min_total_fields` 与 `rule_hash`；`runtime_snapshot` 只包含 `snapshot_id`、`runtime_hash`、`tool_registry_hash`、`manifest_bundle_hash`、`prompt_bundle_hash`、`policy_version_hash`、`available_tool_names` 与 `tool_count`；`permission_context` 只包含 `actor_user_id`、`project_id`、`access_level`、`project_access`、`implicit_all_project_permissions`、`explicit_permission_codes`、`explicit_permission_count` 与 `permission_hash`。不得把私有 frontmatter 原文、Skill 正文、Skill-local 私有 prompt 资源、完整 tools schema、manifest bundle、用户资料或完整授权表写入可读 payload。`LoopObservation.decision_context_build_id` 指向的 ContextBuild 必须能解释 required-tool follow-up 等静默修复的 Skill 规则来源，以及该决策绑定的工具/策略/权限版本。
 
 Required LoopObservation entity payload contract:
 
@@ -3093,17 +3110,19 @@ migration.block_resolved
 heartbeat
 ```
 
-无工具调用的对话型 Run 通过 `AIService.chat_stream()` 生成模型输出，但模型输出仍必须先写入 EventStore：`memory.context_injected` 表示本轮模型调用前已注入项目 Memory，`model.started` 表示模型调用开始，`model.delta.content` 表示流式增量，`model.completed.content` 表示完整 assistant 文本。普通自然语言的 `model.delta` 必须在模型 stream 仍在进行时实时写入 EventStore/SSE；只有疑似 `agent_tool_request` 的输出需要先缓冲到可判断格式，避免工具请求 JSON 被前端展示为 assistant 文本。SSE 只负责读取这些事件并传输给前端，刷新后的最终文本以 `run.completed.result.message` 校准。`POST /api/v1/agents/runs/{run_id}/cancel` 是外部并发取消信号，`AgentConversationRunner` 必须在模型 stream、工具请求 repair、ToolCall 创建前和 final summary 结束后重新读取 run terminal 状态；一旦 `run.cancelled` 已写入，后续不得再写 `model.completed(final_summary=true)` 或 `run.completed` 覆盖取消结果。
+无工具调用的对话型 Run 通过 `AIService.chat_stream()` 生成模型输出，但模型输出仍必须先写入 EventStore：`memory.context_injected` 表示本轮模型调用前已注入项目 Memory，`model.started` 表示模型调用开始，`model.delta.content` 表示流式增量，`model.completed.content` 表示完整 assistant 文本。软件测试领域通用问答属于普通自然语言回复，可无 ToolCall 直接完成；普通自然语言的首个可见 `model.delta` 必须在模型 stream 仍在进行时实时写入 EventStore/SSE，后续极小 delta 可以微批提交，降低每 token 一次事务的数据库压力。只有疑似 `agent_tool_request` 的输出需要先缓冲到可判断格式，避免工具请求 JSON 被前端展示为 assistant 文本。SSE 只负责读取这些事件并传输给前端，刷新后的最终文本以 `run.completed.result.message` 校准；若 active run 超过 `AGENT_RUN_STALE_TIMEOUT_SECONDS` 没有新事件，读路径写入 `run.failed(agent_run_stale_worker_lost)` 后同样以终态事件校准前端。`POST /api/v1/agents/runs/{run_id}/cancel` 是外部并发取消信号，`AgentConversationRunner` 必须在模型 stream 中定期读取 run terminal 状态，并在工具请求 repair、ToolCall 创建前和 final summary 结束后重新读取 run terminal 状态；一旦 `run.cancelled` 已写入，后续不得再写 `model.completed(final_summary=true)` 或 `run.completed` 覆盖取消结果。
 
-普通 `POST /api/v1/agents/runs` 创建后必须把非 terminal run 交给 `AgentConversationRunner`。MySQL 与文件 SQLite 环境都应提交后台 worker；只有 in-memory SQLite 单元测试库可以跳过后台线程，避免测试库跨线程不可见。生产或本地文件库中如果事件链停在 `run.started` 且只有 heartbeat，就视为 runner 启动链路异常，必须通过 `GET /api/v1/agents/runs/{run_id}/events/snapshot`、`GET /api/v1/agents/model-health` 携带 `live=true`，或 `POST /api/v1/agents/conversation-smoke` 定位。
+普通 `POST /api/v1/agents/runs` 创建后必须把非 terminal run 交给 `AgentConversationRunner`。MySQL 与文件 SQLite 环境都应提交后台 worker；只有 in-memory SQLite 单元测试库可以跳过后台线程，避免测试库跨线程不可见。生产或本地文件库中如果事件链停在 `run.started` 且只有 heartbeat，就视为 runner 启动链路异常，必须通过 `GET /api/v1/agents/runs/{run_id}/events/snapshot`、`GET /api/v1/agents/model-health` 携带 `live=true`，或 `POST /api/v1/agents/conversation-smoke` 定位。若 run 静默时间超过 stale timeout，snapshot/detail/SSE 读取会触发 `run.failed(agent_run_stale_worker_lost)`，这是可审计的后端中断终态，不应继续展示“正在思考”。若 snapshot/detail/SSE 传入的 cursor 大于当前 run 的 `last_event_sequence`，后端应记录 cursor reset 并从 0 重放，避免前端复用其他 run cursor 时看不到任何已落库事件。
 
 真实环境排障还必须能从后端仓库运行 `scripts/agent_conversation_e2e_check.py`。该脚本复用普通用户 `create_agent_run` 路径，而不是 admin-only smoke shortcut；它先做 `AgentModelHealthService.check(live=True)`，再在真实数据库上创建普通 run，并通过 `AgentRuntimeService.get_event_snapshot` 轮询 EventStore。成功条件是 `model.started`、至少一个 `model.delta`、`model.completed`、`run.completed` 和 summary `assistant_visible=true` 全部出现。若脚本成功但前端没有显示回复，架构判断应转向前端 SSE 解析、鉴权 header、cursor 或渲染状态，而不是继续怀疑 provider key、MySQL 迁移或 runner 启动。
 
 `AgentRunCreateRequest.auto_complete` 不属于真实模型对话路径，只能用于后端 smoke/debug、EventStore replay 和 Outbox 回归。auto-complete Run 可以写入 `run.completed`，但结果必须显式标记 `completion_source=smoke_auto_complete`、`model_invoked=false`、`assistant_visible=false`，以证明它没有调用模型，也不能被 UI 渲染为 assistant 对话气泡。
 
-模型工具请求格式错误不应直接让 Codex 风格对话断流：`AgentConversationRunner` 发现 `agent_tool_request` JSON 缺字段、类型错误或非法 JSON 时，必须写入 `model.tool_request_invalid`，追加一条修复提示并再次调用模型，`model.started.repair_attempt=true` 标记这次修复调用。修复输出若成为合法工具请求，写入 `model.tool_request_repaired` 后继续 `model.tool_request_detected -> ToolCall`；修复仍不合法时写入 `model.tool_request_repair_failed` 并按模型错误终止 run。
+模型工具请求格式错误不应直接让 Codex 风格对话断流：`AgentConversationRunner` 发现 `agent_tool_request` JSON 缺字段、类型错误、非法 JSON，或模型把自然语言与工具 fenced block 混在一起时，必须写入 `model.tool_request_invalid`，追加一条修复提示并再次调用模型，`model.started.repair_attempt=true` 标记这次修复调用。修复输出若成为合法工具请求，写入 `model.tool_request_repaired` 后继续 `model.tool_request_detected -> ToolCall`；修复仍不合法时写入 `model.tool_request_repair_failed` 并按模型错误终止 run。
 
-业务 recipe 级工具顺序也由 Harness 校验，而不是只依赖提示词。当前规则是：`scenario.compose_draft` 在同一 run 内必须看到至少一个成功的 `testcase.query_project_cases` ToolCall；缺失时该 compose ToolCall 在执行前失败，`error_code=scenario_compose_requires_case_query`，并通过 `tool.result_observed` 作为模型下一轮输入。该失败属于可恢复的流程纠正信号，前端展示为 ToolCall 错误，最终是否失败仍以 run terminal 状态为准。
+业务 recipe 级工具顺序也由 Harness 校验，而不是只依赖提示词。当前规则是：`scenario.compose_draft` 的 ToolSpec 声明 `required_successful_tool_before=testcase.query_project_cases`，Runner 在执行前检查同一 run 内是否存在时间顺序更早的成功 query ToolCall；缺失时该 compose ToolCall 在执行前失败，`error_code=scenario_compose_requires_case_query`，并通过 `tool.result_observed` 作为模型下一轮输入。query 成功后模型若没有继续 compose，则由 Skill 私有 `routing_required_tool_after_success` 触发 `model.required_tool_missing(after_tool, required_tool)` 和静默修复。该失败属于可恢复的流程纠正信号，前端展示为 ToolCall 错误，最终是否失败仍以 run terminal 状态为准。
+
+通用工具结果质量闭环也属于同一 Harness 纠正信号：当任意成功 ToolCall 输出包含可自动修复 warnings/issues/diagnostics，`ToolResultPolicy` 会附加质量闭环规则、问题分类和推荐修复路径；推荐修复路径由对应 ToolSpec 的后端私有 `tool_result_repair_guidance` 声明，未知工具才使用通用 fallback，避免策略层维护工具名分支。模型必须先分析用户目标、工具输入输出、历史工具结果和平台上下文，再通过合适的安全工具继续修复或验证，例如 `ai_skill.run_draft(input.extra_requirements=...)`、`testcase.validate_schema` 或 `scenario.compose_draft(input.extra_requirements=...)`；失败 ToolCall 若错误属于输入、schema、validation、草稿结构或字段格式，也会进入失败修复闭环并要求修正参数后重试；若同一工具连续两次以相同 `error_code` 与 `error_message` 失败，Runner 必须写入 stop 用 ContextBuild 与 `loop.observed(RC_NO_PROGRESS_PURE)`，并以 `run.failed(agent_repair_no_progress)` 终止无进展修复；只有鉴权令牌等缺少平台来源的阻断项进入最终用户提示。
 
 ---
 
@@ -3133,6 +3152,10 @@ heartbeat
 | `evidence_volatile_requires_revalidation_total` | 活跃易变证据导致 require_revalidation 数量 |
 | `evidence_historical_volatile_excluded_total` | 历史 volatile evidence 被排除出 policy refs 数量 |
 | `evidence_mixed_volatile_frozen_total` | active mixed evidence 中 volatile 优先命中数量 |
+| `tool_prerequisite_missing_total` | 工具前置顺序缺失修复数量 |
+| `tool_request_format_invalid_total` | 工具请求格式修复数量 |
+| `required_tool_followup_missing_total` | 必需 follow-up 漏调用修复数量 |
+| `max_iterations_total` | 达到 run.max_iterations 的停止数量 |
 | `same_failure_no_progress_total` | 相同失败无进展终止数量 |
 | `loop_root_cause_context_degraded_total` | 上游根因为上下文压缩的停止数量 |
 | `loop_root_cause_unknown_total` | 因果归因 fallback 到 unknown 的数量 |
@@ -3398,14 +3421,17 @@ fields=project_id,generated_at,complete,status,checks,backend_scope,launch_audit
 check_fields=name,status,severity,summary,details
 checks=model_provider_configured,conversation_runner_streaming,server_side_conversation_history,tool_loop_and_approval_resume,memory_context_injection,frontend_contract_surface,observability_and_release_gate,backend_delivery_docs_synced,live_e2e_diagnostic_available
 status_values=pass,attention,blocked
+runtime_contract_keys=run,events,snapshot,summary,actions,history,transcript,export,tool_execution_context,runbook_execution_context_summary,runbook_execution_context_summary_fields
+diagnostic_keys=model_health,launch_audit,completion_audit,conversation_smoke,e2e_script,tool_call_detail,runbook_diagnosis
+runbook_execution_context_summary_fields=execution_context_version_hash,execution_context_hash,tool_call_id,run_id,runtime_snapshot_id,tool_name,tool_version,worker_id,tool_status,execution_phase,effect_submission_state,effect_boundary_crossed,backend_name,backend_operation,backend_contract_version,backend_request_schema_hash,backend_output_schema_hash,reconcile_contract_version,result_adapter_version,backend_effect_capability,resolved_side_effect_class,resolved_replay_policy,approval_state,approval_lineage_id,approval_epoch,approved_approval_id,approved_by,input_hash,output_hash,recovery_decision,error_code,error_message_hash
 source=AgentBackendCompletionAuditService.audit
 ```
 
-`GET /api/v1/agents/backend-completion-audit` 是后端仓库范围内 Agent 功能完成度的聚合审计口。带 `project_id` 时按项目权限读取，不带 `project_id` 时仅 admin 可读全局审计。它复用 `AgentLaunchAuditService.audit` 的模型配置、dashboard 与 release gate 输入，并额外固定校验对话流式生成、服务端历史、工具循环、审批恢复、Memory 注入、前端契约面、观测/门禁、文档同步和真实 E2E 诊断路径。该接口不得触发 live provider 调用，不得暴露 `DEEPSEEK_API_KEY`。`complete=true` 只声明后端仓库拥有的 Agent runtime/contract/diagnostic/prototype docs 范围完成；前端实现仍属于外部仓库，生产灰度仍以 release gate 为准。
+`GET /api/v1/agents/backend-completion-audit` 是后端仓库范围内 Agent 功能完成度的聚合审计口。带 `project_id` 时按项目权限读取，不带 `project_id` 时仅 admin 可读全局审计。它复用 `AgentLaunchAuditService.audit` 的模型配置、dashboard 与 release gate 输入，并额外固定校验对话流式生成、服务端历史、工具循环、审批恢复、Memory 注入、前端契约面、观测/门禁、文档同步和真实 E2E 诊断路径。该接口不得触发 live provider 调用，不得暴露 `DEEPSEEK_API_KEY`。`runtime_contracts` 必须声明 `AgentToolCall.policy_reason_json.execution_context` 与 `AgentRunbookRecommendation.details.execution_context` 的白名单摘要来源；`diagnostics` 必须同时提供 ToolCall Detail 与 Runbook diagnosis 跳转入口，便于交付验收从 completion audit 追到完整执行诊断。`complete=true` 只声明后端仓库拥有的 Agent runtime/contract/diagnostic/prototype docs 范围完成；前端实现仍属于外部仓库，生产灰度仍以 release gate 为准。
 
 `GET /api/v1/agents/launch-audit` 是前端联调和上线前准备状态的聚合审计口。带 `project_id` 时按项目权限读取，不带 `project_id` 时仅 admin 可读全局审计。它聚合 `AgentModelHealthService.check(live=false)`、`AgentReadinessDashboardService.snapshot` 与 `AgentReleaseGateService.promotion_assessment`，不得触发 live provider 调用，不得暴露 `DEEPSEEK_API_KEY`。`ready=true` 只表示后端仓库拥有的 Agent 对话链路、前端事件契约、summary/actions/history/export 契约和 dashboard/release gate 输入已经可供前端集成；它不等价于 L3 生产灰度已放开。
 
-`metrics_catalog_complete` 必须输出 `required_metric_keys`、`required_metric_count` 与 `missing_metric_keys`。`required_metric_keys` 覆盖 P0/P1 监控清单中已经由 `AgentMetricsService.snapshot` 计算的所有 recovery/governance 指标，包括 `tool_call_orphan_recovered_total`、`tool_call_send_intent_orphan_total`、`tool_call_safe_retry_after_send_intent_not_found_total`、`tool_call_transport_sent_uncertain_total`、`tool_call_backend_accepted_uncertain_total`、`backend_effect_capability_receipt_first_total`、`backend_effect_capability_legacy_no_receipt_total`、`tool_call_legacy_no_receipt_manual_total`、`tool_call_backend_contract_unsupported_total`、`approval_superseded_total`、`approval_approve_conflict_total`、`context_degraded_total`、`context_decision_build_missing_total`、`runtime_snapshot_migration_block_total`、`backend_contract_migration_block_total`、`run_migration_blocked_total`、`release_gate_violation_count`、`loop_root_cause_context_degraded_total`、`loop_root_cause_unknown_total`、`invalid_repair_scope_total`、`same_failure_no_progress_total`、`memory_contradiction_penalty_applied_total`、`memory_retrieved_total`、`memory_used_active_policy_total`、`memory_retrieval_profile_missing_total`、`memory_low_confidence_filtered_total`、`memory_evidence_watch_stale_total` 与 `backend_capability_degraded_total`，防止 dashboard 只校验部分高优先级指标而漏掉 P1/P2 观测面。
+`metrics_catalog_complete` 必须输出 `required_metric_keys`、`required_metric_count` 与 `missing_metric_keys`。`required_metric_keys` 覆盖 P0/P1 监控清单中已经由 `AgentMetricsService.snapshot` 计算的所有 recovery/governance 指标，包括 `tool_call_orphan_recovered_total`、`tool_call_send_intent_orphan_total`、`tool_call_safe_retry_after_send_intent_not_found_total`、`tool_call_transport_sent_uncertain_total`、`tool_call_backend_accepted_uncertain_total`、`backend_effect_capability_receipt_first_total`、`backend_effect_capability_legacy_no_receipt_total`、`tool_call_legacy_no_receipt_manual_total`、`tool_call_backend_contract_unsupported_total`、`approval_superseded_total`、`approval_approve_conflict_total`、`context_degraded_total`、`context_decision_build_missing_total`、`runtime_snapshot_migration_block_total`、`backend_contract_migration_block_total`、`run_migration_blocked_total`、`release_gate_violation_count`、`loop_root_cause_context_degraded_total`、`loop_root_cause_unknown_total`、`invalid_repair_scope_total`、`tool_prerequisite_missing_total`、`tool_request_format_invalid_total`、`required_tool_followup_missing_total`、`max_iterations_total`、`same_failure_no_progress_total`、`memory_contradiction_penalty_applied_total`、`memory_retrieved_total`、`memory_used_active_policy_total`、`memory_retrieval_profile_missing_total`、`memory_low_confidence_filtered_total`、`memory_evidence_watch_stale_total` 与 `backend_capability_degraded_total`，防止 dashboard 只校验部分高优先级指标而漏掉 P1/P2 观测面。
 
 Required dashboard metrics:
 
@@ -3442,6 +3468,7 @@ fault_injection_required_case_total
 invalid_repair_scope_total
 loop_root_cause_context_degraded_total
 loop_root_cause_unknown_total
+max_iterations_total
 memory_bypassed_evidence_ref_total
 memory_contradiction_penalty_applied_total
 memory_contradiction_total
@@ -3472,12 +3499,15 @@ tool_call_safe_retry_after_send_intent_not_found_total
 tool_call_send_intent_orphan_total
 tool_call_transport_sent_uncertain_total
 tool_call_uncertain_total
+tool_prerequisite_missing_total
+tool_request_format_invalid_total
+required_tool_followup_missing_total
 worker_queue_duplicate_active_lease_total
 worker_queue_expired_lease_total
 worker_queue_oldest_queued_age_ms
 ```
 
-`runbook_catalog_complete` 必须输出 `covered_required_runbook_ids` 与 `missing_required_runbook_ids`，dashboard check details 与顶层 runbooks summary 都要包含这两个字段。Required catalog 覆盖所有 P0/P1 alert rule 需要的处置路径，包括 `tool_call_uncertain`、`migration_blocked`、`backend_capability_degraded`、`approval_stale`、`checkpoint_stale`、`outbox_publish_lag`、`event_replay_recovery`、`fault_injection_coverage`、`worker_queue_recovery`、`context_linkage_repair`、`root_cause_rule_missing`、`memory_evidence_ref_violation` 与 `release_gate_violation`。所有 P0/P1 `AgentAlertService.ALERT_RULES` 和动态 release gate P0 alert 必须提供非空 `runbook_id`，且该 id 必须能在 `AgentRunbookService.list_runbooks()` 中找到。后端文档驱动测试必须从本段 Required catalog 抽取 required runbook id，并与代码常量、runbook catalog、dashboard `covered_required_runbook_ids` / `missing_required_runbook_ids` 以及 P0/P1 alert rule 的 `runbook_id` 引用全量比对。
+`runbook_catalog_complete` 必须输出 `covered_required_runbook_ids` 与 `missing_required_runbook_ids`，dashboard check details 与顶层 runbooks summary 都要包含这两个字段。Required catalog 覆盖所有 P0/P1 alert rule 需要的处置路径和已知运行时 loop repair/stop 诊断入口，包括 `tool_call_uncertain`、`migration_blocked`、`backend_capability_degraded`、`approval_stale`、`checkpoint_stale`、`outbox_publish_lag`、`event_replay_recovery`、`fault_injection_coverage`、`worker_queue_recovery`、`context_linkage_repair`、`agent_runtime_loop_repair`、`root_cause_rule_missing`、`memory_evidence_ref_violation` 与 `release_gate_violation`。所有 P0/P1 `AgentAlertService.ALERT_RULES` 和动态 release gate P0 alert 必须提供非空 `runbook_id`，且该 id 必须能在 `AgentRunbookService.list_runbooks()` 中找到。后端文档驱动测试必须从本段 Required catalog 抽取 required runbook id，并与代码常量、runbook catalog、dashboard `covered_required_runbook_ids` / `missing_required_runbook_ids` 以及 P0/P1 alert rule 的 `runbook_id` 引用全量比对。
 
 Required alert runbook binding contract:
 
@@ -3491,7 +3521,7 @@ dashboard_details=runbook_required_severities,alert_runbook_ids,covered_required
 
 每个 Runbook 的 `safe_api_actions` 必须是当前 OpenAPI 中存在的 `/api/v1/agents...` method+path。后端契约测试必须从 `AgentRunbookService.RUNBOOKS` 抽取所有 safe actions，并与 FastAPI OpenAPI 对齐，防止恢复文档和实际路由漂移。
 
-`AgentRunbookService.diagnose_run` 不得只诊断 run 内部异常；当当前 release gate snapshot 存在 tool matrix violation 时，也必须返回 `release_gate_violation` recommendation，携带当前 rollout level、违规数量和违规工具摘要，确保动态 P0 发布门禁问题能进入单次运行的恢复建议。`GET /api/v1/agents/runs/{run_id}/runbook`、`GET /api/v1/agents/runs/{run_id}/events`、`GET /api/v1/agents/runs/{run_id}/events/snapshot` 与 `GET /api/v1/agents/runs/{run_id}/events/replay-audit` 均属于 run-scoped 治理接口，必须在读取诊断、建立 SSE 事件流、拉取事件快照或执行重放审计前通过 `AgentRuntimeService.get_run` / 等价路径校验 run 所属项目访问权限；项目成员和 admin 可读取，项目外用户必须 403。
+`AgentRunbookService.diagnose_run` 不得只诊断 run 内部异常；当当前 release gate snapshot 存在 tool matrix violation 时，也必须返回 `release_gate_violation` recommendation，携带当前 rollout level、违规数量和违规工具摘要，确保动态 P0 发布门禁问题能进入单次运行的恢复建议。对于 `tool_prerequisite_missing`、`tool_request_format_invalid`、`required_tool_followup_missing`、`max_iterations` 与 `same_failure_no_progress` 这类由 AgentConversationRunner 主动写入的 runtime repair/stop LoopObservation，Runbook 必须返回 `agent_runtime_loop_repair` recommendation，携带 `observation_id`、`stop_action_reason`、`root_cause_rule_id`、`root_cause_primary` 与 `mitigation_action`，并指向 run-scoped loop observations 详情。对于 `tool_call_uncertain` 与 `backend_capability_degraded` 这类 ToolCall 恢复建议，Runbook recommendation 的 `details.execution_context` 必须携带 ToolCall execution context 的白名单摘要，使前端 Runbook 面板能直接看到执行 hash、worker、运行时快照、效果状态、后端能力和恢复动作，同时仍通过 `tool_call_id` 跳转完整 ToolCall Detail。`GET /api/v1/agents/runs/{run_id}/runbook`、`GET /api/v1/agents/runs/{run_id}/events`、`GET /api/v1/agents/runs/{run_id}/events/snapshot` 与 `GET /api/v1/agents/runs/{run_id}/events/replay-audit` 均属于 run-scoped 治理接口，必须在读取诊断、建立 SSE 事件流、拉取事件快照或执行重放审计前通过 `AgentRuntimeService.get_run` / 等价路径校验 run 所属项目访问权限；项目成员和 admin 可读取，项目外用户必须 403。
 
 Required Runbook diagnosis contract:
 
@@ -3501,7 +3531,7 @@ diagnosis_fields=run_id,run_status,recommendations,runbooks
 recommendation_fields=runbook_id,reason,severity,action,tool_call_id,details
 recommendation_required_fields=runbook_id,reason,severity,action,details
 recommendation_optional_fields=tool_call_id
-recommendation_runbook_ids=tool_call_uncertain,migration_blocked,backend_capability_degraded,approval_stale,checkpoint_stale,outbox_publish_lag,event_replay_recovery,fault_injection_coverage,worker_queue_recovery,context_linkage_repair,root_cause_rule_missing,memory_evidence_ref_violation,release_gate_violation
+recommendation_runbook_ids=tool_call_uncertain,migration_blocked,backend_capability_degraded,approval_stale,checkpoint_stale,outbox_publish_lag,event_replay_recovery,fault_injection_coverage,worker_queue_recovery,context_linkage_repair,agent_runtime_loop_repair,root_cause_rule_missing,memory_evidence_ref_violation,release_gate_violation
 recommendation_action_contract=openapi_agent_route
 recommendation_severity_source=runbook_catalog
 checkpoint_freshness_safe_actions=continue_from_checkpoint:POST /api/v1/agents/runs/{run_id}/resume ,replan_from_latest_safe_state:POST /api/v1/agents/runs/{run_id}/context-builds ,migration_block:GET /api/v1/agents/runs/{run_id}/migration-blocks ,fetch_evidence_and_rebuild_context:POST /api/v1/agents/runs/{run_id}/context-builds ,materialize_latest_evidence:POST /api/v1/agents/runs/{run_id}/context-builds ,revalidate_before_side_effect:POST /api/v1/agents/runs/{run_id}/context-builds ,supersede_or_refresh_approval:GET /api/v1/agents/tool-calls/{tool_call_id} ,refresh_permissions_or_manual_review:GET /api/v1/agents/tool-calls/{tool_call_id}

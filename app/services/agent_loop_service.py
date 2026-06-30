@@ -18,9 +18,12 @@ from app.models.agent import (
     AgentMemoryContradictionEvent,
     AgentRootCauseRule,
     AgentRun,
+    AgentRuntimeSnapshot,
 )
+from app.models.project import Project
 from app.models.user import User
 from app.schemas.agent import AgentContextBuildCreateRequest, AgentLoopObservationCreateRequest
+from app.services.agent_skill_registry import AgentSkillRegistry
 from app.services.permission_service import PermissionService
 
 
@@ -34,6 +37,7 @@ EVIDENCE_FRESHNESS_POLICIES = {"none", "revalidate_on_resume", "revalidate_befor
 DEFAULT_EVIDENCE_MUTABILITY_CLASS = "mutable_current"
 DEFAULT_EVIDENCE_DEPENDENCY_ROLE = "audit_background"
 HIGH_RISK_SIDE_EFFECT_CLASSES = {"business_create", "business_update", "destructive", "external_effect"}
+REQUIRED_TOOL_AFTER_SUCCESS_ROUTING_KEY = "routing_required_tool_after_success"
 DEGRADATION_RANK = {"none": 0, "light": 1, "medium": 2, "heavy": 3}
 ROOT_CAUSE_PRIORITY_BANDS = {
     "safety": (1, 19),
@@ -51,6 +55,9 @@ ROOT_CAUSE_DEFAULT_RULE_CONTRACT = {
     "RC_MEMORY_CONTRADICTION": {"priority_band": "evidence_context", "priority": 30},
     "RC_APPROVAL_PENDING": {"priority_band": "recovery", "priority": 40},
     "RC_BACKEND_CAPABILITY_DEGRADED": {"priority_band": "recovery", "priority": 45},
+    "RC_TOOL_PREREQUISITE_MISSING": {"priority_band": "recovery", "priority": 50},
+    "RC_TOOL_REQUEST_FORMAT_INVALID": {"priority_band": "recovery", "priority": 52},
+    "RC_REQUIRED_TOOL_FOLLOWUP_MISSING": {"priority_band": "recovery", "priority": 54},
     "RC_NO_PROGRESS_PURE": {"priority_band": "repair_quality", "priority": 60},
     "RC_REPAIR_REGRESSION": {"priority_band": "repair_quality", "priority": 65},
     "RC_MAX_ITERATIONS": {"priority_band": "resource_limit", "priority": 80},
@@ -298,6 +305,134 @@ class EvidenceWatchService:
         return len(watches)
 
 
+def _agent_skill_decision_metadata(intent: str | None) -> dict:
+    registry = AgentSkillRegistry()
+    selected_skills = registry.select_for_intent(intent or "")
+    selected = [
+        {
+            "name": skill.name,
+            "skill_hash": request_fingerprint({
+                "name": skill.name,
+                "description": skill.description,
+                "prompt": skill.prompt_block(),
+            }),
+        }
+        for skill in selected_skills
+    ]
+    text = (intent or "").casefold()
+    matched_rules: list[dict] = []
+    for skill in selected_skills:
+        for raw_rule in registry.private_list(skill.name, REQUIRED_TOOL_AFTER_SUCCESS_ROUTING_KEY):
+            fields = _parse_semicolon_fields(raw_rule)
+            after_tool = fields.get("after")
+            required_tool = fields.get("require")
+            if not after_tool or not required_tool:
+                continue
+            intent_markers = tuple(
+                marker.strip()
+                for marker in fields.get("intent_markers", "").split(",")
+                if marker.strip()
+            )
+            if intent_markers and not any(marker.casefold() in text for marker in intent_markers):
+                continue
+            matched_rules.append({
+                "skill_name": skill.name,
+                "routing_key": REQUIRED_TOOL_AFTER_SUCCESS_ROUTING_KEY,
+                "after_tool": after_tool,
+                "required_tool": required_tool,
+                "min_total_fields": [
+                    field.strip()
+                    for field in fields.get("min_total_fields", "").split(",")
+                    if field.strip()
+                ],
+                "rule_hash": request_fingerprint(raw_rule),
+            })
+    return {
+        "selected_agent_skills": selected,
+        "matched_agent_skill_routing_rules": matched_rules,
+    }
+
+
+def _runtime_snapshot_decision_metadata(db: Session, run: AgentRun) -> dict:
+    snapshot = db.scalar(
+        select(AgentRuntimeSnapshot).where(
+            AgentRuntimeSnapshot.project_id == run.project_id,
+            AgentRuntimeSnapshot.snapshot_id == run.runtime_snapshot_id,
+        )
+    )
+    if snapshot is None:
+        return {
+            "runtime_snapshot": {
+                "snapshot_id": run.runtime_snapshot_id,
+                "snapshot_missing": True,
+            }
+        }
+    tool_names = sorted(
+        str(item["name"])
+        for item in (snapshot.tools_json or [])
+        if isinstance(item, dict) and item.get("name")
+    )
+    return {
+        "runtime_snapshot": {
+            "snapshot_id": snapshot.snapshot_id,
+            "runtime_hash": snapshot.runtime_hash,
+            "tool_registry_hash": snapshot.tool_registry_hash,
+            "manifest_bundle_hash": snapshot.manifest_bundle_hash,
+            "prompt_bundle_hash": snapshot.prompt_bundle_hash,
+            "policy_version_hash": snapshot.policy_version_hash,
+            "available_tool_names": tool_names,
+            "tool_count": len(snapshot.tools_json or []),
+        }
+    }
+
+
+def _permission_context_decision_metadata(
+    permission_service: PermissionService,
+    *,
+    run: AgentRun,
+    current_user: User,
+    project: Project,
+) -> dict:
+    if permission_service.is_admin(current_user):
+        access_level = "platform_admin"
+        implicit_all_project_permissions = True
+        explicit_permission_codes: list[str] = []
+    elif permission_service.is_project_creator(current_user, project):
+        access_level = "project_creator"
+        implicit_all_project_permissions = True
+        explicit_permission_codes = []
+    else:
+        access_level = "project_member"
+        implicit_all_project_permissions = False
+        explicit_permission_codes = sorted(
+            permission_service.project_repository.get_member_permission_codes(
+                project_id=run.project_id,
+                user_id=current_user.id,
+            )
+        )
+    permission_context = {
+        "actor_user_id": current_user.id,
+        "project_id": run.project_id,
+        "access_level": access_level,
+        "project_access": True,
+        "implicit_all_project_permissions": implicit_all_project_permissions,
+        "explicit_permission_codes": explicit_permission_codes,
+        "explicit_permission_count": len(explicit_permission_codes),
+    }
+    permission_context["permission_hash"] = request_fingerprint(permission_context)
+    return {"permission_context": permission_context}
+
+
+def _parse_semicolon_fields(raw: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for part in raw.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        fields[key.strip()] = value.strip()
+    return fields
+
+
 class ContextBuilder:
     def __init__(self, db: Session):
         self.db = db
@@ -314,7 +449,7 @@ class ContextBuilder:
         run = self.db.scalar(select(AgentRun).where(AgentRun.run_id == run_id).with_for_update())
         if run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent run not found")
-        self.permission_service.require_project_access(current_user, run.project_id)
+        project = self.permission_service.require_project_access(current_user, run.project_id)
         max_seq = self.db.scalar(
             select(func.max(AgentContextBuild.build_seq)).where(
                 AgentContextBuild.run_id == run.run_id,
@@ -333,6 +468,14 @@ class ContextBuilder:
         omitted_ids = {item.evidence_ref_id for item in omitted_refs}
         required_complete = not any(ref_id in omitted_ids for ref_id in payload.required_evidence_ref_ids)
         risk = _decision_quality_risk(degradation=degradation, required_complete=required_complete)
+        skill_metadata = _agent_skill_decision_metadata(run.intent)
+        runtime_snapshot_metadata = _runtime_snapshot_decision_metadata(self.db, run)
+        permission_context_metadata = _permission_context_decision_metadata(
+            self.permission_service,
+            run=run,
+            current_user=current_user,
+            project=project,
+        )
         build = AgentContextBuild(
             context_build_id=f"agent-ctx-{uuid.uuid4().hex}",
             run_id=run.run_id,
@@ -356,6 +499,9 @@ class ContextBuilder:
                 "kept_refs": [item.to_json() for item in kept_refs],
             }),
             build_metadata_json={
+                **skill_metadata,
+                **runtime_snapshot_metadata,
+                **permission_context_metadata,
                 "policy_refs": [
                     item.to_json()
                     for item in EvidenceRefResolver().select_policy_refs([ref.raw or ref.to_json() for ref in evidence_refs])
@@ -766,6 +912,45 @@ def _default_root_cause_rules() -> list[dict[str, Any]]:
             "updated_at": now,
         },
         {
+            "rule_id": "RC_TOOL_PREREQUISITE_MISSING",
+            "reason_key": "tool_prerequisite_missing",
+            "root_cause_primary": "tool_prerequisite_missing",
+            "causal_chain_json": ["tool_order_invalid", "required_prerequisite_missing", "harness_blocked_execution"],
+            "mitigation_action": "call_required_prerequisite_tool",
+            "priority": 50,
+            "priority_band": "recovery",
+            "match_expression_json": {"any_reasons": ["tool_prerequisite_missing"]},
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+        },
+        {
+            "rule_id": "RC_TOOL_REQUEST_FORMAT_INVALID",
+            "reason_key": "tool_request_format_invalid",
+            "root_cause_primary": "tool_request_format_invalid",
+            "causal_chain_json": ["model_output_invalid", "tool_request_schema_violation", "repair_prompt_required"],
+            "mitigation_action": "repair_tool_request_format",
+            "priority": 52,
+            "priority_band": "recovery",
+            "match_expression_json": {"any_reasons": ["tool_request_format_invalid"]},
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+        },
+        {
+            "rule_id": "RC_REQUIRED_TOOL_FOLLOWUP_MISSING",
+            "reason_key": "required_tool_followup_missing",
+            "root_cause_primary": "required_tool_followup_missing",
+            "causal_chain_json": ["required_followup_rule_matched", "model_stopped_early", "repair_prompt_required"],
+            "mitigation_action": "repair_required_tool_followup",
+            "priority": 54,
+            "priority_band": "recovery",
+            "match_expression_json": {"any_reasons": ["required_tool_followup_missing"]},
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+        },
+        {
             "rule_id": "RC_NO_PROGRESS_PURE",
             "reason_key": "same_failure_no_progress",
             "root_cause_primary": "same_failure_no_progress",
@@ -932,6 +1117,9 @@ def _primary_stop_reason(reasons: list[str]) -> str | None:
         "permission_revoked_before_execution",
         "backend_capability_degraded",
         "backend_contract_unsupported",
+        "tool_prerequisite_missing",
+        "tool_request_format_invalid",
+        "required_tool_followup_missing",
         "max_iterations",
         "cost_budget_exceeded",
         "context_budget_exhausted",

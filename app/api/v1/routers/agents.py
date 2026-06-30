@@ -86,6 +86,7 @@ from app.schemas.agent import (
     AgentRunSummaryRead,
     AgentRootCauseRuleGovernanceAuditRead,
     AgentRuntimeSnapshotRead,
+    AgentSkillRead,
     AgentToolCallRead,
     AgentWorkerQueueAuditRead,
 )
@@ -121,9 +122,14 @@ from app.services.agent_runtime_service import (
     ExecutionLedgerService,
     RUN_TERMINAL_STATUSES,
 )
+from app.services.agent_skill_registry import AgentSkillRegistry
 from app.services.permission_service import PermissionService
 
 router = APIRouter()
+
+AGENT_SSE_ACTIVE_POLL_INTERVAL_SECONDS = 0.1
+AGENT_SSE_IDLE_POLL_INTERVAL_SECONDS = 0.5
+AGENT_SSE_HEARTBEAT_INTERVAL_SECONDS = 15
 
 
 def _run_agent_conversation(run_id: str, user_id: int) -> None:
@@ -161,6 +167,14 @@ def get_agent_model_health(
     if live and not PermissionService(db).is_admin(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin required for live Agent model probe")
     return success(data=AgentModelHealthRead.model_validate(AgentModelHealthService().check(live=live)))
+
+
+@router.get("/skills", summary="查询 Agent Skill 目录")
+def list_agent_skills(
+    current_user: User = Depends(get_current_user),
+):
+    _ = current_user
+    return success(data=[AgentSkillRead.model_validate(item) for item in AgentSkillRegistry().catalog()])
 
 
 @router.post("/conversation-smoke", summary="执行 Agent 对话端到端 smoke 诊断")
@@ -1021,10 +1035,13 @@ def stream_agent_run_events(
 
             if run_status in RUN_TERMINAL_STATUSES and sequence >= last_sequence:
                 return
-            if time.monotonic() - heartbeat_at >= 15:
+            if time.monotonic() - heartbeat_at >= AGENT_SSE_HEARTBEAT_INTERVAL_SECONDS:
                 yield "event: heartbeat\ndata: {}\n\n"
                 heartbeat_at = time.monotonic()
-            time.sleep(0.5)
+            if run_status in {"queued", "running"}:
+                time.sleep(AGENT_SSE_ACTIVE_POLL_INTERVAL_SECONDS)
+            else:
+                time.sleep(AGENT_SSE_IDLE_POLL_INTERVAL_SECONDS)
 
     return StreamingResponse(
         event_stream(),

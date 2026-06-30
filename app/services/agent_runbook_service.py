@@ -156,6 +156,20 @@ RUNBOOKS: dict[str, dict[str, Any]] = {
             "GET /api/v1/agents/runs/{run_id}/loop-observations",
         ],
     },
+    "agent_runtime_loop_repair": {
+        "title": "Runbook: Agent runtime loop repair and stop handling",
+        "trigger": "AgentConversationRunner records runtime repair or stop LoopObservations.",
+        "severity": "P2",
+        "steps": [
+            "Inspect the LoopObservation root_cause_rule_id, stop_action_reason, and mitigation_action.",
+            "For repair observations, verify the next model/tool turn followed the mitigation path.",
+            "For stop observations, decide whether to extend limits, change tool inputs, or hand off to a human.",
+        ],
+        "safe_api_actions": [
+            "GET /api/v1/agents/runs/{run_id}/loop-observations",
+            "GET /api/v1/agents/tool-calls/{tool_call_id}",
+        ],
+    },
     "root_cause_rule_missing": {
         "title": "Runbook: missing RootCause governance rule",
         "trigger": "Loop reasons were observed without an explicit RootCause rule.",
@@ -219,6 +233,47 @@ RUNBOOK_RECOMMENDATION_FIELDS = (
 RUNBOOK_RECOMMENDATION_REQUIRED_FIELDS = {"runbook_id", "reason", "severity", "action", "details"}
 RUNBOOK_RECOMMENDATION_OPTIONAL_FIELDS = {"tool_call_id"}
 RUNBOOK_DIAGNOSIS_RECOMMENDATION_RUNBOOK_IDS = set(RUNBOOKS)
+RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS = (
+    "execution_context_version_hash",
+    "execution_context_hash",
+    "tool_call_id",
+    "run_id",
+    "runtime_snapshot_id",
+    "tool_name",
+    "tool_version",
+    "worker_id",
+    "tool_status",
+    "execution_phase",
+    "effect_submission_state",
+    "effect_boundary_crossed",
+    "backend_name",
+    "backend_operation",
+    "backend_contract_version",
+    "backend_request_schema_hash",
+    "backend_output_schema_hash",
+    "reconcile_contract_version",
+    "result_adapter_version",
+    "backend_effect_capability",
+    "resolved_side_effect_class",
+    "resolved_replay_policy",
+    "approval_state",
+    "approval_lineage_id",
+    "approval_epoch",
+    "approved_approval_id",
+    "approved_by",
+    "input_hash",
+    "output_hash",
+    "recovery_decision",
+    "error_code",
+    "error_message_hash",
+)
+RUNTIME_LOOP_REPAIR_STOP_REASONS = {
+    "tool_prerequisite_missing",
+    "tool_request_format_invalid",
+    "required_tool_followup_missing",
+    "max_iterations",
+    "same_failure_no_progress",
+}
 CHECKPOINT_FRESHNESS_SAFE_ACTIONS = {
     "continue_from_checkpoint": "POST /api/v1/agents/runs/{run_id}/resume",
     "replan_from_latest_safe_state": "POST /api/v1/agents/runs/{run_id}/context-builds",
@@ -250,6 +305,7 @@ class AgentRunbookService:
         recommendations.extend(self._approval_recommendations(run))
         recommendations.extend(self._backend_capability_recommendations(run))
         recommendations.extend(self._context_linkage_recommendations(run))
+        recommendations.extend(self._runtime_loop_repair_recommendations(run))
         recommendations.extend(self._root_cause_rule_recommendations(run))
         recommendations.extend(self._memory_evidence_recommendations(run))
         recommendations.extend(self._release_gate_recommendations())
@@ -287,6 +343,28 @@ class AgentRunbookService:
             "POST /api/v1/agents/runs/{run_id}/context-builds",
         )
 
+    @staticmethod
+    def _execution_context_summary(call: AgentToolCall) -> dict[str, Any] | None:
+        execution_context = (call.policy_reason_json or {}).get("execution_context")
+        if not isinstance(execution_context, dict):
+            return None
+        summary = {
+            field: execution_context[field]
+            for field in RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS
+            if field in execution_context
+        }
+        return summary or None
+
+    def _details_with_execution_context(
+        self,
+        call: AgentToolCall,
+        details: dict[str, Any],
+    ) -> dict[str, Any]:
+        execution_context = self._execution_context_summary(call)
+        if execution_context is None:
+            return details
+        return {**details, "execution_context": execution_context}
+
     def _uncertain_recommendations(self, run: AgentRun) -> list[dict[str, Any]]:
         calls = list(
             self.db.scalars(
@@ -305,12 +383,12 @@ class AgentRunbookService:
                 "severity": RUNBOOKS["tool_call_uncertain"]["severity"],
                 "action": "POST /api/v1/agents/runs/{run_id}/reconcile",
                 "tool_call_id": call.tool_call_id,
-                "details": {
+                "details": self._details_with_execution_context(call, {
                     "status": call.status,
                     "effect_submission_state": call.effect_submission_state,
                     "backend_effect_capability": call.backend_effect_capability,
                     "backend_operation": call.backend_operation,
-                },
+                }),
             }
             for call in calls
         ]
@@ -412,14 +490,14 @@ class AgentRunbookService:
                 "severity": RUNBOOKS["backend_capability_degraded"]["severity"],
                 "action": "GET /api/v1/agents/tool-calls/{tool_call_id}",
                 "tool_call_id": call.tool_call_id,
-                "details": {
+                "details": self._details_with_execution_context(call, {
                     "backend_effect_capability": call.backend_effect_capability,
                     "backend_operation": call.backend_operation,
                     "backend_name": call.backend_name,
                     "status": call.status,
                     "recovery_decision": call.recovery_decision,
                     "error_code": call.error_code,
-                },
+                }),
             }
             for call in calls
         ]
@@ -460,6 +538,39 @@ class AgentRunbookService:
                 },
             }
             for observation in missing[:5]
+        ]
+
+    def _runtime_loop_repair_recommendations(self, run: AgentRun) -> list[dict[str, Any]]:
+        observations = list(
+            self.db.scalars(
+                select(AgentLoopObservation)
+                .where(
+                    AgentLoopObservation.run_id == run.run_id,
+                    AgentLoopObservation.stop_action_reason.in_(RUNTIME_LOOP_REPAIR_STOP_REASONS),
+                )
+                .order_by(AgentLoopObservation.iteration.asc(), AgentLoopObservation.step_index.asc())
+            ).all()
+        )
+        return [
+            {
+                "runbook_id": "agent_runtime_loop_repair",
+                "reason": "runtime_loop_repair_or_stop_observed",
+                "severity": RUNBOOKS["agent_runtime_loop_repair"]["severity"],
+                "action": "GET /api/v1/agents/runs/{run_id}/loop-observations",
+                "details": {
+                    "observation_id": observation.observation_id,
+                    "iteration": observation.iteration,
+                    "step_index": observation.step_index,
+                    "next_action": observation.next_action,
+                    "stop_action_reason": observation.stop_action_reason,
+                    "stop_reasons_all": observation.stop_reasons_all_json,
+                    "root_cause_rule_id": observation.root_cause_rule_id,
+                    "root_cause_primary": observation.root_cause_primary,
+                    "mitigation_action": observation.mitigation_action,
+                    "observation_source": (observation.observation_json or {}).get("source"),
+                },
+            }
+            for observation in observations[:5]
         ]
 
     def _root_cause_rule_recommendations(self, run: AgentRun) -> list[dict[str, Any]]:

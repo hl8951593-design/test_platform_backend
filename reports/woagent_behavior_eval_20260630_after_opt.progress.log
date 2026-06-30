@@ -1,0 +1,17 @@
+[login] account=admin user_id=1
+[start] T01 通用测试知识问答
+[done] T01 score=57 passed=False run_id=agent-run-8f98b772ae8a40d599822412e0780fc2
+[start] T02 多轮上下文追问且不创建对象
+[done] T02 score=62 passed=False run_id=agent-run-9393a983d4224d18bc2e781ac60e3e32
+[start] T03 读取项目上下文
+[error] T03 HTTP 500 GET /agents/runs/agent-run-93119883842448a9ac9df621247f10e9/events/snapshot: {"code":500,"message":"internal server error","data":{"error":"internal_server_error","request_id":"5a942924-e213-486b-8261-e2a2341661e2"}}
+[start] T04 企业场景 query-first 组合草稿
+[done] T04 score=73 passed=False run_id=agent-run-0e21a0f1e5e349ac8c070d9a3ed55a05
+[start] T05 场景 warnings 可修复项闭环
+[error] T05 HTTP 500 POST /agents/runs: {"code":500,"message":"internal server error","data":{"error":"internal_server_error","request_id":"24aba027-6062-44bb-9e74-d4cb08e57225"}}
+[start] T06 保存正式场景边界
+[error] T06 HTTP 500 POST /agents/runs: {"code":500,"message":"internal server error","data":{"error":"internal_server_error","request_id":"5160eca4-bab4-491e-8ed9-c0a3953e28df"}}
+[start] T07 数据集参数化理解与草稿更新
+[error] T07 timed out
+[start] T08 非测试领域能力边界
+[done] T08 score=57 passed=False run_id=agent-run-1e571b49c3d94951a5cc9bbd3a285b4f

@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError
 
 from app.core.errors import register_exception_handlers
 from app.core.request_logging import register_request_logging_middleware
@@ -42,6 +43,15 @@ def build_test_app() -> FastAPI:
     @app.get("/crash")
     def crash():
         raise RuntimeError("database password must not leak")
+
+    @app.get("/db-lost")
+    def db_lost():
+        raise OperationalError(
+            "SELECT secret_value FROM accounts",
+            {},
+            Exception("Lost connection to MySQL server during query"),
+            connection_invalidated=True,
+        )
 
     return app
 
@@ -121,6 +131,25 @@ class ErrorResponseTests(unittest.TestCase):
             },
         })
         self.assertNotIn("password", response.text)
+
+    def test_database_disconnect_is_reported_as_temporary_unavailable(self):
+        with patch("app.core.errors.logger.warning"), patch("app.db.session.engine.dispose") as dispose:
+            response = self.client.get(
+                "/db-lost", headers={"X-Request-ID": "request-db"}
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers["X-Request-ID"], "request-db")
+        self.assertEqual(response.json(), {
+            "code": 503,
+            "message": "database temporarily unavailable",
+            "data": {
+                "error": "database_connection_lost",
+                "request_id": "request-db",
+            },
+        })
+        self.assertNotIn("secret_value", response.text)
+        dispose.assert_called_once()
 
     def test_main_openapi_declares_standard_error_schema(self):
         from app.main import create_app

@@ -1,0 +1,266 @@
+INFO:     Started server process [12444]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+2026-06-30 16:14:19,512 WARNING [a4ba992d-f6fb-4669-a1fc-464e74e586d2] app.core.errors - HTTP exception request_id=a4ba992d-f6fb-4669-a1fc-464e74e586d2 method=GET path=/api/v1/agents/skills status=401 detail=Not authenticated
+2026-06-30 16:14:19,514 WARNING [a4ba992d-f6fb-4669-a1fc-464e74e586d2] app.request - request_completed method=GET path=/api/v1/agents/skills query= status=401 duration_ms=3 client=127.0.0.1
+2026-06-30 16:14:37,857 WARNING [599066ae-47ce-428e-b623-bf30c405f76d] app.core.errors - HTTP exception request_id=599066ae-47ce-428e-b623-bf30c405f76d method=GET path=/api/v1/agents/skills status=401 detail=Not authenticated
+2026-06-30 16:14:37,858 WARNING [599066ae-47ce-428e-b623-bf30c405f76d] app.request - request_completed method=GET path=/api/v1/agents/skills query= status=401 duration_ms=0 client=127.0.0.1
+2026-06-30 16:15:07,762 INFO [0b4a5fcb-9b94-43b9-8a5e-f2d8facc29ee] app.request - request_completed method=POST path=/api/v1/auth/login query= status=200 duration_ms=239 client=127.0.0.1
+2026-06-30 16:15:08,350 INFO [b990c57a-4e90-4c03-b715-3c42b0c3ef63] app.core.execution_worker - Execution worker task accepted task_id=bfe07510-ad37-4d67-8d8c-2efd93ded045 request_id=b990c57a-4e90-4c03-b715-3c42b0c3ef63 fn=_run_agent_conversation
+2026-06-30 16:15:08,351 INFO [b990c57a-4e90-4c03-b715-3c42b0c3ef63] app.core.execution_worker - Execution worker task started task_id=bfe07510-ad37-4d67-8d8c-2efd93ded045 request_id=b990c57a-4e90-4c03-b715-3c42b0c3ef63 fn=_run_agent_conversation
+2026-06-30 16:15:08,357 INFO [b990c57a-4e90-4c03-b715-3c42b0c3ef63] app.request - request_completed method=POST path=/api/v1/agents/runs query= status=200 duration_ms=590 client=127.0.0.1
+2026-06-30 16:15:08,418 INFO [b990c57a-4e90-4c03-b715-3c42b0c3ef63] app.services.agent_runtime_service - agent_conversation_start run_id=agent-run-ec24b0a75b294091acbe5711e58c35d3 project_id=1 user_id=1 conversation_id=agent-conv-594989e74b664ddfb8ba6ad7885a4b1b max_iterations=3
+2026-06-30 16:15:08,821 INFO [b990c57a-4e90-4c03-b715-3c42b0c3ef63] app.services.agent_runtime_service - agent_model_stream_start run_id=agent-run-ec24b0a75b294091acbe5711e58c35d3 project_id=1 iteration=0 final_summary=False repair_attempt=False message_count=6
+2026-06-30 16:15:09,087 INFO [68f390c3-08fb-48e1-ab31-10a3a77e0dd8] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-ec24b0a75b294091acbe5711e58c35d3/events/snapshot query=after_sequence=0&limit=500 status=200 duration_ms=126 client=127.0.0.1
+2026-06-30 16:15:09,611 ERROR [b990c57a-4e90-4c03-b715-3c42b0c3ef63] app.services.agent_runtime_service - agent_conversation_failed_unhandled run_id=agent-run-ec24b0a75b294091acbe5711e58c35d3 project_id=1
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1505, in run
+    content, chunks, model_payload = self._stream_model_response(
+                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 2053, in _stream_model_response
+    for item in AIService().chat_stream(request):
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\ai_service.py", line 78, in chat_stream
+    with httpx.Client(timeout=settings.DEEPSEEK_TIMEOUT_SECONDS) as client:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 700, in __init__
+    else self._init_proxy_transport(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 750, in _init_proxy_transport
+    return HTTPTransport(
+           ^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_transports\default.py", line 191, in __init__
+    raise ImportError(
+ImportError: Using SOCKS proxy, but the 'socksio' package is not installed. Make sure to install httpx using `pip install httpx[socks]`.
+2026-06-30 16:15:09,820 INFO [e764c9cc-4329-454c-a365-f70a64f705b7] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-ec24b0a75b294091acbe5711e58c35d3/events/snapshot query=after_sequence=3&limit=500 status=200 duration_ms=130 client=127.0.0.1
+2026-06-30 16:15:09,854 INFO [b990c57a-4e90-4c03-b715-3c42b0c3ef63] app.core.execution_worker - Execution worker task completed task_id=bfe07510-ad37-4d67-8d8c-2efd93ded045 request_id=b990c57a-4e90-4c03-b715-3c42b0c3ef63 fn=_run_agent_conversation duration_ms=1502
+2026-06-30 16:15:10,521 INFO [b81c278a-4715-4f2a-b1cb-68979586edb4] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-ec24b0a75b294091acbe5711e58c35d3/events/snapshot query=after_sequence=4&limit=500 status=200 duration_ms=98 client=127.0.0.1
+2026-06-30 16:15:10,851 INFO [7df73747-67e0-4af9-b2e6-3d490e6555a8] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-ec24b0a75b294091acbe5711e58c35d3/summary query= status=200 duration_ms=311 client=127.0.0.1
+2026-06-30 16:15:10,938 INFO [f57fc1b6-05ae-4109-b598-6d7d3d448286] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-ec24b0a75b294091acbe5711e58c35d3/events query= status=200 duration_ms=84 client=127.0.0.1
+2026-06-30 16:15:10,984 INFO [f57fc1b6-05ae-4109-b598-6d7d3d448286] app.services.agent_runtime_service - agent_event_cursor_reset run_id=agent-run-ec24b0a75b294091acbe5711e58c35d3 after_sequence=999999 latest_event_sequence=4 status=failed
+2026-06-30 16:15:11,528 INFO [40795da8-3238-477d-b89a-2e7b3bcaf2c6] app.core.execution_worker - Execution worker task accepted task_id=45ed6125-841d-412c-97ab-e427bb76e4d9 request_id=40795da8-3238-477d-b89a-2e7b3bcaf2c6 fn=_run_agent_conversation
+2026-06-30 16:15:11,528 INFO [40795da8-3238-477d-b89a-2e7b3bcaf2c6] app.core.execution_worker - Execution worker task started task_id=45ed6125-841d-412c-97ab-e427bb76e4d9 request_id=40795da8-3238-477d-b89a-2e7b3bcaf2c6 fn=_run_agent_conversation
+2026-06-30 16:15:11,528 INFO [40795da8-3238-477d-b89a-2e7b3bcaf2c6] app.request - request_completed method=POST path=/api/v1/agents/runs query= status=200 duration_ms=459 client=127.0.0.1
+2026-06-30 16:15:11,590 INFO [40795da8-3238-477d-b89a-2e7b3bcaf2c6] app.services.agent_runtime_service - agent_conversation_start run_id=agent-run-faf772dbe01342c4a2387e9b8ed312e5 project_id=1 user_id=1 conversation_id=agent-conv-594989e74b664ddfb8ba6ad7885a4b1b max_iterations=3
+2026-06-30 16:15:11,978 INFO [40795da8-3238-477d-b89a-2e7b3bcaf2c6] app.services.agent_runtime_service - agent_model_stream_start run_id=agent-run-faf772dbe01342c4a2387e9b8ed312e5 project_id=1 iteration=0 final_summary=False repair_attempt=False message_count=5
+2026-06-30 16:15:12,263 INFO [98a875bd-8ae9-4557-b5d9-dcbf615ba177] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-faf772dbe01342c4a2387e9b8ed312e5/events/snapshot query=after_sequence=0&limit=500 status=200 duration_ms=129 client=127.0.0.1
+2026-06-30 16:15:12,710 ERROR [40795da8-3238-477d-b89a-2e7b3bcaf2c6] app.services.agent_runtime_service - agent_conversation_failed_unhandled run_id=agent-run-faf772dbe01342c4a2387e9b8ed312e5 project_id=1
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1505, in run
+    content, chunks, model_payload = self._stream_model_response(
+                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 2053, in _stream_model_response
+    for item in AIService().chat_stream(request):
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\ai_service.py", line 78, in chat_stream
+    with httpx.Client(timeout=settings.DEEPSEEK_TIMEOUT_SECONDS) as client:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 700, in __init__
+    else self._init_proxy_transport(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 750, in _init_proxy_transport
+    return HTTPTransport(
+           ^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_transports\default.py", line 191, in __init__
+    raise ImportError(
+ImportError: Using SOCKS proxy, but the 'socksio' package is not installed. Make sure to install httpx using `pip install httpx[socks]`.
+2026-06-30 16:15:12,916 INFO [40795da8-3238-477d-b89a-2e7b3bcaf2c6] app.core.execution_worker - Execution worker task completed task_id=45ed6125-841d-412c-97ab-e427bb76e4d9 request_id=40795da8-3238-477d-b89a-2e7b3bcaf2c6 fn=_run_agent_conversation duration_ms=1387
+2026-06-30 16:15:12,977 INFO [af2443ea-5acf-4446-85b7-5b516bc5fecf] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-faf772dbe01342c4a2387e9b8ed312e5/events/snapshot query=after_sequence=3&limit=500 status=200 duration_ms=109 client=127.0.0.1
+2026-06-30 16:15:13,316 INFO [2b1616e6-0877-4a68-9031-5f506b341f3d] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-faf772dbe01342c4a2387e9b8ed312e5/summary query= status=200 duration_ms=312 client=127.0.0.1
+2026-06-30 16:15:13,402 INFO [cb8bafd6-ddc0-434c-8d9f-6a36966e00ef] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-faf772dbe01342c4a2387e9b8ed312e5/events query= status=200 duration_ms=83 client=127.0.0.1
+2026-06-30 16:15:13,442 INFO [cb8bafd6-ddc0-434c-8d9f-6a36966e00ef] app.services.agent_runtime_service - agent_event_cursor_reset run_id=agent-run-faf772dbe01342c4a2387e9b8ed312e5 after_sequence=999999 latest_event_sequence=4 status=failed
+2026-06-30 16:15:13,929 INFO [8fe1a895-18db-454e-a4bd-743ac9fc623a] app.core.execution_worker - Execution worker task accepted task_id=6ab4defc-00d9-45c5-9e20-b4848c9369e8 request_id=8fe1a895-18db-454e-a4bd-743ac9fc623a fn=_run_agent_conversation
+2026-06-30 16:15:13,930 INFO [8fe1a895-18db-454e-a4bd-743ac9fc623a] app.core.execution_worker - Execution worker task started task_id=6ab4defc-00d9-45c5-9e20-b4848c9369e8 request_id=8fe1a895-18db-454e-a4bd-743ac9fc623a fn=_run_agent_conversation
+2026-06-30 16:15:13,930 INFO [8fe1a895-18db-454e-a4bd-743ac9fc623a] app.request - request_completed method=POST path=/api/v1/agents/runs query= status=200 duration_ms=427 client=127.0.0.1
+2026-06-30 16:15:13,992 INFO [8fe1a895-18db-454e-a4bd-743ac9fc623a] app.services.agent_runtime_service - agent_conversation_start run_id=agent-run-b268f806d0b1425eb32cc26a4c18557d project_id=1 user_id=1 conversation_id=agent-conv-3b4fe40babbe405f87142c8d7dce39af max_iterations=4
+2026-06-30 16:15:14,372 INFO [8fe1a895-18db-454e-a4bd-743ac9fc623a] app.services.agent_runtime_service - agent_model_stream_start run_id=agent-run-b268f806d0b1425eb32cc26a4c18557d project_id=1 iteration=0 final_summary=False repair_attempt=False message_count=6
+2026-06-30 16:15:14,683 INFO [494deeb6-9132-47ff-b591-62b780d6a5a8] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-b268f806d0b1425eb32cc26a4c18557d/events/snapshot query=after_sequence=0&limit=500 status=200 duration_ms=128 client=127.0.0.1
+2026-06-30 16:15:15,176 ERROR [8fe1a895-18db-454e-a4bd-743ac9fc623a] app.services.agent_runtime_service - agent_conversation_failed_unhandled run_id=agent-run-b268f806d0b1425eb32cc26a4c18557d project_id=1
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1505, in run
+    content, chunks, model_payload = self._stream_model_response(
+                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 2053, in _stream_model_response
+    for item in AIService().chat_stream(request):
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\ai_service.py", line 78, in chat_stream
+    with httpx.Client(timeout=settings.DEEPSEEK_TIMEOUT_SECONDS) as client:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 700, in __init__
+    else self._init_proxy_transport(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 750, in _init_proxy_transport
+    return HTTPTransport(
+           ^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_transports\default.py", line 191, in __init__
+    raise ImportError(
+ImportError: Using SOCKS proxy, but the 'socksio' package is not installed. Make sure to install httpx using `pip install httpx[socks]`.
+2026-06-30 16:15:15,368 INFO [8fe1a895-18db-454e-a4bd-743ac9fc623a] app.core.execution_worker - Execution worker task completed task_id=6ab4defc-00d9-45c5-9e20-b4848c9369e8 request_id=8fe1a895-18db-454e-a4bd-743ac9fc623a fn=_run_agent_conversation duration_ms=1437
+2026-06-30 16:15:15,391 INFO [ff02d495-7d7f-49fd-a224-8d9105629c0f] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-b268f806d0b1425eb32cc26a4c18557d/events/snapshot query=after_sequence=3&limit=500 status=200 duration_ms=105 client=127.0.0.1
+2026-06-30 16:15:15,684 INFO [944b97a9-fa09-4c33-a9de-6530fa2175ed] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-b268f806d0b1425eb32cc26a4c18557d/summary query= status=200 duration_ms=290 client=127.0.0.1
+2026-06-30 16:15:15,800 INFO [e55d931e-f80a-4555-9847-4a0891516bfc] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-b268f806d0b1425eb32cc26a4c18557d/events query= status=200 duration_ms=96 client=127.0.0.1
+2026-06-30 16:15:15,840 INFO [e55d931e-f80a-4555-9847-4a0891516bfc] app.services.agent_runtime_service - agent_event_cursor_reset run_id=agent-run-b268f806d0b1425eb32cc26a4c18557d after_sequence=999999 latest_event_sequence=4 status=failed
+2026-06-30 16:15:16,337 INFO [9c8f6645-a162-40fd-b50e-678aad1b3aba] app.core.execution_worker - Execution worker task accepted task_id=7b4053b0-f49d-445c-a0c3-1c2dd1dd0b7b request_id=9c8f6645-a162-40fd-b50e-678aad1b3aba fn=_run_agent_conversation
+2026-06-30 16:15:16,337 INFO [9c8f6645-a162-40fd-b50e-678aad1b3aba] app.core.execution_worker - Execution worker task started task_id=7b4053b0-f49d-445c-a0c3-1c2dd1dd0b7b request_id=9c8f6645-a162-40fd-b50e-678aad1b3aba fn=_run_agent_conversation
+2026-06-30 16:15:16,338 INFO [9c8f6645-a162-40fd-b50e-678aad1b3aba] app.request - request_completed method=POST path=/api/v1/agents/runs query= status=200 duration_ms=435 client=127.0.0.1
+2026-06-30 16:15:16,401 INFO [9c8f6645-a162-40fd-b50e-678aad1b3aba] app.services.agent_runtime_service - agent_conversation_start run_id=agent-run-bbfbb7a93c074a84af0915cb272a6964 project_id=1 user_id=1 conversation_id=agent-conv-5de4fbd67f434703b2a21b2bb26dbf47 max_iterations=6
+2026-06-30 16:15:17,078 ERROR [9c8f6645-a162-40fd-b50e-678aad1b3aba] app.services.agent_runtime_service - agent_conversation_failed_unhandled run_id=agent-run-bbfbb7a93c074a84af0915cb272a6964 project_id=1
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1498, in run
+    unsupported_guard = self._unsupported_capability_guard_for_run(run)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1717, in _unsupported_capability_guard_for_run
+    if self._classify_unsupported_capability_intent(run, guard):
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1742, in _classify_unsupported_capability_intent
+    response = AIService().chat(
+               ^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\ai_service.py", line 37, in chat
+    with httpx.Client(timeout=settings.DEEPSEEK_TIMEOUT_SECONDS) as client:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 700, in __init__
+    else self._init_proxy_transport(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 750, in _init_proxy_transport
+    return HTTPTransport(
+           ^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_transports\default.py", line 191, in __init__
+    raise ImportError(
+ImportError: Using SOCKS proxy, but the 'socksio' package is not installed. Make sure to install httpx using `pip install httpx[socks]`.
+2026-06-30 16:15:17,098 INFO [e51c4751-1e30-47f9-9dd8-3431495e63c5] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-bbfbb7a93c074a84af0915cb272a6964/events/snapshot query=after_sequence=0&limit=500 status=200 duration_ms=135 client=127.0.0.1
+2026-06-30 16:15:17,273 INFO [9c8f6645-a162-40fd-b50e-678aad1b3aba] app.core.execution_worker - Execution worker task completed task_id=7b4053b0-f49d-445c-a0c3-1c2dd1dd0b7b request_id=9c8f6645-a162-40fd-b50e-678aad1b3aba fn=_run_agent_conversation duration_ms=934
+2026-06-30 16:15:17,799 INFO [abdb3258-ed0f-41af-984a-0dbaa354b0e1] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-bbfbb7a93c074a84af0915cb272a6964/events/snapshot query=after_sequence=2&limit=500 status=200 duration_ms=99 client=127.0.0.1
+2026-06-30 16:15:18,111 INFO [c96277f3-91bd-462d-8657-0b7f59b94b54] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-bbfbb7a93c074a84af0915cb272a6964/summary query= status=200 duration_ms=309 client=127.0.0.1
+2026-06-30 16:15:18,194 INFO [af322e23-df03-4d84-b194-2271615699c3] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-bbfbb7a93c074a84af0915cb272a6964/events query= status=200 duration_ms=81 client=127.0.0.1
+2026-06-30 16:15:18,243 INFO [af322e23-df03-4d84-b194-2271615699c3] app.services.agent_runtime_service - agent_event_cursor_reset run_id=agent-run-bbfbb7a93c074a84af0915cb272a6964 after_sequence=999999 latest_event_sequence=3 status=failed
+2026-06-30 16:15:18,745 INFO [194ab8b8-e656-4337-9aae-d8817a028fab] app.core.execution_worker - Execution worker task accepted task_id=68ff5bbb-2481-4058-947b-edf4e737413e request_id=194ab8b8-e656-4337-9aae-d8817a028fab fn=_run_agent_conversation
+2026-06-30 16:15:18,746 INFO [194ab8b8-e656-4337-9aae-d8817a028fab] app.core.execution_worker - Execution worker task started task_id=68ff5bbb-2481-4058-947b-edf4e737413e request_id=194ab8b8-e656-4337-9aae-d8817a028fab fn=_run_agent_conversation
+2026-06-30 16:15:18,746 INFO [194ab8b8-e656-4337-9aae-d8817a028fab] app.request - request_completed method=POST path=/api/v1/agents/runs query= status=200 duration_ms=441 client=127.0.0.1
+2026-06-30 16:15:18,816 INFO [194ab8b8-e656-4337-9aae-d8817a028fab] app.services.agent_runtime_service - agent_conversation_start run_id=agent-run-ddd4f882776b4a1b90135067a2ea8217 project_id=1 user_id=1 conversation_id=agent-conv-5de4fbd67f434703b2a21b2bb26dbf47 max_iterations=6
+2026-06-30 16:15:19,531 INFO [7c729ef9-650a-4152-aeda-fa0f7f53030c] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-ddd4f882776b4a1b90135067a2ea8217/events/snapshot query=after_sequence=0&limit=500 status=200 duration_ms=178 client=127.0.0.1
+2026-06-30 16:15:19,620 ERROR [194ab8b8-e656-4337-9aae-d8817a028fab] app.services.agent_runtime_service - agent_conversation_failed_unhandled run_id=agent-run-ddd4f882776b4a1b90135067a2ea8217 project_id=1
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1498, in run
+    unsupported_guard = self._unsupported_capability_guard_for_run(run)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1717, in _unsupported_capability_guard_for_run
+    if self._classify_unsupported_capability_intent(run, guard):
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1742, in _classify_unsupported_capability_intent
+    response = AIService().chat(
+               ^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\ai_service.py", line 37, in chat
+    with httpx.Client(timeout=settings.DEEPSEEK_TIMEOUT_SECONDS) as client:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 700, in __init__
+    else self._init_proxy_transport(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 750, in _init_proxy_transport
+    return HTTPTransport(
+           ^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_transports\default.py", line 191, in __init__
+    raise ImportError(
+ImportError: Using SOCKS proxy, but the 'socksio' package is not installed. Make sure to install httpx using `pip install httpx[socks]`.
+2026-06-30 16:15:19,820 INFO [194ab8b8-e656-4337-9aae-d8817a028fab] app.core.execution_worker - Execution worker task completed task_id=68ff5bbb-2481-4058-947b-edf4e737413e request_id=194ab8b8-e656-4337-9aae-d8817a028fab fn=_run_agent_conversation duration_ms=1073
+2026-06-30 16:15:20,286 INFO [07f3b254-a2b3-44e1-8427-7222b7cea762] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-ddd4f882776b4a1b90135067a2ea8217/events/snapshot query=after_sequence=2&limit=500 status=200 duration_ms=152 client=127.0.0.1
+2026-06-30 16:15:20,601 INFO [6676f22b-9eff-419a-a36a-65bc64c77dba] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-ddd4f882776b4a1b90135067a2ea8217/summary query= status=200 duration_ms=313 client=127.0.0.1
+2026-06-30 16:15:20,690 INFO [78da6f10-f586-4e05-abcb-534ab24a66c4] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-ddd4f882776b4a1b90135067a2ea8217/events query= status=200 duration_ms=85 client=127.0.0.1
+2026-06-30 16:15:20,755 INFO [78da6f10-f586-4e05-abcb-534ab24a66c4] app.services.agent_runtime_service - agent_event_cursor_reset run_id=agent-run-ddd4f882776b4a1b90135067a2ea8217 after_sequence=999999 latest_event_sequence=3 status=failed
+2026-06-30 16:15:21,327 INFO [3c59a13e-edae-4712-837c-3b07f24c5c49] app.core.execution_worker - Execution worker task accepted task_id=2cbdb6dc-1fa7-4b71-83a7-88b108e0640c request_id=3c59a13e-edae-4712-837c-3b07f24c5c49 fn=_run_agent_conversation
+2026-06-30 16:15:21,328 INFO [3c59a13e-edae-4712-837c-3b07f24c5c49] app.core.execution_worker - Execution worker task started task_id=2cbdb6dc-1fa7-4b71-83a7-88b108e0640c request_id=3c59a13e-edae-4712-837c-3b07f24c5c49 fn=_run_agent_conversation
+2026-06-30 16:15:21,328 INFO [3c59a13e-edae-4712-837c-3b07f24c5c49] app.request - request_completed method=POST path=/api/v1/agents/runs query= status=200 duration_ms=483 client=127.0.0.1
+2026-06-30 16:15:21,392 INFO [3c59a13e-edae-4712-837c-3b07f24c5c49] app.services.agent_runtime_service - agent_conversation_start run_id=agent-run-14779d096744491c8dec8da8f448be73 project_id=1 user_id=1 conversation_id=agent-conv-5de4fbd67f434703b2a21b2bb26dbf47 max_iterations=4
+2026-06-30 16:15:22,084 INFO [cc08ecc0-39d3-4314-bb02-0feca312a084] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-14779d096744491c8dec8da8f448be73/events/snapshot query=after_sequence=0&limit=500 status=200 duration_ms=131 client=127.0.0.1
+2026-06-30 16:15:22,175 ERROR [3c59a13e-edae-4712-837c-3b07f24c5c49] app.services.agent_runtime_service - agent_conversation_failed_unhandled run_id=agent-run-14779d096744491c8dec8da8f448be73 project_id=1
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1498, in run
+    unsupported_guard = self._unsupported_capability_guard_for_run(run)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1717, in _unsupported_capability_guard_for_run
+    if self._classify_unsupported_capability_intent(run, guard):
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1742, in _classify_unsupported_capability_intent
+    response = AIService().chat(
+               ^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\ai_service.py", line 37, in chat
+    with httpx.Client(timeout=settings.DEEPSEEK_TIMEOUT_SECONDS) as client:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 700, in __init__
+    else self._init_proxy_transport(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 750, in _init_proxy_transport
+    return HTTPTransport(
+           ^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_transports\default.py", line 191, in __init__
+    raise ImportError(
+ImportError: Using SOCKS proxy, but the 'socksio' package is not installed. Make sure to install httpx using `pip install httpx[socks]`.
+2026-06-30 16:15:22,414 INFO [3c59a13e-edae-4712-837c-3b07f24c5c49] app.core.execution_worker - Execution worker task completed task_id=2cbdb6dc-1fa7-4b71-83a7-88b108e0640c request_id=3c59a13e-edae-4712-837c-3b07f24c5c49 fn=_run_agent_conversation duration_ms=1085
+2026-06-30 16:15:22,794 INFO [d8b9a713-a86f-4bfd-949c-b7b5fb088db1] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-14779d096744491c8dec8da8f448be73/events/snapshot query=after_sequence=2&limit=500 status=200 duration_ms=106 client=127.0.0.1
+2026-06-30 16:15:23,081 INFO [c669ad0e-f911-49e3-9141-42f50d05461e] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-14779d096744491c8dec8da8f448be73/summary query= status=200 duration_ms=283 client=127.0.0.1
+2026-06-30 16:15:23,201 INFO [33e04151-a3c1-4925-a755-db36e90c9227] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-14779d096744491c8dec8da8f448be73/events query= status=200 duration_ms=118 client=127.0.0.1
+2026-06-30 16:15:23,244 INFO [33e04151-a3c1-4925-a755-db36e90c9227] app.services.agent_runtime_service - agent_event_cursor_reset run_id=agent-run-14779d096744491c8dec8da8f448be73 after_sequence=999999 latest_event_sequence=3 status=failed
+2026-06-30 16:15:23,726 INFO [731d679b-e24b-4825-929a-8e617563dc7e] app.core.execution_worker - Execution worker task accepted task_id=00867612-4125-4c20-a78f-197b4ac37dfb request_id=731d679b-e24b-4825-929a-8e617563dc7e fn=_run_agent_conversation
+2026-06-30 16:15:23,727 INFO [731d679b-e24b-4825-929a-8e617563dc7e] app.core.execution_worker - Execution worker task started task_id=00867612-4125-4c20-a78f-197b4ac37dfb request_id=731d679b-e24b-4825-929a-8e617563dc7e fn=_run_agent_conversation
+2026-06-30 16:15:23,727 INFO [731d679b-e24b-4825-929a-8e617563dc7e] app.request - request_completed method=POST path=/api/v1/agents/runs query= status=200 duration_ms=421 client=127.0.0.1
+2026-06-30 16:15:23,824 INFO [731d679b-e24b-4825-929a-8e617563dc7e] app.services.agent_runtime_service - agent_conversation_start run_id=agent-run-34975c0a3bfc41168e85ea481c715950 project_id=1 user_id=1 conversation_id=agent-conv-5de4fbd67f434703b2a21b2bb26dbf47 max_iterations=6
+2026-06-30 16:15:24,454 INFO [3bd48e04-4ba3-4703-a91c-f90913bee740] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-34975c0a3bfc41168e85ea481c715950/events/snapshot query=after_sequence=0&limit=500 status=200 duration_ms=119 client=127.0.0.1
+2026-06-30 16:15:24,533 ERROR [731d679b-e24b-4825-929a-8e617563dc7e] app.services.agent_runtime_service - agent_conversation_failed_unhandled run_id=agent-run-34975c0a3bfc41168e85ea481c715950 project_id=1
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1498, in run
+    unsupported_guard = self._unsupported_capability_guard_for_run(run)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1717, in _unsupported_capability_guard_for_run
+    if self._classify_unsupported_capability_intent(run, guard):
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1742, in _classify_unsupported_capability_intent
+    response = AIService().chat(
+               ^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\ai_service.py", line 37, in chat
+    with httpx.Client(timeout=settings.DEEPSEEK_TIMEOUT_SECONDS) as client:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 700, in __init__
+    else self._init_proxy_transport(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 750, in _init_proxy_transport
+    return HTTPTransport(
+           ^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_transports\default.py", line 191, in __init__
+    raise ImportError(
+ImportError: Using SOCKS proxy, but the 'socksio' package is not installed. Make sure to install httpx using `pip install httpx[socks]`.
+2026-06-30 16:15:24,782 INFO [731d679b-e24b-4825-929a-8e617563dc7e] app.core.execution_worker - Execution worker task completed task_id=00867612-4125-4c20-a78f-197b4ac37dfb request_id=731d679b-e24b-4825-929a-8e617563dc7e fn=_run_agent_conversation duration_ms=1054
+2026-06-30 16:15:25,159 INFO [ed8cba8c-a0ab-47fe-88e7-4fe6096bf1aa] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-34975c0a3bfc41168e85ea481c715950/events/snapshot query=after_sequence=2&limit=500 status=200 duration_ms=102 client=127.0.0.1
+2026-06-30 16:15:25,605 INFO [e5d5c257-d21b-4c94-90f5-6a014620b1e8] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-34975c0a3bfc41168e85ea481c715950/summary query= status=200 duration_ms=443 client=127.0.0.1
+2026-06-30 16:15:25,695 INFO [63035f94-d660-42b2-a7c8-d88a1e4d15a0] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-34975c0a3bfc41168e85ea481c715950/events query= status=200 duration_ms=87 client=127.0.0.1
+2026-06-30 16:15:25,734 INFO [63035f94-d660-42b2-a7c8-d88a1e4d15a0] app.services.agent_runtime_service - agent_event_cursor_reset run_id=agent-run-34975c0a3bfc41168e85ea481c715950 after_sequence=999999 latest_event_sequence=3 status=failed
+2026-06-30 16:15:26,401 INFO [2351727d-5f2d-4b63-a73d-362baaecd10b] app.core.execution_worker - Execution worker task accepted task_id=bed9efc1-f968-4dbc-aa2b-9141ec60eb72 request_id=2351727d-5f2d-4b63-a73d-362baaecd10b fn=_run_agent_conversation
+2026-06-30 16:15:26,401 INFO [2351727d-5f2d-4b63-a73d-362baaecd10b] app.core.execution_worker - Execution worker task started task_id=bed9efc1-f968-4dbc-aa2b-9141ec60eb72 request_id=2351727d-5f2d-4b63-a73d-362baaecd10b fn=_run_agent_conversation
+2026-06-30 16:15:26,402 INFO [2351727d-5f2d-4b63-a73d-362baaecd10b] app.request - request_completed method=POST path=/api/v1/agents/runs query= status=200 duration_ms=607 client=127.0.0.1
+2026-06-30 16:15:26,465 INFO [2351727d-5f2d-4b63-a73d-362baaecd10b] app.services.agent_runtime_service - agent_conversation_start run_id=agent-run-d5200fd247a44cdba6080ec3eb393f6c project_id=1 user_id=1 conversation_id=agent-conv-9549a7628a2846b39e6a03d0a8d9059f max_iterations=3
+2026-06-30 16:15:26,925 INFO [2351727d-5f2d-4b63-a73d-362baaecd10b] app.services.agent_runtime_service - agent_model_stream_start run_id=agent-run-d5200fd247a44cdba6080ec3eb393f6c project_id=1 iteration=0 final_summary=False repair_attempt=False message_count=3
+2026-06-30 16:15:27,134 INFO [155c80af-728d-4837-9ebc-a51adabb1439] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-d5200fd247a44cdba6080ec3eb393f6c/events/snapshot query=after_sequence=0&limit=500 status=200 duration_ms=126 client=127.0.0.1
+2026-06-30 16:15:27,730 ERROR [2351727d-5f2d-4b63-a73d-362baaecd10b] app.services.agent_runtime_service - agent_conversation_failed_unhandled run_id=agent-run-d5200fd247a44cdba6080ec3eb393f6c project_id=1
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 1505, in run
+    content, chunks, model_payload = self._stream_model_response(
+                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\agent_runtime_service.py", line 2053, in _stream_model_response
+    for item in AIService().chat_stream(request):
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\app\services\ai_service.py", line 78, in chat_stream
+    with httpx.Client(timeout=settings.DEEPSEEK_TIMEOUT_SECONDS) as client:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 700, in __init__
+    else self._init_proxy_transport(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_client.py", line 750, in _init_proxy_transport
+    return HTTPTransport(
+           ^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\PycharmProjects\devtestbackend\.venv\Lib\site-packages\httpx\_transports\default.py", line 191, in __init__
+    raise ImportError(
+ImportError: Using SOCKS proxy, but the 'socksio' package is not installed. Make sure to install httpx using `pip install httpx[socks]`.
+2026-06-30 16:15:27,896 INFO [7a7d0b05-477f-481c-a431-0492f0f6cdce] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-d5200fd247a44cdba6080ec3eb393f6c/events/snapshot query=after_sequence=3&limit=500 status=200 duration_ms=147 client=127.0.0.1
+2026-06-30 16:15:27,924 INFO [2351727d-5f2d-4b63-a73d-362baaecd10b] app.core.execution_worker - Execution worker task completed task_id=bed9efc1-f968-4dbc-aa2b-9141ec60eb72 request_id=2351727d-5f2d-4b63-a73d-362baaecd10b fn=_run_agent_conversation duration_ms=1523
+2026-06-30 16:15:28,195 INFO [fcd79626-419f-4270-a819-57585a08b1ad] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-d5200fd247a44cdba6080ec3eb393f6c/summary query= status=200 duration_ms=297 client=127.0.0.1
+2026-06-30 16:15:28,282 INFO [4d628e1c-ca73-4504-b1a0-2bb53ee2641a] app.request - request_completed method=GET path=/api/v1/agents/runs/agent-run-d5200fd247a44cdba6080ec3eb393f6c/events query= status=200 duration_ms=84 client=127.0.0.1
+2026-06-30 16:15:28,344 INFO [4d628e1c-ca73-4504-b1a0-2bb53ee2641a] app.services.agent_runtime_service - agent_event_cursor_reset run_id=agent-run-d5200fd247a44cdba6080ec3eb393f6c after_sequence=999999 latest_event_sequence=4 status=failed

@@ -1,5 +1,8 @@
 # 自动化测试平台后端技术架构文档
 
+状态：当前实现
+最后核验：2026-06-30
+
 文档入口、权威范围和维护要求见 [文档索引与维护规范](README.md)。
 
 开发过程中的模块关系、业务逻辑、数据权限和用户权限记录见 [开发过程技术文档](development_technical_notes.md)。
@@ -56,7 +59,25 @@ MinIO 图片附件接口和部署配置见 [媒体存储接口文档](api_media.
 | 配置管理 | pydantic-settings + .env | 管理环境配置 |
 | 日志 | Python logging 或 loguru | 记录系统日志和执行日志 |
 
-Harness Loop Agent 的业务工具调用走 Codex 式闭环：Runner 组装 run context、ToolRegistry、权限边界和历史上下文后调用 `AIService`，模型只能通过受控 `agent_tool_request` 发起 ToolCall，Harness 执行后把 `tool.result_observed` 回灌给下一轮模型。场景组合是当前强约束 recipe：必须先执行 `testcase.query_project_cases` 获取项目 HTTP/WebSocket 用例，再执行 `scenario.compose_draft`；直接 compose 会被 Runner 以 `scenario_compose_requires_case_query` 阻断并回灌给模型纠正。
+Harness Loop Agent 的业务工具调用走 Codex 式闭环：Runner 组装 run context、ToolRegistry、权限边界和历史上下文后调用 `AIService`，模型只能通过受控 `agent_tool_request` 发起 ToolCall，Harness 执行后把 `tool.result_observed` 回灌给下一轮模型。模型输出的 fenced JSON 先被解析成内部 `AgentToolRequest` envelope，再进入 EventStore 和 ExecutionLedger：该 envelope 只保留 `tool_name`、`tool_input`、`reason`、`evidence_refs` 四类受控字段，并通过拷贝方法生成 ToolCall input/evidence 与 `model.tool_request_detected` payload，未知模型字段不会穿透到后端账本或前端事件。ToolCall 执行链路已拆成 `ToolExecutor` 生命周期编排、`AgentToolRuntime` 后端调用门面、`AgentToolRouter` 显式 handler 路由三层：Executor 负责审批/权限/队列/EventStore 状态推进，Runtime 负责把已落账的 ToolCall 转成后端执行请求，Router 负责从 `ToolRegistry` 的私有 `backend_handler` 解析可调用处理器。普通自然语言流式回复采用低延迟 EventStore/SSE 路径：首个可见 `model.delta` 立即写入，后续小碎片按短时间窗口或字符阈值微批提交，减少高频数据库事务；但涉及项目上下文、场景组合、保存动作等工具规划轮时，Runner 会先静默收流并解析工具请求，防止内部 `agent_tool_request` JSON 或候选分析泄露到 assistant 气泡；若静默规划轮最终产出普通文本，Runner 只补发一个合并后的可见 `model.delta`，避免长文本逐 token 回放压住 SSE/EventStore；模型若把自然语言和单个工具 fenced block 混在一起，会优先本地挽救并规范化轻微 schema 偏差，其他非法格式才进入一次 LLM 工具请求修复。SSE 对 `queued/running` run 使用短轮询，对非活跃状态保持普通轮询和 heartbeat。`Last-Event-ID` 与 `after_sequence` 是 run-scoped cursor；若客户端把其他 run 的较大 cursor 带到当前 run，后端会在 cursor 大于当前 `last_event_sequence` 时重置为 0 重放当前 run 事件，避免 heartbeat-only 连接。为避免 worker 崩溃、进程重启或前端错过终态导致 UI 无限“正在思考”，Agent read paths 会用最新 EventStore 事件时间识别超过 `AGENT_RUN_STALE_TIMEOUT_SECONDS` 的 `queued/running` run，并写入 `run.failed(agent_run_stale_worker_lost)` 作为可审计终态；若 DeepSeek 已产生部分内容后流式连接中断，Runner 写入 `model.stream_interrupted` 并尽量用 partial content 继续解析/完成，避免用户可见结果为空。Agent 同时具备软件测试领域的通用自然语言回答能力：测试理论、用例设计、接口/WebSocket 测试、断言、测试数据、缺陷定位、回归策略、CI 和报告解读等不需要项目实时事实或平台副作用的问题，可以直接通过 `model.delta`/`run.completed.result.message` 回答；超出软件测试领域的问题必须说明边界。工具结果质量闭环由 `ToolResultPolicy` 统一实现：任何成功 ToolCall 输出中的 `warnings`、`issues`、`diagnostics`、`errors` 或 `valid=false` 都会被抽取并拆分为可自动修复项、用户/外部配置阻断项和待模型继续判断项；按工具推荐的修复路径由各 `ToolSpec.tool_result_repair_guidance` 后端私有字段声明，策略层只负责读取元数据和通用 fallback；失败 ToolCall 若错误属于输入、schema、validation、草稿结构或字段格式，也会进入修复闭环；若修复后同一工具连续两次以相同 `error_code` 与 `error_message` 失败，Runner 会写入 stop 用 ContextBuild 与 `loop.observed(RC_NO_PROGRESS_PURE)`，并以 `run.failed(agent_repair_no_progress)` 停止继续消耗模型和工具循环；硬编码字段、结构校验、提取器、断言 expected、数据集、schema/type/format 等可由平台数据或安全工具推断的问题，应优先通过 read/query/draft/validate/dry-run 工具继续修复或验证，鉴权令牌、账号密码、密钥、审批或没有平台来源的私有输入才交给用户。工具结果后的最终回复默认只输出已完成、已自动修复/验证、剩余阻断项和下一步，完整草稿结构和长 JSON 留在 ToolCall/summary/report 详情中。场景组合仍是当前强约束 recipe，但规则来源已收口到 Skill/ToolSpec：`scenario-composition/SKILL.md` 的私有 `routing_required_tool_after_success` 负责 query 成功后缺 compose 的静默修复，且可用 `intent_markers` 把 follow-up 限定在生成、创建、组合、执行场景、场景草稿、dry-run、数据集/参数化等明确场景编排意图内；`scenario.compose_draft` 的 ToolSpec 私有 `required_successful_tool_before` 负责执行前顺序校验。直接 compose 会被 Runner 以 `scenario_compose_requires_case_query` 阻断并回灌给模型纠正；query 成功但模型没有继续 compose 时，只有命中 `intent_markers` 才会写入 `model.required_tool_missing(after_tool, required_tool)`，绑定修复用 decision ContextBuild，写入 `loop.observed(RC_REQUIRED_TOOL_FOLLOWUP_MISSING)` 并静默修复。纯项目上下文、资源盘点或“是否已有场景”这类只读问题即使命中 scenario Skill，也允许在 read/query 工具后直接给最终总结。保存/持久化这类副作用遵循 Skill 声明式语义 guardrail：`guard_unsupported_capability` 声明缺失工具集合、预检查关键词、分类 prompt、分类 JSON 字段、最终消息资源和 completion source；Runner 只解释规则，只有分类确认用户要求正式持久化且 ToolRegistry 没有对应工具时，才以 `unsupported_scenario_save_guard` 说明当前无法保存；“不要保存/仅生成草稿”的请求继续走 query-first 组合链路。
+
+ToolPolicyResolver 会把工具策略判定固化到 `AgentToolCall.policy_reason_json.policy_context`：该 envelope 记录 `policy_version_hash`、tool name/version、base/resolved side effect、base/resolved replay policy、approval policy、approval reason、active/volatile/frozen policy evidence 计数、mixed evidence 标记和 `policy_hash`。这样 ToolCall Detail、Runbook 和后续评测可以从一个稳定 hash 解释“为什么该工具需要审批、为什么 replay policy 被提升为 require_revalidation、以及本次策略解析基于哪些证据类别”，形态上更接近 openai/codex per-turn `approval_policy` 与工具上下文，但不暴露原始 evidence 内容。
+
+ToolExecutor 会把执行侧上下文固化到 `AgentToolCall.policy_reason_json.execution_context`：成功提交效果、backend capability guard 阻断、审批/权限 guard 阻断、backend exception 失败以及 eventstore 写入失败后的 uncertain recovery，都会记录 tool/run/runtime snapshot、worker、tool status、execution/effect state、backend contract/schema hash/effect capability、resolved policy、approval lineage/epoch/approved approval、input/output hash、recovery decision、error code、error message hash 与 `execution_context_hash`。这让 ToolCall Detail、Runbook 和评测能够从同一个摘要解释“本次工具执行由哪个审批 lineage 放行、打到了哪个后端契约、是否跨过效果边界、失败或恢复原因是什么”，形态上继续对齐 openai/codex 的 `ToolCtx`/`ApprovalCtx`/sandbox attempt 组合，但不复制原始 input、output、evidence 或 error message。Runbook 诊断在 `tool_call_uncertain` 和 `backend_capability_degraded` recommendation 的 `details.execution_context` 中只嵌入白名单摘要，使恢复面板能直接展示执行上下文，同时仍要求完整 payload 通过 ToolCall Detail 按权限读取。
+
+`AgentBackendCompletionAuditService.audit` 把这条执行诊断链纳入后端完成度验收面：`runtime_contracts` 声明 ToolCall execution context 来源、Runbook 白名单摘要来源和摘要字段；`diagnostics` 声明 ToolCall Detail 与 Runbook diagnosis 跳转入口；`observability_and_release_gate.details` 同步输出摘要字段，供交付验收确认执行上下文、Runbook 和诊断入口已经成为后端完成边界。该 audit 仍只做能力和入口摘要，不触发 live provider，不复制原始 input/output/evidence/error message，也不替代 ToolCall Detail 的权限校验。
+
+同一个用户问题在 Agent loop 中可能触发多次 LLM 调用，后端通过 `iteration_id`、`model_call_id`、`loop_step` 把 `model.started`、`model.delta`、`model.markdown_normalized`、`model.completed`、`model.stream_interrupted` 串成可追踪的调用链，并通过嵌套 `loop_state` envelope 明确 `iteration`、`phase`、`step`、`model_call_id`、`tool_call_id` 与 `decision_reason`。旧顶层 trace 字段继续保留，方便前端兼容；新 envelope 让评测报告和调试 UI 可以区分普通回答、工具规划、工具请求修复、必需工具修复、工具执行/观察、最终总结和意图能力 guard，也让前端不再把工具规划轮的暂时无 delta 误判为后端卡死。工具前置条件被 Harness 阻断时，runner 会同时创建修复用 decision ContextBuild 和 `loop.observed`，以 `RC_TOOL_PREREQUISITE_MISSING` 记录需要先调用的 prerequisite tool；模型输出非法 `agent_tool_request` 时同样以 `RC_TOOL_REQUEST_FORMAT_INVALID` 记录格式修复决策，避免这些可恢复纠错只表现为普通审计事件或 `tool.failed`。
+
+当工具闭环达到 `run.max_iterations` 后仍需要给用户最终总结时，Runner 会先绑定 stop 用 decision ContextBuild，并写入 `loop.observed(RC_MAX_ITERATIONS)`，`next_action=stop`、`reasons=[max_iterations]`，再进入 `final_summary` 模型调用。这让迭代上限从隐式 for-loop 退出变成可审计 Resource / Limit 决策；前端和 Runbook 应把它展示为 stop observation，而不是 assistant 文本或普通工具失败。`AgentMetricsService.snapshot` 也会按 LoopObservation 的 stop reason 输出运行时纠错/停止指标：`tool_prerequisite_missing_total`、`tool_request_format_invalid_total`、`required_tool_followup_missing_total`、`max_iterations_total` 与 `same_failure_no_progress_total`，并纳入 dashboard `metrics_catalog_complete`，防止已审计的 Agent 循环纠错原因只停留在事件流里。`AgentRunbookService.diagnose_run` 会把这些已知运行时 repair/stop observation 聚合为 `agent_runtime_loop_repair` recommendation，携带 observation id、RootCause、stop reason 和 mitigation，作为 loop diagnostics 的跳转入口。
+
+DeepSeek stream 只在首个 `delta/done` 前做可配置重试，避免 provider 首包前 SSL EOF、连接重置或短暂 5xx 直接让 run 失败；每次 retry 写入 `model.stream_retrying`，payload 只包含 attempt、delay 和安全错误摘要，不包含 prompt、API key 或请求体。若已经收到 partial content 后才断流，则保持 `model.stream_interrupted` 路径，用 partial content 尽量继续完成，避免重复输出。
+
+数据库连接池默认开启 pre-ping、recycle、MySQL connect timeout 和 pool size/overflow/timeout 配置。SQLAlchemy transient disconnect 进入统一错误处理分支，返回 503 `database_connection_lost` 与 `Retry-After: 1`，并 dispose 当前 engine pool，让后续请求重新建连；业务响应不暴露 SQL、DSN 或堆栈。
+
+为提高多轮 agent 的 provider prompt/cache 命中率，Runner 构造系统提示时保持稳定前缀：ToolRegistry 清单按工具名排序，工具 JSON 使用固定字段排序和紧凑分隔符序列化；只要工具集合和策略版本未变，同一 runtime hash 下重复构建的系统提示字符串应保持一致。
+
+Runner 同时对服务端 conversation history 执行轻量上下文预算控制：同一会话历史最多取最近若干轮，估算 token 超过预算时把较早轮次压成一个 system 摘要，并保留最近完整轮次的截断内容；压缩会写入 `context.history_compacted` 审计事件，前端和评测可以据此区分“长历史被压缩”与“历史丢失”。
 
 ## 3. 架构分层
 
@@ -150,6 +171,53 @@ AI 能力按正式 skill 包组织，不把长 prompt 写在 Router 或业务 Se
 要求固定 JSON 根对象、字段名不能拆行、字符串内不输出真实控制字符，断言必须使用
 `expected` 字段。模型输出仍被视为不可信，必须经过 JSON 修复、业务归一化和 Pydantic
 Schema 校验后才能作为草稿返回。
+
+### 3.6 Harness Agent Skills
+
+Harness Loop Agent 的对话型能力采用 Codex 风格的渐进加载 Skill 目录，而不是把所有业务规则长期硬编码在 `AgentConversationRunner` 主 prompt 中。
+
+| 模块 | 职责 |
+| --- | --- |
+| `app/agent_skills/{skill_name}/SKILL.md` | 可复用 Agent Skill，使用 `name`、`description`、后端私有 `triggers` 以及 `guard_*` / `routing_*` frontmatter 描述目录、触发范围和窄 guard 预检查；正文记录工具顺序、业务边界和输出约束；同目录可放置后端私有 prompt 资源 |
+| `app/services/agent_skill_registry.py` | 读取、校验、排序并缓存 Skill；提供前端元数据 catalog，并按每个 Skill 自带的 `triggers` 和 description 选择相关 Skill；后端可读取私有 routing hints（例如 `routing_requires_tool`、带 `intent_markers` 的 `routing_required_tool_after_success`）和 Skill-local 私有资源文本，但不会把它们放入 catalog 或 prompt block |
+| `GET /api/v1/agents/skills` | 只返回 `{name,description}` 元数据，Skill 正文仅供后端运行时注入，不作为前端可见指令 |
+| `AgentConversationRunner` | 系统 prompt 只携带稳定 Skill catalog；每次 run 根据用户 intent 注入相关 Skill 正文 |
+
+`ContextBuilder` 会在 `build_metadata_json` 中记录本轮实际选中的 Agent Skill 摘要、匹配到的私有 routing rule 摘要、run 当前 RuntimeSnapshot 摘要和当前操作者的项目权限上下文摘要。Skill 侧只保存 name/hash、after_tool/required_tool/rule_hash 等诊断字段，不落私有规则原文或 Skill 正文；runtime 侧只保存 snapshot id、runtime/tool registry/manifest/prompt/policy hash、available tool names 和 tool count，不复制完整工具 schema；permission 侧只保存 actor/project/access level、显式权限码列表/count 和 permission hash，不复制用户资料或完整授权表。这样 required-tool follow-up、unsupported capability guard、工具前置阻断、权限相关停止决策和后续 Runbook 都能从 decision ContextBuild 追溯“为什么这轮模型被要求继续调用某个工具，以及当时基于哪版工具/策略/权限环境”，形态上接近 openai/codex 的 per-turn `TurnContext`，但仍保持前端 catalog 只读元数据边界。
+
+当前内置 Agent Skill：
+
+- `general-testing-answer`：软件测试、自动化、接口/WebSocket、断言、提取器、测试数据、缺陷、CI、报告等通用问答。
+- `project-context`：当前项目上下文、真实项目用例、资源和实时平台事实读取；通过 `project.read_context` 或 `testcase.query_project_cases` 取得证据。
+- `project-permission-admin`：项目、成员、角色、管理员、项目创建者、普通测试人员、权限码、项目访问和 403 授权失败诊断；没有权限写入 ToolCall 时只给管理员操作清单。
+- `environment-config-management`：多环境、默认环境、`base_url`、环境变量、鉴权变量、变量替换和多环境绑定建议；真实环境事实通过 `project.read_context` 取得。
+- `security-auth-testing`：鉴权、认证、授权、JWT/token/session/cookie、权限边界、越权、限流、CSRF 和安全负向测试；真实令牌或权限状态必须由工具证据确认，私密凭据不能编造或输出。
+- `api-definition-import`：OpenAPI/Swagger、接口定义、接口资产、endpoint catalog、path/method/schema 提取和从接口生成用例规划；缺少接口资产写入工具时不声称导入或保存。
+- `ai-skill-runtime-governance`：AI Skill 包、manifest/schema、prompt、JSON 修复、模型输出、provider 状态和 AI Skill Run 可观测诊断；生成结果始终保持草稿边界直到保存工具确认。
+- `http-test-case-design`：HTTP/API 测试用例设计、生成、扩写、断言、提取器、变量、请求体和 Schema 校验；需要草稿时通过 `ai_skill.run_draft` 调用 `http-test-case`，需要结构校验时使用 `testcase.validate_schema`。
+- `websocket-test-case-design`：WebSocket 握手、鉴权 header、子协议、消息顺序、接收断言、超时、ping/pong 和关闭行为；需要草稿时通过 `ai_skill.run_draft` 调用 `websocket-test-case`。
+- `assertion-extractor-binding`：断言、提取器、变量路径、响应字段、上下游参数流和变量绑定修复；真实路径必须来自响应样本、执行详情或报告证据。
+- `test-asset-lifecycle`：测试资产标签、目录、复制、重命名、删除、归档、版本历史和依赖影响评估；破坏性操作必须先确认引用和历史记录边界。
+- `visual-flow-design`：可视化 Flow DAG、HTTP/WebSocket 节点、条件、延迟、数据绑定、节点执行和 Flow 报告/执行记录诊断；没有 Flow 写入 ToolCall 时不声称保存流程。
+- `scenario-composition`：测试场景创建、组合、校验、dry-run、数据驱动、保存边界和 query-first 工具链。
+- `dataset-parameterization`：场景数据集、records、参数化、CSV/JSON 测试数据、请求覆盖、每 record 独立运行和数据驱动执行建议；缺少数据集写入工具时不声称导入或保存。
+- `mock-service-virtualization`：Mock API、stub、fake dependency、服务虚拟化、挡板和契约模拟设计；缺少 mock 写入工具时只输出契约和规则草案，不声称创建 Mock 服务。
+- `test-plan-management`：测试计划、计划目标、冒烟/回归套件、覆盖率、发布准入、计划运行和计划报告分析；真实计划结果优先从报告摘要读取。
+- `ci-release-integration`：CI/CD、Jenkins/GitLab/GitHub Actions、webhook、定时回归、发布门禁和部署准入设计；缺少流水线写入工具时只输出集成契约，不声称配置已生效。
+- `batch-execution-scheduling`：批量执行、调度、队列、worker、并发、超时、重试、取消和执行顺序治理；真实队列或运行状态需由工具证据确认。
+- `execution-diagnosis`：HTTP/WebSocket/场景/Flow 执行失败、flaky、超时、重试、断言/提取失败、SSE 卡住和环境不匹配诊断；优先复用 `report.read_summary` 与 `project.read_context`。
+- `api-error-contract-debugging`：统一错误响应、HTTP 状态码、`request_id`、422 校验错误、401/403/404/409/500 和前端错误展示契约排障；不泄露内部堆栈或密钥。
+- `notification-alerting-config`：通知、告警、邮件、SMTP、webhook、失败/完成提醒和 release gate 消息配置设计；缺少通知写入或投递工具时不声称已发送。
+- `report-summary`：报告摘要、执行结果、通过率、失败原因和缺陷建议；通过 `report.read_summary` 读取最近测试报告、失败报告样本、状态统计和返回页内用例通过率。
+- `report-archive-export`：HTML/PDF 导出、报告归档、历史趋势、保留周期、分享链接和审计证据设计；缺少导出/归档工具时不声称生成文件或持久化归档。
+- `data-privacy-redaction`：敏感数据、PII、token/cookie/key、日志、报告、截图、签名 URL 和 AI prompt 脱敏治理；最终回复不复述原始密钥或个人信息。
+- `migration-compatibility-planning`：数据库迁移、Alembic、API 兼容、历史数据修复、旧客户端、上线顺序和回滚规划；真实迁移状态必须验证后再陈述。
+- `defect-triage`：缺陷草拟、分类、严重程度/优先级、复现步骤、截图/媒体证据和生命周期建议；当前没有缺陷写入 ToolCall 时只输出待保存草稿，不声称创建或更新缺陷。
+- `media-evidence-management`：截图、附件、媒体证据、MinIO 对象、预签名 URL、格式校验、脱敏和删除/孤儿对象风险说明；缺少媒体工具时只输出证据处理清单。
+- `browser-capture-analysis`：Chrome 插件/浏览器采集流量清洗、脱敏、去重、业务动作分组和转 HTTP/WebSocket 用例建议；需要草稿时复用 HTTP/WebSocket AI Skill，缺少采集写入工具时不声称导入或保存。
+- `agent-runtime-operations`：Agent Run、SSE/EventStore、model streaming、readiness dashboard、runbook、worker queue、stale run、Memory usage、model health 和行为评测诊断。
+
+新增 Agent 能力时优先添加或修改独立 `SKILL.md` 的正文、`triggers` 和必要的私有 `guard_*` / `routing_*` hints；窄 guard 或 classifier 的长提示词与 guard 最终回复放入同 Skill 目录的私有资源文件，再用 registry 单测锁定触发范围；需要表达“用户要求的能力当前缺少后端工具”的边界时，优先新增 `guard_unsupported_capability` 规则，而不是在 Runner 中新增业务专用 guard。需要强制静默工具规划或漏调用修复的实时平台事实请求应优先补充 `routing_requires_tool` 或 `routing_required_tool_after_success`，其中 follow-up 规则应配置足够窄的 `intent_markers`，避免只读查询被 broad trigger 误推进到写草稿/执行类工具；不要为了新增业务领域继续修改中央 prompt 或硬编码 Python 路由表。只有需要稳定审计、权限、幂等、EventStore、ToolCall 生命周期、执行前安全顺序校验或工具结果修复路径的规则才下沉到 Runner/ToolRegistry 代码中。ToolRegistry 的内置 `ToolSpec` 同时声明后端私有 `backend_handler`、可选 `required_successful_tool_before` 和可选 `tool_result_repair_guidance`，`AgentToolBackend` 从 spec 解析执行函数，Runner 从 spec 解析前置工具要求，`ToolResultPolicy` 从 spec 解析工具结果修复 guidance，避免工具 manifest、执行 map、前置校验和修复策略分叉；这些后端私有字段不进入 `to_json()`、模型初始工具清单或前端契约。
 
 ## 4. 核心业务模块
 

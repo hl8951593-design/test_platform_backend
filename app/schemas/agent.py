@@ -118,6 +118,11 @@ class AgentRunSummaryRead(BaseModel):
     updated_at: datetime
 
 
+class AgentSkillRead(BaseModel):
+    name: str
+    description: str
+
+
 class AgentRunActionRead(BaseModel):
     action_id: str
     label: str

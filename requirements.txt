@@ -27,6 +27,7 @@ PyMySQL==1.2.0
 python-dotenv==1.2.2
 python-multipart>=0.0.9,<1
 SQLAlchemy==2.0.50
+socksio==1.0.0
 starlette==1.2.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0

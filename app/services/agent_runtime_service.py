@@ -5,6 +5,7 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
@@ -13,6 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.sensitive_data import mask_sensitive, request_fingerprint
 from app.models.agent import (
     AgentApproval,
@@ -29,10 +31,17 @@ from app.models.agent import (
 )
 from app.models.user import User
 from app.schemas.ai import AIChatMessage, AIChatRequest
-from app.schemas.agent import AgentRunCreateRequest, AgentToolCallCreateRequest
+from app.schemas.agent import (
+    AgentContextBuildCreateRequest,
+    AgentLoopObservationCreateRequest,
+    AgentRunCreateRequest,
+    AgentToolCallCreateRequest,
+)
 from app.services.agent_approval_service import ApprovalService, PolicyManager
-from app.services.agent_loop_service import EvidenceRefResolver, EvidenceWatchService
+from app.services.agent_loop_service import ContextBuilder, EvidenceRefResolver, EvidenceWatchService, LoopController
 from app.services.agent_memory_service import MemoryCandidate, MemoryManager
+from app.services.agent_skill_registry import AgentSkill, AgentSkillRegistry
+from app.services.agent_tool_result_policy import FINAL_RESPONSE_BUDGET_INSTRUCTION, build_tool_result_message
 from app.services.ai_service import AIService
 from app.services.agent_tool_service import AgentToolBackend, SAFE_SIDE_EFFECT_CLASSES, ToolPolicyResolver, ToolRegistry
 from app.services.permission_service import PermissionService
@@ -41,6 +50,7 @@ from app.services.permission_service import PermissionService
 logger = logging.getLogger(__name__)
 
 RUN_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+RUN_STALE_ACTIVE_STATUSES = {"queued", "running"}
 RUN_STATUSES = ["queued", "running", "paused", "completed", "failed", "cancelled", "migration_blocked", "needs_human"]
 TOOL_CALL_STATUSES = [
     "planned",
@@ -81,11 +91,18 @@ AGENT_CONVERSATION_SYSTEM_PROMPT = (
     "Memory、Runbook 和 Dashboard 契约为边界。"
     "当需要平台上下文或草稿能力时，只能通过下方工具协议提出一次工具调用，"
     "不要假装已经完成真实工具副作用。"
-    "如果用户要求创建、生成或组合测试场景、测试用例、报告摘要等平台对象，必须优先调用可用工具，"
+    "如果用户要求创建、生成、读取或分析平台对象，必须优先遵循已加载 Agent Skill 和可用工具，"
     "不要仅用自然语言答复。当前 Agent Run 已携带 project_id，除非工具确实缺少不可推断字段，否则不要向用户反问 project_id。"
-    "当用户要求创建或组合场景组合时，必须先调用 testcase.query_project_cases 查询当前项目测试用例，"
-    "再根据工具返回的真实用例 id 调用 scenario.compose_draft。"
 )
+AGENT_SKILL_CATALOG_PROMPT = """
+Agent Skill 目录如下。它们采用 Codex 式渐进加载：模型始终可见 name/description；当用户目标命中某个 Skill 时，后端会额外注入该 Skill 的正文流程。
+{skills}
+
+选择行为：
+- 先根据用户目标和 Skill description 判断任务类型。
+- 已加载 Skill 正文时，优先遵循正文中的 workflow、tool boundary、output 和 done criteria。
+- 未加载 Skill 正文时，只使用基础平台规则和可用工具，不要臆造未声明能力。
+""".strip()
 AGENT_MARKDOWN_RESPONSE_PROMPT = """
 面向用户的自然语言回复必须严格遵守 GitHub Flavored Markdown：
 - 不要把整段回复包在 ```markdown fenced block 中。
@@ -109,6 +126,65 @@ AGENT_TOOL_PROTOCOL_PROMPT = """
 """.strip()
 TOOL_REQUEST_BLOCK_RE = re.compile(r"```agent_tool_request\s*(?P<body>\{.*?\})\s*```", re.S)
 MARKDOWN_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
+AGENT_MODEL_DELTA_FLUSH_INTERVAL_SECONDS = 0.35
+AGENT_MODEL_DELTA_FLUSH_CHARS = 240
+AGENT_MODEL_STREAM_CANCEL_CHECK_INTERVAL_SECONDS = 0.2
+AGENT_HISTORY_CONTEXT_MAX_RUNS = 12
+AGENT_HISTORY_CONTEXT_TOKEN_BUDGET = 2400
+AGENT_HISTORY_CONTEXT_FULL_TURNS = 4
+AGENT_HISTORY_CONTEXT_SUMMARY_CHARS = 360
+AGENT_HISTORY_CONTEXT_RECENT_USER_CHARS = 800
+AGENT_HISTORY_CONTEXT_RECENT_ASSISTANT_CHARS = 1200
+
+
+REQUIRES_TOOL_ROUTING_KEY = "routing_requires_tool"
+REQUIRED_TOOL_AFTER_SUCCESS_ROUTING_KEY = "routing_required_tool_after_success"
+UNSUPPORTED_CAPABILITY_GUARD_KEY = "guard_unsupported_capability"
+
+
+@dataclass(frozen=True)
+class RequiredToolFollowupRule:
+    after_tool: str
+    required_tool: str
+    min_total_fields: tuple[str, ...] = ()
+    intent_markers: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class UnsupportedCapabilityGuard:
+    skill_name: str
+    name: str
+    intent_key: str
+    subject_key: str
+    unavailable_tools: tuple[str, ...]
+    classifier_prompt_key: str
+    requires_field: str
+    completion_source: str
+    message_key: str
+    synthetic_reason: str
+
+
+@dataclass(frozen=True)
+class AgentToolRequest:
+    tool_name: str
+    tool_input: dict[str, Any]
+    reason: str | None = None
+    evidence_refs: tuple[dict[str, Any], ...] = ()
+
+    def input_for_ledger(self) -> dict[str, Any]:
+        return dict(self.tool_input)
+
+    def evidence_refs_for_ledger(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self.evidence_refs]
+
+    def detected_event_payload(self, *, iteration: int) -> dict[str, Any]:
+        return {
+            "iteration": iteration,
+            "tool_name": self.tool_name,
+            "reason": self.reason,
+            "decision_reason": self.reason,
+        }
+
 
 AGENT_RUN_FIELDS = (
     "run_id",
@@ -542,7 +618,7 @@ class AgentRuntimeService:
     def get_run(self, *, run_id: str, current_user: User) -> AgentRun:
         run = self._get_run_or_404(run_id)
         self.permission_service.require_project_access(current_user, run.project_id)
-        return run
+        return self._fail_stale_active_run_if_needed(run)
 
     def get_run_summary(self, *, run_id: str, current_user: User) -> dict[str, Any]:
         run = self.get_run(run_id=run_id, current_user=current_user)
@@ -808,11 +884,15 @@ class AgentRuntimeService:
             statement = statement.where(AgentRun.conversation_id == conversation_id)
         if status_filter:
             statement = statement.where(AgentRun.status == status_filter)
-        return list(
+        runs = list(
             self.db.scalars(
                 statement.order_by(AgentRun.updated_at.desc(), AgentRun.id.desc()).limit(limit)
             ).all()
         )
+        runs = [self._fail_stale_active_run_if_needed(run) for run in runs]
+        if status_filter:
+            runs = [run for run in runs if run.status == status_filter]
+        return runs
 
     def _count_where(self, *criteria, model) -> int:
         return int(
@@ -832,6 +912,53 @@ class AgentRuntimeService:
         if event is None:
             return {}
         return dict(event.payload_json or {})
+
+    def _latest_event_created_at(self, run_id: str) -> datetime | None:
+        return self.db.scalar(
+            select(AgentEvent.created_at)
+            .where(AgentEvent.run_id == run_id)
+            .order_by(AgentEvent.event_seq.desc())
+            .limit(1)
+        )
+
+    def _fail_stale_active_run_if_needed(self, run: AgentRun) -> AgentRun:
+        if run.status not in RUN_STALE_ACTIVE_STATUSES:
+            return run
+        timeout_seconds = float(settings.AGENT_RUN_STALE_TIMEOUT_SECONDS or 0)
+        if timeout_seconds <= 0:
+            return run
+        last_activity_at = self._latest_event_created_at(run.run_id) or run.updated_at or run.started_at or run.created_at
+        if last_activity_at is None:
+            return run
+        idle_seconds = _activity_idle_seconds(last_activity_at)
+        if idle_seconds < timeout_seconds:
+            return run
+
+        locked_run = self.db.scalar(select(AgentRun).where(AgentRun.id == run.id).with_for_update())
+        if locked_run is None or locked_run.status not in RUN_STALE_ACTIVE_STATUSES:
+            return locked_run or run
+        latest_event_at = self._latest_event_created_at(locked_run.run_id) or locked_run.updated_at or locked_run.started_at or locked_run.created_at
+        latest_idle_seconds = _activity_idle_seconds(latest_event_at) if latest_event_at is not None else idle_seconds
+        if latest_idle_seconds < timeout_seconds:
+            return locked_run
+
+        logger.warning(
+            "agent_run_mark_stale_failed run_id=%s status=%s idle_seconds=%s timeout_seconds=%s last_event_sequence=%s",
+            locked_run.run_id,
+            locked_run.status,
+            int(latest_idle_seconds),
+            int(timeout_seconds),
+            locked_run.last_event_sequence,
+        )
+        return self.fail_run(
+            locked_run,
+            error_code="agent_run_stale_worker_lost",
+            error_message=(
+                "Agent run did not produce events before the stale timeout; "
+                "the background worker may have stopped before writing a terminal event."
+            ),
+            commit=True,
+        )
 
     def _ids_where(self, column, *criteria, model) -> list[str]:
         return [
@@ -881,6 +1008,7 @@ class AgentRuntimeService:
                 .order_by(AgentRun.updated_at.desc(), AgentRun.id.desc())
             ).all()
         )
+        runs = [self._fail_stale_active_run_if_needed(run) for run in runs]
         conversations: dict[str, dict[str, Any]] = {}
         for run in runs:
             if run.conversation_id is None:
@@ -902,6 +1030,10 @@ class AgentRuntimeService:
                 }
             else:
                 existing["run_count"] += 1
+                if run.updated_at > existing["updated_at"]:
+                    existing["latest_run_id"] = run.run_id
+                    existing["latest_run_status"] = run.status
+                    existing["updated_at"] = run.updated_at
                 if run.created_at < existing["created_at"]:
                     existing["created_at"] = run.created_at
                     existing["title"] = title
@@ -928,6 +1060,7 @@ class AgentRuntimeService:
         runs = list(self.db.scalars(statement).all())
         if not runs:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent conversation 不存在")
+        runs = [self._fail_stale_active_run_if_needed(run) for run in runs]
 
         run_count = self._count_where(
             AgentRun.project_id == project_id,
@@ -1053,6 +1186,8 @@ class AgentRuntimeService:
 
     def list_events(self, *, run_id: str, after_sequence: int) -> tuple[list[AgentEvent], AgentRun]:
         run = self._get_run_or_404(run_id)
+        run = self._fail_stale_active_run_if_needed(run)
+        after_sequence = self._normalize_event_cursor(run=run, after_sequence=after_sequence)
         events = list(self.db.scalars(
             select(AgentEvent)
             .where(AgentEvent.run_id == run_id, AgentEvent.event_seq > after_sequence)
@@ -1069,6 +1204,7 @@ class AgentRuntimeService:
         current_user: User,
     ) -> dict[str, Any]:
         run = self.get_run(run_id=run_id, current_user=current_user)
+        after_sequence = self._normalize_event_cursor(run=run, after_sequence=after_sequence)
         events = list(self.db.scalars(
             select(AgentEvent)
             .where(AgentEvent.run_id == run_id, AgentEvent.event_seq > after_sequence)
@@ -1086,6 +1222,18 @@ class AgentRuntimeService:
             "terminal": run.status in RUN_TERMINAL_STATUSES,
             "generated_at": _utcnow(),
         }
+
+    def _normalize_event_cursor(self, *, run: AgentRun, after_sequence: int) -> int:
+        if after_sequence <= (run.last_event_sequence or 0):
+            return after_sequence
+        logger.info(
+            "agent_event_cursor_reset run_id=%s after_sequence=%s latest_event_sequence=%s status=%s",
+            run.run_id,
+            after_sequence,
+            run.last_event_sequence,
+            run.status,
+        )
+        return 0
 
     def append_event(
         self,
@@ -1310,8 +1458,14 @@ class AgentConversationRunner:
                 chunks=chunks,
                 iteration=run.current_iteration,
                 final_summary=True,
+                trace_payload=_model_trace_from_payload(clean_model_payload),
             )
-            self._emit_model_deltas(run=run, runtime=runtime, chunks=chunks)
+            self._emit_model_deltas(
+                run=run,
+                runtime=runtime,
+                chunks=chunks,
+                trace_payload=_model_trace_from_payload(clean_model_payload),
+            )
             runtime.append_event(
                 run,
                 "model.completed",
@@ -1369,6 +1523,10 @@ class AgentConversationRunner:
                 run.conversation_id,
                 run.max_iterations,
             )
+            unsupported_guard = self._unsupported_capability_guard_for_run(run)
+            if unsupported_guard is not None:
+                return self._complete_unsupported_capability(run=run, runtime=runtime, guard=unsupported_guard)
+
             messages = self._build_chat_messages(run, current_user=user, runtime=runtime)
             tool_summaries: list[dict[str, Any]] = []
             for iteration in range(max(1, run.max_iterations)):
@@ -1377,6 +1535,7 @@ class AgentConversationRunner:
                     messages=messages,
                     runtime=runtime,
                     iteration=iteration,
+                    suppress_visible_deltas=self._should_suppress_realtime_deltas(run),
                 )
                 self.db.refresh(run)
                 if run.status in RUN_TERMINAL_STATUSES:
@@ -1387,9 +1546,11 @@ class AgentConversationRunner:
                 except HTTPException as exc:
                     content, chunks, clean_model_payload, tool_request = self._repair_invalid_tool_request(
                         run=run,
+                        current_user=user,
                         messages=messages,
                         invalid_content=content,
                         error_message=_http_exception_detail(exc),
+                        model_payload=clean_model_payload,
                         runtime=runtime,
                         iteration=iteration,
                     )
@@ -1397,36 +1558,57 @@ class AgentConversationRunner:
                     if run.status in RUN_TERMINAL_STATUSES:
                         return run
                 if tool_request is None:
-                    content, chunks = self._normalize_user_visible_markdown(
-                        run=run,
-                        runtime=runtime,
-                        content=content,
-                        chunks=chunks,
-                        iteration=iteration,
-                        final_summary=False,
-                    )
-                    self._emit_model_deltas(run=run, runtime=runtime, chunks=chunks)
-                    runtime.append_event(
-                        run,
-                        "model.completed",
-                        {
-                            "content": content,
-                            "iteration": iteration,
-                            "requested_tool": False,
-                            **clean_model_payload,
-                        },
-                        commit=False,
-                    )
-                    result = {"message": content, **clean_model_payload}
-                    if tool_summaries:
-                        result["tool_calls"] = tool_summaries
-                    logger.info(
-                        "agent_conversation_complete_without_tool run_id=%s iteration=%s content_length=%s",
-                        run.run_id,
-                        iteration,
-                        len(content),
-                    )
-                    return runtime.complete_run(run, result, commit=True)
+                    missing_required_tool = self._missing_required_tool_after_model_response(run)
+                    if missing_required_tool is not None:
+                        content, chunks, clean_model_payload, tool_request = self._repair_missing_required_tool_request(
+                            run=run,
+                            current_user=user,
+                            messages=messages,
+                            invalid_content=content,
+                            required_followup=missing_required_tool,
+                            runtime=runtime,
+                            iteration=iteration,
+                        )
+                        self.db.refresh(run)
+                        if run.status in RUN_TERMINAL_STATUSES:
+                            return run
+                    if tool_request is None:
+                        content, chunks = self._normalize_user_visible_markdown(
+                            run=run,
+                            runtime=runtime,
+                            content=content,
+                            chunks=chunks,
+                            iteration=iteration,
+                            final_summary=False,
+                            trace_payload=_model_trace_from_payload(clean_model_payload),
+                        )
+                        self._emit_model_deltas(
+                            run=run,
+                            runtime=runtime,
+                            chunks=chunks,
+                            trace_payload=_model_trace_from_payload(clean_model_payload),
+                        )
+                        runtime.append_event(
+                            run,
+                            "model.completed",
+                            {
+                                "content": content,
+                                "iteration": iteration,
+                                "requested_tool": False,
+                                **clean_model_payload,
+                            },
+                            commit=False,
+                        )
+                        result = {"message": content, **clean_model_payload}
+                        if tool_summaries:
+                            result["tool_calls"] = tool_summaries
+                        logger.info(
+                            "agent_conversation_complete_without_tool run_id=%s iteration=%s content_length=%s",
+                            run.run_id,
+                            iteration,
+                            len(content),
+                        )
+                        return runtime.complete_run(run, result, commit=True)
 
                 runtime.append_event(
                     run,
@@ -1443,9 +1625,8 @@ class AgentConversationRunner:
                     run,
                     "model.tool_request_detected",
                     {
-                        "iteration": iteration,
-                        "tool_name": tool_request["tool_name"],
-                        "reason": tool_request.get("reason"),
+                        **tool_request.detected_event_payload(iteration=iteration),
+                        **_model_trace_from_payload(clean_model_payload),
                     },
                     commit=True,
                 )
@@ -1453,8 +1634,8 @@ class AgentConversationRunner:
                     "agent_tool_request_detected run_id=%s iteration=%s tool_name=%s reason=%s",
                     run.run_id,
                     iteration,
-                    tool_request["tool_name"],
-                    tool_request.get("reason"),
+                    tool_request.tool_name,
+                    tool_request.reason,
                 )
                 self.db.refresh(run)
                 if run.status in RUN_TERMINAL_STATUSES:
@@ -1478,15 +1659,40 @@ class AgentConversationRunner:
                 self.db.refresh(run)
                 if run.status == "needs_human":
                     return run
+                previous_failed_call = self._previous_same_failed_tool_call(run=run, call=call)
+                if previous_failed_call is not None:
+                    self._record_tool_no_progress_loop_observation(
+                        run=run,
+                        current_user=user,
+                        previous_call=previous_failed_call,
+                        repeated_call=call,
+                    )
+                    return runtime.fail_run(
+                        run,
+                        error_code="agent_repair_no_progress",
+                        error_message=(
+                            f"Agent stopped because {call.tool_name} failed twice with the same error "
+                            "during repair."
+                        ),
+                        commit=True,
+                    )
                 messages.append(AIChatMessage(role="user", content=_tool_result_message(call)))
 
+            self._record_max_iterations_loop_observation(
+                run=run,
+                current_user=user,
+                tool_summaries=tool_summaries,
+            )
             content, chunks, model_payload = self._stream_model_response(
                 run=run,
                 messages=[
                     *messages,
                     AIChatMessage(
                         role="user",
-                        content="工具迭代次数已达到上限。请基于当前已返回的工具结果给出最终总结，不要再请求工具。",
+                        content=(
+                            "工具迭代次数已达到上限。请基于当前已返回的工具结果给出最终总结，不要再请求工具。"
+                            f"\n{FINAL_RESPONSE_BUDGET_INSTRUCTION}"
+                        ),
                     ),
                 ],
                 runtime=runtime,
@@ -1504,8 +1710,14 @@ class AgentConversationRunner:
                 chunks=chunks,
                 iteration=run.max_iterations,
                 final_summary=True,
+                trace_payload=_model_trace_from_payload(clean_model_payload),
             )
-            self._emit_model_deltas(run=run, runtime=runtime, chunks=chunks)
+            self._emit_model_deltas(
+                run=run,
+                runtime=runtime,
+                chunks=chunks,
+                trace_payload=_model_trace_from_payload(clean_model_payload),
+            )
             runtime.append_event(
                 run,
                 "model.completed",
@@ -1542,6 +1754,450 @@ class AgentConversationRunner:
                 commit=True,
             )
 
+    def _unsupported_capability_guard_for_run(self, run: AgentRun) -> UnsupportedCapabilityGuard | None:
+        available_tools = {spec.name for spec in ToolRegistry().list_specs()}
+        for guard in _unsupported_capability_guards_for_intent(run.intent):
+            if any(tool_name in available_tools for tool_name in guard.unavailable_tools):
+                continue
+            if self._classify_unsupported_capability_intent(run, guard):
+                return guard
+        return None
+
+    def _classify_unsupported_capability_intent(self, run: AgentRun, guard: UnsupportedCapabilityGuard) -> bool:
+        classifier_prompt = _unsupported_capability_classifier_prompt(guard)
+        if classifier_prompt is None:
+            logger.warning(
+                "agent_unsupported_capability_classifier_prompt_missing run_id=%s skill_name=%s guard_name=%s",
+                run.run_id,
+                guard.skill_name,
+                guard.name,
+            )
+            return False
+        messages = [
+            AIChatMessage(role="system", content=classifier_prompt),
+            AIChatMessage(
+                role="user",
+                content=(
+                    "请根据系统分类规则判断下面的用户请求是否需要触发当前能力 guard。\n\n"
+                    f"用户请求：{run.intent}"
+                ),
+            ),
+        ]
+        try:
+            response = AIService().chat(
+                AIChatRequest(
+                    messages=messages,
+                    temperature=0,
+                    max_tokens=200,
+                    response_format="json",
+                )
+            )
+        except HTTPException as exc:
+            logger.warning(
+                "agent_unsupported_capability_classification_failed run_id=%s guard_name=%s error=%s",
+                run.run_id,
+                guard.name,
+                _http_exception_detail(exc),
+            )
+            return False
+
+        try:
+            payload = json.loads(response.content)
+        except ValueError:
+            logger.warning(
+                "agent_unsupported_capability_classification_invalid_json run_id=%s guard_name=%s content=%s",
+                run.run_id,
+                guard.name,
+                response.content[:500],
+            )
+            return False
+
+        requires_guard = bool(payload.get(guard.requires_field))
+        logger.info(
+            "agent_unsupported_capability_classified run_id=%s guard_name=%s requires_guard=%s confidence=%s reason=%s",
+            run.run_id,
+            guard.name,
+            requires_guard,
+            payload.get("confidence"),
+            payload.get("reason"),
+        )
+        return requires_guard
+
+    def _complete_unsupported_capability(
+        self,
+        *,
+        run: AgentRun,
+        runtime: AgentRuntimeService,
+        guard: UnsupportedCapabilityGuard,
+    ) -> AgentRun:
+        message = _unsupported_capability_message(guard) or (
+            f"当前 Agent 可用工具中缺少 `{guard.name}` 对应的后端能力，"
+            "我不能假装已经完成该操作。请先补充对应工具后再让我执行。"
+        )
+        trace_payload = _loop_trace_payload(
+            run=run,
+            iteration=0,
+            loop_step="intent_capability_guard",
+            model_call_id=_new_model_call_id(run=run, iteration=0, loop_step="intent_capability_guard"),
+        )
+        runtime.append_event(
+            run,
+            "model.started",
+            {
+                "provider": "harness",
+                "iteration": 0,
+                "synthetic": True,
+                "reason": guard.synthetic_reason,
+                **trace_payload,
+            },
+            commit=True,
+        )
+        runtime.append_event(run, "model.delta", {"content": message, **trace_payload}, commit=True)
+        runtime.append_event(
+            run,
+            "model.completed",
+            {
+                "content": message,
+                "iteration": 0,
+                "requested_tool": False,
+                "synthetic": True,
+                "reason": guard.synthetic_reason,
+                **trace_payload,
+            },
+            commit=False,
+        )
+        return runtime.complete_run(
+            run,
+            {
+                "message": message,
+                "completion_source": guard.completion_source,
+            },
+            commit=True,
+        )
+
+    def _should_suppress_realtime_deltas(self, run: AgentRun) -> bool:
+        return _intent_likely_requires_agent_tool(run.intent)
+
+    def _missing_required_tool_after_model_response(self, run: AgentRun) -> RequiredToolFollowupRule | None:
+        for rule in _required_tool_followup_rules_for_intent(run.intent):
+            if self._has_successful_tool_call(run, rule.required_tool):
+                continue
+            after_call = self._latest_successful_tool_call(run, rule.after_tool)
+            if after_call is None:
+                continue
+            if rule.min_total_fields and not _tool_output_min_total_satisfied(
+                after_call.output_json_redacted,
+                rule.min_total_fields,
+            ):
+                continue
+            return rule
+        return None
+
+    def _latest_successful_tool_call(self, run: AgentRun, tool_name: str) -> AgentToolCall | None:
+        return self.db.scalar(
+            select(AgentToolCall)
+            .where(
+                AgentToolCall.run_id == run.run_id,
+                AgentToolCall.tool_name == tool_name,
+                AgentToolCall.status == "succeeded",
+            )
+            .order_by(AgentToolCall.id.desc())
+            .limit(1)
+        )
+
+    def _repair_missing_required_tool_request(
+        self,
+        *,
+        run: AgentRun,
+        current_user: User,
+        messages: list[AIChatMessage],
+        invalid_content: str,
+        required_followup: RequiredToolFollowupRule,
+        runtime: AgentRuntimeService,
+        iteration: int,
+    ) -> tuple[str, list[str], dict[str, Any], AgentToolRequest | None]:
+        runtime.append_event(
+            run,
+            "model.required_tool_missing",
+            {
+                "iteration": iteration,
+                "after_tool": required_followup.after_tool,
+                "required_tool": required_followup.required_tool,
+                "content_preview": invalid_content[:500],
+            },
+            commit=True,
+        )
+        self._record_required_tool_followup_loop_observation(
+            run=run,
+            current_user=current_user,
+            iteration=iteration,
+            invalid_content=invalid_content,
+            required_followup=required_followup,
+        )
+        repair_messages = [
+            *messages,
+            AIChatMessage(role="assistant", content=invalid_content),
+            AIChatMessage(
+                role="user",
+                content=(
+                    f"用户目标要求继续调用 `{required_followup.required_tool}`；"
+                    f"该调用必须发生在 `{required_followup.after_tool}` 成功后，"
+                    "但上一条回复只输出了自然语言。"
+                    f"请基于最新 `{required_followup.after_tool}` 工具结果，"
+                    f"只输出一个合法的 ```agent_tool_request fenced JSON block 来调用 "
+                    f"`{required_followup.required_tool}`。"
+                    "不要输出候选用例分析、解释或最终总结；分析内容应写进工具 input.requirement 或 input.extra_requirements。"
+                ),
+            ),
+        ]
+        repaired_content, repaired_chunks, repaired_payload = self._stream_model_response(
+            run=run,
+            messages=repair_messages,
+            runtime=runtime,
+            iteration=iteration,
+            repair_attempt=True,
+            suppress_visible_deltas=True,
+            loop_step="required_tool_repair",
+        )
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return repaired_content, repaired_chunks, repaired_payload, None
+        clean_payload = {key: value for key, value in repaired_payload.items() if value is not None}
+        try:
+            tool_request = self._parse_tool_request(repaired_content)
+        except HTTPException as exc:
+            runtime.append_event(
+                run,
+                "model.required_tool_repair_failed",
+                {
+                    "iteration": iteration,
+                    "after_tool": required_followup.after_tool,
+                    "required_tool": required_followup.required_tool,
+                    "error_message": _http_exception_detail(exc),
+                    "content_preview": repaired_content[:500],
+                },
+                commit=True,
+            )
+            raise
+        runtime.append_event(
+            run,
+            "model.required_tool_repaired",
+            {
+                "iteration": iteration,
+                "after_tool": required_followup.after_tool,
+                "required_tool": required_followup.required_tool,
+                "requested_tool": tool_request is not None,
+                "tool_name": tool_request.tool_name if tool_request else None,
+            },
+            commit=True,
+        )
+        return repaired_content, repaired_chunks, clean_payload, tool_request
+
+    def _record_required_tool_followup_loop_observation(
+        self,
+        *,
+        run: AgentRun,
+        current_user: User,
+        iteration: int,
+        invalid_content: str,
+        required_followup: RequiredToolFollowupRule,
+    ) -> None:
+        content_preview = invalid_content[:500]
+        build = ContextBuilder(self.db).build(
+            run_id=run.run_id,
+            payload=AgentContextBuildCreateRequest(
+                build_purpose="repair",
+                step_index=run.current_step_index,
+                token_budget=1024,
+                evidence_refs=[
+                    {
+                        "evidence_ref_id": f"model-output:{run.run_id}:iter-{iteration}:required-followup",
+                        "ref_type": "model_output",
+                        "ref_id": f"{run.run_id}:iter-{iteration}:required-followup",
+                        "mutability_class": "immutable",
+                        "dependency_role": "audit_background",
+                        "active_for_policy": False,
+                        "content_hash": request_fingerprint(
+                            {
+                                "after_tool": required_followup.after_tool,
+                                "required_tool": required_followup.required_tool,
+                                "content_preview": content_preview,
+                            }
+                        ),
+                    }
+                ],
+                required_evidence_ref_ids=[],
+            ),
+            current_user=current_user,
+            commit=False,
+        )
+        LoopController(self.db).record_observation(
+            run_id=run.run_id,
+            payload=AgentLoopObservationCreateRequest(
+                decision_context_build_id=build.context_build_id,
+                next_action="repair",
+                next_action_is_high_risk=False,
+                reasons=["required_tool_followup_missing"],
+                observation={
+                    "source": "required_tool_followup_guard",
+                    "after_tool": required_followup.after_tool,
+                    "required_tool": required_followup.required_tool,
+                    "content_preview": content_preview,
+                },
+            ),
+            current_user=current_user,
+        )
+
+    def _record_max_iterations_loop_observation(
+        self,
+        *,
+        run: AgentRun,
+        current_user: User,
+        tool_summaries: list[dict[str, Any]],
+    ) -> None:
+        tool_call_ids: list[str] = []
+        evidence_refs: list[dict[str, Any]] = []
+        for summary in tool_summaries:
+            if not summary.get("tool_call_id"):
+                continue
+            tool_call_id = str(summary["tool_call_id"])
+            tool_call_ids.append(tool_call_id)
+            evidence_refs.append({
+                "evidence_ref_id": f"tool-call:{tool_call_id}",
+                "ref_type": "tool_call",
+                "ref_id": tool_call_id,
+                "mutability_class": "immutable",
+                "dependency_role": "audit_background",
+                "active_for_policy": False,
+                "content_hash": request_fingerprint(summary),
+            })
+        if not evidence_refs:
+            evidence_refs = [
+                {
+                    "evidence_ref_id": f"run:{run.run_id}:max-iterations",
+                    "ref_type": "agent_run",
+                    "ref_id": run.run_id,
+                    "mutability_class": "immutable",
+                    "dependency_role": "audit_background",
+                    "active_for_policy": False,
+                    "content_hash": request_fingerprint(
+                        {
+                            "run_id": run.run_id,
+                            "max_iterations": run.max_iterations,
+                            "current_iteration": run.current_iteration,
+                        }
+                    ),
+                }
+            ]
+        build = ContextBuilder(self.db).build(
+            run_id=run.run_id,
+            payload=AgentContextBuildCreateRequest(
+                build_purpose="stop",
+                step_index=run.current_step_index,
+                token_budget=1024,
+                evidence_refs=evidence_refs,
+                required_evidence_ref_ids=[],
+            ),
+            current_user=current_user,
+            commit=False,
+        )
+        LoopController(self.db).record_observation(
+            run_id=run.run_id,
+            payload=AgentLoopObservationCreateRequest(
+                decision_context_build_id=build.context_build_id,
+                next_action="stop",
+                next_action_is_high_risk=False,
+                reasons=["max_iterations"],
+                observation={
+                    "source": "max_iteration_guard",
+                    "max_iterations": run.max_iterations,
+                    "current_iteration": run.current_iteration,
+                    "final_summary_iteration": run.max_iterations,
+                    "tool_call_count": len(tool_summaries),
+                    "tool_call_ids": tool_call_ids,
+                },
+            ),
+            current_user=current_user,
+        )
+
+    def _previous_same_failed_tool_call(self, *, run: AgentRun, call: AgentToolCall) -> AgentToolCall | None:
+        current_signature = _tool_failure_signature(call)
+        if current_signature is None:
+            return None
+        previous = self.db.scalar(
+            select(AgentToolCall)
+            .where(
+                AgentToolCall.run_id == run.run_id,
+                AgentToolCall.id < call.id,
+            )
+            .order_by(AgentToolCall.id.desc())
+            .limit(1)
+        )
+        if previous is None:
+            return None
+        if _tool_failure_signature(previous) != current_signature:
+            return None
+        return previous
+
+    def _record_tool_no_progress_loop_observation(
+        self,
+        *,
+        run: AgentRun,
+        current_user: User,
+        previous_call: AgentToolCall,
+        repeated_call: AgentToolCall,
+    ) -> None:
+        evidence_refs = []
+        for call in (previous_call, repeated_call):
+            evidence_refs.append({
+                "evidence_ref_id": f"tool-call:{call.tool_call_id}",
+                "ref_type": "tool_call",
+                "ref_id": call.tool_call_id,
+                "mutability_class": "immutable",
+                "dependency_role": "audit_background",
+                "active_for_policy": False,
+                "content_hash": call.output_hash
+                or request_fingerprint(
+                    {
+                        "tool_call_id": call.tool_call_id,
+                        "tool_name": call.tool_name,
+                        "status": call.status,
+                        "error_code": call.error_code,
+                        "error_message": call.error_message,
+                    }
+                ),
+            })
+        build = ContextBuilder(self.db).build(
+            run_id=run.run_id,
+            payload=AgentContextBuildCreateRequest(
+                build_purpose="stop",
+                step_index=run.current_step_index,
+                token_budget=1024,
+                evidence_refs=evidence_refs,
+                required_evidence_ref_ids=[],
+            ),
+            current_user=current_user,
+            commit=False,
+        )
+        LoopController(self.db).record_observation(
+            run_id=run.run_id,
+            payload=AgentLoopObservationCreateRequest(
+                decision_context_build_id=build.context_build_id,
+                next_action="stop",
+                next_action_is_high_risk=False,
+                reasons=["same_failure_no_progress"],
+                observation={
+                    "source": "tool_result_no_progress_guard",
+                    "tool_name": repeated_call.tool_name,
+                    "error_code": repeated_call.error_code,
+                    "error_message": repeated_call.error_message,
+                    "repeat_count": 2,
+                    "tool_call_ids": [previous_call.tool_call_id, repeated_call.tool_call_id],
+                },
+            ),
+            current_user=current_user,
+        )
+
     def _stream_model_response(
         self,
         *,
@@ -1551,9 +2207,22 @@ class AgentConversationRunner:
         iteration: int,
         final_summary: bool = False,
         repair_attempt: bool = False,
+        suppress_visible_deltas: bool = False,
+        loop_step: str | None = None,
     ) -> tuple[str, list[str], dict[str, Any]]:
         content_parts: list[str] = []
-        model_payload: dict[str, Any] = {}
+        resolved_loop_step = loop_step or _default_model_loop_step(
+            final_summary=final_summary,
+            repair_attempt=repair_attempt,
+            suppress_visible_deltas=suppress_visible_deltas,
+        )
+        trace_payload = _loop_trace_payload(
+            run=run,
+            iteration=iteration,
+            loop_step=resolved_loop_step,
+            model_call_id=_new_model_call_id(run=run, iteration=iteration, loop_step=resolved_loop_step),
+        )
+        model_payload: dict[str, Any] = dict(trace_payload)
         runtime.append_event(
             run,
             "model.started",
@@ -1562,6 +2231,7 @@ class AgentConversationRunner:
                 "iteration": iteration,
                 "final_summary": final_summary,
                 "repair_attempt": repair_attempt,
+                **trace_payload,
             },
             commit=True,
         )
@@ -1577,59 +2247,179 @@ class AgentConversationRunner:
         request = AIChatRequest(messages=messages, temperature=0.2)
         deltas_emitted = False
         first_delta_logged = False
-        for item in AIService().chat_stream(request):
+        pending_visible_deltas: list[str] = []
+        pending_visible_chars = 0
+        last_delta_flush_at = time.monotonic()
+        last_cancel_check_at = 0.0
+        tool_request_marker_seen = False
+        stream_interrupted = False
+
+        def should_stop_stream(*, force: bool = False) -> bool:
+            nonlocal last_cancel_check_at
+            current = time.monotonic()
+            if not force and current - last_cancel_check_at < AGENT_MODEL_STREAM_CANCEL_CHECK_INTERVAL_SECONDS:
+                return False
+            last_cancel_check_at = current
             self.db.refresh(run)
-            if run.status in RUN_TERMINAL_STATUSES:
-                break
-            if item.get("type") == "delta":
-                delta = str(item.get("content") or "")
-                if delta:
-                    content_parts.append(delta)
-                    content = "".join(content_parts)
-                    if deltas_emitted:
-                        if not first_delta_logged:
-                            logger.info(
-                                "agent_model_first_delta run_id=%s iteration=%s final_summary=%s",
-                                run.run_id,
-                                iteration,
-                                final_summary,
-                            )
-                            first_delta_logged = True
-                        runtime.append_event(run, "model.delta", {"content": delta}, commit=True)
-                    elif not _should_hold_for_tool_request_detection(content):
-                        deltas_emitted = True
-                        if not first_delta_logged:
-                            logger.info(
-                                "agent_model_first_delta run_id=%s iteration=%s final_summary=%s",
-                                run.run_id,
-                                iteration,
-                                final_summary,
-                            )
-                            first_delta_logged = True
-                        for pending_delta in content_parts:
-                            runtime.append_event(run, "model.delta", {"content": pending_delta}, commit=True)
-            elif item.get("type") == "done":
-                model_payload = {
-                    "provider": AIService.provider,
-                    "model": item.get("model"),
-                    "finish_reason": item.get("finish_reason"),
-                    "usage": item.get("usage"),
-                }
+            return run.status in RUN_TERMINAL_STATUSES
+
+        def log_first_delta_once() -> None:
+            nonlocal first_delta_logged
+            if first_delta_logged:
+                return
+            logger.info(
+                "agent_model_first_delta run_id=%s iteration=%s final_summary=%s",
+                run.run_id,
+                iteration,
+                final_summary,
+            )
+            first_delta_logged = True
+
+        def flush_visible_delta(*, force: bool = False) -> None:
+            nonlocal last_cancel_check_at, pending_visible_chars, last_delta_flush_at
+            if not pending_visible_deltas:
+                return
+            current = time.monotonic()
+            if (
+                not force
+                and pending_visible_chars < AGENT_MODEL_DELTA_FLUSH_CHARS
+                and current - last_delta_flush_at < AGENT_MODEL_DELTA_FLUSH_INTERVAL_SECONDS
+            ):
+                return
+            if should_stop_stream(force=force):
+                pending_visible_deltas.clear()
+                pending_visible_chars = 0
+                last_delta_flush_at = current
+                return
+            delta = "".join(pending_visible_deltas)
+            pending_visible_deltas.clear()
+            pending_visible_chars = 0
+            last_delta_flush_at = current
+            log_first_delta_once()
+            runtime.append_event(run, "model.delta", {"content": delta, **trace_payload}, commit=True)
+            last_cancel_check_at = 0.0
+
+        def queue_visible_delta(delta: str, *, immediate: bool = False) -> None:
+            nonlocal pending_visible_chars
+            if suppress_visible_deltas:
+                return
+            pending_visible_deltas.append(delta)
+            pending_visible_chars += len(delta)
+            flush_visible_delta(force=immediate)
+
+        try:
+            for item in AIService().chat_stream(request):
+                if should_stop_stream():
+                    break
+                if item.get("type") == "retry":
+                    retry_payload = {
+                        "provider": AIService.provider,
+                        "iteration": iteration,
+                        "final_summary": final_summary,
+                        "repair_attempt": repair_attempt,
+                        "attempt": item.get("attempt"),
+                        "max_retries": item.get("max_retries"),
+                        "delay_seconds": item.get("delay_seconds"),
+                        "error_message": item.get("error_message"),
+                        **trace_payload,
+                    }
+                    runtime.append_event(run, "model.stream_retrying", retry_payload, commit=True)
+                    logger.warning(
+                        "agent_model_stream_retrying run_id=%s iteration=%s final_summary=%s attempt=%s max_retries=%s error=%s",
+                        run.run_id,
+                        iteration,
+                        final_summary,
+                        item.get("attempt"),
+                        item.get("max_retries"),
+                        item.get("error_message"),
+                    )
+                    continue
+                if item.get("type") == "delta":
+                    delta = str(item.get("content") or "")
+                    if delta:
+                        content_parts.append(delta)
+                        content = "".join(content_parts)
+                        if "```agent_tool_request" in content:
+                            tool_request_marker_seen = True
+                            pending_visible_deltas.clear()
+                            pending_visible_chars = 0
+                            continue
+                        if suppress_visible_deltas:
+                            continue
+                        if deltas_emitted:
+                            queue_visible_delta(delta)
+                        elif not _should_hold_for_tool_request_detection(content):
+                            deltas_emitted = True
+                            for pending_delta in content_parts:
+                                queue_visible_delta(pending_delta, immediate=True)
+                elif item.get("type") == "done":
+                    model_payload = {
+                        **trace_payload,
+                        "provider": AIService.provider,
+                        "model": item.get("model"),
+                        "finish_reason": item.get("finish_reason"),
+                        "usage": item.get("usage"),
+                    }
+        except HTTPException as exc:
+            if not content_parts:
+                raise
+            stream_interrupted = True
+            detail = _http_exception_detail(exc)
+            model_payload = {
+                **trace_payload,
+                "provider": AIService.provider,
+                "finish_reason": "stream_interrupted",
+                "stream_interrupted": True,
+                "error_message": detail,
+            }
+            runtime.append_event(
+                run,
+                "model.stream_interrupted",
+                {
+                    "iteration": iteration,
+                    "final_summary": final_summary,
+                    "repair_attempt": repair_attempt,
+                    "content_length": len("".join(content_parts)),
+                    "error_message": detail,
+                    **trace_payload,
+                },
+                commit=True,
+            )
+            logger.warning(
+                "agent_model_stream_interrupted run_id=%s iteration=%s final_summary=%s content_length=%s error=%s",
+                run.run_id,
+                iteration,
+                final_summary,
+                len("".join(content_parts)),
+                detail,
+            )
+        flush_visible_delta(force=True)
         content = "".join(content_parts).strip()
-        if content_parts and not deltas_emitted and not _looks_like_tool_request_content(content):
-            if not first_delta_logged:
-                logger.info(
-                    "agent_model_first_delta run_id=%s iteration=%s final_summary=%s",
-                    run.run_id,
-                    iteration,
-                    final_summary,
-                )
-                first_delta_logged = True
+        if (
+            content_parts
+            and not suppress_visible_deltas
+            and not deltas_emitted
+            and not _looks_like_tool_request_content(content)
+        ):
             for pending_delta in content_parts:
-                runtime.append_event(run, "model.delta", {"content": pending_delta}, commit=True)
+                queue_visible_delta(pending_delta)
+            flush_visible_delta(force=True)
             deltas_emitted = True
+        if tool_request_marker_seen and deltas_emitted:
+            runtime.append_event(
+                run,
+                "model.tool_request_stream_suppressed",
+                {
+                    "iteration": iteration,
+                    "final_summary": final_summary,
+                    "repair_attempt": repair_attempt,
+                    "content_length": len(content),
+                    **trace_payload,
+                },
+                commit=True,
+            )
         logger.info(
-            "agent_model_stream_done run_id=%s iteration=%s final_summary=%s content_length=%s deltas_emitted=%s finish_reason=%s model=%s",
+            "agent_model_stream_done run_id=%s iteration=%s final_summary=%s content_length=%s deltas_emitted=%s finish_reason=%s model=%s stream_interrupted=%s",
             run.run_id,
             iteration,
             final_summary,
@@ -1637,7 +2427,12 @@ class AgentConversationRunner:
             deltas_emitted,
             model_payload.get("finish_reason"),
             model_payload.get("model"),
+            stream_interrupted,
         )
+        if suppress_visible_deltas and not deltas_emitted:
+            if content and not _looks_like_tool_request_content(content):
+                return content, [content], model_payload
+            return content, [], model_payload
         return content, [] if deltas_emitted else content_parts, model_payload
 
     def _emit_model_deltas(
@@ -1646,12 +2441,14 @@ class AgentConversationRunner:
         run: AgentRun,
         runtime: AgentRuntimeService,
         chunks: list[str],
+        trace_payload: dict[str, Any] | None = None,
     ) -> None:
+        trace_payload = trace_payload or {}
         for delta in chunks:
             self.db.refresh(run)
             if run.status in RUN_TERMINAL_STATUSES:
                 return
-            runtime.append_event(run, "model.delta", {"content": delta}, commit=True)
+            runtime.append_event(run, "model.delta", {"content": delta, **trace_payload}, commit=True)
 
     def _normalize_user_visible_markdown(
         self,
@@ -1662,6 +2459,7 @@ class AgentConversationRunner:
         chunks: list[str],
         iteration: int,
         final_summary: bool,
+        trace_payload: dict[str, Any] | None = None,
     ) -> tuple[str, list[str]]:
         normalized = _normalize_agent_markdown_response(content)
         if normalized == content:
@@ -1684,15 +2482,33 @@ class AgentConversationRunner:
                 "normalized_length": len(normalized),
                 "content": normalized,
                 "replace_content": True,
+                **(trace_payload or {}),
             },
             commit=False,
         )
         return normalized, [normalized] if chunks else chunks
 
-    def _parse_tool_request(self, content: str) -> dict[str, Any] | None:
+    def _parse_tool_request(
+        self,
+        content: str,
+        *,
+        allow_surrounding_text: bool = False,
+        normalize_evidence_refs: bool = False,
+    ) -> AgentToolRequest | None:
         raw = None
         match = TOOL_REQUEST_BLOCK_RE.search(content)
         if match:
+            surrounding = (content[:match.start()] + content[match.end():]).strip()
+            if surrounding and not allow_surrounding_text:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="模型工具请求必须只包含 agent_tool_request fenced JSON block，不能混合自然语言",
+                )
+            if allow_surrounding_text and TOOL_REQUEST_BLOCK_RE.search(content, match.end()):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="模型工具请求只能包含一个 agent_tool_request fenced JSON block",
+                )
             raw = match.group("body")
         else:
             stripped = content.strip()
@@ -1704,39 +2520,48 @@ class AgentConversationRunner:
             payload = json.loads(raw)
         except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="模型工具请求不是合法 JSON",
             ) from exc
         tool_name = payload.get("tool_name")
         if not isinstance(tool_name, str) or not tool_name:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="模型工具请求缺少 tool_name")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型工具请求缺少 tool_name")
         tool_input = payload.get("input", {})
         if tool_input is None:
             tool_input = {}
         if not isinstance(tool_input, dict):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="模型工具 input 必须是对象")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型工具 input 必须是对象")
         evidence_refs = payload.get("evidence_refs", [])
         if evidence_refs is None:
             evidence_refs = []
+        if normalize_evidence_refs:
+            if isinstance(evidence_refs, dict):
+                evidence_refs = [evidence_refs] if evidence_refs else []
+            elif isinstance(evidence_refs, list):
+                evidence_refs = [item for item in evidence_refs if isinstance(item, dict)]
+            else:
+                evidence_refs = []
         if not isinstance(evidence_refs, list) or not all(isinstance(item, dict) for item in evidence_refs):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="模型工具 evidence_refs 必须是对象列表")
-        return {
-            "tool_name": tool_name,
-            "input": tool_input,
-            "reason": payload.get("reason") if isinstance(payload.get("reason"), str) else None,
-            "evidence_refs": evidence_refs,
-        }
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型工具 evidence_refs 必须是对象列表")
+        return AgentToolRequest(
+            tool_name=tool_name,
+            tool_input=dict(tool_input),
+            reason=payload.get("reason") if isinstance(payload.get("reason"), str) else None,
+            evidence_refs=tuple(dict(item) for item in evidence_refs),
+        )
 
     def _repair_invalid_tool_request(
         self,
         *,
         run: AgentRun,
+        current_user: User,
         messages: list[AIChatMessage],
         invalid_content: str,
         error_message: str,
+        model_payload: dict[str, Any],
         runtime: AgentRuntimeService,
         iteration: int,
-    ) -> tuple[str, list[str], dict[str, Any], dict[str, Any] | None]:
+    ) -> tuple[str, list[str], dict[str, Any], AgentToolRequest | None]:
         runtime.append_event(
             run,
             "model.tool_request_invalid",
@@ -1744,9 +2569,34 @@ class AgentConversationRunner:
                 "iteration": iteration,
                 "error_message": error_message,
                 "content_preview": invalid_content[:500],
+                **_model_trace_from_payload(model_payload),
             },
             commit=True,
         )
+        self._record_invalid_tool_request_loop_observation(
+            run=run,
+            current_user=current_user,
+            iteration=iteration,
+            invalid_content=invalid_content,
+            error_message=error_message,
+            model_payload=model_payload,
+        )
+        salvaged_tool_request = self._try_salvage_mixed_tool_request(invalid_content)
+        if salvaged_tool_request is not None:
+            runtime.append_event(
+                run,
+                "model.tool_request_repaired",
+                {
+                    "iteration": iteration,
+                    "requested_tool": True,
+                    "tool_name": salvaged_tool_request.tool_name,
+                    "repair_strategy": "salvaged_fenced_tool_request",
+                    **_model_trace_from_payload(model_payload),
+                },
+                commit=True,
+            )
+            return invalid_content, [], model_payload, salvaged_tool_request
+
         repair_messages = [
             *messages,
             AIChatMessage(role="assistant", content=invalid_content),
@@ -1766,6 +2616,7 @@ class AgentConversationRunner:
             runtime=runtime,
             iteration=iteration,
             repair_attempt=True,
+            suppress_visible_deltas=True,
         )
         self.db.refresh(run)
         if run.status in RUN_TERMINAL_STATUSES:
@@ -1781,6 +2632,7 @@ class AgentConversationRunner:
                     "iteration": iteration,
                     "error_message": _http_exception_detail(exc),
                     "content_preview": repaired_content[:500],
+                    **_model_trace_from_payload(clean_payload),
                 },
                 commit=True,
             )
@@ -1791,37 +2643,116 @@ class AgentConversationRunner:
             {
                 "iteration": iteration,
                 "requested_tool": tool_request is not None,
-                "tool_name": tool_request["tool_name"] if tool_request else None,
+                "tool_name": tool_request.tool_name if tool_request else None,
+                **_model_trace_from_payload(clean_payload),
             },
             commit=True,
         )
         return repaired_content, repaired_chunks, clean_payload, tool_request
+
+    def _record_invalid_tool_request_loop_observation(
+        self,
+        *,
+        run: AgentRun,
+        current_user: User,
+        iteration: int,
+        invalid_content: str,
+        error_message: str,
+        model_payload: dict[str, Any],
+    ) -> None:
+        model_call_id = model_payload.get("model_call_id")
+        content_preview = invalid_content[:500]
+        evidence_ref_id = f"model-call:{model_call_id}" if model_call_id else f"model-output:{run.run_id}:iter-{iteration}"
+        build = ContextBuilder(self.db).build(
+            run_id=run.run_id,
+            payload=AgentContextBuildCreateRequest(
+                build_purpose="repair",
+                step_index=run.current_step_index,
+                token_budget=1024,
+                evidence_refs=[
+                    {
+                        "evidence_ref_id": evidence_ref_id,
+                        "ref_type": "model_output",
+                        "ref_id": str(model_call_id or f"{run.run_id}:iter-{iteration}"),
+                        "mutability_class": "immutable",
+                        "dependency_role": "audit_background",
+                        "active_for_policy": False,
+                        "content_hash": request_fingerprint({
+                            "content_preview": content_preview,
+                            "error_message": error_message,
+                        }),
+                    }
+                ],
+                required_evidence_ref_ids=[],
+            ),
+            current_user=current_user,
+            commit=False,
+        )
+        LoopController(self.db).record_observation(
+            run_id=run.run_id,
+            payload=AgentLoopObservationCreateRequest(
+                decision_context_build_id=build.context_build_id,
+                next_action="repair",
+                next_action_is_high_risk=False,
+                reasons=["tool_request_format_invalid"],
+                observation={
+                    "source": "tool_request_parse_guard",
+                    "model_call_id": model_call_id,
+                    "content_preview": content_preview,
+                    "error_message": error_message,
+                },
+            ),
+            current_user=current_user,
+        )
+
+    def _try_salvage_mixed_tool_request(self, content: str) -> AgentToolRequest | None:
+        match = TOOL_REQUEST_BLOCK_RE.search(content)
+        if match is None or TOOL_REQUEST_BLOCK_RE.search(content, match.end()):
+            return None
+        surrounding = (content[:match.start()] + content[match.end():]).strip()
+        if not surrounding:
+            return None
+        try:
+            return self._parse_tool_request(
+                content,
+                allow_surrounding_text=True,
+                normalize_evidence_refs=True,
+            )
+        except HTTPException:
+            return None
 
     def _create_and_execute_tool_request(
         self,
         *,
         run: AgentRun,
         current_user: User,
-        tool_request: dict[str, Any],
+        tool_request: AgentToolRequest,
         iteration: int,
     ) -> AgentToolCall:
         runtime = AgentRuntimeService(self.db)
         tool_input = self._normalize_tool_input(
             run=run,
-            tool_name=tool_request["tool_name"],
-            tool_input=dict(tool_request["input"]),
+            tool_name=tool_request.tool_name,
+            tool_input=tool_request.input_for_ledger(),
         )
         call = ExecutionLedgerService(self.db).create_tool_call(
             payload=AgentToolCallCreateRequest(
                 run_id=run.run_id,
-                tool_name=tool_request["tool_name"],
+                tool_name=tool_request.tool_name,
                 input=tool_input,
                 step_index=run.current_step_index,
                 attempt_index=iteration,
-                evidence_refs=tool_request["evidence_refs"],
+                evidence_refs=tool_request.evidence_refs_for_ledger(),
             ),
             current_user=current_user,
             enqueue=False,
+        )
+        tool_trace_payload = _loop_trace_payload(
+            run=run,
+            iteration=iteration,
+            loop_step="tool_execution",
+            tool_call_id=call.tool_call_id,
+            decision_reason=tool_request.reason,
         )
         self.db.refresh(run)
         if call.approval_required:
@@ -1837,6 +2768,7 @@ class AgentConversationRunner:
                     "reason": "tool_approval_required",
                     "tool_call_id": call.tool_call_id,
                     "tool_name": call.tool_name,
+                    **tool_trace_payload,
                 },
                 commit=False,
             )
@@ -1845,26 +2777,25 @@ class AgentConversationRunner:
             self.db.refresh(call)
             return call
 
-        if self._should_block_tool_request_before_execution(run=run, call=call):
+        missing_prerequisite_tool = self._missing_tool_prerequisite_before_execution(run=run, call=call)
+        if missing_prerequisite_tool is not None:
+            spec = ToolRegistry().get(call.tool_name)
             output = {
-                "required_tool": "testcase.query_project_cases",
+                "required_tool": missing_prerequisite_tool,
                 "blocked_tool": call.tool_name,
-                "next_action": (
-                    "Call testcase.query_project_cases for the current project, then use the returned "
-                    "test case ids when calling scenario.compose_draft."
+                "next_action": spec.missing_prerequisite_next_action or (
+                    f"Call {missing_prerequisite_tool} before calling {call.tool_name}."
                 ),
             }
             call.status = "failed"
             call.execution_phase = "blocked_by_harness"
-            call.error_code = "scenario_compose_requires_case_query"
+            call.error_code = spec.missing_prerequisite_error_code or "tool_prerequisite_required"
             call.error_message = (
-                "scenario.compose_draft requires a successful testcase.query_project_cases result "
+                f"{call.tool_name} requires a successful {missing_prerequisite_tool} result "
                 "in the same Agent Run before execution."
             )
             call.output_json_redacted = output
             call.output_hash = request_fingerprint(output)
-            run.current_iteration = iteration + 1
-            run.current_step_index += 1
             runtime.append_event(
                 run,
                 "tool.failed",
@@ -1873,6 +2804,7 @@ class AgentConversationRunner:
                     "tool_name": call.tool_name,
                     "error_code": call.error_code,
                     "error_message": call.error_message,
+                    **tool_trace_payload,
                 },
                 commit=False,
             )
@@ -1884,9 +2816,18 @@ class AgentConversationRunner:
                     "tool_name": call.tool_name,
                     "status": call.status,
                     "error_code": call.error_code,
+                    **tool_trace_payload,
                 },
                 commit=False,
             )
+            self._record_tool_prerequisite_loop_observation(
+                run=run,
+                current_user=current_user,
+                call=call,
+                required_tool=missing_prerequisite_tool,
+            )
+            run.current_iteration = iteration + 1
+            run.current_step_index += 1
             self.db.commit()
             self.db.refresh(run)
             self.db.refresh(call)
@@ -1908,6 +2849,7 @@ class AgentConversationRunner:
                 "tool_call_id": executed.tool_call_id,
                 "tool_name": executed.tool_name,
                 "status": executed.status,
+                **tool_trace_payload,
             },
             commit=False,
         )
@@ -1916,6 +2858,54 @@ class AgentConversationRunner:
         self.db.refresh(executed)
         return executed
 
+    def _record_tool_prerequisite_loop_observation(
+        self,
+        *,
+        run: AgentRun,
+        current_user: User,
+        call: AgentToolCall,
+        required_tool: str,
+    ) -> None:
+        build = ContextBuilder(self.db).build(
+            run_id=run.run_id,
+            payload=AgentContextBuildCreateRequest(
+                build_purpose="repair",
+                step_index=run.current_step_index,
+                token_budget=1024,
+                evidence_refs=[
+                    {
+                        "evidence_ref_id": f"tool-call:{call.tool_call_id}",
+                        "ref_type": "tool_call",
+                        "ref_id": call.tool_call_id,
+                        "mutability_class": "immutable",
+                        "dependency_role": "audit_background",
+                        "active_for_policy": False,
+                        "content_hash": call.output_hash,
+                    }
+                ],
+                required_evidence_ref_ids=[],
+            ),
+            current_user=current_user,
+            commit=False,
+        )
+        LoopController(self.db).record_observation(
+            run_id=run.run_id,
+            payload=AgentLoopObservationCreateRequest(
+                decision_context_build_id=build.context_build_id,
+                next_action="repair",
+                next_action_is_high_risk=False,
+                reasons=["tool_prerequisite_missing"],
+                observation={
+                    "source": "tool_prerequisite_guard",
+                    "tool_call_id": call.tool_call_id,
+                    "blocked_tool": call.tool_name,
+                    "required_tool": required_tool,
+                    "error_code": call.error_code,
+                },
+            ),
+            current_user=current_user,
+        )
+
     def _normalize_tool_input(self, *, run: AgentRun, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
         spec = ToolRegistry().get(tool_name)
         required = set((spec.input_schema or {}).get("required") or [])
@@ -1923,21 +2913,29 @@ class AgentConversationRunner:
             tool_input["project_id"] = run.project_id
         return tool_input
 
-    def _should_block_tool_request_before_execution(self, *, run: AgentRun, call: AgentToolCall) -> bool:
-        if call.tool_name != "scenario.compose_draft":
-            return False
-        return not self._has_successful_project_case_query(run)
+    def _missing_tool_prerequisite_before_execution(self, *, run: AgentRun, call: AgentToolCall) -> str | None:
+        prerequisite_tool = ToolRegistry().get(call.tool_name).required_successful_tool_before
+        if prerequisite_tool is None:
+            return None
+        if self._has_successful_tool_call(run, prerequisite_tool, before_tool_call_id=call.id):
+            return None
+        return prerequisite_tool
 
-    def _has_successful_project_case_query(self, run: AgentRun) -> bool:
-        return self.db.scalar(
-            select(AgentToolCall.tool_call_id)
-            .where(
-                AgentToolCall.run_id == run.run_id,
-                AgentToolCall.tool_name == "testcase.query_project_cases",
-                AgentToolCall.status == "succeeded",
-            )
-            .limit(1)
-        ) is not None
+    def _has_successful_tool_call(
+        self,
+        run: AgentRun,
+        tool_name: str,
+        *,
+        before_tool_call_id: int | None = None,
+    ) -> bool:
+        query = select(AgentToolCall.tool_call_id).where(
+            AgentToolCall.run_id == run.run_id,
+            AgentToolCall.tool_name == tool_name,
+            AgentToolCall.status == "succeeded",
+        )
+        if before_tool_call_id is not None:
+            query = query.where(AgentToolCall.id < before_tool_call_id)
+        return self.db.scalar(query.limit(1)) is not None
 
     def _build_chat_messages(
         self,
@@ -1948,6 +2946,7 @@ class AgentConversationRunner:
     ) -> list[AIChatMessage]:
         messages = [AIChatMessage(role="system", content=_conversation_system_prompt())]
         messages.append(AIChatMessage(role="system", content=_format_run_context(run)))
+        messages.extend(_agent_skill_messages(run.intent))
         memory_context = self._memory_context_message(run=run, current_user=current_user, runtime=runtime)
         if memory_context is not None:
             messages.append(memory_context)
@@ -1961,16 +2960,62 @@ class AgentConversationRunner:
                         AgentRun.id < run.id,
                     )
                     .order_by(AgentRun.id.desc())
-                    .limit(8)
+                    .limit(AGENT_HISTORY_CONTEXT_MAX_RUNS)
                 ).all()
             )
-            for previous in reversed(previous_runs):
-                messages.append(AIChatMessage(role="user", content=previous.intent))
-                assistant_content = _assistant_message_from_run(previous)
-                if assistant_content:
-                    messages.append(AIChatMessage(role="assistant", content=assistant_content))
+            history_messages, compaction_payload = self._conversation_history_messages(
+                previous_runs=list(reversed(previous_runs))
+            )
+            messages.extend(history_messages)
+            if compaction_payload is not None:
+                runtime.append_event(run, "context.history_compacted", compaction_payload, commit=True)
         messages.append(AIChatMessage(role="user", content=run.intent))
         return messages
+
+    def _conversation_history_messages(
+        self,
+        *,
+        previous_runs: list[AgentRun],
+    ) -> tuple[list[AIChatMessage], dict[str, Any] | None]:
+        pairs = [
+            {
+                "run_id": previous.run_id,
+                "status": previous.status,
+                "intent": previous.intent,
+                "assistant": _assistant_message_from_run(previous) or "",
+            }
+            for previous in previous_runs
+        ]
+        full_messages = _history_pairs_to_messages(pairs)
+        estimated_before = _estimate_chat_messages_tokens(full_messages)
+        if estimated_before <= AGENT_HISTORY_CONTEXT_TOKEN_BUDGET:
+            return full_messages, None
+
+        recent_count = min(AGENT_HISTORY_CONTEXT_FULL_TURNS, len(pairs))
+        older_pairs = pairs[:-recent_count] if recent_count else pairs
+        recent_pairs = pairs[-recent_count:] if recent_count else []
+        compacted_messages = []
+        if older_pairs:
+            compacted_messages.append(AIChatMessage(
+                role="system",
+                content=_compact_history_summary(older_pairs),
+            ))
+        compacted_messages.extend(_history_pairs_to_messages(
+            recent_pairs,
+            user_chars=AGENT_HISTORY_CONTEXT_RECENT_USER_CHARS,
+            assistant_chars=AGENT_HISTORY_CONTEXT_RECENT_ASSISTANT_CHARS,
+        ))
+        estimated_after = _estimate_chat_messages_tokens(compacted_messages)
+        payload = {
+            "original_run_count": len(pairs),
+            "compacted_run_count": len(older_pairs),
+            "kept_full_run_count": len(recent_pairs),
+            "estimated_tokens_before": estimated_before,
+            "estimated_tokens_after": estimated_after,
+            "token_budget": AGENT_HISTORY_CONTEXT_TOKEN_BUDGET,
+            "strategy": "summarize_older_keep_recent",
+        }
+        return compacted_messages, payload
 
     def _memory_context_message(
         self,
@@ -2307,6 +3352,24 @@ class AgentWorkerQueueService:
             self.db.commit()
 
 
+class AgentToolRuntime:
+    def __init__(
+        self,
+        db: Session,
+        *,
+        backend_factory: Callable[[Session], AgentToolBackend] = AgentToolBackend,
+    ):
+        self.db = db
+        self.backend_factory = backend_factory
+
+    def execute(self, *, call: AgentToolCall, current_user: User) -> dict[str, Any]:
+        return self.backend_factory(self.db).execute(
+            tool_name=call.tool_name,
+            payload=call.input_json_redacted,
+            current_user=current_user,
+        )
+
+
 class ToolExecutor:
     def __init__(
         self,
@@ -2314,11 +3377,13 @@ class ToolExecutor:
         *,
         runtime_factory: Callable[[Session], AgentRuntimeService] = AgentRuntimeService,
         backend_factory: Callable[[Session], AgentToolBackend] = AgentToolBackend,
+        tool_runtime_factory: Callable[..., AgentToolRuntime] = AgentToolRuntime,
     ):
         self.db = db
         self.policy_manager = PolicyManager(db)
         self.runtime_factory = runtime_factory
         self.backend_factory = backend_factory
+        self.tool_runtime_factory = tool_runtime_factory
 
     def execute_next(self, *, worker_id: str) -> AgentToolCall | None:
         queue_item = AgentWorkerQueueService(self.db).claim_next(worker_id=worker_id)
@@ -2355,8 +3420,14 @@ class ToolExecutor:
         except HTTPException as exc:
             if exc.status_code == status.HTTP_403_FORBIDDEN:
                 call.status = "failed"
+                call.execution_phase = "blocked"
                 call.error_code = "permission_revoked_before_execution"
                 call.error_message = "Execute-time permission check failed"
+                call.recovery_decision = "permission_required_before_execution"
+                call.policy_reason_json = _policy_reason_with_execution_context(
+                    call,
+                    worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
+                )
                 runtime.append_event(
                     run,
                     "tool.failed",
@@ -2370,8 +3441,14 @@ class ToolExecutor:
             if exc.status_code == status.HTTP_409_CONFLICT:
                 detail = exc.detail if isinstance(exc.detail, dict) else {}
                 call.status = "manual_intervention"
+                call.execution_phase = "blocked"
                 call.error_code = str(detail.get("code") or "approval_required_before_execution")
                 call.error_message = "Approval guard blocked execution"
+                call.recovery_decision = "approval_required_before_execution"
+                call.policy_reason_json = _policy_reason_with_execution_context(
+                    call,
+                    worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
+                )
                 runtime.append_event(
                     run,
                     "tool.failed",
@@ -2386,7 +3463,13 @@ class ToolExecutor:
 
         if call.backend_effect_capability is None and call.resolved_side_effect_class not in SAFE_SIDE_EFFECT_CLASSES:
             call.status = "manual_intervention"
+            call.execution_phase = "blocked"
             call.error_code = "backend_capability_too_weak"
+            call.recovery_decision = "backend_capability_required_before_execution"
+            call.policy_reason_json = _policy_reason_with_execution_context(
+                call,
+                worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
+            )
             runtime.append_event(run, "tool.failed", {"tool_call_id": call.tool_call_id, "error_code": call.error_code}, commit=False)
             if queue_item is not None:
                 queue_service.mark_failed(queue_item, error_code=call.error_code, commit=False)
@@ -2405,11 +3488,10 @@ class ToolExecutor:
             call.downstream_request_observed_sent_at = _utcnow()
             runtime.append_event(run, "tool.transport_sent_observed", {"tool_call_id": call.tool_call_id}, commit=False)
 
-            output = self.backend_factory(self.db).execute(
-                tool_name=call.tool_name,
-                payload=call.input_json_redacted,
-                current_user=current_user,
-            )
+            output = self.tool_runtime_factory(
+                self.db,
+                backend_factory=self.backend_factory,
+            ).execute(call=call, current_user=current_user)
 
             if call.backend_effect_capability == "receipt_first":
                 call.effect_submission_state = "backend_accepted"
@@ -2422,6 +3504,10 @@ class ToolExecutor:
             call.output_hash = request_fingerprint(output)
             call.status = "succeeded"
             call.execution_phase = "completed"
+            call.policy_reason_json = _policy_reason_with_execution_context(
+                call,
+                worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
+            )
             try:
                 runtime.append_event(run, "tool.effect_committed", {"tool_call_id": call.tool_call_id}, commit=False)
                 runtime.append_event(run, "tool.completed", {"tool_call_id": call.tool_call_id, "status": call.status}, commit=False)
@@ -2436,6 +3522,11 @@ class ToolExecutor:
             call.status = "failed"
             call.error_code = "tool_execution_failed"
             call.error_message = str(exc)[:512]
+            call.recovery_decision = "tool_execution_failed_repair_required"
+            call.policy_reason_json = _policy_reason_with_execution_context(
+                call,
+                worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
+            )
             runtime.append_event(
                 run,
                 "tool.failed",
@@ -2461,11 +3552,65 @@ class ToolExecutor:
         call.error_code = "eventstore_write_failed_after_effect"
         call.error_message = str(exc)[:512]
         call.recovery_decision = "reconcile_required_after_eventstore_failure"
+        call.policy_reason_json = _policy_reason_with_execution_context(
+            call,
+            worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
+        )
         if queue_item is not None:
             queue_service.mark_failed(queue_item, error_code=call.error_code, commit=False)
         self.db.commit()
         self.db.refresh(call)
         return call
+
+
+def _policy_reason_with_execution_context(call: AgentToolCall, *, worker_id: str | None) -> dict[str, Any]:
+    execution_context = {
+        "execution_context_version_hash": "agent-tool-execution-v1",
+        "tool_call_id": call.tool_call_id,
+        "run_id": call.run_id,
+        "runtime_snapshot_id": call.runtime_snapshot_id,
+        "tool_name": call.tool_name,
+        "tool_version": call.tool_version,
+        "worker_id": worker_id,
+        "tool_status": call.status,
+        "execution_phase": call.execution_phase,
+        "effect_submission_state": call.effect_submission_state,
+        "effect_boundary_crossed": bool(call.effect_boundary_crossed),
+        "backend_name": call.backend_name,
+        "backend_operation": call.backend_operation,
+        "backend_contract_version": call.backend_contract_version,
+        "backend_request_schema_hash": call.backend_request_schema_hash,
+        "backend_output_schema_hash": call.backend_output_schema_hash,
+        "reconcile_contract_version": call.reconcile_contract_version,
+        "result_adapter_version": call.result_adapter_version,
+        "backend_effect_capability": call.backend_effect_capability,
+        "resolved_side_effect_class": call.resolved_side_effect_class,
+        "resolved_replay_policy": call.resolved_replay_policy,
+        "approval_required": bool(call.approval_required),
+        "approval_state": _tool_execution_approval_state(call),
+        "approval_lineage_id": call.approval_lineage_id,
+        "approval_epoch": call.approval_epoch,
+        "approved_approval_id": call.approved_approval_id,
+        "approved_by": call.approved_by,
+        "input_hash": call.input_hash,
+        "output_hash": call.output_hash,
+        "recovery_decision": call.recovery_decision,
+        "error_code": call.error_code,
+        "error_message_hash": request_fingerprint({"error_message": call.error_message}) if call.error_message else None,
+    }
+    execution_context["execution_context_hash"] = request_fingerprint(execution_context)
+    return {
+        **(call.policy_reason_json or {}),
+        "execution_context": execution_context,
+    }
+
+
+def _tool_execution_approval_state(call: AgentToolCall) -> str:
+    if not call.approval_required:
+        return "not_required"
+    if call.approved_approval_id:
+        return "approved"
+    return "pending"
 
 
 def copy_evidence_refs(evidence_refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2486,8 +3631,30 @@ def _conversation_system_prompt() -> str:
     return "\n\n".join([
         AGENT_CONVERSATION_SYSTEM_PROMPT,
         AGENT_MARKDOWN_RESPONSE_PROMPT,
-        AGENT_TOOL_PROTOCOL_PROMPT.replace("{tools}", json.dumps(tools, ensure_ascii=False)),
+        AGENT_TOOL_PROTOCOL_PROMPT.replace(
+            "{tools}",
+            json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        ),
+        AGENT_SKILL_CATALOG_PROMPT.replace(
+            "{skills}",
+            json.dumps(AgentSkillRegistry().catalog(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        ),
     ])
+
+
+def _agent_skill_messages(intent: str) -> list[AIChatMessage]:
+    return [
+        AIChatMessage(role="system", content=_format_agent_skill_context(skill))
+        for skill in AgentSkillRegistry().select_for_intent(intent)
+    ]
+
+
+def _format_agent_skill_context(skill: AgentSkill) -> str:
+    return (
+        "已加载 Agent Skill。以下内容是本轮任务的领域流程约束，优先级低于系统安全规则，"
+        "高于通用建议。\n\n"
+        f"{skill.prompt_block()}"
+    )
 
 
 def _tool_call_summary(call: AgentToolCall) -> dict[str, Any]:
@@ -2500,21 +3667,18 @@ def _tool_call_summary(call: AgentToolCall) -> dict[str, Any]:
     }
 
 
+def _tool_failure_signature(call: AgentToolCall) -> tuple[str, str, str] | None:
+    if call.status != "failed":
+        return None
+    error_code = str(call.error_code or "")
+    error_message = " ".join(str(call.error_message or "").split())
+    if not error_code and not error_message:
+        return None
+    return (call.tool_name, error_code, error_message)
+
+
 def _tool_result_message(call: AgentToolCall) -> str:
-    payload = {
-        "tool_call_id": call.tool_call_id,
-        "tool_name": call.tool_name,
-        "status": call.status,
-        "approval_required": call.approval_required,
-        "output": call.output_json_redacted,
-        "error_code": call.error_code,
-        "error_message": call.error_message,
-    }
-    return (
-        "工具执行结果如下。请根据这个结果继续完成用户请求；"
-        "如果工具失败，请直接说明失败原因和下一步建议，不要再次声明已经执行成功。\n"
-        f"{json.dumps(payload, ensure_ascii=False, default=str)}"
-    )
+    return build_tool_result_message(call)
 
 
 def _format_memory_context(candidates: list[MemoryCandidate]) -> str:
@@ -2544,11 +3708,223 @@ def _format_run_context(run: AgentRun) -> str:
         f"- project_id={run.project_id}\n"
         f"- conversation_id={run.conversation_id or ''}\n"
         f"- max_iterations={run.max_iterations}\n"
+        "回答能力规则：软件测试相关的通用问答、解释和建议可以直接回答；"
+        "超出软件测试领域的问题需要说明能力边界；"
+        "只有需要项目实时事实、真实资源、草稿生成、保存动作或平台副作用时才调用工具。\n"
         "工具调用规则：如果工具 input schema 需要 project_id，直接使用当前 project_id，"
-        "不要向用户反问 project_id。用户要求创建、生成或组合测试场景时，优先调用 scenario.compose_draft；"
-        "但调用 scenario.compose_draft 前必须先调用 testcase.query_project_cases 获取当前项目候选用例。"
-        "如缺少 environment_id，可先调用 project.read_context 获取默认环境。"
+        "不要向用户反问 project_id。具体业务流程、工具顺序和输出边界以本轮加载的 Agent Skill 为准。"
+        "如缺少 environment_id 或其他平台事实，可先调用只读工具获取上下文。"
     )
+
+
+def _intent_likely_requires_agent_tool(intent: str) -> bool:
+    return _intent_matches_selected_skill_private_list(intent, REQUIRES_TOOL_ROUTING_KEY)
+
+
+def _unsupported_capability_guards_for_intent(intent: str) -> tuple[UnsupportedCapabilityGuard, ...]:
+    registry = AgentSkillRegistry()
+    guards: list[UnsupportedCapabilityGuard] = []
+    for skill in registry.select_for_intent(intent):
+        for raw_rule in registry.private_list(skill.name, UNSUPPORTED_CAPABILITY_GUARD_KEY):
+            guard = _parse_unsupported_capability_guard(skill.name, raw_rule)
+            if guard is not None and _intent_matches_unsupported_capability_guard(intent, guard, registry=registry):
+                guards.append(guard)
+    return tuple(guards)
+
+
+def _parse_unsupported_capability_guard(skill_name: str, raw_rule: str) -> UnsupportedCapabilityGuard | None:
+    fields = _parse_semicolon_fields(raw_rule)
+    name = fields.get("name")
+    intent_key = fields.get("intent")
+    subject_key = fields.get("subject")
+    classifier_prompt_key = fields.get("classifier_prompt")
+    requires_field = fields.get("requires_field")
+    completion_source = fields.get("completion_source")
+    message_key = fields.get("message")
+    if not all((name, intent_key, subject_key, classifier_prompt_key, requires_field, completion_source, message_key)):
+        return None
+    unavailable_tools = tuple(
+        item.strip()
+        for item in fields.get("unavailable_tools", "").split(",")
+        if item.strip()
+    )
+    return UnsupportedCapabilityGuard(
+        skill_name=skill_name,
+        name=name,
+        intent_key=intent_key,
+        subject_key=subject_key,
+        unavailable_tools=unavailable_tools,
+        classifier_prompt_key=classifier_prompt_key,
+        requires_field=requires_field,
+        completion_source=completion_source,
+        message_key=message_key,
+        synthetic_reason=fields.get("reason") or f"unsupported_{name}",
+    )
+
+
+def _intent_matches_unsupported_capability_guard(
+    intent: str,
+    guard: UnsupportedCapabilityGuard,
+    *,
+    registry: AgentSkillRegistry | None = None,
+) -> bool:
+    text = (intent or "").casefold()
+    if not text:
+        return False
+    registry = registry or AgentSkillRegistry()
+    intent_keywords = registry.private_list(guard.skill_name, guard.intent_key)
+    subject_keywords = registry.private_list(guard.skill_name, guard.subject_key)
+    if not any(keyword.casefold() in text for keyword in intent_keywords):
+        return False
+    return any(keyword.casefold() in text for keyword in subject_keywords)
+
+
+def _unsupported_capability_classifier_prompt(guard: UnsupportedCapabilityGuard) -> str | None:
+    return AgentSkillRegistry().private_resource_text(guard.skill_name, guard.classifier_prompt_key)
+
+
+def _unsupported_capability_message(guard: UnsupportedCapabilityGuard) -> str | None:
+    return AgentSkillRegistry().private_resource_text(guard.skill_name, guard.message_key)
+
+
+def _required_tool_followup_rules_for_intent(intent: str) -> tuple[RequiredToolFollowupRule, ...]:
+    registry = AgentSkillRegistry()
+    text = (intent or "").casefold()
+    rules: list[RequiredToolFollowupRule] = []
+    for skill in registry.select_for_intent(intent):
+        for raw_rule in registry.private_list(skill.name, REQUIRED_TOOL_AFTER_SUCCESS_ROUTING_KEY):
+            rule = _parse_required_tool_followup_rule(raw_rule)
+            if rule is not None and _required_tool_followup_rule_matches_intent(rule, text):
+                rules.append(rule)
+    return tuple(rules)
+
+
+def _parse_required_tool_followup_rule(raw_rule: str) -> RequiredToolFollowupRule | None:
+    fields = _parse_semicolon_fields(raw_rule)
+    after_tool = fields.get("after")
+    required_tool = fields.get("require")
+    if not after_tool or not required_tool:
+        return None
+    min_total_fields = tuple(
+        field.strip()
+        for field in fields.get("min_total_fields", "").split(",")
+        if field.strip()
+    )
+    return RequiredToolFollowupRule(
+        after_tool=after_tool,
+        required_tool=required_tool,
+        min_total_fields=min_total_fields,
+        intent_markers=tuple(
+            marker.strip()
+            for marker in fields.get("intent_markers", "").split(",")
+            if marker.strip()
+        ),
+    )
+
+
+def _required_tool_followup_rule_matches_intent(rule: RequiredToolFollowupRule, text: str) -> bool:
+    if not rule.intent_markers:
+        return True
+    return any(marker.casefold() in text for marker in rule.intent_markers)
+
+
+def _parse_semicolon_fields(raw_rule: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for part in raw_rule.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+def _tool_output_min_total_satisfied(output: Any, field_names: tuple[str, ...]) -> bool:
+    if not isinstance(output, dict):
+        return True
+    total = 0
+    for field_name in field_names:
+        try:
+            total += int(output.get(field_name) or 0)
+        except (TypeError, ValueError):
+            continue
+    return total > 0
+
+
+def _intent_matches_selected_skill_private_list(intent: str, key: str) -> bool:
+    text = (intent or "").casefold()
+    if not text:
+        return False
+    registry = AgentSkillRegistry()
+    for skill in registry.list_skills():
+        values = registry.private_list(skill.name, key)
+        if any(value.casefold() in text for value in values):
+            return True
+    return False
+
+
+def _loop_iteration_id(*, run: AgentRun, iteration: int) -> str:
+    return f"{run.run_id}:iter-{iteration}"
+
+
+def _new_model_call_id(*, run: AgentRun, iteration: int, loop_step: str) -> str:
+    return f"{run.run_id}:model-{iteration}-{loop_step}-{uuid.uuid4().hex}"
+
+
+def _loop_trace_payload(
+    *,
+    run: AgentRun,
+    iteration: int,
+    loop_step: str,
+    model_call_id: str | None = None,
+    tool_call_id: str | None = None,
+    decision_reason: str | None = None,
+) -> dict[str, Any]:
+    iteration_id = _loop_iteration_id(run=run, iteration=iteration)
+    phase = "tool" if tool_call_id and not model_call_id else "model"
+    loop_state: dict[str, Any] = {
+        "iteration": iteration,
+        "iteration_id": iteration_id,
+        "phase": phase,
+        "step": loop_step,
+    }
+    payload: dict[str, Any] = {
+        "iteration_id": iteration_id,
+        "loop_step": loop_step,
+        "loop_state": loop_state,
+    }
+    if model_call_id:
+        payload["model_call_id"] = model_call_id
+        loop_state["model_call_id"] = model_call_id
+    if tool_call_id:
+        payload["tool_call_id"] = tool_call_id
+        loop_state["tool_call_id"] = tool_call_id
+    if decision_reason:
+        payload["decision_reason"] = decision_reason
+        loop_state["decision_reason"] = decision_reason
+    return payload
+
+
+def _model_trace_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: payload[key]
+        for key in ("iteration_id", "model_call_id", "loop_step", "loop_state")
+        if key in payload
+    }
+
+
+def _default_model_loop_step(
+    *,
+    final_summary: bool,
+    repair_attempt: bool,
+    suppress_visible_deltas: bool,
+) -> str:
+    if final_summary:
+        return "final_summary"
+    if repair_attempt:
+        return "tool_request_repair"
+    if suppress_visible_deltas:
+        return "tool_planning"
+    return "assistant_response"
 
 
 def _should_hold_for_tool_request_detection(content: str) -> bool:
@@ -2566,7 +3942,7 @@ def _should_hold_for_tool_request_detection(content: str) -> bool:
 
 def _looks_like_tool_request_content(content: str) -> bool:
     stripped = content.strip()
-    return stripped.startswith("```agent_tool_request") or (
+    return "```agent_tool_request" in stripped or (
         stripped.startswith("{")
         and stripped.endswith("}")
         and '"tool_name"' in stripped
@@ -2685,6 +4061,53 @@ def _assistant_message_from_run(run: AgentRun) -> str | None:
     return None
 
 
+def _history_pairs_to_messages(
+    pairs: list[dict[str, Any]],
+    *,
+    user_chars: int | None = None,
+    assistant_chars: int | None = None,
+) -> list[AIChatMessage]:
+    messages: list[AIChatMessage] = []
+    for pair in pairs:
+        user_content = str(pair.get("intent") or "")
+        assistant_content = str(pair.get("assistant") or "")
+        if user_chars is not None:
+            user_content = _truncate_history_text(user_content, user_chars)
+        if assistant_chars is not None:
+            assistant_content = _truncate_history_text(assistant_content, assistant_chars)
+        messages.append(AIChatMessage(role="user", content=user_content))
+        if assistant_content.strip():
+            messages.append(AIChatMessage(role="assistant", content=assistant_content))
+    return messages
+
+
+def _compact_history_summary(pairs: list[dict[str, Any]]) -> str:
+    lines = [
+        "Conversation history compacted for prompt budget.",
+        "Older turns are summarized; use recent full turns and current user request as the strongest context.",
+    ]
+    for index, pair in enumerate(pairs, start=1):
+        intent = _truncate_history_text(str(pair.get("intent") or ""), AGENT_HISTORY_CONTEXT_SUMMARY_CHARS)
+        assistant = _truncate_history_text(str(pair.get("assistant") or ""), AGENT_HISTORY_CONTEXT_SUMMARY_CHARS)
+        line = f"{index}. run_id={pair.get('run_id')}, status={pair.get('status')}, user={intent}"
+        if assistant:
+            line = f"{line}; assistant={assistant}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _estimate_chat_messages_tokens(messages: list[AIChatMessage]) -> int:
+    total_chars = sum(len(message.content or "") for message in messages)
+    return max(1, total_chars // 4)
+
+
+def _truncate_history_text(value: str, max_chars: int) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[: max(0, max_chars - 3)]}..."
+
+
 def _http_exception_detail(exc: HTTPException) -> str:
     if isinstance(exc.detail, str):
         return exc.detail
@@ -2694,6 +4117,15 @@ def _http_exception_detail(exc: HTTPException) -> str:
 def _conversation_title(intent: str) -> str:
     normalized = " ".join(intent.split())
     return normalized[:60] if normalized else "未命名会话"
+
+
+def _activity_idle_seconds(last_activity_at: datetime) -> float:
+    utc_idle = (_utcnow() - last_activity_at).total_seconds()
+    local_idle = (datetime.now().replace(tzinfo=None) - last_activity_at).total_seconds()
+    non_negative_candidates = [value for value in (utc_idle, local_idle) if value >= 0]
+    if non_negative_candidates:
+        return min(non_negative_candidates)
+    return max(utc_idle, local_idle)
 
 
 def _utcnow() -> datetime:

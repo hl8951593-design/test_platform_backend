@@ -240,6 +240,29 @@ AGENT_BACKEND_COMPLETION_AUDIT_CHECK_NAMES = (
     "observability_and_release_gate",
     "backend_delivery_docs_synced",
     "live_e2e_diagnostic_available",
+    "behavior_evaluation_suite_available",
+)
+AGENT_BEHAVIOR_EVALUATION_CASE_IDS = (
+    "T01",
+    "T02",
+    "T03",
+    "T04",
+    "T05",
+    "T06",
+    "T07",
+    "T08",
+)
+AGENT_BEHAVIOR_EVALUATION_ASSERTIONS = (
+    "general_answer_no_tool",
+    "conversation_context_no_object_creation",
+    "project_context_tool_use",
+    "query_first_tool_order",
+    "tool_result_repair_loop",
+    "unsupported_save_boundary",
+    "dataset_parameterization",
+    "domain_boundary",
+    "model_call_trace",
+    "sse_high_cursor_replay",
 )
 FAULT_INJECTION_COVERAGE_FIELDS = (
     "generated_at",
@@ -320,6 +343,10 @@ REQUIRED_DASHBOARD_METRICS = {
     "loop_root_cause_unknown_total",
     "root_cause_rule_missing_total",
     "invalid_repair_scope_total",
+    "tool_prerequisite_missing_total",
+    "tool_request_format_invalid_total",
+    "required_tool_followup_missing_total",
+    "max_iterations_total",
     "same_failure_no_progress_total",
     "memory_contradiction_total",
     "memory_contradiction_penalty_applied_total",
@@ -388,6 +415,7 @@ REQUIRED_RUNBOOKS = {
     "fault_injection_coverage",
     "worker_queue_recovery",
     "context_linkage_repair",
+    "agent_runtime_loop_repair",
     "root_cause_rule_missing",
     "memory_evidence_ref_violation",
     "release_gate_violation",
@@ -967,6 +995,18 @@ class AgentMetricsService:
             ),
             "invalid_repair_scope_total": self._count_loop_observations_with_reason(
                 project_id, "invalid_repair_scope"
+            ),
+            "tool_prerequisite_missing_total": self._count_loop_observations(
+                project_id, AgentLoopObservation.stop_action_reason == "tool_prerequisite_missing"
+            ),
+            "tool_request_format_invalid_total": self._count_loop_observations(
+                project_id, AgentLoopObservation.stop_action_reason == "tool_request_format_invalid"
+            ),
+            "required_tool_followup_missing_total": self._count_loop_observations(
+                project_id, AgentLoopObservation.stop_action_reason == "required_tool_followup_missing"
+            ),
+            "max_iterations_total": self._count_loop_observations(
+                project_id, AgentLoopObservation.stop_action_reason == "max_iterations"
             ),
             "same_failure_no_progress_total": self._count_loop_observations(
                 project_id, AgentLoopObservation.stop_action_reason == "same_failure_no_progress"
@@ -2105,6 +2145,8 @@ class AgentBackendCompletionAuditService:
         self.db = db
 
     def audit(self, *, project_id: int | None = None) -> dict[str, Any]:
+        from app.services.agent_runbook_service import RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS
+
         launch_audit = AgentLaunchAuditService(self.db).audit(project_id=project_id)
         launch_checks = {item["name"]: item for item in launch_audit["checks"]}
         final_delivery = launch_audit["dashboard"]["check_statuses"]
@@ -2198,6 +2240,9 @@ class AgentBackendCompletionAuditService:
                     "dashboard_check_statuses": final_delivery,
                     "promotion_decision": launch_audit["promotion"]["decision"],
                     "promotion_is_production_gate": True,
+                    "tool_execution_context_source": "AgentToolCall.policy_reason_json.execution_context",
+                    "runbook_execution_context_summary": "AgentRunbookRecommendation.details.execution_context",
+                    "runbook_execution_context_summary_fields": list(RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS),
                 },
             ),
             self._check(
@@ -2233,6 +2278,24 @@ class AgentBackendCompletionAuditService:
                     ],
                 },
             ),
+            self._check(
+                name="behavior_evaluation_suite_available",
+                status="pass",
+                severity="P1",
+                summary="Maintainers have a repeatable multi-case behavior evaluation for Agent loop, repair and tool boundaries",
+                details={
+                    "script": "scripts/agent_behavior_evaluation.py",
+                    "case_ids": list(AGENT_BEHAVIOR_EVALUATION_CASE_IDS),
+                    "case_count": len(AGENT_BEHAVIOR_EVALUATION_CASE_IDS),
+                    "assertions": list(AGENT_BEHAVIOR_EVALUATION_ASSERTIONS),
+                    "output_prefix": "reports/woagent_behavior_eval_{timestamp}",
+                    "artifacts": [
+                        "reports/woagent_behavior_eval_*.json",
+                        "reports/woagent_behavior_eval_*.md",
+                        "reports/woagent_behavior_eval_*.progress.log",
+                    ],
+                },
+            ),
         ]
         status = self._status(checks)
         snapshot = {
@@ -2262,6 +2325,9 @@ class AgentBackendCompletionAuditService:
                 "history": "GET /api/v1/agents/conversations",
                 "transcript": "GET /api/v1/agents/conversations/{conversation_id}/transcript",
                 "export": "GET /api/v1/agents/conversations/{conversation_id}/export",
+                "tool_execution_context": "AgentToolCall.policy_reason_json.execution_context",
+                "runbook_execution_context_summary": "AgentRunbookRecommendation.details.execution_context",
+                "runbook_execution_context_summary_fields": list(RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS),
             },
             "diagnostics": {
                 "model_health": "GET /api/v1/agents/model-health",
@@ -2269,11 +2335,16 @@ class AgentBackendCompletionAuditService:
                 "completion_audit": "GET /api/v1/agents/backend-completion-audit",
                 "conversation_smoke": "POST /api/v1/agents/conversation-smoke",
                 "e2e_script": "scripts/agent_conversation_e2e_check.py",
+                "tool_call_detail": "GET /api/v1/agents/tool-calls/{tool_call_id}",
+                "runbook_diagnosis": "GET /api/v1/agents/runs/{run_id}/runbook",
+                "behavior_evaluation_script": "scripts/agent_behavior_evaluation.py",
+                "behavior_evaluation_reports": "reports/woagent_behavior_eval_*.json|md",
             },
             "derived_from": {
                 "launch_audit": "AgentLaunchAuditService.audit",
                 "readiness_dashboard": "AgentReadinessDashboardService.snapshot",
                 "release_gate": "AgentReleaseGateService.promotion_assessment",
+                "behavior_evaluation_suite": "scripts.agent_behavior_evaluation.CASES",
             },
         }
         return {field: snapshot[field] for field in AGENT_BACKEND_COMPLETION_AUDIT_FIELDS}

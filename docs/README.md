@@ -7,14 +7,28 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 最近核对日期 | 2026-06-25 |
-| 开发基线 | 3.0.4 |
-| Alembic head | `0020_scenario_nodes` |
+| 最近核对日期 | 2026-06-30 |
+| 开发基线 | `3.0.269-agent-skill-governance-coverage` |
+| Alembic head | `0028_agent_memory_staleness_events` |
 | 回归命令 | `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v` |
-| 最近完整回归 | 147 项通过 |
+| 最近完整回归 | 本轮未重跑全量后端回归；已执行 `.\.venv\Scripts\python.exe -m unittest tests.test_ai_service tests.test_error_responses tests.test_agent_runtime`，291 项通过 |
 
 数字基线只能在实际执行命令后更新。数据库结构以 Alembic migration 和当前模型共同为准，
 不能只修改模型而遗漏迁移。
+
+## 文档收敛规则
+
+当前文档已经分散到后端 `docs/`、后端 `front_tech_docs/`、前端 `docs/` 和前端 `api_docs/`。后续维护按以下唯一权威收敛：
+
+| 范围 | 唯一权威 | 说明 |
+| --- | --- | --- |
+| 后端架构、数据模型、迁移、执行模型 | 本仓库 `docs/technical_architecture.md`、`docs/development_technical_notes.md` | 记录后端当前实现和开发基线 |
+| 后端 API 契约 | 本仓库 `docs/api_*.md` 和 `docs/api_agent_frontend_contract.md` | 前端仓库 `api_docs/` 只是联调镜像或便捷副本 |
+| 前端当前实现 | `C:\Users\Administrator\PycharmProjects\devtestplatform\docs/` | 前端页面、状态管理、视觉交互和测试基线以该目录为准 |
+| Agent 前端原型/专项计划 | 已合并进前端 `docs/agent-runtime-frontend-architecture.md` 与 `docs/frontend-development-plan.md` | 旧 `agent-codex-prototype`、`agent-frontend-development-plan` 只保留为历史入口 |
+| 后端 `front_tech_docs/` | 历史快照 | 不再作为前端当前实现的权威来源，新增或修正前端行为时更新前端仓库 |
+
+后续如果发现两个文档描述同一事实，应优先把事实合并到对应唯一权威文档，旧文档改成跳转说明，而不是继续复制整段内容。
 
 ## 最高优先级工程约束：后端异步与非阻塞
 
@@ -46,7 +60,7 @@
 | [媒体存储](api_media.md) | MinIO 图片上传、附件绑定、临时访问地址和清理契约 |
 | [Agent 前端接口契约](api_agent_frontend_contract.md) | Harness Loop Agent 前端接入接口、SSE、字段契约和限制 |
 | `api_*.md` | 已实现接口、请求响应、权限、错误、兼容规则和部署要求 |
-| `front_tech_docs/` | 前端接入、页面交互和客户端状态管理约定 |
+| `front_tech_docs/` | 历史前端接入快照；当前前端实现以 `devtestplatform/docs/` 为准 |
 | `alembic/versions/` | 数据库结构变更及升级顺序 |
 | `tests/` | 可执行行为证据和回归边界 |
 

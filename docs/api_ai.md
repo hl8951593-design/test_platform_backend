@@ -22,6 +22,9 @@ POST https://api.deepseek.com/chat/completions
 | `DEEPSEEK_BASE_URL` | DeepSeek API 基础地址，默认 `https://api.deepseek.com` |
 | `DEEPSEEK_MODEL` | 默认模型，默认 `deepseek-v4-flash` |
 | `DEEPSEEK_TIMEOUT_SECONDS` | 请求超时时间，默认 60 秒 |
+| `DEEPSEEK_STREAM_MAX_RETRIES` | 流式响应首个 delta/done 前的最大重试次数，默认 2 |
+| `DEEPSEEK_STREAM_RETRY_BASE_SECONDS` | 首包前流式重试退避起点，默认 0.5 秒 |
+| `DEEPSEEK_STREAM_RETRY_MAX_SECONDS` | 首包前流式重试退避上限，默认 4 秒 |
 
 `.env.example` 只保留占位符，不记录真实 key。
 
@@ -404,6 +407,7 @@ data: {"result":{}}
 | `step.started` / `step.completed` | 平台内部步骤，例如权限校验、结构校验 |
 | `tool.started` / `tool.completed` | 工具或数据访问，例如读取候选用例、执行候选接口 |
 | `model.started` / `model.delta` / `model.completed` | 模型调用过程和流式输出 |
+| `model.stream_retrying` | DeepSeek 流式响应在首个 delta/done 前失败后准备重试；payload 不包含 key、prompt 或请求体 |
 | `heartbeat` | SSE 心跳 |
 
 安全规则：
@@ -419,7 +423,7 @@ data: {"result":{}}
 | --- | --- | --- |
 | 未配置 `DEEPSEEK_API_KEY` | 500 | 本地服务配置缺失 |
 | DeepSeek 返回 4xx/5xx | 502 | 上游 AI 服务返回异常 |
-| 网络错误或超时 | 503 | 无法连接 DeepSeek |
+| 网络错误或超时 | 503 | 无法连接 DeepSeek；流式调用在首个 delta/done 前会按配置重试 |
 | skill 不存在 | 404 | `skill_id` 未注册 |
 | operation 不存在或缺少必要上下文 | 400 | operation 不属于该 skill，或缺少 `environment_id` / `source_id` |
 | skill input 校验失败 | 422 | `input` 不符合 operation 的输入 schema |

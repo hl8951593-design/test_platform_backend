@@ -1,0 +1,14 @@
+[login] account=admin user_id=1
+[start] T01 通用测试知识问答
+[done] T01 score=100 passed=True run_id=agent-run-fd2c2a638cb549459b6d7b842ddde2f1
+[start] T02 多轮上下文追问且不创建对象
+[done] T02 score=100 passed=True run_id=agent-run-dfae9b29125043fdb4f1fbddc3d7e6dc
+[start] T03 读取项目上下文
+[done] T03 score=100 passed=True run_id=agent-run-3ca27bda2e524327a013403f5229f65b
+[start] T04 企业场景 query-first 组合草稿
+[done] T04 score=100 passed=True run_id=agent-run-8d30a788e01a404ebbf16da1947aeb78
+[start] T05 场景 warnings 可修复项闭环
+[done] T05 score=88 passed=False run_id=agent-run-164acaa52af74fa9bebe4de4a12742b6
+[start] T06 保存正式场景边界
+[done] T06 score=100 passed=True run_id=agent-run-c764ef73f934425cba11927f688c6ddc
+[start] T07 数据集参数化理解与草稿更新

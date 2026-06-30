@@ -1,10 +1,12 @@
 import unittest
+import tempfile
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import HTTPException
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import create_engine, func, inspect, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -102,6 +104,7 @@ from app.schemas.agent import (
     AgentRunbookRecommendationRead,
     AgentWorkerQueueAuditRead,
 )
+from app.schemas.ai import AIChatResponse
 from app.services.agent_approval_service import (
     APPROVAL_CONFLICT_ERROR_CODES,
     APPROVAL_EVENT_TYPES,
@@ -287,6 +290,7 @@ from app.services.agent_release_gate_service import (
 from app.services.agent_resume_service import AgentRunResumeService
 from app.services.agent_runbook_service import (
     CHECKPOINT_FRESHNESS_SAFE_ACTIONS,
+    RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS,
     RUNBOOK_DIAGNOSIS_FIELDS,
     RUNBOOK_DIAGNOSIS_RECOMMENDATION_RUNBOOK_IDS,
     RUNBOOK_FIELDS,
@@ -294,6 +298,11 @@ from app.services.agent_runbook_service import (
     RUNBOOK_RECOMMENDATION_OPTIONAL_FIELDS,
     RUNBOOK_RECOMMENDATION_REQUIRED_FIELDS,
     AgentRunbookService,
+)
+from app.services.agent_tool_result_policy import (
+    DEFAULT_TOOL_RESULT_REPAIR_GUIDANCE,
+    FINAL_RESPONSE_BUDGET_INSTRUCTION,
+    ToolResultPolicy,
 )
 from app.services.agent_runtime_service import (
     AGENT_CONVERSATION_EXPORT_FIELDS,
@@ -315,6 +324,12 @@ from app.services.agent_runtime_service import (
     AgentWorkerQueueService,
     ExecutionLedgerService,
     ToolExecutor,
+    _conversation_system_prompt,
+    _intent_likely_requires_agent_tool,
+    _required_tool_followup_rules_for_intent,
+    _unsupported_capability_classifier_prompt,
+    _unsupported_capability_guards_for_intent,
+    _unsupported_capability_message,
 )
 
 
@@ -418,6 +433,58 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual([item.event_type for item in events], ["run.queued", "run.started", "run.completed"])
         self.assertEqual([item.event_seq for item in events], [1, 2, 3])
 
+    def test_get_run_marks_stale_active_run_failed(self):
+        runtime = AgentRuntimeService(self.db)
+        run = runtime.create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="stale agent run"),
+            current_user=self.owner,
+        )
+        stale_at = datetime.now().replace(tzinfo=None) - timedelta(hours=1)
+        for event in self.db.scalars(select(AgentEvent).where(AgentEvent.run_id == run.run_id)).all():
+            event.created_at = stale_at
+        run.updated_at = stale_at
+        self.db.commit()
+
+        healed = AgentRuntimeService(self.db).get_run(run_id=run.run_id, current_user=self.member)
+        events = list(
+            self.db.scalars(
+                select(AgentEvent)
+                .where(AgentEvent.run_id == run.run_id)
+                .order_by(AgentEvent.event_seq.asc())
+            ).all()
+        )
+
+        self.assertEqual(healed.status, "failed")
+        self.assertEqual(healed.error_code, "agent_run_stale_worker_lost")
+        self.assertEqual(events[-1].event_type, "run.failed")
+        self.assertEqual(events[-1].event_seq, healed.last_event_sequence)
+        self.assertEqual(events[-1].payload_json["error_code"], "agent_run_stale_worker_lost")
+
+    def test_event_replay_resets_cursor_from_another_run(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="cursor reset", auto_complete=True),
+            current_user=self.owner,
+        )
+
+        events, listed_run = AgentRuntimeService(self.db).list_events(
+            run_id=run.run_id,
+            after_sequence=9999,
+        )
+        snapshot = AgentRuntimeService(self.db).get_event_snapshot(
+            run_id=run.run_id,
+            after_sequence=9999,
+            limit=10,
+            current_user=self.member,
+        )
+
+        self.assertEqual(listed_run.run_id, run.run_id)
+        self.assertEqual([item.event_seq for item in events], [1, 2, 3])
+        self.assertEqual([item.event_type for item in events], ["run.queued", "run.started", "run.completed"])
+        self.assertEqual(snapshot["after_sequence"], 0)
+        self.assertEqual(snapshot["next_after_sequence"], 3)
+        self.assertEqual([item.event_seq for item in snapshot["events"]], [1, 2, 3])
+        self.assertTrue(snapshot["terminal"])
+
     def test_conversation_runner_streams_model_events_and_completes_run(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="你可以帮我做什么"),
@@ -458,6 +525,153 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(events[5].payload_json["content"], "我可以帮你编排测试。")
         self.assertEqual(events[6].payload_json["result"]["model"], "deepseek-test")
 
+    def test_conversation_runner_records_model_stream_retrying_event(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="retry before first token"),
+            current_user=self.owner,
+        )
+
+        stream_events = [
+            {
+                "type": "retry",
+                "attempt": 1,
+                "max_retries": 2,
+                "delay_seconds": 0.25,
+                "error_message": "temporary EOF",
+            },
+            {"type": "delta", "content": "ok"},
+            {"type": "done", "finish_reason": "stop", "model": "deepseek-test"},
+        ]
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", return_value=iter(stream_events)):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+
+        self.assertEqual(completed.status, "completed")
+        self.assertIn("model.stream_retrying", event_types)
+        retry_event = next(item for item in events if item.event_type == "model.stream_retrying")
+        self.assertEqual(retry_event.payload_json["attempt"], 1)
+        self.assertEqual(retry_event.payload_json["max_retries"], 2)
+        self.assertEqual(retry_event.payload_json["delay_seconds"], 0.25)
+        self.assertEqual(retry_event.payload_json["error_message"], "temporary EOF")
+        self.assertEqual(retry_event.payload_json["loop_step"], "assistant_response")
+
+    def test_conversation_runner_allows_software_testing_general_answers_without_tools(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="边界值分析和等价类划分有什么区别？"),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.extend(payload.messages)
+            yield {"type": "delta", "content": "边界值分析关注输入边界附近，"}
+            yield {"type": "delta", "content": "等价类划分关注把输入集合分组。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        system_prompt = "\n\n".join(message.content for message in captured_messages if message.role == "system")
+        tool_calls = list(
+            self.db.scalars(
+                select(AgentToolCall).where(AgentToolCall.run_id == run.run_id)
+            ).all()
+        )
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        started_event = next(item for item in events if item.event_type == "model.started")
+        delta_event = next(item for item in events if item.event_type == "model.delta")
+        completed_event = next(item for item in events if item.event_type == "model.completed")
+        model_call_id = started_event.payload_json["model_call_id"]
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(
+            completed.result_json["message"],
+            "边界值分析关注输入边界附近，等价类划分关注把输入集合分组。",
+        )
+        self.assertEqual(tool_calls, [])
+        self.assertEqual(started_event.payload_json["iteration_id"], f"{run.run_id}:iter-0")
+        self.assertEqual(started_event.payload_json["loop_step"], "assistant_response")
+        expected_loop_state = {
+            "iteration": 0,
+            "iteration_id": f"{run.run_id}:iter-0",
+            "phase": "model",
+            "step": "assistant_response",
+            "model_call_id": model_call_id,
+        }
+        self.assertEqual(started_event.payload_json["loop_state"], expected_loop_state)
+        self.assertEqual(delta_event.payload_json["loop_state"], expected_loop_state)
+        self.assertEqual(completed_event.payload_json["loop_state"], expected_loop_state)
+        self.assertEqual(delta_event.payload_json["model_call_id"], model_call_id)
+        self.assertEqual(completed_event.payload_json["model_call_id"], model_call_id)
+        self.assertEqual(completed.result_json["model_call_id"], model_call_id)
+        self.assertIn('"name":"general-testing-answer"', system_prompt)
+        self.assertIn("Agent Skill: general-testing-answer", system_prompt)
+        self.assertIn("Answer software testing, test automation", system_prompt)
+        self.assertIn("Do not call tools for conceptual explanations", system_prompt)
+        self.assertIn("软件测试相关的通用问答、解释和建议可以直接回答", system_prompt)
+
+    def test_conversation_runner_compacts_long_conversation_history_before_model_call(self):
+        runtime = AgentRuntimeService(self.db)
+        conversation_id = "agent-conv-long-history"
+        for index in range(7):
+            previous = runtime.create_run(
+                payload=AgentRunCreateRequest(
+                    project_id=10,
+                    conversation_id=conversation_id,
+                    intent=f"historical intent {index} " + ("input detail " * 220),
+                ),
+                current_user=self.owner,
+            )
+            runtime.complete_run(
+                previous,
+                {
+                    "message": f"historical assistant {index} " + ("assistant detail " * 260),
+                    "assistant_visible": True,
+                },
+                commit=True,
+            )
+        current = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="current compacted history question",
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(service_self, payload):
+            captured_messages.extend(payload.messages)
+            yield {"type": "delta", "content": "ok"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=current.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == current.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        compaction_event = next(item for item in events if item.event_type == "context.history_compacted")
+        system_contents = [message.content for message in captured_messages if message.role == "system"]
+
+        self.assertTrue(any("Conversation history compacted for prompt budget." in item for item in system_contents))
+        self.assertEqual(compaction_event.payload_json["strategy"], "summarize_older_keep_recent")
+        self.assertIn("compacted_run_count", compaction_event.payload_json)
+        self.assertIn("estimated_tokens_after", compaction_event.payload_json)
+        self.assertIn("current compacted history question", captured_messages[-1].content)
+
     def test_conversation_runner_normalizes_user_visible_markdown_tables(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="生成场景组合说明"),
@@ -497,6 +711,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(completed.result_json["message"], expected_markdown)
         self.assertEqual(completed_event.payload_json["content"], expected_markdown)
         self.assertEqual(normalized_event.payload_json["content"], expected_markdown)
+        self.assertEqual(normalized_event.payload_json["model_call_id"], completed_event.payload_json["model_call_id"])
         self.assertTrue(normalized_event.payload_json["replace_content"])
         self.assertIn("GitHub Flavored Markdown", system_prompt)
         self.assertIn("表头、分隔行和每一条数据行都必须独占一行", system_prompt)
@@ -670,6 +885,146 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(events[3].payload_json["content"], "第一段")
         self.assertEqual(completed.result_json["message"], "第一段第二段")
 
+    def test_conversation_runner_batches_small_model_deltas_after_first_visible_delta(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="实时返回很多小片段"),
+            current_user=self.owner,
+        )
+        observed_mid_stream = {"delta_count_after_first": 0}
+        tiny_chunks = [str(index % 10) for index in range(30)]
+
+        def fake_stream(service_self, payload):
+            _ = (service_self, payload)
+            yield {"type": "delta", "content": "首段"}
+            observed_mid_stream["delta_count_after_first"] = self_db.scalar(
+                select(func.count())
+                .select_from(AgentEvent)
+                .where(
+                    AgentEvent.run_id == run.run_id,
+                    AgentEvent.event_type == "model.delta",
+                )
+            )
+            for chunk in tiny_chunks:
+                yield {"type": "delta", "content": chunk}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        self_db = self.db
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        delta_events = list(
+            self.db.scalars(
+                select(AgentEvent)
+                .where(AgentEvent.run_id == run.run_id, AgentEvent.event_type == "model.delta")
+                .order_by(AgentEvent.event_seq)
+            ).all()
+        )
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(observed_mid_stream["delta_count_after_first"], 1)
+        self.assertLess(len(delta_events), 1 + len(tiny_chunks))
+        self.assertEqual(delta_events[0].payload_json["content"], "首段")
+        self.assertEqual(
+            "".join(item.payload_json["content"] for item in delta_events),
+            "首段" + "".join(tiny_chunks),
+        )
+        self.assertEqual(completed.result_json["message"], "首段" + "".join(tiny_chunks))
+
+    def test_conversation_runner_compacts_suppressed_plain_text_stream_to_one_delta(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="读取当前项目后直接返回总结"),
+            current_user=self.owner,
+        )
+        observed_mid_stream = {"delta_count": 0}
+        chunks = ["这是", "一个", "较长", "总结", "片段", "。"]
+
+        def fake_stream(service_self, payload):
+            _ = (service_self, payload)
+            for index, chunk in enumerate(chunks):
+                yield {"type": "delta", "content": chunk}
+                if index == 3:
+                    observed_mid_stream["delta_count"] = self_db.scalar(
+                        select(func.count())
+                        .select_from(AgentEvent)
+                        .where(
+                            AgentEvent.run_id == run.run_id,
+                            AgentEvent.event_type == "model.delta",
+                        )
+                    )
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        self_db = self.db
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        delta_events = list(
+            self.db.scalars(
+                select(AgentEvent)
+                .where(AgentEvent.run_id == run.run_id, AgentEvent.event_type == "model.delta")
+                .order_by(AgentEvent.event_seq)
+            ).all()
+        )
+
+        expected = "".join(chunks)
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(observed_mid_stream["delta_count"], 0)
+        self.assertEqual(len(delta_events), 1)
+        self.assertEqual(delta_events[0].payload_json["content"], expected)
+        self.assertEqual(delta_events[0].payload_json["loop_step"], "tool_planning")
+        self.assertIn("model_call_id", delta_events[0].payload_json)
+        self.assertEqual(completed.result_json["message"], expected)
+
+    def test_tool_result_policy_classifies_repairable_and_blocking_issues(self):
+        call = SimpleNamespace(
+            tool_call_id="tool-1",
+            tool_name="scenario.compose_draft",
+            status="succeeded",
+            approval_required=False,
+            output_json_redacted={
+                "draft": {"warnings": ["companyName 未动态绑定"]},
+                "diagnostics": ["Lingxi-Auth 未授权，需要有效 token"],
+            },
+            error_code=None,
+            error_message=None,
+        )
+
+        policy = ToolResultPolicy()
+        decision = policy.evaluate(call)
+        message = policy.build_message(call)
+        from app.services.agent_tool_service import ToolRegistry
+
+        self.assertIn("companyName", [item.display() for item in decision.auto_fixable][0])
+        self.assertTrue(any("Lingxi-Auth" in item.display() for item in decision.blocked))
+        self.assertEqual(
+            decision.repair_guidance,
+            ToolRegistry().get("scenario.compose_draft").tool_result_repair_guidance,
+        )
+        self.assertIn("通用工具结果质量闭环", decision.followup_instruction)
+        self.assertIn(FINAL_RESPONSE_BUDGET_INSTRUCTION, message)
+
+    def test_tool_result_policy_retries_fixable_failed_tool_inputs(self):
+        call = SimpleNamespace(
+            tool_call_id="tool-2",
+            tool_name="scenario.compose_draft",
+            status="failed",
+            approval_required=False,
+            output_json_redacted=None,
+            error_code="tool_execution_failed",
+            error_message="validation error: datasets.0.id missing",
+        )
+
+        decision = ToolResultPolicy().evaluate(call)
+
+        self.assertTrue(decision.should_continue_reasoning)
+        self.assertTrue(any("datasets.0.id" in item.display() for item in decision.auto_fixable))
+        self.assertIn("工具失败修复闭环", decision.followup_instruction)
+
+    def test_tool_result_policy_repair_guidance_falls_back_for_unknown_tools(self):
+        self.assertEqual(
+            ToolResultPolicy().repair_guidance("unknown.tool"),
+            DEFAULT_TOOL_RESULT_REPAIR_GUIDANCE,
+        )
+
     def test_agent_model_health_reports_config_without_live_probe(self):
         provider = SimpleNamespace(
             provider="deepseek",
@@ -769,6 +1124,19 @@ class AgentRuntimeTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as ctx:
             get_agent_model_health(live=True, db=self.db, current_user=self.owner)
         self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_agent_skill_catalog_route_returns_metadata_only(self):
+        from app.api.v1.routers.agents import list_agent_skills
+
+        payload = list_agent_skills(current_user=self.owner)["data"]
+
+        names = [item["name"] for item in payload]
+        self.assertEqual(names, sorted(names))
+        self.assertIn("general-testing-answer", names)
+        self.assertIn("scenario-composition", names)
+        self.assertIn("report-summary", names)
+        self.assertTrue(all(set(item) == {"name", "description"} for item in payload))
+        self.assertFalse(any("Workflow" in str(item) for item in payload))
 
     def test_agent_conversation_smoke_route_runs_full_agent_loop_admin_only(self):
         from app.api.v1.routers.agents import run_agent_conversation_smoke
@@ -941,12 +1309,12 @@ class AgentRuntimeTests(unittest.TestCase):
                 AgentMemoryUsageEvent.memory_id == memory.id,
             )
         )
-        events = [
-            item.event_type
-            for item in self.db.scalars(
+        event_rows = list(
+            self.db.scalars(
                 select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
             ).all()
-        ]
+        )
+        events = [item.event_type for item in event_rows]
         memory_messages = [
             message.content
             for message in captured_messages
@@ -960,6 +1328,35 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("登录接口测试偏好", memory_messages[0])
         self.assertIn("token 过期", memory_messages[0])
         self.assertEqual(captured_messages[-1].content, "请继续设计登录接口测试")
+
+    def test_parse_tool_request_returns_structured_envelope(self):
+        request = AgentConversationRunner(self.db)._parse_tool_request(
+            (
+                "```agent_tool_request\n"
+                '{"tool_name":"project.read_context","input":{"project_id":10},'
+                '"reason":"Need project context","evidence_refs":{"kind":"run","id":"evidence-1"},'
+                '"unknown_field":"must not leak"}'
+                "\n```"
+            ),
+            normalize_evidence_refs=True,
+        )
+
+        self.assertIsNotNone(request)
+        self.assertNotIsInstance(request, dict)
+        self.assertEqual(request.tool_name, "project.read_context")
+        self.assertEqual(request.tool_input, {"project_id": 10})
+        self.assertEqual(request.reason, "Need project context")
+        self.assertEqual(request.evidence_refs_for_ledger(), [{"kind": "run", "id": "evidence-1"}])
+        self.assertEqual(
+            request.detected_event_payload(iteration=2),
+            {
+                "iteration": 2,
+                "tool_name": "project.read_context",
+                "reason": "Need project context",
+                "decision_reason": "Need project context",
+            },
+        )
+        self.assertNotIn("unknown_field", request.detected_event_payload(iteration=2))
 
     def test_conversation_runner_executes_model_requested_tool_and_feeds_result_back(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -994,12 +1391,14 @@ class AgentRuntimeTests(unittest.TestCase):
             completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
 
         call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.run_id))
-        events = [
-            item.event_type
-            for item in self.db.scalars(
+        event_rows = list(
+            self.db.scalars(
                 select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
             ).all()
-        ]
+        )
+        events = [item.event_type for item in event_rows]
+        tool_request_event = next(item for item in event_rows if item.event_type == "model.tool_request_detected")
+        tool_result_event = next(item for item in event_rows if item.event_type == "tool.result_observed")
 
         self.assertEqual(completed.status, "completed")
         self.assertEqual(completed.result_json["message"], "我已读取项目 TestAuto，可以继续生成接口测试方案。")
@@ -1010,6 +1409,23 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("tool.completed", events)
         self.assertIn("tool.result_observed", events)
         self.assertIn("run.completed", events)
+        model_loop_state = tool_request_event.payload_json["loop_state"]
+        self.assertEqual(model_loop_state["iteration"], 0)
+        self.assertEqual(model_loop_state["iteration_id"], f"{run.run_id}:iter-0")
+        self.assertEqual(model_loop_state["phase"], "model")
+        self.assertEqual(model_loop_state["step"], "tool_planning")
+        self.assertEqual(model_loop_state["model_call_id"], tool_request_event.payload_json["model_call_id"])
+        self.assertEqual(
+            tool_result_event.payload_json["loop_state"],
+            {
+                "iteration": 0,
+                "iteration_id": f"{run.run_id}:iter-0",
+                "phase": "tool",
+                "step": "tool_execution",
+                "tool_call_id": call.tool_call_id,
+                "decision_reason": tool_result_event.payload_json["decision_reason"],
+            },
+        )
         self.assertEqual(len(captured_messages), 2)
         self.assertIn("工具执行结果如下", captured_messages[1][-1].content)
         self.assertIn("TestAuto", captured_messages[1][-1].content)
@@ -1076,6 +1492,85 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(captured_payload["payload"].input["http_test_case_ids"], [200])
         self.assertEqual(captured_payload["payload"].input["websocket_test_case_ids"], [])
         self.assertEqual(result["draft"]["scenario"]["name"], "Enterprise Scenario")
+
+    def test_report_read_summary_tool_returns_recent_report_context(self):
+        from app.models.test_plan import TestPlanRun
+        from app.models.visual_flow import VisualFlowExecution, VisualFlowNodeExecution
+        from app.services.agent_tool_service import AgentToolBackend
+
+        now = datetime.now().replace(microsecond=0)
+        plan_run = TestPlanRun(
+            id=301,
+            plan_id=None,
+            project_id=10,
+            plan_name="Nightly Regression",
+            plan_version=3,
+            environment_id=None,
+            environment_name=None,
+            status="passed",
+            trigger="schedule",
+            plan_snapshot={"targets": []},
+            target_results=[],
+            target_count=3,
+            passed_count=3,
+            failed_count=0,
+            operator_id=self.owner.id,
+            started_at=now - timedelta(minutes=20),
+            finished_at=now - timedelta(minutes=18),
+            duration_ms=120000,
+            created_at=now - timedelta(minutes=20),
+            is_deleted=False,
+        )
+        flow_execution = VisualFlowExecution(
+            id=401,
+            flow_id=None,
+            flow_version_id=None,
+            project_id=10,
+            environment_id=None,
+            status="failed",
+            trigger_type="manual",
+            trigger_user_id=self.owner.id,
+            context_snapshot={"variables": {}},
+            started_at=now - timedelta(minutes=10),
+            finished_at=now - timedelta(minutes=9),
+            created_at=now - timedelta(minutes=10),
+        )
+        nodes = [
+            VisualFlowNodeExecution(
+                id=501,
+                execution_id=401,
+                node_id="login",
+                status="passed",
+                attempt=1,
+            ),
+            VisualFlowNodeExecution(
+                id=502,
+                execution_id=401,
+                node_id="checkout",
+                status="failed",
+                attempt=1,
+                error={"message": "assertion failed"},
+            ),
+        ]
+        self.db.add_all([plan_run, flow_execution, *nodes])
+        self.db.commit()
+
+        result = AgentToolBackend(self.db).execute(
+            tool_name="report.read_summary",
+            payload={"project_id": 10, "page_size": 10},
+            current_user=self.owner,
+        )
+
+        self.assertEqual(result["project_id"], 10)
+        self.assertEqual(result["report_count"], 2)
+        self.assertEqual(result["returned_report_count"], 2)
+        self.assertEqual(result["status_counts"], {"failed": 1, "passed": 1})
+        self.assertEqual(result["returned_case_totals"]["total"], 5)
+        self.assertEqual(result["returned_case_totals"]["passed"], 4)
+        self.assertEqual(result["returned_case_totals"]["failed"], 1)
+        self.assertEqual(result["returned_case_totals"]["pass_rate"], 80.0)
+        self.assertEqual(result["latest_reports"][0]["source_type"], "flow")
+        self.assertEqual(result["failure_reports"][0]["source_id"], 401)
 
     def test_conversation_runner_queries_cases_before_composing_scenario(self):
         from app.models.project import ProjectEnvironment
@@ -1177,6 +1672,331 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(calls[1].status, "succeeded")
         self.assertEqual(captured_skill_payload["skill_id"], "scenario-composer")
         self.assertEqual(captured_skill_payload["payload"].input["http_test_case_ids"], [201])
+
+    def test_conversation_runner_project_context_query_does_not_force_scenario_compose(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+
+        environment = ProjectEnvironment(
+            id=108,
+            project_id=10,
+            name="test",
+            base_url="https://api.example.test",
+            description="default env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        case = TestCase(
+            id=208,
+            project_id=10,
+            environment_id=108,
+            name="Enterprise Company List",
+            description="query companies",
+            method="GET",
+            path="/companies",
+            headers={},
+            query_params={},
+            body_type="json",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, case])
+        self.db.commit()
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent=(
+                    "Please read current project context, test resources, default environment, "
+                    "and whether existing scenario exists."
+                ),
+                max_iterations=3,
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(service_self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{"project_id":10},'
+                        '"reason":"Read project context first","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 2:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"testcase.query_project_cases","input":{"project_id":10},'
+                        '"reason":"Summarize available test resources","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {
+                "type": "delta",
+                "content": "Project has one HTTP test case, default environment test, and no confirmed saved scenario.",
+            }
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        calls = list(
+            self.db.scalars(
+                select(AgentToolCall).where(AgentToolCall.run_id == run.run_id).order_by(AgentToolCall.id.asc())
+            ).all()
+        )
+        event_types = [
+            event.event_type
+            for event in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq.asc())
+            ).all()
+        ]
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual([call.tool_name for call in calls], ["project.read_context", "testcase.query_project_cases"])
+        self.assertNotIn("model.required_tool_missing", event_types)
+        self.assertNotIn("model.required_tool_repaired", event_types)
+        self.assertIn("default environment test", completed.result_json["message"])
+
+    def test_conversation_runner_prompts_repair_for_fixable_scenario_warnings(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+
+        environment = ProjectEnvironment(
+            id=105,
+            project_id=10,
+            name="default",
+            base_url="https://api.example.test",
+            description="default env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        case = TestCase(
+            id=205,
+            project_id=10,
+            environment_id=105,
+            name="Enterprise Company List",
+            description="query companies",
+            method="GET",
+            path="/companies",
+            headers={},
+            query_params={},
+            body_type="json",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, case])
+        self.db.commit()
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="Create an enterprise scenario and repair fixable validation warnings.",
+                max_iterations=4,
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+        captured_skill_inputs = []
+
+        def fake_stream(service_self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"testcase.query_project_cases","input":{"project_id":10},'
+                        '"reason":"Need cases before composing scenario","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 2:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"scenario.compose_draft","input":{"project_id":10,'
+                        '"environment_id":105,"input":{"requirement":"enterprise workflow",'
+                        '"http_test_case_ids":[205],"include_latest_execution":true,'
+                        '"self_validate":true,"max_nodes":3}},'
+                        '"reason":"Compose initial scenario","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 3:
+                repair_prompt = captured_messages[-1][-1].content
+                self.assertIn("通用工具结果质量闭环", repair_prompt)
+                self.assertIn("scenario.compose_draft", repair_prompt)
+                self.assertIn("可自动修复项", repair_prompt)
+                self.assertIn("companyName 未动态绑定", repair_prompt)
+                self.assertIn("需要用户输入或外部配置的阻断项", repair_prompt)
+                self.assertIn("鉴权令牌问题", repair_prompt)
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"scenario.compose_draft","input":{"project_id":10,'
+                        '"environment_id":105,"input":{"requirement":"enterprise workflow",'
+                        '"http_test_case_ids":[205],"include_latest_execution":true,'
+                        '"self_validate":true,"max_nodes":3,'
+                        '"extra_requirements":"修复 companyName 未动态绑定：从企业列表响应提取 companyName 并绑定关注接口 body.companyName；保留鉴权令牌为用户配置项。"}},'
+                        '"reason":"Repair fixable scenario warnings before final answer","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "Scenario draft repaired; only auth token remains for user configuration."}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def fake_run_skill(service_self, *, skill_id, payload, current_user):
+            captured_skill_inputs.append(payload.input)
+            if len(captured_skill_inputs) == 1:
+                return {
+                    "scenario": {"name": "Enterprise Workflow"},
+                    "warnings": [
+                        "鉴权令牌问题：需要用户配置 Lingxi-Auth。",
+                        "companyName 未动态绑定：关注接口 body.companyName 被硬编码。",
+                    ],
+                }
+            return {
+                "scenario": {"name": "Enterprise Workflow Repaired"},
+                "warnings": ["鉴权令牌问题：需要用户配置 Lingxi-Auth。"],
+            }
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch("app.services.agent_tool_service.AISkillService.run_skill", new=fake_run_skill),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        calls = list(
+            self.db.scalars(
+                select(AgentToolCall).where(AgentToolCall.run_id == run.run_id).order_by(AgentToolCall.id.asc())
+            ).all()
+        )
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(
+            completed.result_json["message"],
+            "Scenario draft repaired; only auth token remains for user configuration.",
+        )
+        self.assertEqual(
+            [call.tool_name for call in calls],
+            ["testcase.query_project_cases", "scenario.compose_draft", "scenario.compose_draft"],
+        )
+        self.assertIn("companyName 未动态绑定", captured_skill_inputs[1]["extra_requirements"])
+
+    def test_conversation_runner_applies_generic_repair_loop_to_ai_skill_warnings(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="Generate HTTP test cases and repair fixable draft warnings.",
+                max_iterations=3,
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+        captured_skill_inputs = []
+
+        def fake_stream(service_self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"ai_skill.run_draft","input":{"project_id":10,'
+                        '"skill_id":"http-test-case","operation":"generate",'
+                        '"input":{"interface_text":"GET /companies returns company list",'
+                        '"generate_count":1,"include_assertions":true}},'
+                        '"reason":"Generate draft HTTP cases","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 2:
+                repair_prompt = captured_messages[-1][-1].content
+                self.assertIn("通用工具结果质量闭环", repair_prompt)
+                self.assertIn("ai_skill.run_draft", repair_prompt)
+                self.assertIn("推荐修复路径", repair_prompt)
+                self.assertIn("json_equals 缺少 expected", repair_prompt)
+                self.assertIn("需要用户输入或外部配置的阻断项", repair_prompt)
+                self.assertIn("鉴权 token 需要用户配置", repair_prompt)
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"ai_skill.run_draft","input":{"project_id":10,'
+                        '"skill_id":"http-test-case","operation":"generate",'
+                        '"input":{"interface_text":"GET /companies returns company list",'
+                        '"generate_count":1,"include_assertions":true,'
+                        '"extra_requirements":"修复 json_equals 缺少 expected：根据接口响应样本或字段语义补充稳定 expected；鉴权 token 保持为用户配置项。"}},'
+                        '"reason":"Repair fixable AI draft warnings","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "HTTP test case draft repaired; only auth token remains for user configuration."}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def fake_run_skill(service_self, *, skill_id, payload, current_user):
+            captured_skill_inputs.append(payload.input)
+            if len(captured_skill_inputs) == 1:
+                return {
+                    "source_summary": "company list",
+                    "cases": [],
+                    "warnings": [
+                        "第 1 条 json_equals 缺少 expected，已忽略。",
+                        "鉴权 token 需要用户配置。",
+                    ],
+                }
+            return {
+                "source_summary": "company list repaired",
+                "cases": [],
+                "warnings": ["鉴权 token 需要用户配置。"],
+            }
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch("app.services.agent_tool_service.AISkillService.run_skill", new=fake_run_skill),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        calls = list(
+            self.db.scalars(
+                select(AgentToolCall).where(AgentToolCall.run_id == run.run_id).order_by(AgentToolCall.id.asc())
+            ).all()
+        )
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(
+            completed.result_json["message"],
+            "HTTP test case draft repaired; only auth token remains for user configuration.",
+        )
+        self.assertEqual([call.tool_name for call in calls], ["ai_skill.run_draft", "ai_skill.run_draft"])
+        self.assertIn("json_equals 缺少 expected", captured_skill_inputs[1]["extra_requirements"])
 
     def test_conversation_runner_blocks_scenario_compose_until_cases_are_queried(self):
         from app.models.project import ProjectEnvironment
@@ -1294,6 +2114,31 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(calls[0].status, "failed")
         self.assertEqual(calls[0].error_code, "scenario_compose_requires_case_query")
+        observations = list(
+            self.db.scalars(
+                select(AgentLoopObservation)
+                .where(AgentLoopObservation.run_id == run.run_id)
+                .order_by(AgentLoopObservation.id.asc())
+            ).all()
+        )
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].iteration, calls[0].attempt_index)
+        self.assertEqual(observations[0].step_index, calls[0].step_index)
+        self.assertEqual(observations[0].next_action, "repair")
+        self.assertEqual(observations[0].stop_action_reason, "tool_prerequisite_missing")
+        self.assertEqual(observations[0].root_cause_rule_id, "RC_TOOL_PREREQUISITE_MISSING")
+        self.assertEqual(observations[0].root_cause_primary, "tool_prerequisite_missing")
+        self.assertEqual(observations[0].mitigation_action, "call_required_prerequisite_tool")
+        self.assertEqual(
+            observations[0].observation_json,
+            {
+                "source": "tool_prerequisite_guard",
+                "tool_call_id": calls[0].tool_call_id,
+                "blocked_tool": "scenario.compose_draft",
+                "required_tool": "testcase.query_project_cases",
+                "error_code": "scenario_compose_requires_case_query",
+            },
+        )
         self.assertEqual(calls[1].status, "succeeded")
         self.assertEqual(calls[1].output_json_redacted["http_test_cases"][0]["id"], 202)
         self.assertEqual(calls[2].status, "succeeded")
@@ -1362,6 +2207,166 @@ class AgentRuntimeTests(unittest.TestCase):
             for item in events_after_cancel
         ))
 
+    def test_conversation_runner_records_max_iteration_observation_before_final_summary(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="读取项目上下文后总结",
+                max_iterations=1,
+            ),
+            current_user=self.owner,
+        )
+        call_count = {"value": 0}
+
+        def fake_stream(self, payload):
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{"project_id":10},'
+                        '"reason":"读取项目","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "tool_calls", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "这是基于工具结果的最终总结。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_runtime_service.AgentToolBackend.execute",
+                return_value={"project": {"id": 10, "name": "TestAuto"}},
+            ),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        observations = list(
+            self.db.scalars(
+                select(AgentLoopObservation)
+                .where(AgentLoopObservation.run_id == run.run_id)
+                .order_by(AgentLoopObservation.id.asc())
+            ).all()
+        )
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(completed.result_json["message"], "这是基于工具结果的最终总结。")
+        self.assertEqual(call_count["value"], 2)
+        self.assertEqual(len(observations), 1)
+        loop_observed_index = next(
+            index for index, item in enumerate(events) if item.event_type == "loop.observed"
+        )
+        final_summary_started_index = next(
+            index
+            for index, item in enumerate(events)
+            if item.event_type == "model.started" and item.payload_json.get("final_summary")
+        )
+        self.assertEqual(observations[0].iteration, 1)
+        self.assertEqual(observations[0].step_index, 1)
+        self.assertEqual(observations[0].next_action, "stop")
+        self.assertEqual(observations[0].stop_action_reason, "max_iterations")
+        self.assertEqual(observations[0].root_cause_rule_id, "RC_MAX_ITERATIONS")
+        self.assertEqual(observations[0].root_cause_primary, "max_iterations")
+        self.assertEqual(observations[0].mitigation_action, "human_review_or_extend_limit")
+        self.assertEqual(observations[0].observation_json["source"], "max_iteration_guard")
+        self.assertEqual(observations[0].observation_json["max_iterations"], 1)
+        self.assertEqual(observations[0].observation_json["tool_call_count"], 1)
+        self.assertLess(loop_observed_index, final_summary_started_index)
+
+    def test_conversation_runner_stops_on_repeated_failed_tool_no_progress(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="连续修复同一个工具失败时停止",
+                max_iterations=4,
+            ),
+            current_user=self.owner,
+        )
+        model_call_count = {"value": 0}
+        backend_call_count = {"value": 0}
+
+        def fake_stream(self, payload):
+            model_call_count["value"] += 1
+            if model_call_count["value"] <= 2:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{"project_id":10},'
+                        '"reason":"读取项目","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "tool_calls", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "不应在重复失败后继续生成最终回复。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def fake_execute(self, *, tool_name, payload, current_user):
+            backend_call_count["value"] += 1
+            raise ValueError("schema invalid: missing required field base_url")
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch("app.services.agent_tool_service.AgentToolBackend.execute", new=fake_execute),
+        ):
+            failed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        calls = list(
+            self.db.scalars(
+                select(AgentToolCall)
+                .where(AgentToolCall.run_id == run.run_id)
+                .order_by(AgentToolCall.id.asc())
+            ).all()
+        )
+        observations = list(
+            self.db.scalars(
+                select(AgentLoopObservation)
+                .where(AgentLoopObservation.run_id == run.run_id)
+                .order_by(AgentLoopObservation.id.asc())
+            ).all()
+        )
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(failed.error_code, "agent_repair_no_progress")
+        self.assertEqual(model_call_count["value"], 2)
+        self.assertEqual(backend_call_count["value"], 2)
+        self.assertEqual([call.status for call in calls], ["failed", "failed"])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].iteration, 2)
+        self.assertEqual(observations[0].step_index, 2)
+        self.assertEqual(observations[0].next_action, "stop")
+        self.assertEqual(observations[0].stop_action_reason, "same_failure_no_progress")
+        self.assertEqual(observations[0].root_cause_rule_id, "RC_NO_PROGRESS_PURE")
+        self.assertEqual(observations[0].root_cause_primary, "same_failure_no_progress")
+        self.assertEqual(observations[0].mitigation_action, "stop_or_escalate_repair_strategy")
+        self.assertEqual(observations[0].observation_json["source"], "tool_result_no_progress_guard")
+        self.assertEqual(observations[0].observation_json["tool_name"], "project.read_context")
+        self.assertEqual(observations[0].observation_json["error_code"], "tool_execution_failed")
+        self.assertEqual(
+            observations[0].observation_json["tool_call_ids"],
+            [calls[0].tool_call_id, calls[1].tool_call_id],
+        )
+        self.assertLess(event_types.index("loop.observed"), event_types.index("run.failed"))
+        self.assertFalse(any(
+            item.event_type == "model.started" and item.payload_json.get("iteration") == 2
+            for item in events
+        ))
+
     def test_conversation_runner_repairs_invalid_model_tool_request_once(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="读取项目上下文后再回答"),
@@ -1411,10 +2416,18 @@ class AgentRuntimeTests(unittest.TestCase):
             ).all()
         )
         event_types = [item.event_type for item in events]
+        invalid_event = next(item for item in events if item.event_type == "model.tool_request_invalid")
         repair_started = [
             item for item in events
             if item.event_type == "model.started" and item.payload_json.get("repair_attempt")
         ]
+        observations = list(
+            self.db.scalars(
+                select(AgentLoopObservation)
+                .where(AgentLoopObservation.run_id == run.run_id)
+                .order_by(AgentLoopObservation.id.asc())
+            ).all()
+        )
 
         self.assertEqual(completed.status, "completed")
         self.assertEqual(completed.result_json["message"], "已读取项目上下文，可以继续规划测试。")
@@ -1422,9 +2435,495 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("model.tool_request_repaired", event_types)
         self.assertIn("model.tool_request_detected", event_types)
         self.assertIn("tool.result_observed", event_types)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].iteration, 0)
+        self.assertEqual(observations[0].step_index, 0)
+        self.assertEqual(observations[0].next_action, "repair")
+        self.assertEqual(observations[0].stop_action_reason, "tool_request_format_invalid")
+        self.assertEqual(observations[0].root_cause_rule_id, "RC_TOOL_REQUEST_FORMAT_INVALID")
+        self.assertEqual(observations[0].root_cause_primary, "tool_request_format_invalid")
+        self.assertEqual(observations[0].mitigation_action, "repair_tool_request_format")
+        self.assertEqual(observations[0].observation_json["source"], "tool_request_parse_guard")
+        self.assertEqual(observations[0].observation_json["error_message"], invalid_event.payload_json["error_message"])
+        self.assertEqual(observations[0].observation_json["model_call_id"], invalid_event.payload_json["model_call_id"])
         self.assertEqual(len(repair_started), 1)
         self.assertIn("格式无效", captured_messages[1][-1].content)
         self.assertIn("工具执行结果如下", captured_messages[2][-1].content)
+
+    def test_conversation_runner_salvages_mixed_tool_block_without_extra_repair_call(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="读取项目上下文并继续回答"),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "我先读取项目上下文。\n\n"
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{},'
+                        '"reason":"需要项目上下文","evidence_refs":["latest-project"]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "已读取项目上下文。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_runtime_service.AgentToolBackend.execute",
+                return_value={"project": {"id": 10, "name": "TestAuto"}},
+            ),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        calls = list(self.db.scalars(select(AgentToolCall).where(AgentToolCall.run_id == run.run_id)).all())
+        event_types = [item.event_type for item in events]
+        repaired_event = next(item for item in events if item.event_type == "model.tool_request_repaired")
+        visible_content = "".join(
+            (item.payload_json or {}).get("content", "")
+            for item in events
+            if item.event_type == "model.delta"
+        )
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(completed.result_json["message"], "已读取项目上下文。")
+        self.assertEqual(len(captured_messages), 2)
+        self.assertIn("model.tool_request_invalid", event_types)
+        self.assertEqual(repaired_event.payload_json["repair_strategy"], "salvaged_fenced_tool_request")
+        self.assertFalse(any(item.payload_json.get("repair_attempt") for item in events if item.event_type == "model.started"))
+        self.assertEqual([call.tool_name for call in calls], ["project.read_context"])
+        self.assertEqual(calls[0].policy_evidence_refs_json, [])
+        self.assertNotIn("agent_tool_request", visible_content)
+
+    def test_conversation_runner_short_circuits_unsupported_scenario_save(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="把刚才的场景直接保存成正式场景，不要问我。",
+            ),
+            current_user=self.owner,
+        )
+
+        classifier_response = AIChatResponse(
+            provider="deepseek",
+            model="deepseek-test",
+            content='{"requires_scenario_persistence": true, "confidence": 0.98, "reason": "用户要求保存为正式场景"}',
+            finish_reason="stop",
+        )
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat", return_value=classifier_response) as chat,
+            patch("app.services.agent_runtime_service.AIService.chat_stream") as chat_stream,
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        calls = list(self.db.scalars(select(AgentToolCall).where(AgentToolCall.run_id == run.run_id)).all())
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+
+        self.assertEqual(completed.status, "completed")
+        self.assertIn("没有“保存正式场景”的后端工具", completed.result_json["message"])
+        self.assertEqual(completed.result_json["completion_source"], "unsupported_scenario_save_guard")
+        self.assertEqual(calls, [])
+        self.assertIn("model.delta", [item.event_type for item in events])
+        chat.assert_called_once()
+        chat_stream.assert_not_called()
+
+    def test_conversation_runner_does_not_short_circuit_negated_scenario_save_intent(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="请基于当前项目已有用例组合一个企业相关场景草稿，不要保存。",
+            ),
+            current_user=self.owner,
+        )
+        classifier_response = AIChatResponse(
+            provider="deepseek",
+            model="deepseek-test",
+            content='{"requires_scenario_persistence": false, "confidence": 0.99, "reason": "用户明确要求不要保存，只生成草稿"}',
+            finish_reason="stop",
+        )
+
+        def fake_stream(self, payload):
+            yield {"type": "delta", "content": "我会继续生成场景草稿，但不会保存正式场景。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat", return_value=classifier_response) as chat,
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        self.assertEqual(completed.status, "completed")
+        self.assertNotEqual(completed.result_json.get("completion_source"), "unsupported_scenario_save_guard")
+        self.assertEqual(completed.result_json["message"], "我会继续生成场景草稿，但不会保存正式场景。")
+        chat.assert_called_once()
+
+    def test_conversation_runner_suppresses_mixed_tool_request_stream_and_repairs(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="请读取当前项目上下文，然后总结。"),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "我先读取项目。\n"
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{"project_id":10},'
+                        '"reason":"读取项目","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 2:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{"project_id":10},'
+                        '"reason":"读取项目","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "已读取项目上下文。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_runtime_service.AgentToolBackend.execute",
+                return_value={"project": {"id": 10, "name": "TestAuto"}},
+            ),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        visible_content = "".join(
+            item.payload_json.get("content", "")
+            for item in events
+            if item.event_type == "model.delta"
+        )
+
+        self.assertEqual(completed.status, "completed")
+        self.assertIn("model.tool_request_invalid", event_types)
+        self.assertIn("model.tool_request_repaired", event_types)
+        self.assertNotIn("agent_tool_request", visible_content)
+        self.assertNotIn("我先读取项目", visible_content)
+        self.assertEqual(completed.result_json["message"], "已读取项目上下文。")
+
+    def test_conversation_runner_repairs_missing_compose_after_case_query(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+
+        environment = ProjectEnvironment(
+            id=106,
+            project_id=10,
+            name="default",
+            base_url="https://api.example.test",
+            description="default env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        case = TestCase(
+            id=206,
+            project_id=10,
+            environment_id=106,
+            name="Enterprise Company List",
+            description="query companies",
+            method="GET",
+            path="/companies",
+            headers={},
+            query_params={},
+            body_type="json",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, case])
+        self.db.commit()
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="请基于当前项目已有用例组合一个企业相关场景草稿。",
+                max_iterations=3,
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+        test_case = self
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"testcase.query_project_cases","input":{"project_id":10},'
+                        '"reason":"查询用例","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 2:
+                yield {"type": "delta", "content": "我已经分析完候选用例，企业列表可作为第一步。"}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 3:
+                test_case.assertIn("要求继续调用", captured_messages[-1][-1].content)
+                test_case.assertIn("scenario.compose_draft", captured_messages[-1][-1].content)
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"scenario.compose_draft","input":{"project_id":10,'
+                        '"environment_id":106,"input":{"requirement":"enterprise workflow",'
+                        '"http_test_case_ids":[206],"self_validate":false,"max_nodes":3}},'
+                        '"reason":"组合场景","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "已生成企业场景草稿。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_tool_service.AISkillService.run_skill",
+                return_value={"scenario": {"name": "Enterprise Workflow"}},
+            ),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        calls = list(
+            self.db.scalars(
+                select(AgentToolCall).where(AgentToolCall.run_id == run.run_id).order_by(AgentToolCall.id.asc())
+            ).all()
+        )
+        event_types = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual([call.tool_name for call in calls], ["testcase.query_project_cases", "scenario.compose_draft"])
+        self.assertIn("model.required_tool_missing", event_types)
+        self.assertIn("model.required_tool_repaired", event_types)
+        self.assertEqual(completed.result_json["message"], "已生成企业场景草稿。")
+        missing_event = next(
+            item
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+            if item.event_type == "model.required_tool_missing"
+        )
+        observations = list(
+            self.db.scalars(
+                select(AgentLoopObservation)
+                .where(AgentLoopObservation.run_id == run.run_id)
+                .order_by(AgentLoopObservation.id.asc())
+            ).all()
+        )
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].iteration, 1)
+        self.assertEqual(observations[0].step_index, 1)
+        self.assertEqual(observations[0].next_action, "repair")
+        self.assertEqual(observations[0].stop_action_reason, "required_tool_followup_missing")
+        self.assertEqual(observations[0].root_cause_rule_id, "RC_REQUIRED_TOOL_FOLLOWUP_MISSING")
+        self.assertEqual(observations[0].root_cause_primary, "required_tool_followup_missing")
+        self.assertEqual(observations[0].mitigation_action, "repair_required_tool_followup")
+        self.assertEqual(observations[0].observation_json["source"], "required_tool_followup_guard")
+        self.assertEqual(observations[0].observation_json["after_tool"], missing_event.payload_json["after_tool"])
+        self.assertEqual(observations[0].observation_json["required_tool"], missing_event.payload_json["required_tool"])
+        repair_context = self.db.scalar(
+            select(AgentContextBuild).where(
+                AgentContextBuild.context_build_id == observations[0].decision_context_build_id
+            )
+        )
+        self.assertIsNotNone(repair_context)
+        metadata = repair_context.build_metadata_json or {}
+        self.assertIn(
+            {"name": "scenario-composition"},
+            [{"name": item["name"]} for item in metadata["selected_agent_skills"]],
+        )
+        self.assertIn(
+            {
+                "skill_name": "scenario-composition",
+                "routing_key": "routing_required_tool_after_success",
+                "after_tool": "testcase.query_project_cases",
+                "required_tool": "scenario.compose_draft",
+            },
+            [
+                {
+                    "skill_name": item["skill_name"],
+                    "routing_key": item["routing_key"],
+                    "after_tool": item["after_tool"],
+                    "required_tool": item["required_tool"],
+                }
+                for item in metadata["matched_agent_skill_routing_rules"]
+            ],
+        )
+
+    def test_conversation_runner_retries_fixable_failed_compose_tool(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+
+        environment = ProjectEnvironment(
+            id=107,
+            project_id=10,
+            name="default",
+            base_url="https://api.example.test",
+            description="default env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        case = TestCase(
+            id=207,
+            project_id=10,
+            environment_id=107,
+            name="Enterprise Company List",
+            description="query companies",
+            method="GET",
+            path="/companies",
+            headers={},
+            query_params={},
+            body_type="json",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, case])
+        self.db.commit()
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="请生成一个支持多个 companyId 数据集的企业场景草稿。",
+                max_iterations=4,
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+        skill_call_count = {"value": 0}
+        test_case = self
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"testcase.query_project_cases","input":{"project_id":10},'
+                        '"reason":"查询用例","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 2:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"scenario.compose_draft","input":{"project_id":10,'
+                        '"environment_id":107,"input":{"requirement":"dataset workflow",'
+                        '"http_test_case_ids":[207],"include_datasets":true,"self_validate":true,"max_nodes":3}},'
+                        '"reason":"生成数据集场景","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 3:
+                repair_prompt = captured_messages[-1][-1].content
+                test_case.assertIn("工具失败修复闭环", repair_prompt)
+                test_case.assertIn("datasets", repair_prompt)
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"scenario.compose_draft","input":{"project_id":10,'
+                        '"environment_id":107,"input":{"requirement":"dataset workflow with fixed schema",'
+                        '"http_test_case_ids":[207],"include_datasets":true,"self_validate":true,'
+                        '"extra_requirements":"修复 datasets schema：补充 dataset id，variables 使用 {name,type} 对象数组。",'
+                        '"max_nodes":3}},'
+                        '"reason":"修复数据集 schema 后重试","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "数据集场景草稿已修复。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def fake_run_skill(self, *, skill_id, payload, current_user):
+            skill_call_count["value"] += 1
+            if skill_call_count["value"] == 1:
+                raise HTTPException(
+                    status_code=502,
+                    detail="AI 返回场景结构校验失败: datasets.0.id missing; variables dict_type",
+                )
+            return {"scenario": {"name": "Dataset Workflow"}}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch("app.services.agent_tool_service.AISkillService.run_skill", new=fake_run_skill),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        calls = list(
+            self.db.scalars(
+                select(AgentToolCall).where(AgentToolCall.run_id == run.run_id).order_by(AgentToolCall.id.asc())
+            ).all()
+        )
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(
+            [call.tool_name for call in calls],
+            ["testcase.query_project_cases", "scenario.compose_draft", "scenario.compose_draft"],
+        )
+        self.assertEqual(calls[1].status, "failed")
+        self.assertEqual(calls[2].status, "succeeded")
+        self.assertEqual(completed.result_json["message"], "数据集场景草稿已修复。")
 
     def test_create_run_route_does_not_start_real_worker_in_sqlite_tests(self):
         from app.api.v1.routers.agents import create_agent_run
@@ -2499,6 +3998,311 @@ class AgentRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(first.runtime_snapshot_id, second.runtime_snapshot_id)
+
+    def test_conversation_system_prompt_keeps_tool_registry_stable_for_prompt_cache(self):
+        from app.services.agent_skill_registry import AgentSkillRegistry
+        from app.services.agent_tool_service import ToolRegistry
+
+        registry = ToolRegistry()
+        skill_registry = AgentSkillRegistry()
+        tool_names = [spec.name for spec in registry.list_specs()]
+        skill_names = [skill.name for skill in skill_registry.list_skills()]
+        first_prompt = _conversation_system_prompt()
+        second_prompt = _conversation_system_prompt()
+
+        self.assertEqual(tool_names, sorted(tool_names))
+        self.assertEqual(skill_names, sorted(skill_names))
+        self.assertEqual(first_prompt, second_prompt)
+        self.assertIn('[{"approval_required":', first_prompt)
+        self.assertLess(first_prompt.index('"approval_required"'), first_prompt.index('"input_schema"'))
+        self.assertLess(first_prompt.index('"input_schema"'), first_prompt.index('"name"'))
+        self.assertIn('"name":"scenario-composition"', first_prompt)
+        self.assertIn("Codex 式渐进加载", first_prompt)
+
+    def test_tool_registry_builtin_specs_declare_executable_backend_handlers(self):
+        from app.services.agent_tool_service import AgentToolBackend, ToolRegistry
+
+        backend = AgentToolBackend(self.db)
+
+        for spec in ToolRegistry().list_specs():
+            self.assertIsNotNone(spec.backend_handler, spec.name)
+            self.assertTrue(callable(getattr(backend, spec.backend_handler or "", None)), spec.name)
+            self.assertNotIn("backend_handler", spec.to_json())
+            self.assertNotIn("required_successful_tool_before", spec.to_json())
+            self.assertNotIn("missing_prerequisite_error_code", spec.to_json())
+            self.assertNotIn("tool_result_repair_guidance", spec.to_json())
+
+        scenario_spec = ToolRegistry().get("scenario.compose_draft")
+        self.assertEqual(scenario_spec.required_successful_tool_before, "testcase.query_project_cases")
+        self.assertEqual(scenario_spec.missing_prerequisite_error_code, "scenario_compose_requires_case_query")
+        self.assertIn("scenario.compose_draft", scenario_spec.tool_result_repair_guidance or "")
+
+    def test_agent_tool_backend_delegates_handler_resolution_to_router(self):
+        from app.services.agent_tool_service import AgentToolBackend, RoutedTool, ToolRegistry
+
+        registry = ToolRegistry()
+        calls = []
+
+        def fake_handler(payload, current_user):
+            return {
+                "handled_by": "fake-router",
+                "project_id": payload["project_id"],
+                "user_id": current_user.id,
+            }
+
+        class FakeRouter:
+            def resolve(self, *, tool_name, backend):
+                calls.append({"tool_name": tool_name, "backend": backend})
+                return RoutedTool(
+                    spec=registry.get("project.read_context"),
+                    handler=fake_handler,
+                )
+
+        backend = AgentToolBackend(self.db, router=FakeRouter())
+
+        result = backend.execute(
+            tool_name="custom.external_tool",
+            payload={"project_id": 10},
+            current_user=self.owner,
+        )
+
+        self.assertEqual(result["handled_by"], "fake-router")
+        self.assertEqual(result["project_id"], 10)
+        self.assertEqual(result["user_id"], self.owner.id)
+        self.assertEqual(calls, [{"tool_name": "custom.external_tool", "backend": backend}])
+
+    def test_agent_skill_registry_selects_relevant_skills_by_intent(self):
+        from app.services.agent_skill_registry import AgentSkillRegistry
+
+        registry = AgentSkillRegistry()
+
+        general = registry.select_for_intent("边界值分析和等价类划分有什么区别？")
+        scenario = registry.select_for_intent("请基于当前项目已有用例组合企业场景草稿，不要保存")
+        report = registry.select_for_intent("请读取当前项目测试报告摘要并分析失败原因")
+        project = registry.select_for_intent("请读取当前项目上下文和真实用例")
+        http_case = registry.select_for_intent("generate HTTP API test case and validate assertions")
+        websocket_case = registry.select_for_intent("design WebSocket handshake message sequence and receive assertions")
+        execution = registry.select_for_intent("diagnose recent execution failure and SSE stuck state")
+        defect = registry.select_for_intent("draft a defect from failed result and classify severity")
+        capture = registry.select_for_intent("clean browser capture traffic and convert to API test cases")
+        environment = registry.select_for_intent("inspect current project default environment variables and base_url")
+        flow = registry.select_for_intent("review visual flow DAG nodes conditions and delay strategy")
+        test_plan = registry.select_for_intent("design regression test plan coverage and release readiness")
+        permission = registry.select_for_intent("troubleshoot project member permission 403 access")
+        api_definition = registry.select_for_intent("review OpenAPI import API definition endpoint catalog")
+        dataset = registry.select_for_intent("design dataset records parameterization for data-driven scenario")
+        media = registry.select_for_intent("review MinIO screenshot attachment evidence redaction")
+        agent_ops = registry.select_for_intent("diagnose agent runtime readiness runbook SSE model.delta stuck")
+        security = registry.select_for_intent("design JWT token auth permission and rate limit tests")
+        mock = registry.select_for_intent("design mock service virtualization stubs for unstable dependency")
+        ci = registry.select_for_intent("integrate CI pipeline webhook release gate promotion checks")
+        archive = registry.select_for_intent("plan PDF report archive export trend retention")
+        batch = registry.select_for_intent("optimize batch execution queue retry timeout worker scheduling")
+        binding = registry.select_for_intent("repair extractor path assertion variable binding from upstream response")
+        error_contract = registry.select_for_intent("debug 422 validation failed ErrorResponse request_id frontend display")
+        ai_skill_runtime = registry.select_for_intent("diagnose AI Skill Run generated draft JSON schema validation failure")
+        asset_lifecycle = registry.select_for_intent("organize test asset tags folders copy delete dependency version history")
+        notification = registry.select_for_intent("configure SMTP webhook notification alert for failed test plan run")
+        privacy = registry.select_for_intent("redact token PII signed URL secrets from report logs and AI prompt")
+        migration = registry.select_for_intent("plan Alembic migration rollback backward compatibility legacy data repair")
+
+        self.assertEqual(general[0].name, "general-testing-answer")
+        self.assertIn("scenario-composition", [skill.name for skill in scenario])
+        self.assertIn("report-summary", [skill.name for skill in report])
+        self.assertIn("project-context", [skill.name for skill in project])
+        self.assertEqual(http_case[0].name, "http-test-case-design")
+        self.assertEqual(websocket_case[0].name, "websocket-test-case-design")
+        self.assertEqual(execution[0].name, "execution-diagnosis")
+        self.assertEqual(defect[0].name, "defect-triage")
+        self.assertEqual(capture[0].name, "browser-capture-analysis")
+        self.assertEqual(environment[0].name, "environment-config-management")
+        self.assertEqual(flow[0].name, "visual-flow-design")
+        self.assertEqual(test_plan[0].name, "test-plan-management")
+        self.assertEqual(permission[0].name, "project-permission-admin")
+        self.assertEqual(api_definition[0].name, "api-definition-import")
+        self.assertEqual(dataset[0].name, "dataset-parameterization")
+        self.assertEqual(media[0].name, "media-evidence-management")
+        self.assertEqual(agent_ops[0].name, "agent-runtime-operations")
+        self.assertEqual(security[0].name, "security-auth-testing")
+        self.assertEqual(mock[0].name, "mock-service-virtualization")
+        self.assertEqual(ci[0].name, "ci-release-integration")
+        self.assertEqual(archive[0].name, "report-archive-export")
+        self.assertEqual(batch[0].name, "batch-execution-scheduling")
+        self.assertEqual(binding[0].name, "assertion-extractor-binding")
+        self.assertEqual(error_contract[0].name, "api-error-contract-debugging")
+        self.assertEqual(ai_skill_runtime[0].name, "ai-skill-runtime-governance")
+        self.assertEqual(asset_lifecycle[0].name, "test-asset-lifecycle")
+        self.assertEqual(notification[0].name, "notification-alerting-config")
+        self.assertEqual(privacy[0].name, "data-privacy-redaction")
+        self.assertEqual(migration[0].name, "migration-compatibility-planning")
+        self.assertIn("generate HTTP test case", registry.private_list("http-test-case-design", "routing_requires_tool"))
+        self.assertIn("generate WebSocket test case", registry.private_list("websocket-test-case-design", "routing_requires_tool"))
+        self.assertIn("real execution result", registry.private_list("execution-diagnosis", "routing_requires_tool"))
+        self.assertIn("default environment", registry.private_list("environment-config-management", "routing_requires_tool"))
+        self.assertIn("real flow execution", registry.private_list("visual-flow-design", "routing_requires_tool"))
+        self.assertIn("plan report", registry.private_list("test-plan-management", "routing_requires_tool"))
+        self.assertIn("project access", registry.private_list("project-permission-admin", "routing_requires_tool"))
+        self.assertIn("current API definition", registry.private_list("api-definition-import", "routing_requires_tool"))
+        self.assertIn("dataset records", registry.private_list("dataset-parameterization", "routing_requires_tool"))
+        self.assertIn("real attachment", registry.private_list("media-evidence-management", "routing_requires_tool"))
+        self.assertIn("real agent event", registry.private_list("agent-runtime-operations", "routing_requires_tool"))
+        self.assertIn("real auth failure", registry.private_list("security-auth-testing", "routing_requires_tool"))
+        self.assertIn("real mock service", registry.private_list("mock-service-virtualization", "routing_requires_tool"))
+        self.assertIn("real release gate", registry.private_list("ci-release-integration", "routing_requires_tool"))
+        self.assertIn("real report archive", registry.private_list("report-archive-export", "routing_requires_tool"))
+        self.assertIn("real batch execution", registry.private_list("batch-execution-scheduling", "routing_requires_tool"))
+        self.assertIn("real extractor failure", registry.private_list("assertion-extractor-binding", "routing_requires_tool"))
+        self.assertIn("real API error", registry.private_list("api-error-contract-debugging", "routing_requires_tool"))
+        self.assertIn("real AI skill run", registry.private_list("ai-skill-runtime-governance", "routing_requires_tool"))
+        self.assertIn("real asset dependency", registry.private_list("test-asset-lifecycle", "routing_requires_tool"))
+        self.assertIn("real notification config", registry.private_list("notification-alerting-config", "routing_requires_tool"))
+        self.assertIn("real sensitive leak", registry.private_list("data-privacy-redaction", "routing_requires_tool"))
+        self.assertIn("real migration state", registry.private_list("migration-compatibility-planning", "routing_requires_tool"))
+        self.assertIn("边界值", general[0].triggers)
+        self.assertIn("当前项目", registry.private_list("project-context", "routing_requires_tool"))
+        self.assertIn("报告摘要", registry.private_list("report-summary", "routing_requires_tool"))
+        self.assertIn("场景草稿", registry.private_list("scenario-composition", "routing_requires_tool"))
+        self.assertTrue(any(
+            rule.startswith(
+                "after=testcase.query_project_cases; require=scenario.compose_draft; "
+                "min_total_fields=http_total,websocket_total; intent_markers="
+            )
+            for rule in registry.private_list("scenario-composition", "routing_required_tool_after_success")
+        ))
+        self.assertTrue(registry.private_list("scenario-composition", "guard_unsupported_capability"))
+        self.assertIn("保存", registry.private_list("scenario-composition", "guard_scenario_save_intent"))
+        self.assertIn("场景", registry.private_list("scenario-composition", "guard_scenario_save_subject"))
+        self.assertEqual(
+            registry.private_value("scenario-composition", "guard_scenario_save_classifier_prompt"),
+            "save-intent-classifier.md",
+        )
+        self.assertIn(
+            "意图分类器",
+            registry.private_resource_text("scenario-composition", "guard_scenario_save_classifier_prompt") or "",
+        )
+        self.assertNotIn("triggers", general[0].metadata())
+        self.assertNotIn("routing_hints", general[0].metadata())
+        self.assertNotIn("routing_requires_tool", http_case[0].metadata())
+        self.assertNotIn("routing_requires_tool", http_case[0].prompt_block())
+
+    def test_required_tool_routing_uses_skill_private_hints(self):
+        self.assertTrue(_intent_likely_requires_agent_tool("请读取当前项目上下文和真实用例"))
+        self.assertTrue(_intent_likely_requires_agent_tool("请总结当前项目最近报告摘要"))
+        self.assertTrue(_intent_likely_requires_agent_tool("请基于已有用例生成场景草稿"))
+        self.assertTrue(_intent_likely_requires_agent_tool("generate HTTP test case"))
+        self.assertTrue(_intent_likely_requires_agent_tool("generate WebSocket test case"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real execution result"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read default environment"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real flow execution"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read plan report"))
+        self.assertTrue(_intent_likely_requires_agent_tool("check project access"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read current API definition"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read dataset records"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real attachment"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real agent event"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real auth failure"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real mock service"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real release gate"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real report archive"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real batch execution"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real extractor failure"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real API error"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real AI skill run"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real asset dependency"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real notification config"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real sensitive leak"))
+        self.assertTrue(_intent_likely_requires_agent_tool("read real migration state"))
+        self.assertFalse(_intent_likely_requires_agent_tool("边界值分析和等价类划分有什么区别？"))
+        self.assertFalse(_intent_likely_requires_agent_tool("场景测试和普通接口用例有什么区别？"))
+        self.assertFalse(_intent_likely_requires_agent_tool("draft a defect template without reading project data"))
+
+        rules = _required_tool_followup_rules_for_intent("请基于已有用例生成场景草稿")
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].after_tool, "testcase.query_project_cases")
+        self.assertEqual(rules[0].required_tool, "scenario.compose_draft")
+        self.assertEqual(rules[0].min_total_fields, ("http_total", "websocket_total"))
+        self.assertTrue(rules[0].intent_markers)
+        self.assertEqual(
+            _required_tool_followup_rules_for_intent(
+                "Please read current project context, test resources, default environment, and whether existing scenario exists."
+            ),
+            (),
+        )
+
+    def test_unsupported_capability_guard_uses_skill_private_routing_hints(self):
+        guards = _unsupported_capability_guards_for_intent("请把刚才的草稿保存为正式场景")
+
+        self.assertEqual(len(guards), 1)
+        self.assertEqual(guards[0].skill_name, "scenario-composition")
+        self.assertEqual(guards[0].name, "scenario_save")
+        self.assertEqual(guards[0].unavailable_tools, ("scenario.save", "scenario.create", "scenario.persist"))
+        self.assertEqual(guards[0].requires_field, "requires_scenario_persistence")
+        self.assertEqual(guards[0].completion_source, "unsupported_scenario_save_guard")
+        self.assertEqual(_unsupported_capability_guards_for_intent("请保存这份报告摘要"), ())
+        self.assertIn("requires_scenario_persistence", _unsupported_capability_classifier_prompt(guards[0]) or "")
+        self.assertIn("没有“保存正式场景”的后端工具", _unsupported_capability_message(guards[0]) or "")
+
+    def test_agent_skill_registry_loads_custom_skill_triggers_from_frontmatter(self):
+        from app.services.agent_skill_registry import AgentSkillRegistry
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = Path(temp_dir) / "custom-dataset-helper"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "\n".join([
+                    "---",
+                    "name: custom-dataset-helper",
+                    "description: Use when the user asks for custom dataset helper behavior.",
+                    "triggers:",
+                    "  - 数据样板",
+                    "  - custom-dataset",
+                    "guard_custom_route:",
+                    "  - 私有路由词",
+                    "routing_requires_tool:",
+                    "  - 数据样板",
+                    "routing_required_tool_after_success:",
+                    "  - after=dataset.query; require=dataset.compose; min_total_fields=total",
+                    "guard_custom_prompt: classifier.md",
+                    "guard_custom_message: message.md",
+                    "guard_unsupported_capability:",
+                    "  - name=dataset_publish; intent=guard_custom_route; subject=routing_requires_tool; unavailable_tools=dataset.publish; classifier_prompt=guard_custom_prompt; requires_field=requires_dataset_publish; completion_source=unsupported_dataset_publish_guard; message=guard_custom_message",
+                    "---",
+                    "",
+                    "# Custom Dataset Helper",
+                    "",
+                    "Answer with a dataset helper workflow.",
+                ]),
+                encoding="utf-8",
+            )
+            (skill_dir / "classifier.md").write_text("私有分类提示词", encoding="utf-8")
+            (skill_dir / "message.md").write_text("私有完成消息", encoding="utf-8")
+
+            registry = AgentSkillRegistry(root=Path(temp_dir))
+            selected = registry.select_for_intent("请生成一份数据样板")
+            private_values = registry.private_list("custom-dataset-helper", "guard_custom_route")
+            tool_values = registry.private_list("custom-dataset-helper", "routing_requires_tool")
+            followup_values = registry.private_list(
+                "custom-dataset-helper",
+                "routing_required_tool_after_success",
+            )
+            prompt_resource = registry.private_resource_text("custom-dataset-helper", "guard_custom_prompt")
+            unsupported_values = registry.private_list("custom-dataset-helper", "guard_unsupported_capability")
+            message_resource = registry.private_resource_text("custom-dataset-helper", "guard_custom_message")
+
+        self.assertEqual([skill.name for skill in selected], ["custom-dataset-helper"])
+        self.assertEqual(private_values, ("私有路由词",))
+        self.assertEqual(tool_values, ("数据样板",))
+        self.assertEqual(followup_values, ("after=dataset.query; require=dataset.compose; min_total_fields=total",))
+        self.assertEqual(prompt_resource, "私有分类提示词")
+        self.assertEqual(len(unsupported_values), 1)
+        self.assertIn("name=dataset_publish", unsupported_values[0])
+        self.assertEqual(message_resource, "私有完成消息")
+        self.assertNotIn("私有路由词", selected[0].prompt_block())
+        self.assertNotIn("routing_requires_tool", selected[0].prompt_block())
+        self.assertNotIn("routing_required_tool_after_success", selected[0].prompt_block())
+        self.assertNotIn("guard_unsupported_capability", selected[0].prompt_block())
+        self.assertNotIn("私有分类提示词", selected[0].prompt_block())
+        self.assertNotIn("私有完成消息", selected[0].prompt_block())
 
     def test_tool_call_idempotency_reuses_existing_call(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -3737,6 +5541,36 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(admin_response.media_type, "text/event-stream")
         self.assertEqual(outsider_ctx.exception.status_code, 403)
 
+    def test_run_event_stream_resets_cross_run_last_event_id(self):
+        import asyncio
+
+        from app.api.v1.routers.agents import stream_agent_run_events
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="sse cursor reset", auto_complete=True),
+            current_user=self.owner,
+        )
+
+        async def read_stream(response) -> str:
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+            return "".join(chunks)
+
+        with patch("app.api.v1.routers.agents.SessionLocal", self.Session):
+            response = stream_agent_run_events(
+                run_id=run.run_id,
+                last_event_id=9999,
+                db=self.db,
+                current_user=self.member,
+            )
+            body = asyncio.run(read_stream(response))
+
+        self.assertIn("event: run.queued", body)
+        self.assertIn("event: run.started", body)
+        self.assertIn("event: run.completed", body)
+        self.assertNotIn("event: heartbeat", body)
+
     def test_run_event_snapshot_route_returns_cursor_state_and_requires_project_access(self):
         from app.api.v1.routers.agents import get_agent_run_event_snapshot
 
@@ -4178,6 +6012,7 @@ class AgentRuntimeTests(unittest.TestCase):
 
     def test_backend_completion_audit_summarizes_agent_backend_delivery(self):
         from app.api.v1.routers.agents import get_agent_backend_completion_audit
+        from scripts.agent_behavior_evaluation import CASES as AGENT_BEHAVIOR_EVALUATION_CASES
 
         provider = SimpleNamespace(
             provider="deepseek",
@@ -4210,11 +6045,58 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue(audit["launch_audit"]["model_configured"])
         self.assertEqual(audit["backend_scope"]["frontend_delivery"], "external repository")
         self.assertEqual(audit["runtime_contracts"]["summary"], "GET /api/v1/agents/runs/{run_id}/summary")
+        self.assertEqual(
+            audit["runtime_contracts"]["tool_execution_context"],
+            "AgentToolCall.policy_reason_json.execution_context",
+        )
+        self.assertEqual(
+            audit["runtime_contracts"]["runbook_execution_context_summary"],
+            "AgentRunbookRecommendation.details.execution_context",
+        )
+        self.assertEqual(
+            audit["runtime_contracts"]["runbook_execution_context_summary_fields"],
+            list(RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS),
+        )
         self.assertEqual(audit["diagnostics"]["completion_audit"], "GET /api/v1/agents/backend-completion-audit")
+        self.assertEqual(audit["diagnostics"]["tool_call_detail"], "GET /api/v1/agents/tool-calls/{tool_call_id}")
+        self.assertEqual(audit["diagnostics"]["runbook_diagnosis"], "GET /api/v1/agents/runs/{run_id}/runbook")
+        self.assertEqual(
+            checks["observability_and_release_gate"]["details"]["tool_execution_context_source"],
+            "AgentToolCall.policy_reason_json.execution_context",
+        )
+        self.assertEqual(
+            checks["observability_and_release_gate"]["details"]["runbook_execution_context_summary_fields"],
+            list(RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS),
+        )
         self.assertIn("model.delta", checks["conversation_runner_streaming"]["details"]["required_event_types"])
         self.assertIn(
-            "scripts/agent_conversation_e2e_check.py",
+                "scripts/agent_conversation_e2e_check.py",
             checks["live_e2e_diagnostic_available"]["details"]["normal_user_script"],
+        )
+        behavior_case_ids = [case.case_id for case in AGENT_BEHAVIOR_EVALUATION_CASES]
+        self.assertEqual(
+            checks["behavior_evaluation_suite_available"]["details"]["script"],
+            "scripts/agent_behavior_evaluation.py",
+        )
+        self.assertEqual(
+            checks["behavior_evaluation_suite_available"]["details"]["case_ids"],
+            behavior_case_ids,
+        )
+        self.assertEqual(
+            checks["behavior_evaluation_suite_available"]["details"]["case_count"],
+            len(behavior_case_ids),
+        )
+        self.assertIn(
+            "query_first_tool_order",
+            checks["behavior_evaluation_suite_available"]["details"]["assertions"],
+        )
+        self.assertEqual(
+            audit["diagnostics"]["behavior_evaluation_script"],
+            "scripts/agent_behavior_evaluation.py",
+        )
+        self.assertEqual(
+            audit["diagnostics"]["behavior_evaluation_reports"],
+            "reports/woagent_behavior_eval_*.json|md",
         )
         chat_stream.assert_not_called()
 
@@ -4251,7 +6133,18 @@ class AgentRuntimeTests(unittest.TestCase):
                 key, value = [item.strip() for item in line.split("=", 1)]
                 parsed[key] = (
                     [item.strip() for item in value.split(",") if item.strip()]
-                    if key in {"fields", "check_fields", "checks", "status_values"}
+                    if key
+                    in {
+                        "fields",
+                        "check_fields",
+                        "checks",
+                        "status_values",
+                        "runtime_contract_keys",
+                        "diagnostic_keys",
+                        "runbook_execution_context_summary_fields",
+                        "behavior_evaluation_case_ids",
+                        "behavior_evaluation_assertions",
+                    }
                     else value
                 )
             return parsed
@@ -4302,7 +6195,16 @@ class AgentRuntimeTests(unittest.TestCase):
                 key, value = [item.strip() for item in line.split("=", 1)]
                 parsed[key] = (
                     [item.strip() for item in value.split(",") if item.strip()]
-                    if key in {"fields", "check_fields", "checks", "status_values"}
+                    if key
+                    in {
+                        "fields",
+                        "check_fields",
+                        "checks",
+                        "status_values",
+                        "runtime_contract_keys",
+                        "diagnostic_keys",
+                        "runbook_execution_context_summary_fields",
+                    }
                     else value
                 )
             return parsed
@@ -4331,6 +6233,23 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(contract["check_fields"], list(DASHBOARD_CHECK_FIELDS))
             self.assertEqual(contract["checks"], list(AGENT_BACKEND_COMPLETION_AUDIT_CHECK_NAMES))
             self.assertEqual(contract["status_values"], list(READINESS_STATUS_VALUES))
+            self.assertEqual(contract["runtime_contract_keys"], list(snapshot["runtime_contracts"]))
+            self.assertEqual(contract["diagnostic_keys"], list(snapshot["diagnostics"]))
+            self.assertEqual(
+                contract["runbook_execution_context_summary_fields"],
+                list(RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS),
+            )
+            behavior_check = {
+                item["name"]: item for item in snapshot["checks"]
+            }["behavior_evaluation_suite_available"]
+            self.assertEqual(
+                contract["behavior_evaluation_case_ids"],
+                behavior_check["details"]["case_ids"],
+            )
+            self.assertEqual(
+                contract["behavior_evaluation_assertions"],
+                behavior_check["details"]["assertions"],
+            )
             self.assertEqual(contract["source"], "AgentBackendCompletionAuditService.audit")
         self.assertEqual(list(AgentBackendCompletionAuditRead.model_fields), list(AGENT_BACKEND_COMPLETION_AUDIT_FIELDS))
         self.assertEqual(list(snapshot), list(AGENT_BACKEND_COMPLETION_AUDIT_FIELDS))
@@ -5449,6 +7368,62 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(metrics["loop_root_cause_context_degraded_total"], 1)
         self.assertEqual(metrics["loop_root_cause_unknown_total"], 1)
 
+    def test_root_cause_metrics_track_runtime_repair_and_limit_reasons(self):
+        run = self._create_run("runtime repair root cause metrics")
+        build = ContextBuilder(self.db).build(
+            run_id=run.run_id,
+            payload=AgentContextBuildCreateRequest(
+                build_purpose="repair",
+                step_index=0,
+                token_budget=1024,
+                evidence_refs=[
+                    {
+                        "evidence_ref_id": "evidence-runtime-repair",
+                        "ref_type": "execution_record",
+                        "ref_id": "execution-runtime-repair-1",
+                        "mutability_class": "immutable",
+                        "dependency_role": "decision_dependency",
+                        "active_for_policy": True,
+                    }
+                ],
+                required_evidence_ref_ids=["evidence-runtime-repair"],
+            ),
+            current_user=self.owner,
+        )
+
+        for reason in [
+            "tool_prerequisite_missing",
+            "tool_request_format_invalid",
+            "required_tool_followup_missing",
+            "max_iterations",
+        ]:
+            LoopController(self.db).record_observation(
+                run_id=run.run_id,
+                payload=AgentLoopObservationCreateRequest(
+                    decision_context_build_id=build.context_build_id,
+                    next_action="repair" if reason != "max_iterations" else "stop",
+                    next_action_is_high_risk=False,
+                    reasons=[reason],
+                    observation={"source": "runtime_repair_metric_test", "reason": reason},
+                ),
+                current_user=self.owner,
+            )
+
+        metrics = AgentMetricsService(self.db).snapshot(project_id=10)["metrics"]
+        dashboard = AgentReadinessDashboardService(self.db).snapshot(project_id=10)
+        checks = {item["name"]: item for item in dashboard["checks"]}
+        required_metrics = set(checks["metrics_catalog_complete"]["details"]["required_metric_keys"])
+
+        expected_metrics = {
+            "tool_prerequisite_missing_total": 1,
+            "tool_request_format_invalid_total": 1,
+            "required_tool_followup_missing_total": 1,
+            "max_iterations_total": 1,
+        }
+        for metric_key, expected_count in expected_metrics.items():
+            self.assertEqual(metrics[metric_key], expected_count)
+            self.assertIn(metric_key, required_metrics)
+
     def test_invalid_repair_scope_metric_counts_loop_reasons(self):
         run = self._create_run("invalid repair scope metric")
         build = ContextBuilder(self.db).build(
@@ -5866,6 +7841,8 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result.error_code, "permission_revoked_before_execution")
 
     def test_executor_blocks_high_risk_tool_when_backend_capability_is_missing(self):
+        from app.core.sensitive_data import request_fingerprint
+
         run = self._create_run("missing backend capability")
         refs = [
             {
@@ -5920,6 +7897,52 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(queue_item.last_error_code, "backend_capability_too_weak")
         self.assertEqual(events[-1].event_type, "tool.failed")
         self.assertEqual(events[-1].payload_json["error_code"], "backend_capability_too_weak")
+        execution_context = result.policy_reason_json["execution_context"]
+        expected_context = {
+            "execution_context_version_hash": "agent-tool-execution-v1",
+            "tool_call_id": call.tool_call_id,
+            "run_id": run.run_id,
+            "runtime_snapshot_id": call.runtime_snapshot_id,
+            "tool_name": "project.read_context",
+            "tool_version": "1.0.0",
+            "worker_id": "worker-capability",
+            "tool_status": "manual_intervention",
+            "execution_phase": "blocked",
+            "effect_submission_state": "none",
+            "effect_boundary_crossed": False,
+            "backend_name": "project-service",
+            "backend_operation": "read_context",
+            "backend_contract_version": "v1",
+            "backend_request_schema_hash": call.backend_request_schema_hash,
+            "backend_output_schema_hash": call.backend_output_schema_hash,
+            "reconcile_contract_version": call.reconcile_contract_version,
+            "result_adapter_version": call.result_adapter_version,
+            "backend_effect_capability": None,
+            "resolved_side_effect_class": "business_create",
+            "resolved_replay_policy": call.resolved_replay_policy,
+            "approval_required": False,
+            "approval_state": "not_required",
+            "approval_lineage_id": None,
+            "approval_epoch": 0,
+            "approved_approval_id": None,
+            "approved_by": None,
+            "input_hash": call.input_hash,
+            "output_hash": None,
+            "recovery_decision": "backend_capability_required_before_execution",
+            "error_code": "backend_capability_too_weak",
+            "error_message_hash": None,
+        }
+        self.assertEqual(
+            {key: execution_context[key] for key in expected_context},
+            expected_context,
+        )
+        self.assertEqual(
+            execution_context["execution_context_hash"],
+            request_fingerprint(expected_context),
+        )
+        self.assertNotIn("input_json_redacted", execution_context)
+        self.assertNotIn("output_json_redacted", execution_context)
+        self.assertNotIn("evidence_refs_json", execution_context)
 
     def test_executor_runs_read_only_tool_and_writes_completion_events(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -5945,6 +7968,195 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(result.effect_submission_state, "effect_committed")
         self.assertIn("tool.completed", events)
+
+    def test_executor_records_execution_context_envelope_after_approved_tool(self):
+        from app.core.sensitive_data import request_fingerprint
+
+        run, call, approval = self._create_pending_approval()
+        call.resolved_side_effect_class = "read_only"
+        self.db.commit()
+        ApprovalService(self.db).approve(
+            tool_call_id=call.tool_call_id,
+            payload=self._approval_decision(approval, reason="approved for execution context"),
+            current_user=self.owner,
+        )
+
+        result = ToolExecutor(self.db).execute_next(worker_id="worker-execution-context")
+        execution_context = result.policy_reason_json["execution_context"]
+        expected_context = {
+            "execution_context_version_hash": "agent-tool-execution-v1",
+            "tool_call_id": call.tool_call_id,
+            "run_id": run.run_id,
+            "runtime_snapshot_id": call.runtime_snapshot_id,
+            "tool_name": "project.read_context",
+            "tool_version": "1.0.0",
+            "worker_id": "worker-execution-context",
+            "tool_status": "succeeded",
+            "execution_phase": "completed",
+            "effect_submission_state": "effect_committed",
+            "effect_boundary_crossed": False,
+            "backend_name": "project-service",
+            "backend_operation": "read_context",
+            "backend_contract_version": "v1",
+            "backend_request_schema_hash": call.backend_request_schema_hash,
+            "backend_output_schema_hash": call.backend_output_schema_hash,
+            "reconcile_contract_version": call.reconcile_contract_version,
+            "result_adapter_version": call.result_adapter_version,
+            "backend_effect_capability": "idempotency_index_only",
+            "resolved_side_effect_class": "read_only",
+            "resolved_replay_policy": call.resolved_replay_policy,
+            "approval_required": True,
+            "approval_state": "approved",
+            "approval_lineage_id": approval.approval_lineage_id,
+            "approval_epoch": approval.approval_epoch,
+            "approved_approval_id": approval.approval_id,
+            "approved_by": self.owner.id,
+            "input_hash": call.input_hash,
+            "output_hash": result.output_hash,
+            "recovery_decision": None,
+            "error_code": None,
+            "error_message_hash": None,
+        }
+
+        self.assertEqual(
+            {key: execution_context[key] for key in expected_context},
+            expected_context,
+        )
+        self.assertEqual(
+            execution_context["execution_context_hash"],
+            request_fingerprint(expected_context),
+        )
+        self.assertNotIn("input_json_redacted", execution_context)
+        self.assertNotIn("output_json_redacted", execution_context)
+        self.assertNotIn("evidence_refs_json", execution_context)
+
+    def test_executor_records_recovery_execution_context_on_backend_failure(self):
+        from app.core.sensitive_data import request_fingerprint
+
+        run = self._create_run("backend failure execution context")
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        class FailingToolRuntime:
+            def __init__(self, db, *, backend_factory):
+                self.db = db
+                self.backend_factory = backend_factory
+
+            def execute(self, *, call, current_user):
+                raise RuntimeError("backend adapter exploded with secret-token")
+
+        result = ToolExecutor(
+            self.db,
+            tool_runtime_factory=lambda db, backend_factory: FailingToolRuntime(
+                db,
+                backend_factory=backend_factory,
+            ),
+        ).execute_next(worker_id="worker-failure")
+
+        execution_context = result.policy_reason_json["execution_context"]
+        expected_context = {
+            "execution_context_version_hash": "agent-tool-execution-v1",
+            "tool_call_id": call.tool_call_id,
+            "run_id": run.run_id,
+            "runtime_snapshot_id": call.runtime_snapshot_id,
+            "tool_name": "project.read_context",
+            "tool_version": "1.0.0",
+            "worker_id": "worker-failure",
+            "tool_status": "failed",
+            "execution_phase": "pre_effect",
+            "effect_submission_state": "transport_sent_observed",
+            "effect_boundary_crossed": False,
+            "backend_name": "project-service",
+            "backend_operation": "read_context",
+            "backend_contract_version": "v1",
+            "backend_request_schema_hash": call.backend_request_schema_hash,
+            "backend_output_schema_hash": call.backend_output_schema_hash,
+            "reconcile_contract_version": call.reconcile_contract_version,
+            "result_adapter_version": call.result_adapter_version,
+            "backend_effect_capability": "idempotency_index_only",
+            "resolved_side_effect_class": "read_only",
+            "resolved_replay_policy": call.resolved_replay_policy,
+            "approval_required": False,
+            "approval_state": "not_required",
+            "approval_lineage_id": None,
+            "approval_epoch": 0,
+            "approved_approval_id": None,
+            "approved_by": None,
+            "input_hash": call.input_hash,
+            "output_hash": None,
+            "recovery_decision": "tool_execution_failed_repair_required",
+            "error_code": "tool_execution_failed",
+            "error_message_hash": request_fingerprint({"error_message": result.error_message}),
+        }
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error_code, "tool_execution_failed")
+        self.assertEqual(
+            {key: execution_context[key] for key in expected_context},
+            expected_context,
+        )
+        self.assertEqual(
+            execution_context["execution_context_hash"],
+            request_fingerprint(expected_context),
+        )
+        self.assertNotIn("secret-token", str(execution_context))
+        self.assertNotIn("input_json_redacted", execution_context)
+        self.assertNotIn("output_json_redacted", execution_context)
+        self.assertNotIn("evidence_refs_json", execution_context)
+
+    def test_executor_delegates_backend_call_to_tool_runtime(self):
+        run = self._create_run("runtime delegates backend execution")
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        runtime_calls = []
+
+        class FakeToolRuntime:
+            def __init__(self, db, *, backend_factory):
+                self.db = db
+                self.backend_factory = backend_factory
+
+            def execute(self, *, call, current_user):
+                runtime_calls.append({
+                    "tool_call_id": call.tool_call_id,
+                    "tool_name": call.tool_name,
+                    "user_id": current_user.id,
+                })
+                return {
+                    "executed_by": "tool-runtime",
+                    "project_id": call.input_json_redacted["project_id"],
+                }
+
+        result = ToolExecutor(
+            self.db,
+            backend_factory=lambda db: RaisingBackend(),
+            tool_runtime_factory=lambda db, backend_factory: FakeToolRuntime(
+                db,
+                backend_factory=backend_factory,
+            ),
+        ).execute_next(worker_id="worker-runtime")
+
+        self.assertEqual(result.tool_call_id, call.tool_call_id)
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.output_json_redacted["executed_by"], "tool-runtime")
+        self.assertEqual(runtime_calls, [{
+            "tool_call_id": call.tool_call_id,
+            "tool_name": "project.read_context",
+            "user_id": self.owner.id,
+        }])
 
     def test_executor_runs_ai_skill_draft_tool_through_allowlisted_backend(self):
         run = self._create_run("ai draft")
@@ -6931,6 +9143,43 @@ class AgentRuntimeTests(unittest.TestCase):
         call.status = "uncertain"
         call.effect_submission_state = "transport_sent_observed"
         call.backend_effect_capability = "legacy_reconcile_only"
+        call.recovery_decision = "reconcile_required_after_eventstore_failure"
+        call.error_code = "eventstore_write_failed_after_effect"
+        call.policy_reason_json = {
+            **(call.policy_reason_json or {}),
+            "execution_context": {
+                "execution_context_version_hash": "agent-tool-execution-v1",
+                "tool_call_id": call.tool_call_id,
+                "run_id": run.run_id,
+                "runtime_snapshot_id": call.runtime_snapshot_id,
+                "tool_name": call.tool_name,
+                "tool_version": call.tool_version,
+                "worker_id": "worker-runbook-context",
+                "tool_status": "uncertain",
+                "execution_phase": "completed",
+                "effect_submission_state": "transport_sent_observed",
+                "effect_boundary_crossed": True,
+                "backend_name": call.backend_name,
+                "backend_operation": call.backend_operation,
+                "backend_contract_version": call.backend_contract_version,
+                "backend_effect_capability": "legacy_reconcile_only",
+                "resolved_side_effect_class": call.resolved_side_effect_class,
+                "resolved_replay_policy": call.resolved_replay_policy,
+                "approval_state": "approved",
+                "approval_lineage_id": call.approval_lineage_id,
+                "approval_epoch": call.approval_epoch,
+                "approved_approval_id": call.approved_approval_id,
+                "input_hash": call.input_hash,
+                "output_hash": call.output_hash,
+                "recovery_decision": "reconcile_required_after_eventstore_failure",
+                "error_code": "eventstore_write_failed_after_effect",
+                "error_message_hash": "safe-error-message-hash",
+                "execution_context_hash": "safe-execution-context-hash",
+                "input_json_redacted": {"token": "do-not-copy"},
+                "output_json_redacted": {"secret": "do-not-copy"},
+                "evidence_refs_json": [{"ref_id": "do-not-copy"}],
+            },
+        }
         run.last_checkpoint_id = None
         self.db.add(
             AgentLoopObservation(
@@ -6986,6 +9235,7 @@ class AgentRuntimeTests(unittest.TestCase):
             "worker_queue_recovery",
             "backend_capability_degraded",
             "context_linkage_repair",
+            "agent_runtime_loop_repair",
             "root_cause_rule_missing",
             "memory_evidence_ref_violation",
             "release_gate_violation",
@@ -7001,12 +9251,111 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("memory_evidence_ref_violation", runbook_ids)
         self.assertNotIn(None, alert_runbook_ids)
         self.assertTrue(alert_runbook_ids.issubset(catalog_ids))
+        for runbook_id in ("tool_call_uncertain", "backend_capability_degraded"):
+            recommendation = next(
+                item
+                for item in diagnosis["recommendations"]
+                if item["runbook_id"] == runbook_id
+            )
+            execution_context = recommendation["details"]["execution_context"]
+            self.assertEqual(execution_context["execution_context_hash"], "safe-execution-context-hash")
+            self.assertEqual(execution_context["tool_status"], "uncertain")
+            self.assertEqual(execution_context["execution_phase"], "completed")
+            self.assertEqual(execution_context["effect_submission_state"], "transport_sent_observed")
+            self.assertEqual(execution_context["backend_effect_capability"], "legacy_reconcile_only")
+            self.assertEqual(
+                execution_context["recovery_decision"],
+                "reconcile_required_after_eventstore_failure",
+            )
+            self.assertEqual(execution_context["error_code"], "eventstore_write_failed_after_effect")
+            self.assertEqual(execution_context["error_message_hash"], "safe-error-message-hash")
+            self.assertEqual(execution_context["worker_id"], "worker-runbook-context")
+            self.assertEqual(execution_context["runtime_snapshot_id"], call.runtime_snapshot_id)
+            self.assertNotIn("input_json_redacted", execution_context)
+            self.assertNotIn("output_json_redacted", execution_context)
+            self.assertNotIn("evidence_refs_json", execution_context)
         memory_recommendation = next(
             item
             for item in diagnosis["recommendations"]
             if item["runbook_id"] == "memory_evidence_ref_violation"
         )
         self.assertEqual(memory_recommendation["severity"], "P0")
+
+    def test_runbook_diagnosis_surfaces_runtime_loop_repair_observations(self):
+        run = self._create_run("runtime loop repair runbook")
+        build = ContextBuilder(self.db).build(
+            run_id=run.run_id,
+            payload=AgentContextBuildCreateRequest(
+                build_purpose="repair",
+                step_index=0,
+                token_budget=1024,
+                evidence_refs=[
+                    {
+                        "evidence_ref_id": "evidence-runtime-runbook",
+                        "ref_type": "execution_record",
+                        "ref_id": "execution-runtime-runbook-1",
+                        "mutability_class": "immutable",
+                        "dependency_role": "decision_dependency",
+                        "active_for_policy": True,
+                    }
+                ],
+                required_evidence_ref_ids=["evidence-runtime-runbook"],
+            ),
+            current_user=self.owner,
+        )
+        runtime_reasons = [
+            "tool_prerequisite_missing",
+            "tool_request_format_invalid",
+            "required_tool_followup_missing",
+            "max_iterations",
+            "same_failure_no_progress",
+        ]
+        for step_index, reason in enumerate(runtime_reasons):
+            LoopController(self.db).record_observation(
+                run_id=run.run_id,
+                payload=AgentLoopObservationCreateRequest(
+                    decision_context_build_id=build.context_build_id,
+                    next_action="stop" if reason in {"max_iterations", "same_failure_no_progress"} else "repair",
+                    next_action_is_high_risk=False,
+                    reasons=[reason],
+                    observation={"source": "runtime_loop_repair_runbook_test", "reason": reason},
+                    step_index=step_index,
+                ),
+                current_user=self.owner,
+            )
+
+        diagnosis = AgentRunbookService(self.db).diagnose_run(run_id=run.run_id, current_user=self.owner)
+        recommendations = [
+            item
+            for item in diagnosis["recommendations"]
+            if item["runbook_id"] == "agent_runtime_loop_repair"
+        ]
+        details_by_reason = {
+            item["details"]["stop_action_reason"]: item["details"]
+            for item in recommendations
+        }
+
+        self.assertEqual(set(details_by_reason), set(runtime_reasons))
+        for reason, details in details_by_reason.items():
+            self.assertEqual(details["stop_reasons_all"], [reason])
+            self.assertIn(details["root_cause_rule_id"], {
+                "RC_TOOL_PREREQUISITE_MISSING",
+                "RC_TOOL_REQUEST_FORMAT_INVALID",
+                "RC_REQUIRED_TOOL_FOLLOWUP_MISSING",
+                "RC_MAX_ITERATIONS",
+                "RC_NO_PROGRESS_PURE",
+            })
+            self.assertIn("mitigation_action", details)
+            self.assertTrue(details["observation_id"].startswith("agent-obs-"))
+        self.assertTrue(all(item["severity"] == "P2" for item in recommendations))
+        self.assertTrue(all(
+            item["reason"] == "runtime_loop_repair_or_stop_observed"
+            for item in recommendations
+        ))
+        self.assertTrue(all(
+            item["action"] == "GET /api/v1/agents/runs/{run_id}/loop-observations"
+            for item in recommendations
+        ))
 
     def test_harness_required_runbook_catalog_matches_architecture_contract(self):
         from pathlib import Path
@@ -9282,6 +11631,58 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(self.db.query(AgentEvidenceWatch).count(), 1)
         self.assertEqual(call.evidence_mutability_summary_json["policy_ref_count"], 1)
 
+    def test_tool_call_policy_reason_records_policy_context_envelope(self):
+        from app.core.sensitive_data import request_fingerprint
+
+        run = self._create_run("tool policy context")
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+                evidence_refs=[
+                    {
+                        "evidence_ref_id": "live-project-context",
+                        "ref_type": "project",
+                        "ref_id": "10",
+                        "mutability_class": "mutable_current",
+                        "dependency_role": "decision_dependency",
+                        "active_for_policy": True,
+                    },
+                ],
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+
+        policy_context = call.policy_reason_json["policy_context"]
+        expected_context = {
+            "policy_version_hash": "agent-policy-v1",
+            "tool_name": "project.read_context",
+            "tool_version": "1.0.0",
+            "base_side_effect_class": "read_only",
+            "resolved_side_effect_class": "read_only",
+            "base_replay_policy": "reuse_allowed",
+            "resolved_replay_policy": "require_revalidation",
+            "approval_policy": "safe_side_effect_auto",
+            "approval_required": False,
+            "approval_required_reason": "safe_initial_tool",
+            "active_policy_ref_count": 1,
+            "volatile_policy_ref_count": 1,
+            "frozen_policy_ref_count": 0,
+            "historical_volatile_excluded_count": 0,
+            "mixed_volatile_frozen": False,
+        }
+
+        self.assertEqual(
+            {key: policy_context[key] for key in expected_context},
+            expected_context,
+        )
+        self.assertEqual(policy_context["policy_hash"], request_fingerprint(expected_context))
+        self.assertEqual(call.resolved_replay_policy, policy_context["resolved_replay_policy"])
+        self.assertEqual(call.approval_required, policy_context["approval_required"])
+
     def test_context_build_records_degradation_and_required_evidence_gap(self):
         run = self._create_run("context build")
         refs = self._large_evidence_refs(count=10)
@@ -9303,6 +11704,21 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(build.context_degradation_level, "heavy")
         self.assertFalse(build.required_evidence_complete)
         self.assertEqual(self.db.query(AgentContextBuild).count(), 1)
+        runtime_snapshot = self.db.scalar(
+            select(AgentRuntimeSnapshot).where(
+                AgentRuntimeSnapshot.snapshot_id == run.runtime_snapshot_id
+            )
+        )
+        self.assertIsNotNone(runtime_snapshot)
+        runtime_metadata = (build.build_metadata_json or {})["runtime_snapshot"]
+        self.assertEqual(runtime_metadata["snapshot_id"], run.runtime_snapshot_id)
+        self.assertEqual(runtime_metadata["runtime_hash"], runtime_snapshot.runtime_hash)
+        self.assertEqual(runtime_metadata["tool_registry_hash"], runtime_snapshot.tool_registry_hash)
+        self.assertEqual(runtime_metadata["manifest_bundle_hash"], runtime_snapshot.manifest_bundle_hash)
+        self.assertEqual(runtime_metadata["prompt_bundle_hash"], runtime_snapshot.prompt_bundle_hash)
+        self.assertEqual(runtime_metadata["policy_version_hash"], runtime_snapshot.policy_version_hash)
+        self.assertIn("project.read_context", runtime_metadata["available_tool_names"])
+        self.assertEqual(runtime_metadata["tool_count"], len(runtime_snapshot.tools_json))
         self.assertIn("context.full_evidence_required", events)
         self.assertGreaterEqual(self.db.query(AgentEvidenceWatch).count(), 1)
         AgentOutboxPublisher(self.db, publisher=lambda event: None).publish_pending(limit=100)
@@ -9318,6 +11734,39 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(alerts["agent_context_required_evidence_missing"]["runbook_id"], "checkpoint_stale")
         self.assertEqual(dashboard["readiness"], "attention")
         self.assertEqual(checks["monitoring_alerts_clear"]["status"], "attention")
+
+    def test_context_build_records_permission_context_for_project_member(self):
+        from app.core.sensitive_data import request_fingerprint
+
+        run = self._create_run("context build permission context")
+        build = ContextBuilder(self.db).build(
+            run_id=run.run_id,
+            payload=AgentContextBuildCreateRequest(
+                build_purpose="repair",
+                step_index=0,
+            ),
+            current_user=self.member,
+        )
+
+        permission_context = (build.build_metadata_json or {})["permission_context"]
+        expected_profile = {
+            "actor_user_id": self.member.id,
+            "project_id": run.project_id,
+            "access_level": "project_member",
+            "project_access": True,
+            "implicit_all_project_permissions": False,
+            "explicit_permission_codes": ["project:view"],
+            "explicit_permission_count": 1,
+        }
+
+        self.assertEqual(
+            {key: permission_context[key] for key in expected_profile},
+            expected_profile,
+        )
+        self.assertEqual(
+            permission_context["permission_hash"],
+            request_fingerprint(expected_profile),
+        )
 
     def test_loop_observation_uses_decision_context_and_explicit_root_cause_rule(self):
         run = self._create_run("loop observation")
@@ -10057,6 +12506,12 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(seeded["RC_POLICY_LOOP"].priority_band, "safety")
         self.assertEqual(seeded["RC_BACKEND_CAPABILITY_DEGRADED"].priority, 45)
         self.assertEqual(seeded["RC_BACKEND_CAPABILITY_DEGRADED"].priority_band, "recovery")
+        self.assertEqual(seeded["RC_TOOL_PREREQUISITE_MISSING"].priority, 50)
+        self.assertEqual(seeded["RC_TOOL_PREREQUISITE_MISSING"].priority_band, "recovery")
+        self.assertEqual(seeded["RC_TOOL_REQUEST_FORMAT_INVALID"].priority, 52)
+        self.assertEqual(seeded["RC_TOOL_REQUEST_FORMAT_INVALID"].priority_band, "recovery")
+        self.assertEqual(seeded["RC_REQUIRED_TOOL_FOLLOWUP_MISSING"].priority, 54)
+        self.assertEqual(seeded["RC_REQUIRED_TOOL_FOLLOWUP_MISSING"].priority_band, "recovery")
         self.assertEqual(seeded["RC_REPAIR_REGRESSION"].priority, 65)
         self.assertEqual(seeded["RC_REPAIR_REGRESSION"].priority_band, "repair_quality")
         self.assertEqual(seeded["RC_MAX_ITERATIONS"].priority, 80)

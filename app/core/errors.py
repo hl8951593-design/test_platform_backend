@@ -7,6 +7,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy.exc import DBAPIError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.logging import get_request_id
@@ -29,6 +30,10 @@ COMMON_ERROR_RESPONSES = {
     409: {"model": ErrorResponse, "description": "资源状态或版本冲突"},
     422: {"model": ErrorResponse, "description": "请求参数校验失败"},
     500: {"model": ErrorResponse, "description": "服务内部错误"},
+}
+COMMON_ERROR_RESPONSES[503] = {
+    "model": ErrorResponse,
+    "description": "temporary dependency unavailable",
 }
 
 
@@ -85,6 +90,47 @@ def register_exception_handlers(application: FastAPI) -> None:
             headers={"X-Request-ID": request_id},
         )
 
+    @application.exception_handler(DBAPIError)
+    async def database_exception_handler(request: Request, exc: DBAPIError):
+        request_id = _request_id(request)
+        if _is_transient_database_disconnect(exc):
+            _dispose_engine_after_database_disconnect(request_id)
+            logger.warning(
+                "Transient database disconnect request_id=%s method=%s path=%s",
+                request_id,
+                request.method,
+                request.url.path,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            return error_response(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                message="database temporarily unavailable",
+                data={
+                    "error": "database_connection_lost",
+                    "request_id": request_id,
+                },
+                headers={
+                    "X-Request-ID": request_id,
+                    "Retry-After": "1",
+                },
+            )
+        logger.error(
+            "Database request error request_id=%s method=%s path=%s",
+            request_id,
+            request.method,
+            request.url.path,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return error_response(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message="internal server error",
+            data={
+                "error": "internal_server_error",
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+
     @application.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         request_id = _request_id(request)
@@ -127,6 +173,34 @@ def _request_id(request: Request) -> str:
     if context_request_id and context_request_id != "-":
         return context_request_id
     return request.headers.get("X-Request-ID") or "-"
+
+
+def _is_transient_database_disconnect(exc: DBAPIError) -> bool:
+    if getattr(exc, "connection_invalidated", False):
+        return True
+    message = str(getattr(exc, "orig", "") or exc).lower()
+    transient_markers = (
+        "lost connection",
+        "server has gone away",
+        "connection reset",
+        "connection refused",
+        "connection timed out",
+        "ssl eof",
+        "eof occurred",
+    )
+    return any(marker in message for marker in transient_markers)
+
+
+def _dispose_engine_after_database_disconnect(request_id: str) -> None:
+    try:
+        from app.db.session import dispose_engine_after_disconnect
+
+        dispose_engine_after_disconnect()
+    except Exception:
+        logger.exception(
+            "Failed to dispose database engine after disconnect request_id=%s",
+            request_id,
+        )
 
 
 def _log_http_exception(

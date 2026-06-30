@@ -24,6 +24,7 @@ from app.services.agent_loop_service import EvidenceRefResolver
 from app.services.ai_skill_service import AISkillService
 from app.services.permission_service import PermissionService
 from app.services.scenario_service import ScenarioService
+from app.services.test_report_service import TestReportService
 
 
 SAFE_SIDE_EFFECT_CLASSES = {"read_only", "deterministic_compute", "draft_only", "execution_record"}
@@ -61,6 +62,11 @@ class ToolSpec:
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
     backend_contract: BackendContractSpec | None = None
+    backend_handler: str | None = None
+    required_successful_tool_before: str | None = None
+    missing_prerequisite_error_code: str | None = None
+    missing_prerequisite_next_action: str | None = None
+    tool_result_repair_guidance: str | None = None
 
     @property
     def schema_hash(self) -> str:
@@ -135,6 +141,25 @@ class ToolRegistry:
 
 
 @dataclass(frozen=True)
+class RoutedTool:
+    spec: ToolSpec
+    handler: Callable[[dict[str, Any], User], dict[str, Any]]
+
+
+class AgentToolRouter:
+    def __init__(self, registry: ToolRegistry | None = None) -> None:
+        self.registry = registry or ToolRegistry()
+
+    def resolve(self, *, tool_name: str, backend: Any) -> RoutedTool:
+        spec = self.registry.get(tool_name)
+        handler_name = spec.backend_handler
+        handler = getattr(backend, handler_name, None) if handler_name else None
+        if handler is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent tool backend 不存在")
+        return RoutedTool(spec=spec, handler=handler)
+
+
+@dataclass(frozen=True)
 class ResolvedToolPolicy:
     resolved_side_effect_class: str
     resolved_replay_policy: str
@@ -164,6 +189,25 @@ class ToolPolicyResolver:
         ]
         replay_policy = "require_revalidation" if volatile else spec.replay_policy
         approval_required = spec.side_effect_class not in SAFE_SIDE_EFFECT_CLASSES
+        approval_required_reason = "unsafe_side_effect" if approval_required else "safe_initial_tool"
+        policy_context = {
+            "policy_version_hash": "agent-policy-v1",
+            "tool_name": spec.name,
+            "tool_version": spec.version,
+            "base_side_effect_class": spec.side_effect_class,
+            "resolved_side_effect_class": spec.side_effect_class,
+            "base_replay_policy": spec.replay_policy,
+            "resolved_replay_policy": replay_policy,
+            "approval_policy": "unsafe_side_effect_requires_approval" if approval_required else "safe_side_effect_auto",
+            "approval_required": approval_required,
+            "approval_required_reason": approval_required_reason,
+            "active_policy_ref_count": len(active_refs),
+            "volatile_policy_ref_count": len(volatile),
+            "frozen_policy_ref_count": len(frozen),
+            "historical_volatile_excluded_count": len(historical_volatile_excluded),
+            "mixed_volatile_frozen": bool(volatile and frozen),
+        }
+        policy_context["policy_hash"] = request_fingerprint(policy_context)
         return ResolvedToolPolicy(
             resolved_side_effect_class=spec.side_effect_class,
             resolved_replay_policy=replay_policy,
@@ -175,15 +219,17 @@ class ToolPolicyResolver:
                 "frozen_policy_ref_count": len(frozen),
                 "historical_volatile_excluded_count": len(historical_volatile_excluded),
                 "mixed_volatile_frozen": bool(volatile and frozen),
-                "approval_required_reason": "unsafe_side_effect" if approval_required else "safe_initial_tool",
+                "approval_required_reason": approval_required_reason,
+                "policy_context": policy_context,
             },
         )
 
 
 class AgentToolBackend:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, router: AgentToolRouter | None = None):
         self.db = db
         self.permission_service = PermissionService(db)
+        self.router = router or AgentToolRouter()
 
     def execute(self, *, tool_name: str, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         logger.info(
@@ -192,26 +238,15 @@ class AgentToolBackend:
             payload.get("project_id"),
             current_user.id,
         )
-        handlers: dict[str, Callable[[dict[str, Any], User], dict[str, Any]]] = {
-            "project.read_context": self._project_read_context,
-            "ai_skill.run_draft": self._ai_skill_run_draft,
-            "scenario.compose_draft": self._scenario_compose_draft,
-            "scenario.execute_dry_run": self._scenario_execute_dry_run,
-            "testcase.query_project_cases": self._testcase_query_project_cases,
-            "testcase.validate_schema": self._testcase_validate_schema,
-            "report.read_summary": self._report_read_summary,
-        }
-        try:
-            result = handlers[tool_name](payload, current_user)
-            logger.info(
-                "agent_tool_backend_execute_done tool_name=%s project_id=%s user_id=%s",
-                tool_name,
-                payload.get("project_id"),
-                current_user.id,
-            )
-            return result
-        except KeyError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent tool backend 不存在") from exc
+        route = self.router.resolve(tool_name=tool_name, backend=self)
+        result = route.handler(payload, current_user)
+        logger.info(
+            "agent_tool_backend_execute_done tool_name=%s project_id=%s user_id=%s",
+            tool_name,
+            payload.get("project_id"),
+            current_user.id,
+        )
+        return result
 
     def _project_read_context(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         project_id = _require_int(payload, "project_id")
@@ -477,15 +512,59 @@ class AgentToolBackend:
 
     def _report_read_summary(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         project_id = _require_int(payload, "project_id")
-        self.permission_service.require_project_permission(
-            current_user,
-            project_id,
-            ProjectPermission.VIEW_REPORT.value,
+        source_type = _optional_report_source_type(payload, "source_type")
+        status_filter = _optional_str(payload, "status")
+        environment_id = _optional_int(payload, "environment_id")
+        page_size = _optional_int(payload, "page_size") or 5
+        if page_size < 1 or page_size > 20:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="page_size must be between 1 and 20",
+            )
+
+        page = TestReportService(self.db).list_reports(
+            project_id=project_id,
+            current_user=current_user,
+            source_type=source_type,
+            status_filter=status_filter,
+            environment_id=environment_id,
+            started_from=None,
+            started_to=None,
+            page=1,
+            page_size=page_size,
         )
+        report_items = normalize_response_data(page.items)
+        status_counts: dict[str, int] = {}
+        totals = {"total": 0, "passed": 0, "failed": 0, "skipped": 0}
+        failure_reports: list[dict[str, Any]] = []
+        for item in report_items:
+            item_status = str(item.get("status") or "unknown")
+            status_counts[item_status] = status_counts.get(item_status, 0) + 1
+            totals["total"] += int(item.get("total_count") or 0)
+            totals["passed"] += int(item.get("passed_count") or 0)
+            totals["failed"] += int(item.get("failed_count") or 0)
+            totals["skipped"] += int(item.get("skipped_count") or 0)
+            if int(item.get("failed_count") or 0) > 0 or item_status in {"failed", "timeout", "error"}:
+                failure_reports.append(item)
+
         return {
             "project_id": project_id,
-            "summary": {},
-            "note": "report.read_summary framework adapter is ready; detailed aggregation is deferred",
+            "filters": {
+                "source_type": source_type,
+                "status": status_filter,
+                "environment_id": environment_id,
+                "page": 1,
+                "page_size": page_size,
+            },
+            "report_count": page.total,
+            "returned_report_count": len(report_items),
+            "status_counts": status_counts,
+            "returned_case_totals": {
+                **totals,
+                "pass_rate": round(totals["passed"] * 100 / totals["total"], 2) if totals["total"] else 0.0,
+            },
+            "latest_reports": report_items,
+            "failure_reports": failure_reports[:3],
         }
 
 
@@ -527,12 +606,38 @@ def _optional_str(payload: dict[str, Any], key: str) -> str | None:
     return value
 
 
+def _optional_report_source_type(payload: dict[str, Any], key: str) -> str | None:
+    value = _optional_str(payload, key)
+    if value is None:
+        return None
+    if value not in {"plan", "flow"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{key} must be one of: plan, flow",
+        )
+    return value
+
+
 def _build_tool_specs() -> dict[str, ToolSpec]:
     schemas = {
         "project_input": {
             "type": "object",
             "required": ["project_id"],
             "properties": {"project_id": {"type": "integer"}},
+        },
+        "report_summary_input": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "source_type": {"type": "string", "enum": ["plan", "flow"]},
+                "status": {"type": "string"},
+                "environment_id": {"type": "integer"},
+                "page_size": {
+                    "type": "integer",
+                    "description": "Number of recent reports to summarize, from 1 to 20. Defaults to 5.",
+                },
+            },
         },
         "scenario_compose_input": {
             "type": "object",
@@ -609,6 +714,7 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 request_schema_hash=request_fingerprint(schemas["project_input"]),
                 output_schema_hash=request_fingerprint({"type": "object"}),
             ),
+            backend_handler="_project_read_context",
         ),
         "ai_skill.run_draft": ToolSpec(
             name="ai_skill.run_draft",
@@ -626,6 +732,11 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 effect_capability="idempotency_index_only",
                 request_schema_hash=request_fingerprint(schemas["ai_skill_run_draft_input"]),
                 output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_ai_skill_run_draft",
+            tool_result_repair_guidance=(
+                "优先复用同一 skill_id/operation 再次调用 ai_skill.run_draft；在 input.extra_requirements 中写清 warnings/issues 的修复要求，"
+                "保持原始用户目标、接口文本、生成数量和环境上下文稳定。"
             ),
         ),
         "scenario.compose_draft": ToolSpec(
@@ -645,6 +756,18 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 request_schema_hash=request_fingerprint(schemas["scenario_compose_input"]),
                 output_schema_hash=request_fingerprint({"type": "object"}),
             ),
+            backend_handler="_scenario_compose_draft",
+            required_successful_tool_before="testcase.query_project_cases",
+            missing_prerequisite_error_code="scenario_compose_requires_case_query",
+            missing_prerequisite_next_action=(
+                "Call testcase.query_project_cases for the current project, then use the returned "
+                "test case ids when calling scenario.compose_draft."
+            ),
+            tool_result_repair_guidance=(
+                "继续遵守 query-first。先分析候选用例用途、请求字段、响应样本和最近执行结果；"
+                "可修复项通过下一次 scenario.compose_draft 的 input.extra_requirements 明确补充提取器、变量绑定、断言、数据集或字段来源，"
+                "必要且安全时可设置 input.execute_candidates=true 获取样本，保留 self_validate=true。"
+            ),
         ),
         "scenario.execute_dry_run": ToolSpec(
             name="scenario.execute_dry_run",
@@ -662,6 +785,11 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 effect_capability="idempotency_index_only",
                 request_schema_hash=request_fingerprint(schemas["scenario_execute_dry_run_input"]),
                 output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_scenario_execute_dry_run",
+            tool_result_repair_guidance=(
+                "不要无意义重复执行相同场景。先根据执行失败、断言差异或变量缺失定位草稿问题，"
+                "通过 compose/validate/read 类工具生成修复版后，再在安全可行时执行 dry-run 验证。"
             ),
         ),
         "testcase.query_project_cases": ToolSpec(
@@ -684,6 +812,7 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 request_schema_hash=request_fingerprint(schemas["testcase_query_project_cases_input"]),
                 output_schema_hash=request_fingerprint({"type": "object"}),
             ),
+            backend_handler="_testcase_query_project_cases",
         ),
         "testcase.validate_schema": ToolSpec(
             name="testcase.validate_schema",
@@ -702,23 +831,29 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 request_schema_hash=request_fingerprint(schemas["testcase_validate_input"]),
                 output_schema_hash=request_fingerprint({"type": "object"}),
             ),
+            backend_handler="_testcase_validate_schema",
+            tool_result_repair_guidance=(
+                "先根据 issues 修正 input.case 的字段、类型、断言或提取器结构，再再次调用 testcase.validate_schema；"
+                "如果缺少真实环境、鉴权或业务私有值，只把这些阻断项交给用户。"
+            ),
         ),
         "report.read_summary": ToolSpec(
             name="report.read_summary",
             version="1.0.0",
-            summary="Read report summary context.",
+            summary="Read recent test report summaries and failure context for the current project.",
             side_effect_class="read_only",
             replay_policy="reuse_allowed",
             required_permissions=(ProjectPermission.VIEW_REPORT.value,),
-            input_schema=copy.deepcopy(schemas["project_input"]),
+            input_schema=schemas["report_summary_input"],
             output_schema={"type": "object"},
             backend_contract=BackendContractSpec(
                 backend_name="report-service",
                 backend_operation="read_summary",
                 backend_contract_version="v1",
                 effect_capability="idempotency_index_only",
-                request_schema_hash=request_fingerprint(schemas["project_input"]),
+                request_schema_hash=request_fingerprint(schemas["report_summary_input"]),
                 output_schema_hash=request_fingerprint({"type": "object"}),
             ),
+            backend_handler="_report_read_summary",
         ),
     }

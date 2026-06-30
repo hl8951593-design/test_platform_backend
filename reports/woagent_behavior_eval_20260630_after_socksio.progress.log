@@ -1,0 +1,18 @@
+[login] account=admin user_id=1
+[start] T01 通用测试知识问答
+[done] T01 score=100 passed=True run_id=agent-run-d1f9e410feda4e5986378b3d9cadcb3b
+[start] T02 多轮上下文追问且不创建对象
+[done] T02 score=88 passed=False run_id=agent-run-563bc822519d4903ba0bb590e6bac571
+[start] T03 读取项目上下文
+[done] T03 score=100 passed=True run_id=agent-run-8c9152e95a9c45e584d28a7b732cbe96
+[start] T04 企业场景 query-first 组合草稿
+[done] T04 score=100 passed=True run_id=agent-run-14b42f9a694043d8818130063983643e
+[start] T05 场景 warnings 可修复项闭环
+[done] T05 score=100 passed=True run_id=agent-run-d2913ea1fb9a4ed3b3ed49c959b33c0e
+[start] T06 保存正式场景边界
+[done] T06 score=100 passed=True run_id=agent-run-c9e0105188d14935824fdc41d485213f
+[start] T07 数据集参数化理解与草稿更新
+[done] T07 score=100 passed=True run_id=agent-run-a5d7ce0cbbfb4cdc9d6cff761563312f
+[start] T08 非测试领域能力边界
+[done] T08 score=100 passed=True run_id=agent-run-81146d59662f456c81732fe49cb15a9d
+[report] json=reports\woagent_behavior_eval_20260630_after_socksio.json markdown=reports\woagent_behavior_eval_20260630_after_socksio.md

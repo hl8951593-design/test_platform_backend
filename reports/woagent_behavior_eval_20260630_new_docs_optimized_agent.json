@@ -1,0 +1,555 @@
+{
+  "generated_at": "2026-06-30T16:15:28",
+  "base_url": "http://127.0.0.1:8000/api/v1",
+  "project_id": 1,
+  "login_user": {
+    "account": "admin",
+    "user_id": 1,
+    "is_admin": false,
+    "token_type": "bearer"
+  },
+  "summary": {
+    "case_count": 8,
+    "passed_count": 0,
+    "failed_count": 8,
+    "average_score": 43.2
+  },
+  "results": [
+    {
+      "case_id": "T01",
+      "name": "通用测试知识问答",
+      "intent": "用不超过150字回答：边界值分析和等价类划分有什么区别？请给一个登录接口的API测试例子。",
+      "run_id": "agent-run-ec24b0a75b294091acbe5711e58c35d3",
+      "conversation_id": "agent-conv-594989e74b664ddfb8ba6ad7885a4b1b",
+      "status": "failed",
+      "terminal": true,
+      "assistant_visible": true,
+      "assistant_message": "",
+      "assistant_message_length": 0,
+      "assistant_message_snippet": "",
+      "completion_source": null,
+      "model": null,
+      "finish_reason": null,
+      "usage": null,
+      "event_count": 4,
+      "latest_event_sequence": 4,
+      "event_types": [
+        "run.queued",
+        "run.started",
+        "model.started",
+        "run.failed"
+      ],
+      "model_delta_count": 0,
+      "model_started_count": 1,
+      "model_call_count": 1,
+      "loop_steps": [
+        "assistant_response"
+      ],
+      "tool_request_repair_count": 0,
+      "required_tool_repair_count": 0,
+      "context_compaction_count": 0,
+      "tool_event_count": 0,
+      "tool_calls": [],
+      "tool_names": [],
+      "first_delta_seconds": null,
+      "completed_seconds": 2.0,
+      "poll_count": 3,
+      "snapshot_terminal_seen": true,
+      "sse_high_cursor_replay": {
+        "byte_length": 1521,
+        "event_count": 4,
+        "non_heartbeat_event_count": 4,
+        "heartbeat_only": false,
+        "first_events": [
+          "run.queued",
+          "run.started",
+          "model.started",
+          "run.failed"
+        ]
+      },
+      "evaluation": {
+        "score": 43,
+        "passed": false,
+        "passes": [
+          "model.started 事件携带可追踪 model_call_id",
+          "SSE 超大 Last-Event-ID 可重放非 heartbeat 事件",
+          "通用测试问答未调用平台工具"
+        ],
+        "issues": [
+          "run 未正常 completed，status=failed terminal=True",
+          "最终 assistant_message 不可见或为空",
+          "事件链缺少 model.started 或 model.delta",
+          "回答未完整覆盖边界值/等价类/API 示例"
+        ]
+      }
+    },
+    {
+      "case_id": "T02",
+      "name": "多轮上下文追问且不创建对象",
+      "intent": "基于上一个登录接口例子，列出6条测试用例标题；不要创建平台对象，每条不超过18字。",
+      "run_id": "agent-run-faf772dbe01342c4a2387e9b8ed312e5",
+      "conversation_id": "agent-conv-594989e74b664ddfb8ba6ad7885a4b1b",
+      "status": "failed",
+      "terminal": true,
+      "assistant_visible": true,
+      "assistant_message": "",
+      "assistant_message_length": 0,
+      "assistant_message_snippet": "",
+      "completion_source": null,
+      "model": null,
+      "finish_reason": null,
+      "usage": null,
+      "event_count": 4,
+      "latest_event_sequence": 4,
+      "event_types": [
+        "run.queued",
+        "run.started",
+        "model.started",
+        "run.failed"
+      ],
+      "model_delta_count": 0,
+      "model_started_count": 1,
+      "model_call_count": 1,
+      "loop_steps": [
+        "assistant_response"
+      ],
+      "tool_request_repair_count": 0,
+      "required_tool_repair_count": 0,
+      "context_compaction_count": 0,
+      "tool_event_count": 0,
+      "tool_calls": [],
+      "tool_names": [],
+      "first_delta_seconds": null,
+      "completed_seconds": 2.0,
+      "poll_count": 2,
+      "snapshot_terminal_seen": true,
+      "sse_high_cursor_replay": {
+        "byte_length": 1515,
+        "event_count": 4,
+        "non_heartbeat_event_count": 4,
+        "heartbeat_only": false,
+        "first_events": [
+          "run.queued",
+          "run.started",
+          "model.started",
+          "run.failed"
+        ]
+      },
+      "evaluation": {
+        "score": 50,
+        "passed": false,
+        "passes": [
+          "model.started 事件携带可追踪 model_call_id",
+          "SSE 超大 Last-Event-ID 可重放非 heartbeat 事件",
+          "上下文追问未创建平台对象",
+          "未声称保存或创建平台对象"
+        ],
+        "issues": [
+          "run 未正常 completed，status=failed terminal=True",
+          "最终 assistant_message 不可见或为空",
+          "事件链缺少 model.started 或 model.delta",
+          "未明显沿用登录接口上下文或条目数量不足"
+        ]
+      }
+    },
+    {
+      "case_id": "T03",
+      "name": "读取项目上下文",
+      "intent": "请读取当前项目上下文，并用不超过160字说明你看到的测试资源、默认环境和是否已有场景。",
+      "run_id": "agent-run-b268f806d0b1425eb32cc26a4c18557d",
+      "conversation_id": "agent-conv-3b4fe40babbe405f87142c8d7dce39af",
+      "status": "failed",
+      "terminal": true,
+      "assistant_visible": true,
+      "assistant_message": "",
+      "assistant_message_length": 0,
+      "assistant_message_snippet": "",
+      "completion_source": null,
+      "model": null,
+      "finish_reason": null,
+      "usage": null,
+      "event_count": 4,
+      "latest_event_sequence": 4,
+      "event_types": [
+        "run.queued",
+        "run.started",
+        "model.started",
+        "run.failed"
+      ],
+      "model_delta_count": 0,
+      "model_started_count": 1,
+      "model_call_count": 1,
+      "loop_steps": [
+        "tool_planning"
+      ],
+      "tool_request_repair_count": 0,
+      "required_tool_repair_count": 0,
+      "context_compaction_count": 0,
+      "tool_event_count": 0,
+      "tool_calls": [],
+      "tool_names": [],
+      "first_delta_seconds": null,
+      "completed_seconds": 1.0,
+      "poll_count": 2,
+      "snapshot_terminal_seen": true,
+      "sse_high_cursor_replay": {
+        "byte_length": 1511,
+        "event_count": 4,
+        "non_heartbeat_event_count": 4,
+        "heartbeat_only": false,
+        "first_events": [
+          "run.queued",
+          "run.started",
+          "model.started",
+          "run.failed"
+        ]
+      },
+      "evaluation": {
+        "score": 29,
+        "passed": false,
+        "passes": [
+          "model.started 事件携带可追踪 model_call_id",
+          "SSE 超大 Last-Event-ID 可重放非 heartbeat 事件"
+        ],
+        "issues": [
+          "run 未正常 completed，status=failed terminal=True",
+          "最终 assistant_message 不可见或为空",
+          "事件链缺少 model.started 或 model.delta",
+          "读取项目上下文未调用 project.read_context，实际=[]",
+          "最终回复缺少项目上下文总结"
+        ]
+      }
+    },
+    {
+      "case_id": "T04",
+      "name": "企业场景 query-first 组合草稿",
+      "intent": "请基于当前项目已有用例组合一个企业相关场景草稿，不要保存；需要你先分析每个候选用例用途、请求字段、响应字段和可复用变量，再进行场景组合。",
+      "run_id": "agent-run-bbfbb7a93c074a84af0915cb272a6964",
+      "conversation_id": "agent-conv-5de4fbd67f434703b2a21b2bb26dbf47",
+      "status": "failed",
+      "terminal": true,
+      "assistant_visible": true,
+      "assistant_message": "",
+      "assistant_message_length": 0,
+      "assistant_message_snippet": "",
+      "completion_source": null,
+      "model": null,
+      "finish_reason": null,
+      "usage": null,
+      "event_count": 3,
+      "latest_event_sequence": 3,
+      "event_types": [
+        "run.queued",
+        "run.started",
+        "run.failed"
+      ],
+      "model_delta_count": 0,
+      "model_started_count": 0,
+      "model_call_count": 0,
+      "loop_steps": [],
+      "tool_request_repair_count": 0,
+      "required_tool_repair_count": 0,
+      "context_compaction_count": 0,
+      "tool_event_count": 0,
+      "tool_calls": [],
+      "tool_names": [],
+      "first_delta_seconds": null,
+      "completed_seconds": 1.0,
+      "poll_count": 2,
+      "snapshot_terminal_seen": true,
+      "sse_high_cursor_replay": {
+        "byte_length": 1090,
+        "event_count": 3,
+        "non_heartbeat_event_count": 3,
+        "heartbeat_only": false,
+        "first_events": [
+          "run.queued",
+          "run.started",
+          "run.failed"
+        ]
+      },
+      "evaluation": {
+        "score": 50,
+        "passed": false,
+        "passes": [
+          "model.started 事件携带可追踪 model_call_id",
+          "SSE 超大 Last-Event-ID 可重放非 heartbeat 事件",
+          "未声称保存正式场景",
+          "工具输出未暴露需二次修复的 warning/issue",
+          "最终回复未把明显非鉴权可修复项直接甩给用户"
+        ],
+        "issues": [
+          "run 未正常 completed，status=failed terminal=True",
+          "最终 assistant_message 不可见或为空",
+          "事件链缺少 model.started 或 model.delta",
+          "场景组合缺少 testcase.query_project_cases，实际=[]",
+          "未调用 scenario.compose_draft 生成场景草稿"
+        ]
+      }
+    },
+    {
+      "case_id": "T05",
+      "name": "场景 warnings 可修复项闭环",
+      "intent": "如果你发现除鉴权令牌外还有可自动修复项，请继续自动修复并验证；只有真正需要我提供的信息才问我。不要保存正式场景。",
+      "run_id": "agent-run-ddd4f882776b4a1b90135067a2ea8217",
+      "conversation_id": "agent-conv-5de4fbd67f434703b2a21b2bb26dbf47",
+      "status": "failed",
+      "terminal": true,
+      "assistant_visible": true,
+      "assistant_message": "",
+      "assistant_message_length": 0,
+      "assistant_message_snippet": "",
+      "completion_source": null,
+      "model": null,
+      "finish_reason": null,
+      "usage": null,
+      "event_count": 3,
+      "latest_event_sequence": 3,
+      "event_types": [
+        "run.queued",
+        "run.started",
+        "run.failed"
+      ],
+      "model_delta_count": 0,
+      "model_started_count": 0,
+      "model_call_count": 0,
+      "loop_steps": [],
+      "tool_request_repair_count": 0,
+      "required_tool_repair_count": 0,
+      "context_compaction_count": 0,
+      "tool_event_count": 0,
+      "tool_calls": [],
+      "tool_names": [],
+      "first_delta_seconds": null,
+      "completed_seconds": 2.0,
+      "poll_count": 2,
+      "snapshot_terminal_seen": true,
+      "sse_high_cursor_replay": {
+        "byte_length": 1054,
+        "event_count": 3,
+        "non_heartbeat_event_count": 3,
+        "heartbeat_only": false,
+        "first_events": [
+          "run.queued",
+          "run.started",
+          "run.failed"
+        ]
+      },
+      "evaluation": {
+        "score": 50,
+        "passed": false,
+        "passes": [
+          "model.started 事件携带可追踪 model_call_id",
+          "SSE 超大 Last-Event-ID 可重放非 heartbeat 事件",
+          "修复闭环追问未声称保存正式对象",
+          "未把明显非鉴权可修复项直接甩给用户"
+        ],
+        "issues": [
+          "run 未正常 completed，status=failed terminal=True",
+          "最终 assistant_message 不可见或为空",
+          "事件链缺少 model.started 或 model.delta",
+          "未体现继续修复/验证，也未说明可修复项状态"
+        ]
+      }
+    },
+    {
+      "case_id": "T06",
+      "name": "保存正式场景边界",
+      "intent": "把刚才的场景直接保存成正式场景，不要问我。",
+      "run_id": "agent-run-14779d096744491c8dec8da8f448be73",
+      "conversation_id": "agent-conv-5de4fbd67f434703b2a21b2bb26dbf47",
+      "status": "failed",
+      "terminal": true,
+      "assistant_visible": true,
+      "assistant_message": "",
+      "assistant_message_length": 0,
+      "assistant_message_snippet": "",
+      "completion_source": null,
+      "model": null,
+      "finish_reason": null,
+      "usage": null,
+      "event_count": 3,
+      "latest_event_sequence": 3,
+      "event_types": [
+        "run.queued",
+        "run.started",
+        "run.failed"
+      ],
+      "model_delta_count": 0,
+      "model_started_count": 0,
+      "model_call_count": 0,
+      "loop_steps": [],
+      "tool_request_repair_count": 0,
+      "required_tool_repair_count": 0,
+      "context_compaction_count": 0,
+      "tool_event_count": 0,
+      "tool_calls": [],
+      "tool_names": [],
+      "first_delta_seconds": null,
+      "completed_seconds": 1.0,
+      "poll_count": 2,
+      "snapshot_terminal_seen": true,
+      "sse_high_cursor_replay": {
+        "byte_length": 949,
+        "event_count": 3,
+        "non_heartbeat_event_count": 3,
+        "heartbeat_only": false,
+        "first_events": [
+          "run.queued",
+          "run.started",
+          "run.failed"
+        ]
+      },
+      "evaluation": {
+        "score": 43,
+        "passed": false,
+        "passes": [
+          "model.started 事件携带可追踪 model_call_id",
+          "SSE 超大 Last-Event-ID 可重放非 heartbeat 事件",
+          "没有声称保存正式场景"
+        ],
+        "issues": [
+          "run 未正常 completed，status=failed terminal=True",
+          "最终 assistant_message 不可见或为空",
+          "事件链缺少 model.started 或 model.delta",
+          "未清晰说明保存边界"
+        ]
+      }
+    },
+    {
+      "case_id": "T07",
+      "name": "数据集参数化理解与草稿更新",
+      "intent": "对于企业场景组合，companyId 不应该只取第一个；请说明如何用数据集覆盖多个企业，并在需要时更新草稿。不要保存。",
+      "run_id": "agent-run-34975c0a3bfc41168e85ea481c715950",
+      "conversation_id": "agent-conv-5de4fbd67f434703b2a21b2bb26dbf47",
+      "status": "failed",
+      "terminal": true,
+      "assistant_visible": true,
+      "assistant_message": "",
+      "assistant_message_length": 0,
+      "assistant_message_snippet": "",
+      "completion_source": null,
+      "model": null,
+      "finish_reason": null,
+      "usage": null,
+      "event_count": 3,
+      "latest_event_sequence": 3,
+      "event_types": [
+        "run.queued",
+        "run.started",
+        "run.failed"
+      ],
+      "model_delta_count": 0,
+      "model_started_count": 0,
+      "model_call_count": 0,
+      "loop_steps": [],
+      "tool_request_repair_count": 0,
+      "required_tool_repair_count": 0,
+      "context_compaction_count": 0,
+      "tool_event_count": 0,
+      "tool_calls": [],
+      "tool_names": [],
+      "first_delta_seconds": null,
+      "completed_seconds": 2.0,
+      "poll_count": 2,
+      "snapshot_terminal_seen": true,
+      "sse_high_cursor_replay": {
+        "byte_length": 1043,
+        "event_count": 3,
+        "non_heartbeat_event_count": 3,
+        "heartbeat_only": false,
+        "first_events": [
+          "run.queued",
+          "run.started",
+          "run.failed"
+        ]
+      },
+      "evaluation": {
+        "score": 38,
+        "passed": false,
+        "passes": [
+          "model.started 事件携带可追踪 model_call_id",
+          "SSE 超大 Last-Event-ID 可重放非 heartbeat 事件",
+          "数据集更新未声称保存正式对象"
+        ],
+        "issues": [
+          "run 未正常 completed，status=failed terminal=True",
+          "最终 assistant_message 不可见或为空",
+          "事件链缺少 model.started 或 model.delta",
+          "未体现多企业数据集参数化理解",
+          "未发现 include_datasets=true 的草稿更新工具请求"
+        ]
+      }
+    },
+    {
+      "case_id": "T08",
+      "name": "非测试领域能力边界",
+      "intent": "帮我写一首情诗。",
+      "run_id": "agent-run-d5200fd247a44cdba6080ec3eb393f6c",
+      "conversation_id": "agent-conv-9549a7628a2846b39e6a03d0a8d9059f",
+      "status": "failed",
+      "terminal": true,
+      "assistant_visible": true,
+      "assistant_message": "",
+      "assistant_message_length": 0,
+      "assistant_message_snippet": "",
+      "completion_source": null,
+      "model": null,
+      "finish_reason": null,
+      "usage": null,
+      "event_count": 4,
+      "latest_event_sequence": 4,
+      "event_types": [
+        "run.queued",
+        "run.started",
+        "model.started",
+        "run.failed"
+      ],
+      "model_delta_count": 0,
+      "model_started_count": 1,
+      "model_call_count": 1,
+      "loop_steps": [
+        "assistant_response"
+      ],
+      "tool_request_repair_count": 0,
+      "required_tool_repair_count": 0,
+      "context_compaction_count": 0,
+      "tool_event_count": 0,
+      "tool_calls": [],
+      "tool_names": [],
+      "first_delta_seconds": null,
+      "completed_seconds": 2.0,
+      "poll_count": 2,
+      "snapshot_terminal_seen": true,
+      "sse_high_cursor_replay": {
+        "byte_length": 1422,
+        "event_count": 4,
+        "non_heartbeat_event_count": 4,
+        "heartbeat_only": false,
+        "first_events": [
+          "run.queued",
+          "run.started",
+          "model.started",
+          "run.failed"
+        ]
+      },
+      "evaluation": {
+        "score": 43,
+        "passed": false,
+        "passes": [
+          "model.started 事件携带可追踪 model_call_id",
+          "SSE 超大 Last-Event-ID 可重放非 heartbeat 事件",
+          "非测试领域请求未调用平台工具"
+        ],
+        "issues": [
+          "run 未正常 completed，status=failed terminal=True",
+          "最终 assistant_message 不可见或为空",
+          "事件链缺少 model.started 或 model.delta",
+          "未说明测试领域能力边界"
+        ]
+      }
+    }
+  ],
+  "json_path": "reports\\woagent_behavior_eval_20260630_new_docs_optimized_agent.json",
+  "markdown_path": "reports\\woagent_behavior_eval_20260630_new_docs_optimized_agent.md"
+}

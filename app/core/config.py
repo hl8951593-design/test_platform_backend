@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     DATABASE_URL: str = Field(
         default="mysql+pymysql://root:password@127.0.0.1:3306/devtestbackend?charset=utf8mb4"
     )
+    DB_POOL_PRE_PING: bool = True
+    DB_POOL_RECYCLE_SECONDS: int = 1800
+    DB_POOL_SIZE: int = 10
+    DB_MAX_OVERFLOW: int = 20
+    DB_POOL_TIMEOUT_SECONDS: float = 30.0
+    DB_CONNECT_TIMEOUT_SECONDS: int = 10
 
     JWT_SECRET_KEY: str = "change-this-secret-key-for-devtestbackend"
     JWT_ALGORITHM: str = "HS256"
@@ -34,9 +40,13 @@ class Settings(BaseSettings):
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
     DEEPSEEK_MODEL: str = "deepseek-v4-flash"
     DEEPSEEK_TIMEOUT_SECONDS: float = 60.0
+    DEEPSEEK_STREAM_MAX_RETRIES: int = 2
+    DEEPSEEK_STREAM_RETRY_BASE_SECONDS: float = 0.5
+    DEEPSEEK_STREAM_RETRY_MAX_SECONDS: float = 4.0
     EXECUTION_WORKER_MAX_WORKERS: int = 8
     EXECUTION_WORKER_QUEUE_SIZE: int = 256
     EXECUTION_REQUEST_WAIT_TIMEOUT_SECONDS: float = 300.0
+    AGENT_RUN_STALE_TIMEOUT_SECONDS: float = 900.0
     LOG_LEVEL: str = "INFO"
     LOG_FILE_PATH: str = "logs/app.log"
     LOG_REQUESTS: bool = True

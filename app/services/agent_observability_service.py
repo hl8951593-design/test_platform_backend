@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -68,7 +69,10 @@ WORKER_QUEUE_AUDIT_FIELDS = (
     "duplicate_active_leases",
     "derived_from",
 )
+AGENT_WORKER_QUEUE_EXPIRED_LEASE_ITEM_ID_PREFIX = "agent-worker-queue-expired-lease"
+AGENT_WORKER_QUEUE_DUPLICATE_ACTIVE_ITEM_ID_PREFIX = "agent-worker-queue-duplicate-active"
 WORKER_QUEUE_EXPIRED_LEASE_FIELDS = (
+    "item_id",
     "queue_id",
     "run_id",
     "tool_call_id",
@@ -78,6 +82,7 @@ WORKER_QUEUE_EXPIRED_LEASE_FIELDS = (
     "last_error_code",
 )
 WORKER_QUEUE_DUPLICATE_ACTIVE_FIELDS = (
+    "item_id",
     "tool_call_id",
     "queue_ids",
     "statuses",
@@ -119,7 +124,10 @@ EVENT_REPLAY_STRESS_AUDIT_FIELDS = (
     "run_audits",
     "derived_from",
 )
+AGENT_EVENT_REPLAY_STRESS_RUN_ITEM_ID_PREFIX = "agent-event-replay-run"
+AGENT_EVENT_REPLAY_CURSOR_ITEM_ID_PREFIX = "agent-event-replay-cursor"
 EVENT_REPLAY_STRESS_RUN_FIELDS = (
+    "item_id",
     "run_id",
     "project_id",
     "last_event_sequence",
@@ -128,6 +136,7 @@ EVENT_REPLAY_STRESS_RUN_FIELDS = (
     "replayable",
 )
 EVENT_REPLAY_CURSOR_AUDIT_FIELDS = (
+    "item_id",
     "after_sequence",
     "replay_event_count",
     "first_replay_event_seq",
@@ -144,6 +153,8 @@ ALERT_RUNBOOK_REQUIRED_SEVERITIES = ("P0", "P1")
 ALERT_DYNAMIC_RUNBOOKS = {
     "agent_release_gate_violation": "release_gate_violation",
 }
+AGENT_ALERT_ITEM_ID_PREFIX = "agent-alert"
+AGENT_DASHBOARD_CHECK_ITEM_ID_PREFIX = "agent-dashboard-check"
 ALERT_SNAPSHOT_FIELDS = (
     "project_id",
     "generated_at",
@@ -153,6 +164,7 @@ ALERT_SNAPSHOT_FIELDS = (
     "derived_from",
 )
 ALERT_ITEM_FIELDS = (
+    "item_id",
     "alert_id",
     "severity",
     "status",
@@ -186,6 +198,7 @@ READINESS_DASHBOARD_FIELDS = (
     "derived_from",
 )
 DASHBOARD_CHECK_FIELDS = (
+    "item_id",
     "name",
     "status",
     "severity",
@@ -1255,8 +1268,40 @@ class AgentMetricsService:
         return int(self.db.scalar(statement) or 0)
 
     def _count_event_replay_gaps(self, project_id: int | None) -> int:
-        runs = list(self.db.scalars(select(AgentRun).where(AgentRun.run_id.in_(self._run_ids(project_id)))).all())
-        return sum(1 for run in runs if not AgentEventReplayAuditService(self.db).audit_run(run_id=run.run_id)["replayable"])
+        statement = (
+            select(
+                AgentRun.run_id,
+                AgentRun.last_event_sequence,
+                func.count(AgentEvent.id).label("event_count"),
+                func.count(func.distinct(AgentEvent.event_seq)).label("distinct_event_count"),
+                func.min(AgentEvent.event_seq).label("min_event_seq"),
+                func.max(AgentEvent.event_seq).label("max_event_seq"),
+            )
+            .select_from(AgentRun)
+            .outerjoin(AgentEvent, AgentEvent.run_id == AgentRun.run_id)
+            .group_by(AgentRun.run_id, AgentRun.last_event_sequence)
+        )
+        if project_id is not None:
+            statement = statement.where(AgentRun.project_id == project_id)
+        gap_total = 0
+        for row in self.db.execute(statement):
+            last_sequence = int(row.last_event_sequence or 0)
+            event_count = int(row.event_count or 0)
+            distinct_event_count = int(row.distinct_event_count or 0)
+            min_event_seq = row.min_event_seq
+            max_event_seq = row.max_event_seq
+            if last_sequence == 0:
+                replayable = event_count == 0
+            else:
+                replayable = (
+                    event_count == last_sequence
+                    and distinct_event_count == last_sequence
+                    and min_event_seq == 1
+                    and max_event_seq == last_sequence
+                )
+            if not replayable:
+                gap_total += 1
+        return gap_total
 
     def _count_reconcile_backoff_active(self, project_id: int | None) -> int:
         now = _utcnow()
@@ -1322,6 +1367,7 @@ class AgentWorkerQueueAuditService:
             "expired_leases": [self._lease_summary(item) for item in expired_leases],
             "duplicate_active_leases": [
                 {
+                    "item_id": _worker_queue_duplicate_active_item_id(tool_call_id),
                     "tool_call_id": tool_call_id,
                     "queue_ids": [row.queue_id for row in rows],
                     "statuses": [row.status for row in rows],
@@ -1354,6 +1400,7 @@ class AgentWorkerQueueAuditService:
     @staticmethod
     def _lease_summary(item: AgentWorkerQueue) -> dict[str, Any]:
         summary = {
+            "item_id": _worker_queue_expired_lease_item_id(item.queue_id),
             "queue_id": item.queue_id,
             "run_id": item.run_id,
             "tool_call_id": item.tool_call_id,
@@ -1383,6 +1430,7 @@ class AgentEventReplayAuditService:
             statement = statement.where(AgentRun.project_id == project_id)
         statement = statement.order_by(AgentRun.created_at.desc(), AgentRun.id.desc()).limit(limit)
         runs = list(self.db.scalars(statement).all())
+        events_by_run_id = self._events_by_run_id([run.run_id for run in runs])
 
         run_audits: list[dict[str, Any]] = []
         cursor_window_count = 0
@@ -1394,8 +1442,9 @@ class AgentEventReplayAuditService:
         for run in runs:
             run_failure = False
             cursor_audits: list[dict[str, Any]] = []
+            events = events_by_run_id.get(run.run_id, [])
             for after_sequence in self._cursor_windows(last_event_sequence=run.last_event_sequence or 0, cursor_count=cursor_total):
-                audit = self.audit_run(run_id=run.run_id, after_sequence=after_sequence)
+                audit = self._audit_loaded_run(run=run, events=events, after_sequence=after_sequence)
                 cursor_window_count += 1
                 total_replay_events += audit["replay_event_count"]
                 max_replay_window_events = max(max_replay_window_events, audit["replay_event_count"])
@@ -1404,6 +1453,7 @@ class AgentEventReplayAuditService:
                 if not audit["replayable"] or not audit["replay_cursor_valid"]:
                     run_failure = True
                 cursor_audit = {
+                    "item_id": _event_replay_cursor_item_id(run.run_id, after_sequence),
                     "after_sequence": after_sequence,
                     "replay_event_count": audit["replay_event_count"],
                     "first_replay_event_seq": audit["first_replay_event_seq"],
@@ -1418,10 +1468,11 @@ class AgentEventReplayAuditService:
             if run_failure:
                 failed_run_ids.add(run.run_id)
             run_audit = {
+                "item_id": _event_replay_stress_run_item_id(run.run_id),
                 "run_id": run.run_id,
                 "project_id": run.project_id,
                 "last_event_sequence": run.last_event_sequence or 0,
-                "event_count": self.audit_run(run_id=run.run_id)["event_count"],
+                "event_count": len(events),
                 "cursor_audits": cursor_audits,
                 "replayable": not run_failure,
             }
@@ -1463,9 +1514,14 @@ class AgentEventReplayAuditService:
         events = list(self.db.scalars(
             select(AgentEvent).where(AgentEvent.run_id == run_id).order_by(AgentEvent.event_seq.asc())
         ).all())
+        return self._audit_loaded_run(run=run, events=events, after_sequence=after_sequence)
+
+    @staticmethod
+    def _audit_loaded_run(*, run: AgentRun, events: list[AgentEvent], after_sequence: int = 0) -> dict[str, Any]:
         sequences = [item.event_seq for item in events]
-        unique_sequences = set(sequences)
-        duplicate_sequences = sorted({seq for seq in sequences if sequences.count(seq) > 1})
+        sequence_counts = Counter(sequences)
+        unique_sequences = set(sequence_counts)
+        duplicate_sequences = sorted(seq for seq, count in sequence_counts.items() if count > 1)
         expected = set(range(1, (run.last_event_sequence or 0) + 1))
         missing_sequences = sorted(expected.difference(unique_sequences))
         unexpected_sequences = sorted(seq for seq in unique_sequences if seq < 1 or seq > (run.last_event_sequence or 0))
@@ -1492,6 +1548,19 @@ class AgentEventReplayAuditService:
             "replay_cursor_valid": 0 <= after_sequence <= (run.last_event_sequence or 0),
         }
         return {field: audit[field] for field in EVENT_REPLAY_AUDIT_FIELDS}
+
+    def _events_by_run_id(self, run_ids: list[str]) -> dict[str, list[AgentEvent]]:
+        if not run_ids:
+            return {}
+        events = self.db.scalars(
+            select(AgentEvent)
+            .where(AgentEvent.run_id.in_(run_ids))
+            .order_by(AgentEvent.run_id.asc(), AgentEvent.event_seq.asc())
+        ).all()
+        grouped: dict[str, list[AgentEvent]] = defaultdict(list)
+        for event in events:
+            grouped[event.run_id].append(event)
+        return grouped
 
     @staticmethod
     def _cursor_windows(*, last_event_sequence: int, cursor_count: int) -> list[int]:
@@ -1539,11 +1608,19 @@ class AgentAlertService:
     def __init__(self, db: Session):
         self.db = db
 
-    def snapshot(self, *, project_id: int | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        *,
+        project_id: int | None = None,
+        metrics_snapshot: dict[str, Any] | None = None,
+        release_gate: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         from app.services.agent_release_gate_service import AgentReleaseGateService
 
-        metrics_snapshot = AgentMetricsService(self.db).snapshot(project_id=project_id)
-        release_gate = AgentReleaseGateService(self.db).snapshot()
+        if metrics_snapshot is None:
+            metrics_snapshot = AgentMetricsService(self.db).snapshot(project_id=project_id)
+        if release_gate is None:
+            release_gate = AgentReleaseGateService(self.db).snapshot()
         alerts = self._metric_alerts(metrics_snapshot["metrics"])
         alerts.extend(self._release_gate_alerts(release_gate))
         severity_counts = self._severity_counts(alerts)
@@ -1592,8 +1669,10 @@ class AgentAlertService:
             details = {"condition": condition}
             if related_metrics:
                 details["related_metrics"] = related_metrics
+            alert_id = rule["alert_id"]
             alert = {
-                "alert_id": rule["alert_id"],
+                "item_id": _agent_alert_item_id(alert_id),
+                "alert_id": alert_id,
                 "severity": rule["severity"],
                 "status": "firing",
                 "metric_key": metric_key,
@@ -1612,8 +1691,10 @@ class AgentAlertService:
         violations = release_gate.get("violations") or []
         if not violations:
             return []
+        alert_id = "agent_release_gate_violation"
         alert = {
-            "alert_id": "agent_release_gate_violation",
+            "item_id": _agent_alert_item_id(alert_id),
+            "alert_id": alert_id,
             "severity": "P0",
             "status": "firing",
             "metric_key": "release_gate_violation_count",
@@ -1651,18 +1732,30 @@ class AgentReadinessDashboardService:
     def __init__(self, db: Session):
         self.db = db
 
-    def snapshot(self, *, project_id: int | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        *,
+        project_id: int | None = None,
+        metrics_snapshot: dict[str, Any] | None = None,
+        release_gate: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         from app.services.agent_fault_injection_service import AgentFaultInjectionService
         from app.services.agent_loop_service import RootCauseRuleEngine
         from app.services.agent_release_gate_service import AgentReleaseGateService
         from app.services.agent_runbook_service import AgentRunbookService
 
-        metrics_snapshot = AgentMetricsService(self.db).snapshot(project_id=project_id)
-        release_gate = AgentReleaseGateService(self.db).snapshot()
+        if metrics_snapshot is None:
+            metrics_snapshot = AgentMetricsService(self.db).snapshot(project_id=project_id)
+        if release_gate is None:
+            release_gate = AgentReleaseGateService(self.db).snapshot()
         fault_cases = AgentFaultInjectionService(self.db).list_cases()
         fault_coverage = AgentFaultInjectionCoverageService(self.db).audit()
         runbooks = AgentRunbookService(self.db).list_runbooks()
-        alert_snapshot = AgentAlertService(self.db).snapshot(project_id=project_id)
+        alert_snapshot = AgentAlertService(self.db).snapshot(
+            project_id=project_id,
+            metrics_snapshot=metrics_snapshot,
+            release_gate=release_gate,
+        )
         promotion_assessment = self._promotion_assessment_summary(release_gate)
         root_cause_governance = RootCauseRuleEngine(self.db).audit_rule_governance()
 
@@ -1975,6 +2068,7 @@ class AgentReadinessDashboardService:
     @staticmethod
     def _check(*, name: str, status: str, severity: str, summary: str, details: dict[str, Any]) -> dict[str, Any]:
         check = {
+            "item_id": _agent_dashboard_check_item_id(name),
             "name": name,
             "status": status,
             "severity": severity,
@@ -2125,6 +2219,7 @@ class AgentLaunchAuditService:
     @staticmethod
     def _check(*, name: str, status: str, severity: str, summary: str, details: dict[str, Any]) -> dict[str, Any]:
         check = {
+            "item_id": _agent_dashboard_check_item_id(name),
             "name": name,
             "status": status,
             "severity": severity,
@@ -2393,6 +2488,7 @@ class AgentBackendCompletionAuditService:
     @staticmethod
     def _check(*, name: str, status: str, severity: str, summary: str, details: dict[str, Any]) -> dict[str, Any]:
         check = {
+            "item_id": _agent_dashboard_check_item_id(name),
             "name": name,
             "status": status,
             "severity": severity,
@@ -2412,6 +2508,30 @@ class AgentBackendCompletionAuditService:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _agent_alert_item_id(alert_id: str) -> str:
+    return f"{AGENT_ALERT_ITEM_ID_PREFIX}://{alert_id}"
+
+
+def _agent_dashboard_check_item_id(name: str) -> str:
+    return f"{AGENT_DASHBOARD_CHECK_ITEM_ID_PREFIX}://{name}"
+
+
+def _worker_queue_expired_lease_item_id(queue_id: str) -> str:
+    return f"{AGENT_WORKER_QUEUE_EXPIRED_LEASE_ITEM_ID_PREFIX}://{queue_id}"
+
+
+def _worker_queue_duplicate_active_item_id(tool_call_id: str) -> str:
+    return f"{AGENT_WORKER_QUEUE_DUPLICATE_ACTIVE_ITEM_ID_PREFIX}://{tool_call_id}"
+
+
+def _event_replay_stress_run_item_id(run_id: str) -> str:
+    return f"{AGENT_EVENT_REPLAY_STRESS_RUN_ITEM_ID_PREFIX}://{run_id}"
+
+
+def _event_replay_cursor_item_id(run_id: str, after_sequence: int) -> str:
+    return f"{AGENT_EVENT_REPLAY_CURSOR_ITEM_ID_PREFIX}://{run_id}/{after_sequence}"
 
 
 def _behavior_evaluation_case_ids() -> list[str]:

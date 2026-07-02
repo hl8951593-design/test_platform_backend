@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 
 from app.core.sensitive_data import request_fingerprint
 from app.models.agent import (
+    AGENT_CONTEXT_BUILD_ITEM_ID_PREFIX as AGENT_CONTEXT_BUILD_MODEL_ITEM_ID_PREFIX,
+    AGENT_LOOP_OBSERVATION_ITEM_ID_PREFIX as AGENT_LOOP_OBSERVATION_MODEL_ITEM_ID_PREFIX,
     AgentContextBuild,
     AgentEvidenceWatch,
     AgentLoopObservation,
@@ -70,8 +72,20 @@ ROOT_CAUSE_NEW_RULE_REQUIRED_FIXTURE_COUNT = 3
 ROOT_CAUSE_FALLBACK_RULE_ID = "RC_RULE_MISSING"
 ROOT_CAUSE_ACCEPTED_UNKNOWN_RULE_ID = "RC_UNKNOWN"
 ROOT_CAUSE_MISSING_RULE_METRIC = "root_cause_rule_missing_total"
+AGENT_ROOT_CAUSE_RULE_VIOLATION_ITEM_ID_PREFIX = "agent-root-cause-rule-violation"
+ROOT_CAUSE_GOVERNANCE_VIOLATION_FIELDS = (
+    "item_id",
+    "rule_id",
+    "priority",
+    "priority_band",
+    "violation",
+    "expected_range",
+)
+AGENT_CONTEXT_BUILD_ITEM_ID_PREFIX = AGENT_CONTEXT_BUILD_MODEL_ITEM_ID_PREFIX
+AGENT_LOOP_OBSERVATION_ITEM_ID_PREFIX = AGENT_LOOP_OBSERVATION_MODEL_ITEM_ID_PREFIX
 
 CONTEXT_BUILD_FIELDS = (
+    "item_id",
     "context_build_id",
     "run_id",
     "iteration",
@@ -93,7 +107,94 @@ CONTEXT_BUILD_FIELDS = (
     "created_at",
 )
 
+CONTEXT_BUILD_METADATA_KEYS = (
+    "selected_agent_skills",
+    "matched_agent_skill_routing_rules",
+    "runtime_snapshot",
+    "permission_context",
+    "policy_refs",
+)
+CONTEXT_BUILD_SELECTED_AGENT_SKILL_FIELDS = (
+    "name",
+    "skill_hash",
+)
+CONTEXT_BUILD_AGENT_SKILL_ROUTING_RULE_FIELDS = (
+    "skill_name",
+    "routing_key",
+    "after_tool",
+    "required_tool",
+    "min_total_fields",
+    "rule_hash",
+)
+CONTEXT_BUILD_RUNTIME_SNAPSHOT_METADATA_FIELDS = (
+    "snapshot_id",
+    "runtime_hash",
+    "tool_registry_hash",
+    "manifest_bundle_hash",
+    "prompt_bundle_hash",
+    "policy_version_hash",
+    "available_tool_names",
+    "tool_count",
+)
+CONTEXT_BUILD_RUNTIME_SNAPSHOT_MISSING_METADATA_FIELDS = (
+    "snapshot_id",
+    "snapshot_missing",
+)
+CONTEXT_BUILD_PERMISSION_CONTEXT_FIELDS = (
+    "actor_user_id",
+    "project_id",
+    "access_level",
+    "project_access",
+    "implicit_all_project_permissions",
+    "explicit_permission_codes",
+    "explicit_permission_count",
+    "permission_hash",
+)
+CONTEXT_BUILD_METADATA_PRIVATE_EXCLUDED_FIELDS = (
+    "triggers",
+    "routing_hints",
+    "private_values",
+    "guard_unsupported_capability",
+    "routing_requires_tool",
+    "routing_required_tool_after_success",
+    "body",
+    "path",
+    "tools_json",
+    "manifests_json",
+    "adapters_json",
+    "policies_json",
+    "email",
+    "username",
+    "hashed_password",
+)
+CONTEXT_BUILD_TOKEN_WINDOW_FIELDS = (
+    "budget_scope",
+    "estimated_input_units",
+    "budget_limit_units",
+    "units_until_budget",
+    "budget_limit_reached",
+    "degradation",
+    "kept_evidence_ref_count",
+    "omitted_evidence_ref_count",
+    "required_evidence_complete",
+)
+CONTEXT_BUILD_TOKEN_WINDOW_BUDGET_SCOPE = "context_build_estimated_input"
+CONTEXT_BUILD_TOKEN_WINDOW_SOURCE = "ContextBuilder.build"
+CONTEXT_BUILD_DEGRADED_EVENT = "context.degraded"
+CONTEXT_BUILD_DEGRADED_EVENT_FIELDS = (
+    "schema_version",
+    "run_id",
+    "project_id",
+    "event_seq",
+    "event_type",
+    "occurred_at",
+    "context_build_id",
+    "degradation",
+    "context_window",
+)
+
 LOOP_OBSERVATION_FIELDS = (
+    "item_id",
     "observation_id",
     "run_id",
     "iteration",
@@ -468,6 +569,14 @@ class ContextBuilder:
         omitted_ids = {item.evidence_ref_id for item in omitted_refs}
         required_complete = not any(ref_id in omitted_ids for ref_id in payload.required_evidence_ref_ids)
         risk = _decision_quality_risk(degradation=degradation, required_complete=required_complete)
+        token_window = _context_build_token_window(
+            estimated_tokens=estimated_tokens,
+            token_budget=payload.token_budget,
+            degradation=degradation,
+            kept_ref_count=len(kept_refs),
+            omitted_ref_count=len(omitted_refs),
+            required_complete=required_complete,
+        )
         skill_metadata = _agent_skill_decision_metadata(run.intent)
         runtime_snapshot_metadata = _runtime_snapshot_decision_metadata(self.db, run)
         permission_context_metadata = _permission_context_decision_metadata(
@@ -487,7 +596,7 @@ class ContextBuilder:
             token_budget=payload.token_budget,
             estimated_input_tokens=estimated_tokens,
             context_degradation_level=degradation,
-            compressed_sections_json={"kept_evidence_ref_count": len(kept_refs)} if degradation != "none" else None,
+            compressed_sections_json=token_window if degradation != "none" else None,
             omitted_evidence_refs_json=[item.to_json() for item in omitted_refs] or None,
             required_evidence_refs_json=list(payload.required_evidence_ref_ids),
             required_evidence_complete=required_complete,
@@ -515,8 +624,12 @@ class ContextBuilder:
         if degradation != "none":
             runtime.append_event(
                 run,
-                "context.degraded",
-                {"context_build_id": build.context_build_id, "degradation": degradation},
+                CONTEXT_BUILD_DEGRADED_EVENT,
+                {
+                    "context_build_id": build.context_build_id,
+                    "degradation": degradation,
+                    "context_window": token_window,
+                },
                 commit=False,
             )
         if omitted_refs:
@@ -626,21 +739,25 @@ class RootCauseRuleEngine:
         for rule in rules:
             band_range = self.PRIORITY_BANDS.get(rule.priority_band)
             if band_range is None:
+                violation = "unknown_priority_band"
                 violations.append({
+                    "item_id": _root_cause_rule_violation_item_id(rule.rule_id, violation),
                     "rule_id": rule.rule_id,
                     "priority": rule.priority,
                     "priority_band": rule.priority_band,
-                    "violation": "unknown_priority_band",
+                    "violation": violation,
                 })
                 continue
             lower, upper = band_range
             if not lower <= rule.priority <= upper:
+                violation = "priority_outside_band"
                 violations.append({
+                    "item_id": _root_cause_rule_violation_item_id(rule.rule_id, violation),
                     "rule_id": rule.rule_id,
                     "priority": rule.priority,
                     "priority_band": rule.priority_band,
                     "expected_range": [lower, upper],
-                    "violation": "priority_outside_band",
+                    "violation": violation,
                 })
         return {
             "rule_count": len(rules),
@@ -1044,6 +1161,10 @@ def _default_root_cause_rules() -> list[dict[str, Any]]:
     ]
 
 
+def _root_cause_rule_violation_item_id(rule_id: str, violation: str) -> str:
+    return f"{AGENT_ROOT_CAUSE_RULE_VIOLATION_ITEM_ID_PREFIX}://{rule_id}/{violation}"
+
+
 def _apply_budget(
     evidence_refs: list[EvidenceRef],
     estimated_tokens: int,
@@ -1064,6 +1185,28 @@ def _apply_budget(
     omitted = evidence_refs[-omit_count:] if evidence_refs else []
     kept = evidence_refs[:-omit_count] if omitted else evidence_refs
     return kept, omitted, degradation
+
+
+def _context_build_token_window(
+    *,
+    estimated_tokens: int,
+    token_budget: int,
+    degradation: str,
+    kept_ref_count: int,
+    omitted_ref_count: int,
+    required_complete: bool,
+) -> dict[str, Any]:
+    return {
+        "budget_scope": CONTEXT_BUILD_TOKEN_WINDOW_BUDGET_SCOPE,
+        "estimated_input_units": estimated_tokens,
+        "budget_limit_units": token_budget,
+        "units_until_budget": max(token_budget - estimated_tokens, 0),
+        "budget_limit_reached": estimated_tokens > token_budget,
+        "degradation": degradation,
+        "kept_evidence_ref_count": kept_ref_count,
+        "omitted_evidence_ref_count": omitted_ref_count,
+        "required_evidence_complete": required_complete,
+    }
 
 
 def _decision_quality_risk(*, degradation: str, required_complete: bool) -> str:

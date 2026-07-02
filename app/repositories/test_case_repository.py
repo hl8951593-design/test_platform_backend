@@ -232,6 +232,10 @@ class TestCaseRepository:
         attempt_history: list | None,
         error_message: str | None,
         duration_ms: int | None,
+        trigger_source: str = "manual",
+        agent_run_id: str | None = None,
+        agent_tool_call_id: str | None = None,
+        trigger_tool_name: str | None = None,
     ) -> TestCaseExecution:
         execution = TestCaseExecution(
             project_id=project_id,
@@ -239,6 +243,10 @@ class TestCaseRepository:
             environment_id=environment_id,
             scenario_run_id=scenario_run_id,
             executed_by_id=executed_by_id,
+            trigger_source=trigger_source,
+            agent_run_id=agent_run_id,
+            agent_tool_call_id=agent_tool_call_id,
+            trigger_tool_name=trigger_tool_name,
             status=status,
             request_snapshot=request_snapshot,
             response_snapshot=response_snapshot,

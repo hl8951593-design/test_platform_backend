@@ -11,12 +11,21 @@ from typing import Any, Callable
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.sensitive_data import mask_sensitive, request_fingerprint
+from app.db.session import SessionLocal, dispose_engine_after_disconnect
 from app.models.agent import (
+    AGENT_APPROVAL_ITEM_ID_PREFIX as AGENT_APPROVAL_MODEL_ITEM_ID_PREFIX,
+    AGENT_APPROVAL_LINEAGE_ITEM_ID_PREFIX as AGENT_APPROVAL_LINEAGE_MODEL_ITEM_ID_PREFIX,
+    AGENT_EVENT_ITEM_ID_PREFIX as AGENT_EVENT_MODEL_ITEM_ID_PREFIX,
+    AGENT_MIGRATION_BLOCK_ITEM_ID_PREFIX as AGENT_MIGRATION_BLOCK_MODEL_ITEM_ID_PREFIX,
+    AGENT_RECONCILE_ATTEMPT_ITEM_ID_PREFIX as AGENT_RECONCILE_ATTEMPT_MODEL_ITEM_ID_PREFIX,
+    AGENT_RUNTIME_SNAPSHOT_ITEM_ID_PREFIX as AGENT_RUNTIME_SNAPSHOT_MODEL_ITEM_ID_PREFIX,
+    AGENT_RUN_ITEM_ID_PREFIX as AGENT_RUN_MODEL_ITEM_ID_PREFIX,
+    AGENT_TOOL_CALL_ITEM_ID_PREFIX as AGENT_TOOL_CALL_MODEL_ITEM_ID_PREFIX,
     AgentApproval,
     AgentBackendContract,
     AgentCheckpoint,
@@ -50,6 +59,11 @@ from app.services.permission_service import PermissionService
 logger = logging.getLogger(__name__)
 
 RUN_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+RUN_TERMINAL_EVENT_TYPES_BY_STATUS = {
+    "completed": "run.completed",
+    "failed": "run.failed",
+    "cancelled": "run.cancelled",
+}
 RUN_STALE_ACTIVE_STATUSES = {"queued", "running"}
 RUN_STATUSES = ["queued", "running", "paused", "completed", "failed", "cancelled", "migration_blocked", "needs_human"]
 TOOL_CALL_STATUSES = [
@@ -66,6 +80,17 @@ TOOL_CALL_STATUSES = [
     "needs_migration",
     "manual_intervention",
 ]
+HIGH_RISK_SIDE_EFFECT_CLASSES = {"business_create", "business_update", "destructive", "external_effect"}
+TOOL_CALL_CLAIMABLE_STATUSES = {"planned"}
+TOOL_CALL_HEARTBEAT_ACTIVE_STATUSES = {"leased", "running_pre_effect"}
+TOOL_CALL_EXECUTABLE_STATUSES = {"planned", "leased"}
+TOOL_CALL_EFFECT_SUBMISSION_STARTED_STATES = {
+    "send_intent_recorded",
+    "transport_sent_observed",
+    "backend_accepted",
+    "effect_committed",
+    "unknown",
+}
 EFFECT_SUBMISSION_STATES = [
     "none",
     "send_intent_recorded",
@@ -85,6 +110,13 @@ MIGRATION_BLOCK_STATUSES = ["open", "resolved", "cancelled"]
 AGENT_ERROR_MESSAGE_SUMMARY_VERSION = "agent_error_message_summary_v1"
 AGENT_ERROR_MESSAGE_MAX_CHARS = 512
 AGENT_ERROR_MESSAGE_TRUNCATION_MARKER = "[agent_error_message_truncated]"
+AGENT_CONTENT_PREVIEW_SUMMARY_VERSION = "agent_content_preview_summary_v1"
+AGENT_CONTENT_PREVIEW_MAX_CHARS = 512
+AGENT_CONTENT_PREVIEW_TRUNCATION_MARKER = "[agent_content_preview_truncated]"
+AGENT_TOOL_REQUEST_CONTEXT_SUMMARY_VERSION = "agent_tool_request_context_summary_v1"
+AGENT_INTERNAL_TOOL_CONTEXT_LEAK_MESSAGE = (
+    "工具执行已完成，但模型返回了仅供内部循环使用的工具上下文摘要；后端已阻止该摘要展示给用户。"
+)
 
 AGENT_CONVERSATION_SYSTEM_PROMPT = (
     "你是 TestAuto 自动化测试平台的 Harness Loop Agent。"
@@ -138,6 +170,63 @@ AGENT_HISTORY_CONTEXT_FULL_TURNS = 4
 AGENT_HISTORY_CONTEXT_SUMMARY_CHARS = 360
 AGENT_HISTORY_CONTEXT_RECENT_USER_CHARS = 800
 AGENT_HISTORY_CONTEXT_RECENT_ASSISTANT_CHARS = 1200
+AGENT_HISTORY_CONTEXT_SOURCE_STATUS = "completed"
+AGENT_HISTORY_CONTEXT_EXCLUDED_STATUSES = tuple(
+    status for status in RUN_STATUSES if status != AGENT_HISTORY_CONTEXT_SOURCE_STATUS
+)
+AGENT_HISTORY_CONTEXT_ASSISTANT_VISIBILITY_RULE = "assistant_visible_not_false"
+AGENT_HISTORY_CONTEXT_USER_INTENT_RULE = "completed_history_user_intent_included"
+AGENT_HISTORY_CONTEXT_ORDER = "oldest_to_newest_after_desc_limit"
+AGENT_HISTORY_CONTEXT_COMPACTION_STRATEGY = "summarize_older_keep_recent"
+AGENT_HISTORY_CONTEXT_COMPACTION_EVENT = "context.history_compacted"
+AGENT_HISTORY_COMPACTION_PAYLOAD_FIELDS = (
+    "trigger",
+    "reason",
+    "phase",
+    "implementation",
+    "strategy",
+    "original_run_count",
+    "compacted_run_count",
+    "kept_full_run_count",
+    "estimated_input_units_before",
+    "estimated_input_units_after",
+    "budget_limit_units",
+    "summary_role",
+    "replacement_history",
+    "initial_context_injection",
+    "reference_context_item",
+    "context_baseline",
+    "window_number",
+    "first_window_id",
+    "previous_window_id",
+    "window_id",
+    "source",
+)
+AGENT_HISTORY_COMPACTION_ENVELOPE_FIELDS = AGENT_HISTORY_COMPACTION_PAYLOAD_FIELDS
+AGENT_HISTORY_COMPACTION_TRIGGER = "auto"
+AGENT_HISTORY_COMPACTION_REASON = "history_budget_exceeded"
+AGENT_HISTORY_COMPACTION_PHASE = "pre_model_call"
+AGENT_HISTORY_COMPACTION_IMPLEMENTATION = "inline_deterministic_summary"
+AGENT_HISTORY_COMPACTION_REPLACEMENT_HISTORY = "summary_plus_recent_turns"
+AGENT_HISTORY_COMPACTION_INITIAL_CONTEXT_INJECTION = "system_prompt_before_history"
+AGENT_HISTORY_COMPACTION_REFERENCE_CONTEXT_ITEM = "not_persisted"
+AGENT_HISTORY_COMPACTION_CONTEXT_BASELINE = "system_run_skill_memory_rebuilt_per_model_call"
+AGENT_HISTORY_COMPACTION_WINDOW_ID_PREFIX = "agent-window"
+AGENT_HISTORY_COMPACTION_CODEX_ALIGNMENT = "ContextCompactionItem"
+AGENT_HISTORY_COMPACTION_SOURCE = "AgentConversationRunner._conversation_history_messages"
+AGENT_EVENT_ITEM_ID_PREFIX = AGENT_EVENT_MODEL_ITEM_ID_PREFIX
+AGENT_RUN_ITEM_ID_PREFIX = AGENT_RUN_MODEL_ITEM_ID_PREFIX
+AGENT_RUNTIME_SNAPSHOT_ITEM_ID_PREFIX = AGENT_RUNTIME_SNAPSHOT_MODEL_ITEM_ID_PREFIX
+AGENT_APPROVAL_ITEM_ID_PREFIX = AGENT_APPROVAL_MODEL_ITEM_ID_PREFIX
+AGENT_APPROVAL_LINEAGE_ITEM_ID_PREFIX = AGENT_APPROVAL_LINEAGE_MODEL_ITEM_ID_PREFIX
+AGENT_MIGRATION_BLOCK_ITEM_ID_PREFIX = AGENT_MIGRATION_BLOCK_MODEL_ITEM_ID_PREFIX
+AGENT_TOOL_CALL_ITEM_ID_PREFIX = AGENT_TOOL_CALL_MODEL_ITEM_ID_PREFIX
+AGENT_RECONCILE_ATTEMPT_ITEM_ID_PREFIX = AGENT_RECONCILE_ATTEMPT_MODEL_ITEM_ID_PREFIX
+AGENT_CONTEXT_COMPACTION_OBJECT_KEY_PREFIX = AGENT_EVENT_ITEM_ID_PREFIX
+AGENT_CONTEXT_COMPACTION_ITEM_ID_PREFIX = "agent-context-compaction"
+AGENT_MODEL_RESPONSE_ITEM_ID_PREFIX = "agent-model-response"
+AGENT_HISTORY_CONTEXT_SUMMARY_ROLE = "system"
+AGENT_HISTORY_CONTEXT_CURRENT_USER_POSITION = "last"
 AGENT_MEMORY_CONTEXT_MESSAGE_MAX_CHARS = 3000
 AGENT_MEMORY_CONTEXT_TITLE_MAX_CHARS = 180
 AGENT_MEMORY_CONTEXT_CONTENT_MAX_CHARS = 500
@@ -159,6 +248,19 @@ AGENT_REPAIR_CONTEXT_TRUNCATION_MARKER = (
 REQUIRES_TOOL_ROUTING_KEY = "routing_requires_tool"
 REQUIRED_TOOL_AFTER_SUCCESS_ROUTING_KEY = "routing_required_tool_after_success"
 UNSUPPORTED_CAPABILITY_GUARD_KEY = "guard_unsupported_capability"
+AMBIGUOUS_DEICTIC_GUARD_SUBJECTS = frozenset({
+    "直接",
+    "刚才",
+    "上面",
+    "前面",
+    "这个",
+    "这些",
+    "它",
+    "this",
+    "that",
+    "above",
+    "previous",
+})
 
 
 @dataclass(frozen=True)
@@ -197,15 +299,24 @@ class AgentToolRequest:
         return [dict(item) for item in self.evidence_refs]
 
     def detected_event_payload(self, *, iteration: int) -> dict[str, Any]:
+        reason = (
+            _bounded_agent_error_message(
+                self.reason,
+                reference="AgentConversationRunner.model.tool_request_detected.reason",
+            )
+            if self.reason is not None
+            else None
+        )
         return {
             "iteration": iteration,
             "tool_name": self.tool_name,
-            "reason": self.reason,
-            "decision_reason": self.reason,
+            "reason": reason,
+            "decision_reason": reason,
         }
 
 
 AGENT_RUN_FIELDS = (
+    "item_id",
     "run_id",
     "project_id",
     "user_id",
@@ -264,6 +375,7 @@ AGENT_RUN_ACTION_FIELDS = (
     "reason",
     "severity",
     "resource_ids",
+    "resource_item_ids",
     "details",
 )
 
@@ -274,6 +386,17 @@ AGENT_RUN_ACTION_STATE_FIELDS = (
     "blocked_reasons",
     "generated_at",
 )
+AGENT_RUN_ACTION_PRIMARY_PRIORITY = (
+    "review_approvals",
+    "resolve_migration",
+    "reconcile_run",
+    "resume_run",
+    "open_runbook",
+    "cancel_run",
+)
+AGENT_RUN_ACTION_RESOURCE_ORDER_TOOL_CALL = ("step_index", "attempt_index", "id")
+AGENT_RUN_ACTION_RESOURCE_ORDER_APPROVAL = ("created_at", "id")
+AGENT_RUN_ACTION_RESOURCE_ORDER_MIGRATION_BLOCK = ("created_at", "id")
 
 AGENT_CONVERSATION_FIELDS = (
     "conversation_id",
@@ -286,15 +409,26 @@ AGENT_CONVERSATION_FIELDS = (
     "updated_at",
 )
 
+AGENT_CONVERSATION_CONTEXT_COMPACTION_FIELDS = (
+    "item_id",
+    "run_id",
+    "event_seq",
+    "event_type",
+    "payload_json",
+    "created_at",
+)
+
 AGENT_CONVERSATION_TRANSCRIPT_FIELDS = (
     "conversation",
     "turns",
+    "context_compactions",
     "generated_at",
 )
 
 AGENT_CONVERSATION_EXPORT_FIELDS = (
     "conversation",
     "turns",
+    "context_compactions",
     "events_by_run_id",
     "tool_calls_by_run_id",
     "approvals_by_run_id",
@@ -340,6 +474,7 @@ AGENT_CONVERSATION_SMOKE_FIELDS = (
 )
 
 AGENT_EVENT_FIELDS = (
+    "item_id",
     "event_seq",
     "event_type",
     "payload_json",
@@ -349,6 +484,7 @@ AGENT_EVENT_FIELDS = (
 AGENT_RUN_EVENT_SNAPSHOT_FIELDS = (
     "run",
     "events",
+    "context_compactions",
     "after_sequence",
     "event_count",
     "latest_event_sequence",
@@ -358,6 +494,7 @@ AGENT_RUN_EVENT_SNAPSHOT_FIELDS = (
 )
 
 RUNTIME_SNAPSHOT_FIELDS = (
+    "item_id",
     "snapshot_id",
     "project_id",
     "created_by",
@@ -374,6 +511,7 @@ RUNTIME_SNAPSHOT_FIELDS = (
 )
 
 TOOL_CALL_FIELDS = (
+    "item_id",
     "tool_call_id",
     "run_id",
     "step_index",
@@ -427,6 +565,51 @@ TOOL_CALL_FIELDS = (
     "recent_reconcile_attempts",
     "created_at",
     "updated_at",
+)
+
+APPROVAL_FIELDS = (
+    "item_id",
+    "approval_id",
+    "approval_lineage_id",
+    "approval_epoch",
+    "run_id",
+    "tool_call_id",
+    "tool_call_item_id",
+    "project_id",
+    "approval_status",
+    "requested_by",
+    "decided_by",
+    "decided_at",
+    "input_hash",
+    "runtime_snapshot_id",
+    "resource_scope_hash",
+    "approval_reason",
+    "decision_reason",
+    "required_permissions_json",
+    "expires_at",
+    "created_at",
+    "updated_at",
+)
+
+MIGRATION_BLOCK_FIELDS = (
+    "item_id",
+    "block_id",
+    "run_id",
+    "tool_call_id",
+    "tool_call_item_id",
+    "status",
+    "block_type",
+    "reason",
+    "backend_name",
+    "backend_operation",
+    "backend_contract_version",
+    "required_migration_type",
+    "details_json",
+    "resolution_summary_json",
+    "resolved_by",
+    "created_at",
+    "updated_at",
+    "resolved_at",
 )
 
 
@@ -665,6 +848,11 @@ class AgentRuntimeService:
             AgentToolCall.status.notin_(["succeeded", "failed", "obsolete"]),
             model=AgentToolCall,
         )
+        retryable_tool_call_count = self._count_where(
+            AgentToolCall.run_id == run_id,
+            AgentToolCall.status == "failed_retryable",
+            model=AgentToolCall,
+        )
         approval_count = self._count_where(AgentApproval.run_id == run_id, model=AgentApproval)
         pending_approval_count = self._count_where(
             AgentApproval.run_id == run_id,
@@ -690,9 +878,19 @@ class AgentRuntimeService:
         if model_invoked is None:
             model_invoked = self._latest_event_payload(run_id, "model.started") != {}
 
-        blocking_tool_call_ids = list(run.blocking_tool_call_ids_json or [])
+        blocking_tool_call_ids = list(dict.fromkeys(run.blocking_tool_call_ids_json or []))
         terminal = run.status in RUN_TERMINAL_STATUSES
-        can_resume = (run.status in {"paused", "needs_human", "migration_blocked"} or bool(blocking_tool_call_ids)) and not terminal
+        resume_candidate = (
+            run.status in {"paused", "needs_human", "migration_blocked"}
+            or bool(blocking_tool_call_ids)
+            or retryable_tool_call_count > 0
+        )
+        can_resume = (
+            resume_candidate
+            and not terminal
+            and pending_approval_count == 0
+            and open_migration_block_count == 0
+        )
         return {
             "run": run,
             "assistant_message": assistant_message,
@@ -728,30 +926,43 @@ class AgentRuntimeService:
             AgentApproval.run_id == run_id,
             AgentApproval.approval_status == "pending",
             model=AgentApproval,
+            order_by=[AgentApproval.created_at.asc(), AgentApproval.id.asc()],
         )
         pending_approval_tool_call_ids = self._ids_where(
             AgentApproval.tool_call_id,
             AgentApproval.run_id == run_id,
             AgentApproval.approval_status == "pending",
             model=AgentApproval,
+            order_by=[AgentApproval.created_at.asc(), AgentApproval.id.asc()],
         )
         open_migration_block_ids = self._ids_where(
             AgentMigrationBlock.block_id,
             AgentMigrationBlock.run_id == run_id,
             AgentMigrationBlock.status == "open",
             model=AgentMigrationBlock,
+            order_by=[AgentMigrationBlock.created_at.asc(), AgentMigrationBlock.id.asc()],
         )
         uncertain_tool_call_ids = self._ids_where(
             AgentToolCall.tool_call_id,
             AgentToolCall.run_id == run_id,
             AgentToolCall.status.in_(["uncertain", "reconciling"]),
             model=AgentToolCall,
+            order_by=[
+                AgentToolCall.step_index.asc(),
+                AgentToolCall.attempt_index.asc(),
+                AgentToolCall.id.asc(),
+            ],
         )
         retryable_tool_call_ids = self._ids_where(
             AgentToolCall.tool_call_id,
             AgentToolCall.run_id == run_id,
             AgentToolCall.status == "failed_retryable",
             model=AgentToolCall,
+            order_by=[
+                AgentToolCall.step_index.asc(),
+                AgentToolCall.attempt_index.asc(),
+                AgentToolCall.id.asc(),
+            ],
         )
 
         blocked_reasons: list[str] = []
@@ -772,7 +983,7 @@ class AgentRuntimeService:
             list(run_summary["blocking_tool_call_ids"]) + pending_approval_tool_call_ids
         ))
         resume_candidate = (
-            run.status in {"paused", "needs_human"}
+            run.status in {"paused", "needs_human", "migration_blocked"}
             or bool(blocking_tool_call_ids)
             or bool(retryable_tool_call_ids)
         )
@@ -787,6 +998,46 @@ class AgentRuntimeService:
             resume_reason = "resume_candidate_ready"
         else:
             resume_reason = "no_resume_candidate"
+        resume_resource_ids = list(dict.fromkeys(blocking_tool_call_ids + retryable_tool_call_ids))
+        pending_approval_resource_item_ids = _tool_call_item_ids(
+            run_id=run_id,
+            tool_call_ids=pending_approval_tool_call_ids,
+        )
+        resume_resource_item_ids = _tool_call_item_ids(
+            run_id=run_id,
+            tool_call_ids=resume_resource_ids,
+        )
+        uncertain_tool_call_item_ids = _tool_call_item_ids(
+            run_id=run_id,
+            tool_call_ids=uncertain_tool_call_ids,
+        )
+        open_migration_block_item_ids = _migration_block_item_ids(
+            run_id=run_id,
+            block_ids=open_migration_block_ids,
+        )
+        reconcile_enabled = bool(uncertain_tool_call_ids)
+        reconcile_reason = (
+            "uncertain_tool_calls"
+            if uncertain_tool_call_ids
+            else ("run_terminal" if terminal else "no_uncertain_tool_calls")
+        )
+        resolve_migration_details = {
+            "open_migration_block_count": len(open_migration_block_ids),
+            "run_status": run.status,
+            "run_terminal": terminal,
+            "resolve_preserves_terminal_run": terminal,
+            "post_resolve_next_action": (
+                "reconcile_run" if terminal else "checkpoint_freshness_then_resume"
+            ),
+        }
+        if terminal:
+            resolve_migration_details["tool_call_status_after_resolve"] = "reconciling"
+        runbook_recovery_reasons = [
+            reason for reason in blocked_reasons if reason != "run_completed"
+        ]
+        open_runbook_enabled = bool(blocked_reasons) and (
+            run.status != "completed" or bool(runbook_recovery_reasons)
+        )
 
         actions = [
             self._run_action(
@@ -826,6 +1077,7 @@ class AgentRuntimeService:
                 "warning",
                 pending_approval_ids,
                 {"pending_approval_count": len(pending_approval_ids)},
+                resource_item_ids=pending_approval_resource_item_ids,
             ),
             self._run_action(
                 "resume_run",
@@ -835,23 +1087,25 @@ class AgentRuntimeService:
                 resume_enabled,
                 resume_reason,
                 "primary",
-                blocking_tool_call_ids + retryable_tool_call_ids,
+                resume_resource_ids,
                 {
                     "blocking_tool_call_ids": blocking_tool_call_ids,
                     "pending_approval_tool_call_ids": pending_approval_tool_call_ids,
                     "retryable_tool_call_ids": retryable_tool_call_ids,
                 },
+                resource_item_ids=resume_resource_item_ids,
             ),
             self._run_action(
                 "reconcile_run",
                 "Reconcile uncertain tools",
                 "POST",
                 f"/api/v1/agents/runs/{run_id}/reconcile",
-                bool(uncertain_tool_call_ids) and not terminal,
-                "uncertain_tool_calls" if uncertain_tool_call_ids else ("run_terminal" if terminal else "no_uncertain_tool_calls"),
+                reconcile_enabled,
+                reconcile_reason,
                 "warning",
                 uncertain_tool_call_ids,
                 {"uncertain_tool_call_count": len(uncertain_tool_call_ids)},
+                resource_item_ids=uncertain_tool_call_item_ids,
             ),
             self._run_action(
                 "resolve_migration",
@@ -862,31 +1116,24 @@ class AgentRuntimeService:
                 "open_migration_blocks" if open_migration_block_ids else "no_open_migration_blocks",
                 "danger",
                 open_migration_block_ids,
-                {"open_migration_block_count": len(open_migration_block_ids)},
+                resolve_migration_details,
+                resource_item_ids=open_migration_block_item_ids,
             ),
             self._run_action(
                 "open_runbook",
                 "Open runbook",
                 "GET",
                 f"/api/v1/agents/runs/{run_id}/runbook",
-                bool(blocked_reasons) and run.status != "completed",
-                "recovery_context_available" if blocked_reasons and run.status != "completed" else "no_recovery_context",
+                open_runbook_enabled,
+                "recovery_context_available" if open_runbook_enabled else "no_recovery_context",
                 "info",
                 [],
                 {"blocked_reasons": blocked_reasons},
             ),
         ]
+        enabled_action_ids = {action["action_id"] for action in actions if action["enabled"]}
         primary_action_ids = [
-            action["action_id"]
-            for action in actions
-            if action["enabled"] and action["action_id"] in {
-                "review_approvals",
-                "resolve_migration",
-                "reconcile_run",
-                "resume_run",
-                "cancel_run",
-                "open_runbook",
-            }
+            action_id for action_id in AGENT_RUN_ACTION_PRIMARY_PRIORITY if action_id in enabled_action_ids
         ]
         return {
             "run_summary": run_summary,
@@ -987,11 +1234,14 @@ class AgentRuntimeService:
             commit=True,
         )
 
-    def _ids_where(self, column, *criteria, model) -> list[str]:
+    def _ids_where(self, column, *criteria, model, order_by=None) -> list[str]:
+        statement = select(column).select_from(model).where(*criteria)
+        if order_by:
+            statement = statement.order_by(*order_by)
         return [
             str(value)
             for value in self.db.scalars(
-                select(column).select_from(model).where(*criteria)
+                statement
             ).all()
         ]
 
@@ -1006,6 +1256,7 @@ class AgentRuntimeService:
         severity: str,
         resource_ids: list[str] | None = None,
         details: dict[str, Any] | None = None,
+        resource_item_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         return {
             "action_id": action_id,
@@ -1016,6 +1267,7 @@ class AgentRuntimeService:
             "reason": reason,
             "severity": severity,
             "resource_ids": resource_ids or [],
+            "resource_item_ids": resource_item_ids or [],
             "details": details or {},
         }
 
@@ -1121,8 +1373,36 @@ class AgentRuntimeService:
                 self.get_run_summary(run_id=run.run_id, current_user=current_user)
                 for run in runs
             ],
+            "context_compactions": self._conversation_context_compactions(
+                run_ids=[run.run_id for run in runs],
+            ),
             "generated_at": _utcnow(),
         }
+
+    def _conversation_context_compactions(self, *, run_ids: list[str]) -> list[dict[str, Any]]:
+        if not run_ids:
+            return []
+        run_order = {run_id: index for index, run_id in enumerate(run_ids)}
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(
+                    AgentEvent.run_id.in_(run_ids),
+                    AgentEvent.event_type == AGENT_HISTORY_CONTEXT_COMPACTION_EVENT,
+                )
+            ).all()
+        )
+        events.sort(key=lambda event: (run_order.get(event.run_id, len(run_order)), event.event_seq, event.id))
+        return [
+            {
+                "item_id": _agent_context_compaction_item_id(event=event),
+                "run_id": event.run_id,
+                "event_seq": event.event_seq,
+                "event_type": event.event_type,
+                "payload_json": event.payload_json,
+                "created_at": event.created_at,
+            }
+            for event in events
+        ]
 
     def export_conversation(
         self,
@@ -1181,6 +1461,7 @@ class AgentRuntimeService:
             "derived_from": {
                 "conversation": "ai_agent_runs",
                 "turns": "AgentRunSummaryRead",
+                "context_compactions": "ai_agent_events.context.history_compacted",
                 "events": "ai_agent_events",
                 "tool_calls": "ai_agent_tool_calls",
                 "approvals": "ai_agent_approvals",
@@ -1242,6 +1523,7 @@ class AgentRuntimeService:
         return {
             "run": run,
             "events": events,
+            "context_compactions": self._conversation_context_compactions(run_ids=[run.run_id]),
             "after_sequence": after_sequence,
             "event_count": len(events),
             "latest_event_sequence": run.last_event_sequence,
@@ -1276,6 +1558,34 @@ class AgentRuntimeService:
             )
             if locked_run is not None:
                 run = locked_run
+            if run.status in RUN_TERMINAL_STATUSES:
+                latest_event = self.db.scalar(
+                    select(AgentEvent)
+                    .where(AgentEvent.run_id == run.run_id)
+                    .order_by(AgentEvent.event_seq.desc())
+                    .limit(1)
+                )
+                terminal_event_type = RUN_TERMINAL_EVENT_TYPES_BY_STATUS.get(run.status)
+                if event_type != terminal_event_type or (
+                    latest_event is not None and latest_event.event_type == terminal_event_type
+                ):
+                    logger.info(
+                        "agent_event_append_skipped_terminal run_id=%s status=%s event_type=%s latest_event_type=%s",
+                        run.run_id,
+                        run.status,
+                        event_type,
+                        latest_event.event_type if latest_event is not None else None,
+                    )
+                    if commit:
+                        self.db.commit()
+                        if latest_event is not None:
+                            self.db.refresh(latest_event)
+                    if latest_event is not None:
+                        return latest_event
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={"code": "agent_run_terminal_event_rejected"},
+                    )
             event_seq = (run.last_event_sequence or 0) + 1
             event = AgentEvent(
                 run_id=run.run_id,
@@ -1309,6 +1619,9 @@ class AgentRuntimeService:
             ) from exc
 
     def complete_run(self, run: AgentRun, result: dict[str, Any], *, commit: bool = True) -> AgentRun:
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return run
         run.status = "completed"
         run.result_json = mask_sensitive(result)
         run.completed_at = _utcnow()
@@ -1319,6 +1632,9 @@ class AgentRuntimeService:
         return run
 
     def fail_run(self, run: AgentRun, *, error_code: str, error_message: str, commit: bool = True) -> AgentRun:
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return run
         run.status = "failed"
         run.error_code = error_code
         run.error_message = _bounded_run_failure_error_message(
@@ -1364,6 +1680,98 @@ class AgentRuntimeService:
         else:
             self.db.flush()
         return checkpoint
+
+    def record_checkpoint_context_compaction(
+        self,
+        *,
+        run: AgentRun,
+        event: AgentEvent,
+        commit: bool = True,
+    ) -> AgentCheckpoint | None:
+        if run.last_checkpoint_id is None:
+            return None
+        checkpoint = self.db.get(AgentCheckpoint, run.last_checkpoint_id)
+        if checkpoint is None:
+            return None
+        object_key = _agent_context_compaction_object_key(
+            run_id=event.run_id,
+            event_seq=event.event_seq,
+        )
+        checkpoint.context_compaction_object_key = object_key
+        freshness_metadata = dict(checkpoint.freshness_metadata_json or {})
+        freshness_metadata["context_compaction"] = {
+            "object_key": object_key,
+            "event_seq": event.event_seq,
+            "event_type": event.event_type,
+        }
+        checkpoint.freshness_metadata_json = freshness_metadata
+        if commit:
+            self.db.commit()
+            self.db.refresh(checkpoint)
+        else:
+            self.db.flush()
+        return checkpoint
+
+    def context_compaction_window_metadata(self, *, run: AgentRun) -> dict[str, Any]:
+        previous_events = self._context_compaction_events_for_window(run=run)
+        window_number = len(previous_events) + 1
+        scope_id = _agent_context_compaction_window_scope_id(run=run)
+        window_id = _agent_context_compaction_window_id(scope_id=scope_id, window_number=window_number)
+
+        if not previous_events:
+            return {
+                "window_number": window_number,
+                "first_window_id": window_id,
+                "previous_window_id": None,
+                "window_id": window_id,
+            }
+
+        first_payload = previous_events[0].payload_json or {}
+        previous_payload = previous_events[-1].payload_json or {}
+        first_window_id = (
+            first_payload.get("first_window_id")
+            or first_payload.get("window_id")
+            or _agent_context_compaction_window_id(scope_id=scope_id, window_number=1)
+        )
+        previous_window_number = previous_payload.get("window_number")
+        if not isinstance(previous_window_number, int):
+            previous_window_number = len(previous_events)
+        previous_window_id = previous_payload.get("window_id") or _agent_context_compaction_window_id(
+            scope_id=scope_id,
+            window_number=previous_window_number,
+        )
+        return {
+            "window_number": window_number,
+            "first_window_id": first_window_id,
+            "previous_window_id": previous_window_id,
+            "window_id": window_id,
+        }
+
+    def _context_compaction_events_for_window(self, *, run: AgentRun) -> list[AgentEvent]:
+        if not run.conversation_id:
+            return list(
+                self.db.scalars(
+                    select(AgentEvent)
+                    .where(
+                        AgentEvent.run_id == run.run_id,
+                        AgentEvent.event_type == AGENT_HISTORY_CONTEXT_COMPACTION_EVENT,
+                    )
+                    .order_by(AgentEvent.event_seq.asc(), AgentEvent.id.asc())
+                ).all()
+            )
+        return list(
+            self.db.scalars(
+                select(AgentEvent)
+                .join(AgentRun, AgentRun.run_id == AgentEvent.run_id)
+                .where(
+                    AgentRun.project_id == run.project_id,
+                    AgentRun.conversation_id == run.conversation_id,
+                    AgentRun.id <= run.id,
+                    AgentEvent.event_type == AGENT_HISTORY_CONTEXT_COMPACTION_EVENT,
+                )
+                .order_by(AgentRun.id.asc(), AgentEvent.event_seq.asc(), AgentEvent.id.asc())
+            ).all()
+        )
 
     def _get_or_create_snapshot(self, *, project_id: int, current_user: User) -> AgentRuntimeSnapshot:
         registry_json = self.tool_registry.registry_json()
@@ -1436,6 +1844,82 @@ class AgentConversationRunner:
     def __init__(self, db: Session):
         self.db = db
 
+    def _fail_run_after_exception(
+        self,
+        *,
+        run: AgentRun,
+        runtime: AgentRuntimeService,
+        error_code: str,
+        error_message: str,
+        original_exception: BaseException,
+    ) -> AgentRun:
+        try:
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run
+            return runtime.fail_run(
+                run,
+                error_code=error_code,
+                error_message=error_message,
+                commit=True,
+            )
+        except SQLAlchemyError as fail_exc:
+            logger.warning(
+                "agent_conversation_primary_failure_write_failed run_id=%s error_code=%s "
+                "original_error_type=%s failure_error_type=%s",
+                run.run_id,
+                error_code,
+                type(original_exception).__name__,
+                type(fail_exc).__name__,
+            )
+            return self._fail_run_with_recovery_session(
+                run_id=run.run_id,
+                error_code=error_code,
+                error_message=error_message,
+                original_exception=original_exception,
+                failure_exception=fail_exc,
+            )
+
+    def _fail_run_with_recovery_session(
+        self,
+        *,
+        run_id: str,
+        error_code: str,
+        error_message: str,
+        original_exception: BaseException,
+        failure_exception: BaseException,
+    ) -> AgentRun:
+        try:
+            self.db.rollback()
+        except SQLAlchemyError:
+            logger.warning("agent_conversation_primary_session_rollback_failed run_id=%s", run_id, exc_info=True)
+        if isinstance(original_exception, SQLAlchemyError) or isinstance(failure_exception, SQLAlchemyError):
+            dispose_engine_after_disconnect()
+        with SessionLocal() as recovery_db:
+            recovery_run = recovery_db.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
+            if recovery_run is None:
+                raise original_exception
+            if recovery_run.status in RUN_TERMINAL_STATUSES:
+                return recovery_run
+            logger.error(
+                "agent_conversation_failed_via_recovery_session run_id=%s error_code=%s "
+                "original_error_type=%s failure_error_type=%s",
+                run_id,
+                error_code,
+                type(original_exception).__name__,
+                type(failure_exception).__name__,
+            )
+            return AgentRuntimeService(recovery_db).fail_run(
+                recovery_run,
+                error_code=error_code,
+                error_message=error_message,
+                commit=True,
+            )
+
+    def _release_db_transaction_before_external_wait(self) -> None:
+        if self.db.in_transaction():
+            self.db.rollback()
+
     def complete_after_tool_results(
         self,
         *,
@@ -1467,6 +1951,9 @@ class AgentConversationRunner:
             role="user",
             content="以上工具已完成审批和执行。请基于这些工具结果给用户最终回复，不要再请求工具。",
         ))
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return run
 
         try:
             content, chunks, model_payload = self._stream_model_response(
@@ -1489,12 +1976,18 @@ class AgentConversationRunner:
                 final_summary=True,
                 trace_payload=_model_trace_from_payload(clean_model_payload),
             )
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run
             self._emit_model_deltas(
                 run=run,
                 runtime=runtime,
                 chunks=chunks,
                 trace_payload=_model_trace_from_payload(clean_model_payload),
             )
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run
             runtime.append_event(
                 run,
                 "model.completed",
@@ -1507,6 +2000,9 @@ class AgentConversationRunner:
                 },
                 commit=False,
             )
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run
             return runtime.complete_run(
                 run,
                 {
@@ -1518,18 +2014,20 @@ class AgentConversationRunner:
             )
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-            return runtime.fail_run(
-                run,
+            return self._fail_run_after_exception(
+                run=run,
+                runtime=runtime,
                 error_code="agent_conversation_model_error",
                 error_message=detail,
-                commit=True,
+                original_exception=exc,
             )
         except Exception as exc:  # noqa: BLE001
-            return runtime.fail_run(
-                run,
+            return self._fail_run_after_exception(
+                run=run,
+                runtime=runtime,
                 error_code="agent_conversation_unhandled_error",
                 error_message=str(exc),
-                commit=True,
+                original_exception=exc,
             )
 
     def run(self, *, run_id: str, user_id: int) -> AgentRun | None:
@@ -1553,12 +2051,18 @@ class AgentConversationRunner:
                 run.max_iterations,
             )
             unsupported_guard = self._unsupported_capability_guard_for_run(run)
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run
             if unsupported_guard is not None:
                 return self._complete_unsupported_capability(run=run, runtime=runtime, guard=unsupported_guard)
 
             messages = self._build_chat_messages(run, current_user=user, runtime=runtime)
             tool_summaries: list[dict[str, Any]] = []
             for iteration in range(max(1, run.max_iterations)):
+                self.db.refresh(run)
+                if run.status in RUN_TERMINAL_STATUSES:
+                    return run
                 content, chunks, model_payload = self._stream_model_response(
                     run=run,
                     messages=messages,
@@ -1587,6 +2091,36 @@ class AgentConversationRunner:
                     if run.status in RUN_TERMINAL_STATUSES:
                         return run
                 if tool_request is None:
+                    if _looks_like_internal_tool_context_leak(content):
+                        content, chunks, clean_model_payload, tool_request = self._repair_invalid_tool_request(
+                            run=run,
+                            current_user=user,
+                            messages=messages,
+                            invalid_content=content,
+                            error_message="model leaked internal tool request context summary",
+                            model_payload=clean_model_payload,
+                            runtime=runtime,
+                            iteration=iteration,
+                        )
+                        self.db.refresh(run)
+                        if run.status in RUN_TERMINAL_STATUSES:
+                            return run
+                        if tool_request is None and _looks_like_internal_tool_context_leak(content):
+                            runtime.append_event(
+                                run,
+                                "model.internal_context_leak_suppressed",
+                                {
+                                    "iteration": iteration,
+                                    "content_preview": _bounded_agent_content_preview(
+                                        content,
+                                        reference="AgentConversationRunner.model.internal_context_leak.content",
+                                    ),
+                                    **_model_trace_from_payload(clean_model_payload),
+                                },
+                                commit=False,
+                            )
+                            content = AGENT_INTERNAL_TOOL_CONTEXT_LEAK_MESSAGE
+                            chunks = [content] if chunks else []
                     missing_required_tool = self._missing_required_tool_after_model_response(run)
                     if missing_required_tool is not None:
                         content, chunks, clean_model_payload, tool_request = self._repair_missing_required_tool_request(
@@ -1611,12 +2145,18 @@ class AgentConversationRunner:
                             final_summary=False,
                             trace_payload=_model_trace_from_payload(clean_model_payload),
                         )
+                        self.db.refresh(run)
+                        if run.status in RUN_TERMINAL_STATUSES:
+                            return run
                         self._emit_model_deltas(
                             run=run,
                             runtime=runtime,
                             chunks=chunks,
                             trace_payload=_model_trace_from_payload(clean_model_payload),
                         )
+                        self.db.refresh(run)
+                        if run.status in RUN_TERMINAL_STATUSES:
+                            return run
                         runtime.append_event(
                             run,
                             "model.completed",
@@ -1628,6 +2168,9 @@ class AgentConversationRunner:
                             },
                             commit=False,
                         )
+                        self.db.refresh(run)
+                        if run.status in RUN_TERMINAL_STATUSES:
+                            return run
                         result = {"message": content, **clean_model_payload}
                         if tool_summaries:
                             result["tool_calls"] = tool_summaries
@@ -1643,18 +2186,22 @@ class AgentConversationRunner:
                     run,
                     "model.completed",
                     {
-                        "content": content,
+                        "content": _bounded_agent_content_preview(
+                            content,
+                            reference="AgentConversationRunner.model.completed.tool_request.content",
+                        ),
                         "iteration": iteration,
                         "requested_tool": True,
                         **clean_model_payload,
                     },
                     commit=False,
                 )
+                detected_event_payload = tool_request.detected_event_payload(iteration=iteration)
                 runtime.append_event(
                     run,
                     "model.tool_request_detected",
                     {
-                        **tool_request.detected_event_payload(iteration=iteration),
+                        **detected_event_payload,
                         **_model_trace_from_payload(clean_model_payload),
                     },
                     commit=True,
@@ -1664,12 +2211,17 @@ class AgentConversationRunner:
                     run.run_id,
                     iteration,
                     tool_request.tool_name,
-                    tool_request.reason,
+                    detected_event_payload.get("reason"),
                 )
                 self.db.refresh(run)
                 if run.status in RUN_TERMINAL_STATUSES:
                     return run
-                messages.append(AIChatMessage(role="assistant", content=content))
+                messages.append(
+                    AIChatMessage(
+                        role="assistant",
+                        content=_tool_request_context_message(tool_request=tool_request, content=content),
+                    )
+                )
                 call = self._create_and_execute_tool_request(
                     run=run,
                     current_user=user,
@@ -1686,6 +2238,8 @@ class AgentConversationRunner:
                 )
                 tool_summaries.append(_tool_call_summary(call))
                 self.db.refresh(run)
+                if run.status in RUN_TERMINAL_STATUSES:
+                    return run
                 if run.status == "needs_human":
                     return run
                 previous_failed_call = self._previous_same_failed_tool_call(run=run, call=call)
@@ -1712,6 +2266,9 @@ class AgentConversationRunner:
                 current_user=user,
                 tool_summaries=tool_summaries,
             )
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run
             content, chunks, model_payload = self._stream_model_response(
                 run=run,
                 messages=[
@@ -1741,18 +2298,27 @@ class AgentConversationRunner:
                 final_summary=True,
                 trace_payload=_model_trace_from_payload(clean_model_payload),
             )
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run
             self._emit_model_deltas(
                 run=run,
                 runtime=runtime,
                 chunks=chunks,
                 trace_payload=_model_trace_from_payload(clean_model_payload),
             )
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run
             runtime.append_event(
                 run,
                 "model.completed",
                 {"content": content, "iteration": run.max_iterations, "final_summary": True, **clean_model_payload},
                 commit=False,
             )
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run
             logger.info(
                 "agent_conversation_complete_after_tools run_id=%s tool_call_count=%s content_length=%s",
                 run.run_id,
@@ -1770,11 +2336,12 @@ class AgentConversationRunner:
                 run.project_id,
                 bounded_detail,
             )
-            return runtime.fail_run(
-                run,
+            return self._fail_run_after_exception(
+                run=run,
+                runtime=runtime,
                 error_code=error_code,
                 error_message=bounded_detail,
-                commit=True,
+                original_exception=exc,
             )
         except Exception as exc:  # noqa: BLE001
             error_code = "agent_conversation_unhandled_error"
@@ -1786,11 +2353,12 @@ class AgentConversationRunner:
                 type(exc).__name__,
                 bounded_detail,
             )
-            return runtime.fail_run(
-                run,
+            return self._fail_run_after_exception(
+                run=run,
+                runtime=runtime,
                 error_code=error_code,
                 error_message=bounded_detail,
-                commit=True,
+                original_exception=exc,
             )
 
     def _unsupported_capability_guard_for_run(self, run: AgentRun) -> UnsupportedCapabilityGuard | None:
@@ -1836,7 +2404,10 @@ class AgentConversationRunner:
                 "agent_unsupported_capability_classification_failed run_id=%s guard_name=%s error=%s",
                 run.run_id,
                 guard.name,
-                _http_exception_detail(exc),
+                _bounded_agent_error_message(
+                    _http_exception_detail(exc),
+                    reference="AgentConversationRunner.unsupported_capability_classifier",
+                ),
             )
             return False
 
@@ -1847,7 +2418,10 @@ class AgentConversationRunner:
                 "agent_unsupported_capability_classification_invalid_json run_id=%s guard_name=%s content=%s",
                 run.run_id,
                 guard.name,
-                response.content[:500],
+                _bounded_agent_error_message(
+                    response.content,
+                    reference="AgentConversationRunner.unsupported_capability_classifier.invalid_json",
+                ),
             )
             return False
 
@@ -1858,7 +2432,10 @@ class AgentConversationRunner:
             guard.name,
             requires_guard,
             payload.get("confidence"),
-            payload.get("reason"),
+            _bounded_agent_error_message(
+                payload.get("reason"),
+                reference="AgentConversationRunner.unsupported_capability_classifier.reason",
+            ),
         )
         return requires_guard
 
@@ -1873,6 +2450,9 @@ class AgentConversationRunner:
             f"当前 Agent 可用工具中缺少 `{guard.name}` 对应的后端能力，"
             "我不能假装已经完成该操作。请先补充对应工具后再让我执行。"
         )
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return run
         trace_payload = _loop_trace_payload(
             run=run,
             iteration=0,
@@ -1891,7 +2471,13 @@ class AgentConversationRunner:
             },
             commit=True,
         )
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return run
         runtime.append_event(run, "model.delta", {"content": message, **trace_payload}, commit=True)
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return run
         runtime.append_event(
             run,
             "model.completed",
@@ -1905,6 +2491,9 @@ class AgentConversationRunner:
             },
             commit=False,
         )
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return run
         return runtime.complete_run(
             run,
             {
@@ -1955,6 +2544,9 @@ class AgentConversationRunner:
         runtime: AgentRuntimeService,
         iteration: int,
     ) -> tuple[str, list[str], dict[str, Any], AgentToolRequest | None]:
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return invalid_content, [], {}, None
         runtime.append_event(
             run,
             "model.required_tool_missing",
@@ -1962,10 +2554,16 @@ class AgentConversationRunner:
                 "iteration": iteration,
                 "after_tool": required_followup.after_tool,
                 "required_tool": required_followup.required_tool,
-                "content_preview": invalid_content[:500],
+                "content_preview": _bounded_agent_content_preview(
+                    invalid_content,
+                    reference="AgentConversationRunner.model.required_tool_missing.content",
+                ),
             },
             commit=True,
         )
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return invalid_content, [], {}, None
         self._record_required_tool_followup_loop_observation(
             run=run,
             current_user=current_user,
@@ -1973,6 +2571,9 @@ class AgentConversationRunner:
             invalid_content=invalid_content,
             required_followup=required_followup,
         )
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return invalid_content, [], {}, None
         repair_messages = [
             *messages,
             AIChatMessage(role="assistant", content=_bounded_repair_context(invalid_content)),
@@ -2005,6 +2606,9 @@ class AgentConversationRunner:
         try:
             tool_request = self._parse_tool_request(repaired_content)
         except HTTPException as exc:
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return repaired_content, repaired_chunks, clean_payload, None
             repair_error_message = _bounded_agent_error_message(
                 _http_exception_detail(exc),
                 reference="AgentConversationRunner.model.required_tool_repair_failed",
@@ -2017,11 +2621,17 @@ class AgentConversationRunner:
                     "after_tool": required_followup.after_tool,
                     "required_tool": required_followup.required_tool,
                     "error_message": repair_error_message,
-                    "content_preview": repaired_content[:500],
+                    "content_preview": _bounded_agent_content_preview(
+                        repaired_content,
+                        reference="AgentConversationRunner.model.required_tool_repair_failed.content",
+                    ),
                 },
                 commit=True,
             )
             raise
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return repaired_content, repaired_chunks, clean_payload, None
         runtime.append_event(
             run,
             "model.required_tool_repaired",
@@ -2045,7 +2655,10 @@ class AgentConversationRunner:
         invalid_content: str,
         required_followup: RequiredToolFollowupRule,
     ) -> None:
-        content_preview = invalid_content[:500]
+        content_preview = _bounded_agent_content_preview(
+            invalid_content,
+            reference="AgentConversationRunner.loop_observation.required_tool_missing.content",
+        )
         build = ContextBuilder(self.db).build(
             run_id=run.run_id,
             payload=AgentContextBuildCreateRequest(
@@ -2253,6 +2866,9 @@ class AgentConversationRunner:
         suppress_visible_deltas: bool = False,
         loop_step: str | None = None,
     ) -> tuple[str, list[str], dict[str, Any]]:
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return "", [], {}
         content_parts: list[str] = []
         resolved_loop_step = loop_step or _default_model_loop_step(
             final_summary=final_summary,
@@ -2287,6 +2903,7 @@ class AgentConversationRunner:
             repair_attempt,
             len(messages),
         )
+        self._release_db_transaction_before_external_wait()
         request = AIChatRequest(messages=messages, temperature=0.2)
         deltas_emitted = False
         first_delta_logged = False
@@ -2305,7 +2922,10 @@ class AgentConversationRunner:
                 return False
             last_cancel_check_at = current
             self.db.refresh(run)
-            return run.status in RUN_TERMINAL_STATUSES
+            terminal = run.status in RUN_TERMINAL_STATUSES
+            if not terminal:
+                self._release_db_transaction_before_external_wait()
+            return terminal
 
         def log_first_delta_once() -> None:
             nonlocal first_delta_logged
@@ -2341,6 +2961,7 @@ class AgentConversationRunner:
             last_delta_flush_at = current
             log_first_delta_once()
             runtime.append_event(run, "model.delta", {"content": delta, **trace_payload}, commit=True)
+            self._release_db_transaction_before_external_wait()
             last_cancel_check_at = 0.0
 
         def queue_visible_delta(delta: str, *, immediate: bool = False) -> None:
@@ -2372,6 +2993,7 @@ class AgentConversationRunner:
                         **trace_payload,
                     }
                     runtime.append_event(run, "model.stream_retrying", retry_payload, commit=True)
+                    self._release_db_transaction_before_external_wait()
                     logger.warning(
                         "agent_model_stream_retrying run_id=%s iteration=%s final_summary=%s attempt=%s max_retries=%s error=%s",
                         run.run_id,
@@ -2406,6 +3028,7 @@ class AgentConversationRunner:
                                     },
                                     commit=True,
                                 )
+                                self._release_db_transaction_before_external_wait()
                                 visible_deltas_retracted = True
                             continue
                         if suppress_visible_deltas:
@@ -2427,6 +3050,10 @@ class AgentConversationRunner:
         except HTTPException as exc:
             if not content_parts:
                 raise
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                content = "".join(content_parts).strip()
+                return content, [], model_payload
             stream_interrupted = True
             detail = _bounded_agent_error_message(
                 _http_exception_detail(exc),
@@ -2473,6 +3100,9 @@ class AgentConversationRunner:
             flush_visible_delta(force=True)
             deltas_emitted = True
         if tool_request_marker_seen and deltas_emitted:
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return content, [] if deltas_emitted else content_parts, model_payload
             runtime.append_event(
                 run,
                 "model.tool_request_stream_suppressed",
@@ -2629,6 +3259,9 @@ class AgentConversationRunner:
         runtime: AgentRuntimeService,
         iteration: int,
     ) -> tuple[str, list[str], dict[str, Any], AgentToolRequest | None]:
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return invalid_content, [], model_payload, None
         error_message = _bounded_agent_error_message(
             error_message,
             reference="AgentConversationRunner.model.tool_request_invalid",
@@ -2639,11 +3272,17 @@ class AgentConversationRunner:
             {
                 "iteration": iteration,
                 "error_message": error_message,
-                "content_preview": invalid_content[:500],
+                "content_preview": _bounded_agent_content_preview(
+                    invalid_content,
+                    reference="AgentConversationRunner.model.tool_request_invalid.content",
+                ),
                 **_model_trace_from_payload(model_payload),
             },
             commit=True,
         )
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return invalid_content, [], model_payload, None
         self._record_invalid_tool_request_loop_observation(
             run=run,
             current_user=current_user,
@@ -2653,6 +3292,9 @@ class AgentConversationRunner:
             model_payload=model_payload,
         )
         salvaged_tool_request = self._try_salvage_mixed_tool_request(invalid_content)
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return invalid_content, [], model_payload, None
         if salvaged_tool_request is not None:
             runtime.append_event(
                 run,
@@ -2696,6 +3338,9 @@ class AgentConversationRunner:
         try:
             tool_request = self._parse_tool_request(repaired_content)
         except HTTPException as exc:
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return repaired_content, repaired_chunks, clean_payload, None
             repair_error_message = _bounded_agent_error_message(
                 _http_exception_detail(exc),
                 reference="AgentConversationRunner.model.tool_request_repair_failed",
@@ -2706,12 +3351,18 @@ class AgentConversationRunner:
                 {
                     "iteration": iteration,
                     "error_message": repair_error_message,
-                    "content_preview": repaired_content[:500],
+                    "content_preview": _bounded_agent_content_preview(
+                        repaired_content,
+                        reference="AgentConversationRunner.model.tool_request_repair_failed.content",
+                    ),
                     **_model_trace_from_payload(clean_payload),
                 },
                 commit=True,
             )
             raise
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return repaired_content, repaired_chunks, clean_payload, None
         runtime.append_event(
             run,
             "model.tool_request_repaired",
@@ -2736,7 +3387,10 @@ class AgentConversationRunner:
         model_payload: dict[str, Any],
     ) -> None:
         model_call_id = model_payload.get("model_call_id")
-        content_preview = invalid_content[:500]
+        content_preview = _bounded_agent_content_preview(
+            invalid_content,
+            reference="AgentConversationRunner.loop_observation.tool_request_invalid.content",
+        )
         evidence_ref_id = f"model-call:{model_call_id}" if model_call_id else f"model-output:{run.run_id}:iter-{iteration}"
         build = ContextBuilder(self.db).build(
             run_id=run.run_id,
@@ -2822,12 +3476,20 @@ class AgentConversationRunner:
             current_user=current_user,
             enqueue=False,
         )
+        decision_reason = (
+            _bounded_agent_error_message(
+                tool_request.reason,
+                reference="AgentConversationRunner.tool_trace.decision_reason",
+            )
+            if tool_request.reason is not None
+            else None
+        )
         tool_trace_payload = _loop_trace_payload(
             run=run,
             iteration=iteration,
             loop_step="tool_execution",
             tool_call_id=call.tool_call_id,
-            decision_reason=tool_request.reason,
+            decision_reason=decision_reason,
         )
         self.db.refresh(run)
         if call.approval_required:
@@ -3021,10 +3683,8 @@ class AgentConversationRunner:
     ) -> list[AIChatMessage]:
         messages = [AIChatMessage(role="system", content=_conversation_system_prompt())]
         messages.append(AIChatMessage(role="system", content=_format_run_context(run)))
-        messages.extend(_agent_skill_messages(run.intent))
-        memory_context = self._memory_context_message(run=run, current_user=current_user, runtime=runtime)
-        if memory_context is not None:
-            messages.append(memory_context)
+        working_context: dict[str, Any] | None = None
+        previous_runs: list[AgentRun] = []
         if run.conversation_id:
             previous_runs = list(
                 self.db.scalars(
@@ -3033,17 +3693,47 @@ class AgentConversationRunner:
                         AgentRun.project_id == run.project_id,
                         AgentRun.conversation_id == run.conversation_id,
                         AgentRun.id < run.id,
+                        AgentRun.status == AGENT_HISTORY_CONTEXT_SOURCE_STATUS,
                     )
                     .order_by(AgentRun.id.desc())
                     .limit(AGENT_HISTORY_CONTEXT_MAX_RUNS)
                 ).all()
             )
+            previous_runs = list(reversed(previous_runs))
+            working_context = _conversation_working_context(
+                current_intent=run.intent,
+                previous_runs=previous_runs,
+            )
+        skill_intent = run.intent
+        if working_context is not None:
+            skill_intent = f"{run.intent}\n{json.dumps(working_context, ensure_ascii=False, default=str)}"
+        messages.extend(_agent_skill_messages(skill_intent))
+        memory_context = self._memory_context_message(run=run, current_user=current_user, runtime=runtime)
+        if memory_context is not None:
+            messages.append(memory_context)
+        if run.conversation_id:
+            if working_context is not None:
+                messages.append(AIChatMessage(
+                    role="system",
+                    content=_format_conversation_working_context(working_context),
+                ))
             history_messages, compaction_payload = self._conversation_history_messages(
-                previous_runs=list(reversed(previous_runs))
+                previous_runs=previous_runs,
+                compaction_window_metadata=lambda: runtime.context_compaction_window_metadata(run=run),
             )
             messages.extend(history_messages)
             if compaction_payload is not None:
-                runtime.append_event(run, "context.history_compacted", compaction_payload, commit=True)
+                compaction_event = runtime.append_event(
+                    run,
+                    AGENT_HISTORY_CONTEXT_COMPACTION_EVENT,
+                    compaction_payload,
+                    commit=True,
+                )
+                runtime.record_checkpoint_context_compaction(
+                    run=run,
+                    event=compaction_event,
+                    commit=True,
+                )
         messages.append(AIChatMessage(role="user", content=run.intent))
         return messages
 
@@ -3051,6 +3741,7 @@ class AgentConversationRunner:
         self,
         *,
         previous_runs: list[AgentRun],
+        compaction_window_metadata: Callable[[], dict[str, Any]] | dict[str, Any] | None = None,
     ) -> tuple[list[AIChatMessage], dict[str, Any] | None]:
         pairs = [
             {
@@ -3072,7 +3763,7 @@ class AgentConversationRunner:
         compacted_messages = []
         if older_pairs:
             compacted_messages.append(AIChatMessage(
-                role="system",
+                role=AGENT_HISTORY_CONTEXT_SUMMARY_ROLE,
                 content=_compact_history_summary(older_pairs),
             ))
         compacted_messages.extend(_history_pairs_to_messages(
@@ -3081,14 +3772,31 @@ class AgentConversationRunner:
             assistant_chars=AGENT_HISTORY_CONTEXT_RECENT_ASSISTANT_CHARS,
         ))
         estimated_after = _estimate_chat_messages_tokens(compacted_messages)
+        if compaction_window_metadata is None:
+            raise ValueError("compaction_window_metadata is required when conversation history is compacted")
+        if callable(compaction_window_metadata):
+            window_metadata = compaction_window_metadata()
+        else:
+            window_metadata = dict(compaction_window_metadata)
         payload = {
+            "trigger": AGENT_HISTORY_COMPACTION_TRIGGER,
+            "reason": AGENT_HISTORY_COMPACTION_REASON,
+            "phase": AGENT_HISTORY_COMPACTION_PHASE,
+            "implementation": AGENT_HISTORY_COMPACTION_IMPLEMENTATION,
+            "strategy": AGENT_HISTORY_CONTEXT_COMPACTION_STRATEGY,
             "original_run_count": len(pairs),
             "compacted_run_count": len(older_pairs),
             "kept_full_run_count": len(recent_pairs),
-            "estimated_tokens_before": estimated_before,
-            "estimated_tokens_after": estimated_after,
-            "token_budget": AGENT_HISTORY_CONTEXT_TOKEN_BUDGET,
-            "strategy": "summarize_older_keep_recent",
+            "estimated_input_units_before": estimated_before,
+            "estimated_input_units_after": estimated_after,
+            "budget_limit_units": AGENT_HISTORY_CONTEXT_TOKEN_BUDGET,
+            "summary_role": AGENT_HISTORY_CONTEXT_SUMMARY_ROLE,
+            "replacement_history": AGENT_HISTORY_COMPACTION_REPLACEMENT_HISTORY,
+            "initial_context_injection": AGENT_HISTORY_COMPACTION_INITIAL_CONTEXT_INJECTION,
+            "reference_context_item": AGENT_HISTORY_COMPACTION_REFERENCE_CONTEXT_ITEM,
+            "context_baseline": AGENT_HISTORY_COMPACTION_CONTEXT_BASELINE,
+            **window_metadata,
+            "source": AGENT_HISTORY_COMPACTION_SOURCE,
         }
         return compacted_messages, payload
 
@@ -3195,11 +3903,37 @@ class ExecutionLedgerService:
             "audit_only": True,
         }
         contract = spec.backend_contract
+        tool_call_id = f"agent-tool-{uuid.uuid4().hex}"
+        input_hash = request_fingerprint(payload.input)
+        evidence_refs = copy_evidence_refs(payload.evidence_refs)
+        decision_context_build_id = payload.decision_context_build_id
+        if resolved.approval_required and resolved.resolved_side_effect_class in HIGH_RISK_SIDE_EFFECT_CLASSES:
+            frozen_input_ref = _approval_tool_call_input_evidence_ref(
+                run=run,
+                tool_call_id=tool_call_id,
+                tool_name=spec.name,
+                input_hash=input_hash,
+            )
+            evidence_refs = [*evidence_refs, frozen_input_ref]
+            if decision_context_build_id is None:
+                build = ContextBuilder(self.db).build(
+                    run_id=run.run_id,
+                    payload=AgentContextBuildCreateRequest(
+                        build_purpose="approval",
+                        step_index=payload.step_index,
+                        token_budget=1024,
+                        evidence_refs=evidence_refs,
+                        required_evidence_ref_ids=[frozen_input_ref["evidence_ref_id"]],
+                    ),
+                    current_user=current_user,
+                    commit=False,
+                )
+                decision_context_build_id = build.context_build_id
         policy_evidence_refs, audit_evidence_refs, evidence_summary = EvidenceRefResolver().split_policy_and_audit_refs(
-            payload.evidence_refs
+            evidence_refs
         )
         call = AgentToolCall(
-            tool_call_id=f"agent-tool-{uuid.uuid4().hex}",
+            tool_call_id=tool_call_id,
             run_id=run.run_id,
             step_index=payload.step_index,
             attempt_index=payload.attempt_index,
@@ -3217,13 +3951,13 @@ class ExecutionLedgerService:
             policy_reason_json=resolved.policy_reason,
             status="planned",
             effect_submission_state="none",
-            input_hash=request_fingerprint(payload.input),
+            input_hash=input_hash,
             input_json_redacted=mask_sensitive(payload.input),
-            evidence_refs_json=copy_evidence_refs(payload.evidence_refs),
+            evidence_refs_json=evidence_refs,
             policy_evidence_refs_json=policy_evidence_refs,
             audit_evidence_refs_json=audit_evidence_refs,
             evidence_mutability_summary_json=evidence_summary,
-            decision_context_build_id=payload.decision_context_build_id,
+            decision_context_build_id=decision_context_build_id,
             permission_snapshot_json=permission_snapshot,
             required_permissions_json=list(spec.required_permissions),
             approval_required=resolved.approval_required,
@@ -3247,7 +3981,7 @@ class ExecutionLedgerService:
         runtime.append_event(run, "tool.planned", {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name}, commit=False)
         EvidenceWatchService(self.db).register_watches(
             run=run,
-            evidence_refs=payload.evidence_refs,
+            evidence_refs=evidence_refs,
             tool_call_id=call.tool_call_id,
             commit=False,
         )
@@ -3301,6 +4035,30 @@ class ExecutionLedgerService:
         return call
 
 
+def _approval_tool_call_input_evidence_ref(
+    *,
+    run: AgentRun,
+    tool_call_id: str,
+    tool_name: str,
+    input_hash: str,
+) -> dict[str, Any]:
+    return {
+        "evidence_ref_id": f"tool-call-input:{tool_call_id}",
+        "ref_type": "system_record",
+        "ref_id": tool_call_id,
+        "authority": "system_record",
+        "mutability_class": "immutable",
+        "dependency_role": "decision_dependency",
+        "active_for_policy": True,
+        "required_for_high_risk": True,
+        "content_hash": input_hash,
+        "snapshot_id": run.runtime_snapshot_id,
+        "captured_at": _utcnow().isoformat(),
+        "freshness_policy": "none",
+        "tool_name": tool_name,
+    }
+
+
 class AgentWorkerQueueService:
     def __init__(self, db: Session):
         self.db = db
@@ -3337,19 +4095,35 @@ class AgentWorkerQueueService:
         if item is None:
             return None
         call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == item.tool_call_id).with_for_update())
-        if call is not None and call.approval_required and not call.approved_approval_id:
-            item.status = "blocked_approval"
-            item.last_error_code = "approval_required_before_execution"
-            call.status = "planned"
-            call.recovery_decision = "awaiting_approval"
+        call_run = (
+            self.db.scalar(select(AgentRun).where(AgentRun.run_id == item.run_id).with_for_update())
+            if item.run_id is not None
+            else None
+        )
+        if call is None:
+            item.status = "failed"
+            item.last_error_code = "tool_call_missing"
+            item.lease_owner = None
+            item.lease_expires_at = None
+            self.db.commit()
+            return None
+        if call is not None and call.run_id != item.run_id:
+            self.mark_queue_item_context_mismatch(
+                item=item,
+                call=call,
+                mark_active_call_uncertain=False,
+                error_message="Worker queue item run_id does not match ToolCall run_id before worker claim",
+            )
             self.db.commit()
             return None
         if call is not None and call.status in {"uncertain", "reconciling"}:
             item.status = "failed"
             item.last_error_code = "tool_call_uncertain_reconcile_required"
+            item.lease_owner = None
+            item.lease_expires_at = None
             call.error_code = "tool_call_uncertain_reconcile_required"
             call.recovery_decision = "reconcile_required_before_execution"
-            call_run = self.db.scalar(select(AgentRun).where(AgentRun.run_id == call.run_id))
+            _clear_tool_call_lease(call)
             if call_run is not None:
                 AgentRuntimeService(self.db).append_event(
                     call_run,
@@ -3357,6 +4131,44 @@ class AgentWorkerQueueService:
                     {"tool_call_id": call.tool_call_id, "error_code": call.error_code},
                     commit=False,
                 )
+            self.db.commit()
+            return None
+        if call_run is not None and call_run.status in RUN_TERMINAL_STATUSES:
+            self._mark_queue_item_obsolete_before_execution(
+                item=item,
+                call=call,
+                run=call_run,
+                worker_id=worker_id,
+                error_message="Agent run reached a terminal state before worker claim could start tool execution",
+            )
+            self.db.commit()
+            return None
+        if call is not None and call.status not in TOOL_CALL_CLAIMABLE_STATUSES:
+            item.status = "failed"
+            item.last_error_code = "tool_call_not_claimable"
+            item.lease_owner = None
+            item.lease_expires_at = None
+            self.db.commit()
+            return None
+        if call_run is None:
+            item.status = "failed"
+            item.last_error_code = "run_missing"
+            item.lease_owner = None
+            item.lease_expires_at = None
+            call.status = "failed"
+            call.execution_phase = "blocked"
+            call.error_code = "run_missing"
+            call.error_message = "Agent run was missing before worker claim could start tool execution"
+            call.recovery_decision = "run_context_missing_before_execution"
+            call.policy_reason_json = _policy_reason_with_execution_context(call, worker_id=worker_id)
+            _clear_tool_call_lease(call)
+            self.db.commit()
+            return None
+        if call is not None and call.approval_required and not call.approved_approval_id:
+            item.status = "blocked_approval"
+            item.last_error_code = "approval_required_before_execution"
+            call.status = "planned"
+            call.recovery_decision = "awaiting_approval"
             self.db.commit()
             return None
         item.status = "leased"
@@ -3374,17 +4186,70 @@ class AgentWorkerQueueService:
     def heartbeat(self, *, queue_id: str, worker_id: str, lease_seconds: int = 60) -> AgentWorkerQueue:
         item = self.db.scalar(
             select(AgentWorkerQueue)
-            .where(AgentWorkerQueue.queue_id == queue_id, AgentWorkerQueue.lease_owner == worker_id)
+            .where(
+                AgentWorkerQueue.queue_id == queue_id,
+                AgentWorkerQueue.lease_owner == worker_id,
+                AgentWorkerQueue.status == "leased",
+            )
             .with_for_update()
         )
         if item is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent worker queue item 不存在")
         now = _utcnow()
-        item.lease_expires_at = now + timedelta(seconds=lease_seconds)
         call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == item.tool_call_id).with_for_update())
-        if call is not None:
-            call.last_heartbeat_at = now
-            call.lease_expires_at = item.lease_expires_at
+        call_run = (
+            self.db.scalar(select(AgentRun).where(AgentRun.run_id == item.run_id).with_for_update())
+            if item.run_id is not None
+            else None
+        )
+        if call is not None and call.run_id != item.run_id:
+            self.mark_queue_item_context_mismatch(
+                item=item,
+                call=call,
+                mark_active_call_uncertain=True,
+                error_message="Worker queue item run_id does not match ToolCall run_id during worker heartbeat; reconcile required",
+            )
+            self.db.commit()
+            self.db.refresh(item)
+            return item
+        if call_run is not None and call_run.status in RUN_TERMINAL_STATUSES:
+            self._mark_queue_item_obsolete_before_execution(
+                item=item,
+                call=call,
+                run=call_run,
+                worker_id=worker_id,
+                error_message="Agent run reached a terminal state before worker heartbeat could extend tool execution",
+            )
+            self.db.commit()
+            self.db.refresh(item)
+            return item
+        if call is None:
+            item.status = "failed"
+            item.last_error_code = "tool_call_missing"
+            item.lease_owner = None
+            item.lease_expires_at = None
+            self.db.commit()
+            self.db.refresh(item)
+            return item
+        if call.status == "leased" and (
+            call.effect_submission_state in TOOL_CALL_EFFECT_SUBMISSION_STARTED_STATES
+            or bool(call.effect_boundary_crossed)
+        ):
+            self._mark_queue_item_uncertain_after_heartbeat_effect_submission(item=item, call=call)
+            self.db.commit()
+            self.db.refresh(item)
+            return item
+        if call.status not in TOOL_CALL_HEARTBEAT_ACTIVE_STATUSES:
+            item.status = "failed"
+            item.last_error_code = "tool_call_not_active_for_heartbeat"
+            item.lease_owner = None
+            item.lease_expires_at = None
+            self.db.commit()
+            self.db.refresh(item)
+            return item
+        item.lease_expires_at = now + timedelta(seconds=lease_seconds)
+        call.last_heartbeat_at = now
+        call.lease_expires_at = item.lease_expires_at
         self.db.commit()
         self.db.refresh(item)
         return item
@@ -3403,26 +4268,183 @@ class AgentWorkerQueueService:
             .with_for_update(skip_locked=True)
         ).all())
         for item in items:
+            call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == item.tool_call_id).with_for_update())
+            call_run = (
+                self.db.scalar(select(AgentRun).where(AgentRun.run_id == item.run_id).with_for_update())
+                if item.run_id is not None
+                else None
+            )
+            if call is not None and call.run_id != item.run_id:
+                self.mark_queue_item_context_mismatch(
+                    item=item,
+                    call=call,
+                    mark_active_call_uncertain=True,
+                    error_message="Worker queue item run_id does not match ToolCall run_id during orphan recovery; reconcile required",
+                )
+                continue
+            if call_run is not None and call_run.status in RUN_TERMINAL_STATUSES:
+                lease_owner = item.lease_owner
+                self._mark_queue_item_obsolete_before_execution(
+                    item=item,
+                    call=call,
+                    run=call_run,
+                    worker_id=lease_owner,
+                    error_message="Agent run reached a terminal state before orphaned tool execution could recover",
+                )
+                continue
+            if call is None:
+                item.status = "failed"
+                item.last_error_code = "tool_call_missing"
+                item.lease_owner = None
+                item.lease_expires_at = None
+                continue
+            can_requeue_pre_effect = (
+                call.status == "running_pre_effect"
+                and call.effect_submission_state in {None, "none"}
+                and not call.effect_boundary_crossed
+            )
+            requires_reconcile_after_effect_submission = (
+                call.status in {"leased", "running_pre_effect"}
+                and (
+                    call.effect_submission_state in TOOL_CALL_EFFECT_SUBMISSION_STARTED_STATES
+                    or bool(call.effect_boundary_crossed)
+                )
+            )
+            if requires_reconcile_after_effect_submission:
+                self._mark_queue_item_uncertain_after_orphan_effect_submission(item=item, call=call)
+                continue
+            if call.status != "leased" and not can_requeue_pre_effect:
+                item.status = "failed"
+                item.last_error_code = "tool_call_not_recoverable_from_orphan"
+                item.lease_owner = None
+                item.lease_expires_at = None
+                continue
             item.status = "queued"
             item.lease_owner = None
             item.lease_expires_at = None
-            call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == item.tool_call_id).with_for_update())
-            if call is not None and call.status == "leased":
-                call.status = "planned"
-                call.lease_owner = None
-                call.lease_expires_at = None
-                call.recovery_decision = "lease_expired_requeued"
+            call.status = "planned"
+            call.execution_phase = None
+            call.effect_submission_state = "none"
+            call.effect_boundary_crossed = False
+            call.lease_owner = None
+            call.lease_expires_at = None
+            call.recovery_decision = "lease_expired_requeued"
         self.db.commit()
         return len(items)
 
+    def mark_queue_item_context_mismatch(
+        self,
+        *,
+        item: AgentWorkerQueue,
+        call: AgentToolCall | None,
+        mark_active_call_uncertain: bool,
+        error_message: str,
+    ) -> None:
+        error_code = "tool_call_queue_context_mismatch"
+        worker_id = item.lease_owner
+        item.status = "failed"
+        item.last_error_code = error_code
+        item.lease_owner = None
+        item.lease_expires_at = None
+        if call is None or not mark_active_call_uncertain:
+            return
+        if call.status not in TOOL_CALL_HEARTBEAT_ACTIVE_STATUSES:
+            return
+        call.status = "uncertain"
+        if call.effect_submission_state in {None, "none"}:
+            call.effect_submission_state = "unknown"
+        call.error_code = error_code
+        call.error_message = error_message
+        call.recovery_decision = "reconcile_required_after_queue_context_mismatch"
+        call.policy_reason_json = _policy_reason_with_execution_context(call, worker_id=worker_id)
+        _clear_tool_call_lease(call)
+
+    def _mark_queue_item_uncertain_after_orphan_effect_submission(
+        self,
+        *,
+        item: AgentWorkerQueue,
+        call: AgentToolCall,
+    ) -> None:
+        error_code = "tool_call_orphaned_after_effect_submission_started"
+        worker_id = item.lease_owner
+        item.status = "failed"
+        item.last_error_code = error_code
+        item.lease_owner = None
+        item.lease_expires_at = None
+        call.status = "uncertain"
+        if call.effect_submission_state in {None, "none"}:
+            call.effect_submission_state = "unknown"
+        call.error_code = error_code
+        call.error_message = "Tool execution lease expired after effect submission started; reconcile required"
+        call.recovery_decision = "reconcile_required_after_orphaned_tool_execution"
+        call.policy_reason_json = _policy_reason_with_execution_context(call, worker_id=worker_id)
+        _clear_tool_call_lease(call)
+
+    def _mark_queue_item_uncertain_after_heartbeat_effect_submission(
+        self,
+        *,
+        item: AgentWorkerQueue,
+        call: AgentToolCall,
+    ) -> None:
+        error_code = "tool_call_heartbeat_after_effect_submission_started"
+        worker_id = item.lease_owner
+        item.status = "failed"
+        item.last_error_code = error_code
+        item.lease_owner = None
+        item.lease_expires_at = None
+        call.status = "uncertain"
+        if call.effect_submission_state in {None, "none"}:
+            call.effect_submission_state = "unknown"
+        call.error_code = error_code
+        call.error_message = "Tool heartbeat found a leased tool after effect submission started; reconcile required"
+        call.recovery_decision = "reconcile_required_after_invalid_tool_call_heartbeat"
+        call.policy_reason_json = _policy_reason_with_execution_context(call, worker_id=worker_id)
+        _clear_tool_call_lease(call)
+
+    def _mark_queue_item_obsolete_before_execution(
+        self,
+        *,
+        item: AgentWorkerQueue,
+        call: AgentToolCall | None,
+        run: AgentRun,
+        worker_id: str | None,
+        error_message: str,
+    ) -> None:
+        error_code = f"agent_run_{run.status}_before_tool_execution"
+        item.status = "failed"
+        item.last_error_code = error_code
+        item.lease_owner = None
+        item.lease_expires_at = None
+        if call is None or call.status in {"uncertain", "reconciling"}:
+            return
+        if (
+            call.status in {"planned", "leased", "running_pre_effect"}
+            and call.effect_submission_state in {None, "none"}
+            and not call.effect_boundary_crossed
+        ):
+            call.status = "obsolete"
+            call.execution_phase = "cancelled"
+            call.effect_submission_state = "none"
+            call.effect_boundary_crossed = False
+            call.lease_owner = None
+            call.lease_expires_at = None
+            call.error_code = error_code
+            call.error_message = error_message
+            call.recovery_decision = f"run_{run.status}_before_tool_execution"
+            call.policy_reason_json = _policy_reason_with_execution_context(call, worker_id=worker_id)
+
     def mark_completed(self, item: AgentWorkerQueue, *, commit: bool = True) -> None:
         item.status = "completed"
+        item.lease_owner = None
+        item.lease_expires_at = None
         if commit:
             self.db.commit()
 
     def mark_failed(self, item: AgentWorkerQueue, *, error_code: str, commit: bool = True) -> None:
         item.status = "failed"
         item.last_error_code = error_code
+        item.lease_owner = None
+        item.lease_expires_at = None
         if commit:
             self.db.commit()
 
@@ -3438,9 +4460,12 @@ class AgentToolRuntime:
         self.backend_factory = backend_factory
 
     def execute(self, *, call: AgentToolCall, current_user: User) -> dict[str, Any]:
+        payload = dict(call.input_json_redacted or {})
+        payload.setdefault("_agent_run_id", call.run_id)
+        payload.setdefault("_agent_tool_call_id", call.tool_call_id)
         return self.backend_factory(self.db).execute(
             tool_name=call.tool_name,
-            payload=call.input_json_redacted,
+            payload=payload,
             current_user=current_user,
         )
 
@@ -3470,13 +4495,198 @@ class ToolExecutor:
             return None
         run = self.db.scalar(select(AgentRun).where(AgentRun.run_id == call.run_id))
         if run is None:
-            AgentWorkerQueueService(self.db).mark_failed(queue_item, error_code="run_missing")
-            return call
+            return self._reject_claimed_tool_call_missing_execution_context(
+                call=call,
+                queue_item=queue_item,
+                error_code="run_missing",
+                recovery_decision="run_context_missing_before_execution",
+                error_message="Agent run was missing after worker queue claim",
+            )
         user = self.db.get(User, run.user_id)
         if user is None:
-            AgentWorkerQueueService(self.db).mark_failed(queue_item, error_code="user_missing")
-            return call
+            return self._reject_claimed_tool_call_missing_execution_context(
+                call=call,
+                queue_item=queue_item,
+                error_code="user_missing",
+                recovery_decision="run_user_missing_before_execution",
+                error_message="Agent run user was missing after worker queue claim",
+            )
         return self.execute_tool_call(call=call, run=run, queue_item=queue_item, current_user=user)
+
+    def _reject_claimed_tool_call_missing_execution_context(
+        self,
+        *,
+        call: AgentToolCall,
+        queue_item: AgentWorkerQueue,
+        error_code: str,
+        recovery_decision: str,
+        error_message: str,
+    ) -> AgentToolCall:
+        worker_id = queue_item.lease_owner or call.lease_owner
+        call.status = "failed"
+        call.execution_phase = "blocked"
+        call.error_code = error_code
+        call.error_message = error_message
+        call.recovery_decision = recovery_decision
+        call.policy_reason_json = _policy_reason_with_execution_context(call, worker_id=worker_id)
+        _clear_tool_call_lease(call)
+        AgentWorkerQueueService(self.db).mark_failed(queue_item, error_code=error_code, commit=False)
+        self.db.commit()
+        self.db.refresh(call)
+        return call
+
+    @staticmethod
+    def _case_update_query_guard_mode(tool_name: str) -> str | None:
+        if tool_name in {"testcase.update_assertions", "testcase.batch_update_assertions"}:
+            return "http"
+        if tool_name in {"websocket_testcase.update_assertions", "websocket_testcase.batch_update_assertions"}:
+            return "websocket"
+        return None
+
+    @staticmethod
+    def _as_int_list(value: Any) -> list[int]:
+        if not isinstance(value, list):
+            return []
+        ids: list[int] = []
+        for item in value:
+            if isinstance(item, bool):
+                continue
+            if isinstance(item, int):
+                ids.append(item)
+            elif isinstance(item, str) and item.strip().isdigit():
+                ids.append(int(item.strip()))
+        return ids
+
+    @classmethod
+    def _case_update_requested_ids(cls, call: AgentToolCall) -> list[int]:
+        payload = call.input_json_redacted if isinstance(call.input_json_redacted, dict) else {}
+        if call.tool_name in {"testcase.batch_update_assertions", "websocket_testcase.batch_update_assertions"}:
+            ids: list[int] = []
+            for item in payload.get("items") or []:
+                if isinstance(item, dict):
+                    ids.extend(cls._as_int_list([item.get("test_case_id")]))
+            return ids
+        return cls._as_int_list([payload.get("test_case_id")])
+
+    @classmethod
+    def _case_ids_from_query_output(cls, output: Any, *, mode: str) -> list[int]:
+        if not isinstance(output, dict):
+            return []
+        if mode == "websocket":
+            id_keys = ("websocket_test_case_ids",)
+            case_keys = ("websocket_test_cases",)
+            batch_keys = (("websocket_batch_execute_input", "websocket_test_case_ids"),)
+        else:
+            id_keys = ("http_test_case_ids",)
+            case_keys = ("http_test_cases",)
+            batch_keys = (("http_batch_execute_input", "test_case_ids"),)
+        ids: list[int] = []
+        for key in id_keys:
+            ids.extend(cls._as_int_list(output.get(key)))
+        for key in case_keys:
+            for item in output.get(key) or []:
+                if isinstance(item, dict):
+                    ids.extend(cls._as_int_list([item.get("id")]))
+        for parent_key, child_key in batch_keys:
+            parent = output.get(parent_key)
+            if isinstance(parent, dict):
+                ids.extend(cls._as_int_list(parent.get(child_key)))
+        return sorted(set(ids))
+
+    def _latest_query_project_case_ids(self, *, call: AgentToolCall, mode: str) -> list[int]:
+        query = (
+            select(AgentToolCall)
+            .where(
+                AgentToolCall.run_id == call.run_id,
+                AgentToolCall.tool_name == "testcase.query_project_cases",
+                AgentToolCall.status == "succeeded",
+            )
+            .order_by(AgentToolCall.id.desc())
+        )
+        if call.id is not None:
+            query = query.where(AgentToolCall.id < call.id)
+        query_call = self.db.scalar(query.limit(1))
+        if query_call is None:
+            return []
+        return self._case_ids_from_query_output(query_call.output_json_redacted, mode=mode)
+
+    def _reject_case_update_ids_not_from_prior_query(
+        self,
+        *,
+        call: AgentToolCall,
+        run: AgentRun,
+        queue_item: AgentWorkerQueue | None,
+        queue_service: AgentWorkerQueueService,
+        runtime: AgentRuntimeService,
+    ) -> AgentToolCall | None:
+        mode = self._case_update_query_guard_mode(call.tool_name)
+        if mode is None:
+            return None
+        requested_ids = self._case_update_requested_ids(call)
+        if not requested_ids:
+            return None
+        valid_ids = self._latest_query_project_case_ids(call=call, mode=mode)
+        valid_id_set = set(valid_ids)
+        invalid_ids = [item for item in requested_ids if item not in valid_id_set]
+        if not invalid_ids:
+            return None
+
+        invalid_key = "invalid_websocket_test_case_ids" if mode == "websocket" else "invalid_test_case_ids"
+        valid_key = "valid_websocket_test_case_ids" if mode == "websocket" else "valid_test_case_ids"
+        error_code = (
+            "agent_websocket_testcase_ids_not_from_query_result"
+            if mode == "websocket"
+            else "agent_testcase_ids_not_from_query_result"
+        )
+        output = {
+            "required_tool": "testcase.query_project_cases",
+            "blocked_tool": call.tool_name,
+            invalid_key: invalid_ids,
+            valid_key: valid_ids,
+            "next_action": (
+                "Call testcase.query_project_cases in this Agent Run and retry using only the ids "
+                "returned in its explicit id lists; do not infer ids from numeric ranges."
+            ),
+        }
+        call.status = "failed"
+        call.execution_phase = "blocked_by_harness"
+        call.error_code = error_code
+        call.error_message = "Test case assertion update ids must come from testcase.query_project_cases returned ids."
+        call.recovery_decision = "query_project_cases_before_retry"
+        call.output_json_redacted = output
+        call.output_hash = request_fingerprint(output)
+        call.policy_reason_json = _policy_reason_with_execution_context(
+            call,
+            worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
+        )
+        _clear_tool_call_lease(call)
+        runtime.append_event(
+            run,
+            "tool.failed",
+            {
+                "tool_call_id": call.tool_call_id,
+                "tool_name": call.tool_name,
+                "error_code": error_code,
+                invalid_key: invalid_ids,
+            },
+            commit=False,
+        )
+        runtime.append_event(
+            run,
+            "tool.result_observed",
+            {
+                "tool_call_id": call.tool_call_id,
+                "tool_name": call.tool_name,
+                "status": "failed",
+                "error_code": error_code,
+            },
+            commit=False,
+        )
+        if queue_item is not None:
+            queue_service.mark_failed(queue_item, error_code=error_code, commit=False)
+        self.db.commit()
+        self.db.refresh(call)
+        return call
 
     def execute_tool_call(
         self,
@@ -3488,6 +4698,68 @@ class ToolExecutor:
     ) -> AgentToolCall:
         runtime = self.runtime_factory(self.db)
         queue_service = AgentWorkerQueueService(self.db)
+        self.db.refresh(run)
+        if queue_item is not None and (
+            queue_item.tool_call_id != call.tool_call_id
+            or queue_item.run_id != call.run_id
+        ):
+            queue_owner_call = call
+            if queue_item.tool_call_id != call.tool_call_id:
+                queue_owner_call = self.db.scalar(
+                    select(AgentToolCall)
+                    .where(AgentToolCall.tool_call_id == queue_item.tool_call_id)
+                    .with_for_update()
+                )
+            if queue_item.status not in {"completed", "failed"}:
+                queue_service.mark_queue_item_context_mismatch(
+                    item=queue_item,
+                    call=queue_owner_call,
+                    mark_active_call_uncertain=True,
+                    error_message=(
+                        "Tool executor received a queue item whose run_id/tool_call_id "
+                        "does not match the ToolCall; reconcile required"
+                    ),
+                )
+            self.db.commit()
+            self.db.refresh(call)
+            return call
+        if (
+            call.status in {"planned", "leased", "running_pre_effect"}
+            and (
+                call.effect_submission_state in TOOL_CALL_EFFECT_SUBMISSION_STARTED_STATES
+                or bool(call.effect_boundary_crossed)
+            )
+        ):
+            return self._mark_tool_uncertain_before_execution_after_effect_submission(
+                call=call,
+                queue_item=queue_item,
+                queue_service=queue_service,
+            )
+        if call.status not in TOOL_CALL_EXECUTABLE_STATUSES:
+            if (
+                run.status in RUN_TERMINAL_STATUSES
+                and call.status == "running_pre_effect"
+                and call.effect_submission_state in {None, "none"}
+                and not call.effect_boundary_crossed
+            ):
+                return self._mark_tool_obsolete_before_execution(
+                    call=call,
+                    run=run,
+                    queue_item=queue_item,
+                    queue_service=queue_service,
+                )
+            return self._reject_tool_call_not_executable(
+                call=call,
+                queue_item=queue_item,
+                queue_service=queue_service,
+            )
+        if run.status in RUN_TERMINAL_STATUSES:
+            return self._mark_tool_obsolete_before_execution(
+                call=call,
+                run=run,
+                queue_item=queue_item,
+                queue_service=queue_service,
+            )
         try:
             self.policy_manager.ensure_context_allows_execution(call=call)
             self.policy_manager.ensure_approval_allows_execution(call=call)
@@ -3503,6 +4775,7 @@ class ToolExecutor:
                     call,
                     worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
                 )
+                _clear_tool_call_lease(call)
                 runtime.append_event(
                     run,
                     "tool.failed",
@@ -3524,6 +4797,7 @@ class ToolExecutor:
                     call,
                     worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
                 )
+                _clear_tool_call_lease(call)
                 runtime.append_event(
                     run,
                     "tool.failed",
@@ -3545,11 +4819,22 @@ class ToolExecutor:
                 call,
                 worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
             )
+            _clear_tool_call_lease(call)
             runtime.append_event(run, "tool.failed", {"tool_call_id": call.tool_call_id, "error_code": call.error_code}, commit=False)
             if queue_item is not None:
                 queue_service.mark_failed(queue_item, error_code=call.error_code, commit=False)
             self.db.commit()
             return call
+
+        blocked_by_case_ids = self._reject_case_update_ids_not_from_prior_query(
+            call=call,
+            run=run,
+            queue_item=queue_item,
+            queue_service=queue_service,
+            runtime=runtime,
+        )
+        if blocked_by_case_ids is not None:
+            return blocked_by_case_ids
 
         try:
             now = _utcnow()
@@ -3567,6 +4852,22 @@ class ToolExecutor:
                 self.db,
                 backend_factory=self.backend_factory,
             ).execute(call=call, current_user=current_user)
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES and call.resolved_side_effect_class in SAFE_SIDE_EFFECT_CLASSES:
+                return self._mark_safe_tool_obsolete_after_run_terminal(
+                    call=call,
+                    run=run,
+                    queue_item=queue_item,
+                    queue_service=queue_service,
+                )
+            if run.status in RUN_TERMINAL_STATUSES:
+                return self._mark_effectful_tool_uncertain_after_run_terminal(
+                    call=call,
+                    run=run,
+                    queue_item=queue_item,
+                    queue_service=queue_service,
+                    output=output,
+                )
 
             if call.backend_effect_capability == "receipt_first":
                 call.effect_submission_state = "backend_accepted"
@@ -3584,6 +4885,7 @@ class ToolExecutor:
                 call,
                 worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
             )
+            _clear_tool_call_lease(call)
             try:
                 runtime.append_event(run, "tool.effect_committed", {"tool_call_id": call.tool_call_id}, commit=False)
                 runtime.append_event(run, "tool.completed", {"tool_call_id": call.tool_call_id, "status": call.status}, commit=False)
@@ -3607,6 +4909,7 @@ class ToolExecutor:
                 call,
                 worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
             )
+            _clear_tool_call_lease(call)
             runtime.append_event(
                 run,
                 "tool.failed",
@@ -3616,8 +4919,128 @@ class ToolExecutor:
             if queue_item is not None:
                 queue_service.mark_failed(queue_item, error_code=call.error_code, commit=False)
             self.db.commit()
-            self.db.refresh(call)
-            return call
+        self.db.refresh(call)
+        return call
+
+    def _mark_tool_uncertain_before_execution_after_effect_submission(
+        self,
+        *,
+        call: AgentToolCall,
+        queue_item: AgentWorkerQueue | None,
+        queue_service: AgentWorkerQueueService,
+    ) -> AgentToolCall:
+        error_code = "tool_call_execution_after_effect_submission_started"
+        worker_id = queue_item.lease_owner if queue_item is not None else call.lease_owner
+        call.status = "uncertain"
+        if call.effect_submission_state in {None, "none"}:
+            call.effect_submission_state = "unknown"
+        call.error_code = error_code
+        call.error_message = "Tool executor found a leased tool after effect submission started; reconcile required"
+        call.recovery_decision = "reconcile_required_after_invalid_tool_call_execution"
+        call.policy_reason_json = _policy_reason_with_execution_context(call, worker_id=worker_id)
+        _clear_tool_call_lease(call)
+        if queue_item is not None and queue_item.status not in {"completed", "failed"}:
+            queue_service.mark_failed(queue_item, error_code=error_code, commit=False)
+        self.db.commit()
+        self.db.refresh(call)
+        return call
+
+    def _reject_tool_call_not_executable(
+        self,
+        *,
+        call: AgentToolCall,
+        queue_item: AgentWorkerQueue | None,
+        queue_service: AgentWorkerQueueService,
+    ) -> AgentToolCall:
+        if queue_item is not None and queue_item.status not in {"completed", "failed"}:
+            queue_service.mark_failed(queue_item, error_code="tool_call_not_executable", commit=False)
+        self.db.commit()
+        self.db.refresh(call)
+        return call
+
+    def _mark_safe_tool_obsolete_after_run_terminal(
+        self,
+        *,
+        call: AgentToolCall,
+        run: AgentRun,
+        queue_item: AgentWorkerQueue | None,
+        queue_service: AgentWorkerQueueService,
+    ) -> AgentToolCall:
+        error_code = f"agent_run_{run.status}_during_tool_execution"
+        call.status = "obsolete"
+        call.execution_phase = "cancelled"
+        call.error_code = error_code
+        call.error_message = "Agent run reached a terminal state before the safe tool result could be recorded"
+        call.recovery_decision = f"run_{run.status}_before_tool_completion"
+        call.policy_reason_json = _policy_reason_with_dispatch_trace(call)
+        call.policy_reason_json = _policy_reason_with_execution_context(
+            call,
+            worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
+        )
+        _clear_tool_call_lease(call)
+        if queue_item is not None:
+            queue_service.mark_failed(queue_item, error_code=error_code, commit=False)
+        self.db.commit()
+        self.db.refresh(call)
+        return call
+
+    def _mark_tool_obsolete_before_execution(
+        self,
+        *,
+        call: AgentToolCall,
+        run: AgentRun,
+        queue_item: AgentWorkerQueue | None,
+        queue_service: AgentWorkerQueueService,
+    ) -> AgentToolCall:
+        error_code = f"agent_run_{run.status}_before_tool_execution"
+        call.status = "obsolete"
+        call.execution_phase = "cancelled"
+        call.effect_submission_state = "none"
+        call.effect_boundary_crossed = False
+        call.error_code = error_code
+        call.error_message = "Agent run reached a terminal state before tool execution started"
+        call.recovery_decision = f"run_{run.status}_before_tool_execution"
+        call.policy_reason_json = _policy_reason_with_execution_context(
+            call,
+            worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
+        )
+        _clear_tool_call_lease(call)
+        if queue_item is not None:
+            queue_service.mark_failed(queue_item, error_code=error_code, commit=False)
+        self.db.commit()
+        self.db.refresh(call)
+        return call
+
+    def _mark_effectful_tool_uncertain_after_run_terminal(
+        self,
+        *,
+        call: AgentToolCall,
+        run: AgentRun,
+        queue_item: AgentWorkerQueue | None,
+        queue_service: AgentWorkerQueueService,
+        output: dict[str, Any],
+    ) -> AgentToolCall:
+        error_code = f"agent_run_{run.status}_after_tool_effect"
+        call.status = "uncertain"
+        call.execution_phase = "completed"
+        call.effect_submission_state = "effect_committed"
+        call.effect_boundary_crossed = True
+        call.output_json_redacted = mask_sensitive(output)
+        call.output_hash = request_fingerprint(output)
+        call.error_code = error_code
+        call.error_message = "Agent run reached a terminal state after an effectful tool returned; reconcile required"
+        call.recovery_decision = "reconcile_required_after_run_terminal"
+        call.policy_reason_json = _policy_reason_with_dispatch_trace(call)
+        call.policy_reason_json = _policy_reason_with_execution_context(
+            call,
+            worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
+        )
+        _clear_tool_call_lease(call)
+        if queue_item is not None:
+            queue_service.mark_failed(queue_item, error_code=error_code, commit=False)
+        self.db.commit()
+        self.db.refresh(call)
+        return call
 
     def _mark_eventstore_write_failed_after_effect(
         self,
@@ -3640,11 +5063,17 @@ class ToolExecutor:
             call,
             worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
         )
+        _clear_tool_call_lease(call)
         if queue_item is not None:
             queue_service.mark_failed(queue_item, error_code=call.error_code, commit=False)
         self.db.commit()
         self.db.refresh(call)
         return call
+
+
+def _clear_tool_call_lease(call: AgentToolCall) -> None:
+    call.lease_owner = None
+    call.lease_expires_at = None
 
 
 def _policy_reason_with_dispatch_trace(call: AgentToolCall) -> dict[str, Any]:
@@ -3794,6 +5223,38 @@ def _tool_result_message(call: AgentToolCall) -> str:
     return build_tool_result_message(call)
 
 
+def _tool_request_context_message(*, tool_request: AgentToolRequest, content: str) -> str:
+    payload = {
+        "summary_version": AGENT_TOOL_REQUEST_CONTEXT_SUMMARY_VERSION,
+        "tool_name": tool_request.tool_name,
+        "input_json": _bounded_agent_content_preview(
+            json.dumps(tool_request.tool_input, ensure_ascii=False, default=str, sort_keys=True),
+            reference="AgentConversationRunner.model_context.tool_request.input",
+        ),
+        "reason": (
+            _bounded_agent_error_message(
+                tool_request.reason,
+                reference="AgentConversationRunner.model_context.tool_request.reason",
+            )
+            if tool_request.reason is not None
+            else None
+        ),
+        "evidence_refs_json": _bounded_agent_content_preview(
+            json.dumps(tool_request.evidence_refs_for_ledger(), ensure_ascii=False, default=str, sort_keys=True),
+            reference="AgentConversationRunner.model_context.tool_request.evidence_refs",
+        ),
+        "source_content_preview": _bounded_agent_content_preview(
+            content,
+            reference="AgentConversationRunner.model_context.tool_request.content",
+        ),
+    }
+    return (
+        "上一轮模型已发起工具请求。以下是给后续模型使用的有界摘要；"
+        "完整结构化事实以 ExecutionLedger/ToolCall 为准。\n"
+        f"{json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)}"
+    )
+
+
 def _tool_result_context_messages(calls: list[AgentToolCall]) -> list[AIChatMessage]:
     messages: list[AIChatMessage] = []
     for call in calls:
@@ -3926,7 +5387,12 @@ def _intent_matches_unsupported_capability_guard(
     subject_keywords = registry.private_list(guard.skill_name, guard.subject_key)
     if not any(keyword.casefold() in text for keyword in intent_keywords):
         return False
-    return any(keyword.casefold() in text for keyword in subject_keywords)
+    explicit_subject_keywords = tuple(
+        keyword
+        for keyword in subject_keywords
+        if keyword.casefold() not in {item.casefold() for item in AMBIGUOUS_DEICTIC_GUARD_SUBJECTS}
+    )
+    return any(keyword.casefold() in text for keyword in explicit_subject_keywords)
 
 
 def _unsupported_capability_classifier_prompt(guard: UnsupportedCapabilityGuard) -> str | None:
@@ -4023,6 +5489,24 @@ def _new_model_call_id(*, run: AgentRun, iteration: int, loop_step: str) -> str:
     return f"{run.run_id}:model-{iteration}-{loop_step}-{uuid.uuid4().hex}"
 
 
+def _model_response_item_id(*, run: AgentRun, model_call_id: str) -> str:
+    return f"{AGENT_MODEL_RESPONSE_ITEM_ID_PREFIX}://{run.run_id}/{model_call_id}"
+
+
+def _tool_call_item_ids(*, run_id: str, tool_call_ids: list[str]) -> list[str]:
+    return list(dict.fromkeys(
+        f"{AGENT_TOOL_CALL_ITEM_ID_PREFIX}://{run_id}/{tool_call_id}"
+        for tool_call_id in tool_call_ids
+    ))
+
+
+def _migration_block_item_ids(*, run_id: str, block_ids: list[str]) -> list[str]:
+    return list(dict.fromkeys(
+        f"{AGENT_MIGRATION_BLOCK_ITEM_ID_PREFIX}://{run_id}/{block_id}"
+        for block_id in block_ids
+    ))
+
+
 def _loop_trace_payload(
     *,
     run: AgentRun,
@@ -4047,6 +5531,10 @@ def _loop_trace_payload(
     }
     if model_call_id:
         payload["model_call_id"] = model_call_id
+        payload["model_response_item_id"] = _model_response_item_id(
+            run=run,
+            model_call_id=model_call_id,
+        )
         loop_state["model_call_id"] = model_call_id
     if tool_call_id:
         payload["tool_call_id"] = tool_call_id
@@ -4060,7 +5548,13 @@ def _loop_trace_payload(
 def _model_trace_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         key: payload[key]
-        for key in ("iteration_id", "model_call_id", "loop_step", "loop_state")
+        for key in (
+            "iteration_id",
+            "model_call_id",
+            "model_response_item_id",
+            "loop_step",
+            "loop_state",
+        )
         if key in payload
     }
 
@@ -4100,6 +5594,10 @@ def _looks_like_tool_request_content(content: str) -> bool:
         and stripped.endswith("}")
         and '"tool_name"' in stripped
     )
+
+
+def _looks_like_internal_tool_context_leak(content: str) -> bool:
+    return AGENT_TOOL_REQUEST_CONTEXT_SUMMARY_VERSION in (content or "")
 
 
 def _normalize_agent_markdown_response(content: str) -> str:
@@ -4208,6 +5706,8 @@ def _close_unclosed_markdown_fence(content: str) -> str:
 def _assistant_message_from_run(run: AgentRun) -> str | None:
     if not isinstance(run.result_json, dict):
         return None
+    if run.result_json.get("assistant_visible") is False:
+        return None
     message = run.result_json.get("message")
     if isinstance(message, str) and message.strip():
         return message
@@ -4232,6 +5732,115 @@ def _history_pairs_to_messages(
         if assistant_content.strip():
             messages.append(AIChatMessage(role="assistant", content=assistant_content))
     return messages
+
+
+def _conversation_working_context(
+    *,
+    current_intent: str,
+    previous_runs: list[AgentRun],
+) -> dict[str, Any] | None:
+    if not previous_runs:
+        return None
+    recent_runs = previous_runs[-AGENT_HISTORY_CONTEXT_FULL_TURNS:]
+    turns = []
+    artifacts = []
+    for run in recent_runs:
+        assistant = _assistant_message_from_run(run) or ""
+        turn = {
+            "run_id": run.run_id,
+            "user_intent": _truncate_history_text(run.intent, AGENT_HISTORY_CONTEXT_RECENT_USER_CHARS),
+            "assistant_message": _truncate_history_text(assistant, AGENT_HISTORY_CONTEXT_SUMMARY_CHARS),
+        }
+        inferred = _infer_working_artifact(run.intent, assistant)
+        if inferred is not None:
+            turn["inferred_artifact"] = inferred
+            artifacts.append({"source_run_id": run.run_id, **inferred})
+        turns.append(turn)
+    payload: dict[str, Any] = {
+        "schema_version": "conversation_working_context_v1",
+        "current_intent": current_intent,
+        "current_intent_is_deictic_followup": _intent_is_deictic_followup(current_intent),
+        "recent_turns": turns,
+        "current_artifact_candidates": artifacts[-3:],
+        "resolution_rules": [
+            "If current_intent_is_deictic_followup is true, resolve it against current_artifact_candidates before choosing tools.",
+            "Prefer the latest artifact whose domain matches the user's last concrete request.",
+            "If the referenced artifact cannot be identified, ask a short clarification instead of guessing.",
+            "High-risk writes still require the matching approved tool and human approval.",
+        ],
+    }
+    return payload
+
+
+def _format_conversation_working_context(payload: dict[str, Any]) -> str:
+    return (
+        "同一会话工作上下文：\n"
+        "当前用户请求可能是对上一轮产物的省略回指；请先依据此结构化上下文解析“直接、刚才、上面、这个”等指代，"
+        "再决定是否调用工具、调用哪个工具、是否需要审批。\n"
+        f"{json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)}"
+    )
+
+
+def _intent_is_deictic_followup(intent: str) -> bool:
+    text = (intent or "").casefold()
+    if not text:
+        return False
+    markers = (
+        "直接",
+        "刚才",
+        "上面",
+        "前面",
+        "这个",
+        "这些",
+        "继续",
+        "按这个",
+        "就这样",
+        "this",
+        "that",
+        "above",
+        "previous",
+        "continue",
+    )
+    return any(marker.casefold() in text for marker in markers)
+
+
+def _infer_working_artifact(user_intent: str, assistant_message: str) -> dict[str, Any] | None:
+    text = f"{user_intent}\n{assistant_message}".casefold()
+    if not text.strip():
+        return None
+    artifact_type: str | None = None
+    domain: str | None = None
+    if "断言" in text or "assertion" in text:
+        artifact_type = "testcase_assertion_draft"
+        domain = "testcase_assertions"
+    elif "提取器" in text or "extractor" in text:
+        artifact_type = "testcase_extractor_draft"
+        domain = "testcase_extractors"
+    elif "场景" in text or "scenario" in text:
+        artifact_type = "scenario_draft"
+        domain = "scenario"
+    elif "测试用例" in text or "test case" in text or "testcase" in text:
+        artifact_type = "testcase_draft"
+        domain = "testcase"
+    if artifact_type is None:
+        return None
+    status_value = "unknown"
+    if "尚未保存" in text or "未保存" in text or "草稿" in text or "draft" in text:
+        status_value = "draft_unsaved"
+    elif "已保存" in text or "保存成功" in text:
+        status_value = "saved"
+    actions = []
+    if "保存" in text or "save" in text:
+        actions.append("save")
+    if "审批" in text or "approval" in text:
+        actions.append("requires_approval")
+    return {
+        "artifact_type": artifact_type,
+        "domain": domain,
+        "status": status_value,
+        "available_followup_actions": actions,
+        "summary": _truncate_history_text(assistant_message or user_intent, AGENT_HISTORY_CONTEXT_SUMMARY_CHARS),
+    }
 
 
 def _compact_history_summary(pairs: list[dict[str, Any]]) -> str:
@@ -4295,6 +5904,21 @@ def _bounded_repair_context(value: str) -> str:
     return f"{text[:prefix_length]}{marker}"
 
 
+def _bounded_agent_content_preview(content: Any, *, reference: str) -> str:
+    text = str(content or "")
+    if len(text) <= AGENT_CONTENT_PREVIEW_MAX_CHARS:
+        return text
+    suffix = (
+        f"{AGENT_CONTENT_PREVIEW_TRUNCATION_MARKER} "
+        f"content_summary_version={AGENT_CONTENT_PREVIEW_SUMMARY_VERSION} "
+        f"content_size_chars={len(text)} "
+        f"content_hash={request_fingerprint({'content': text})} "
+        f"full_content_reference={reference}"
+    )
+    preview_max_chars = max(0, AGENT_CONTENT_PREVIEW_MAX_CHARS - len(suffix))
+    return f"{text[:preview_max_chars]}{suffix}"
+
+
 def _http_exception_detail(exc: HTTPException) -> str:
     if isinstance(exc.detail, str):
         return exc.detail
@@ -4335,6 +5959,25 @@ def _activity_idle_seconds(last_activity_at: datetime) -> float:
     if non_negative_candidates:
         return min(non_negative_candidates)
     return max(utc_idle, local_idle)
+
+
+def _agent_context_compaction_object_key(*, run_id: str, event_seq: int) -> str:
+    return f"{AGENT_CONTEXT_COMPACTION_OBJECT_KEY_PREFIX}://{run_id}/{event_seq}"
+
+
+def _agent_context_compaction_item_id(*, event: AgentEvent) -> str:
+    return f"{AGENT_CONTEXT_COMPACTION_ITEM_ID_PREFIX}://{event.run_id}/{event.event_seq}"
+
+
+def _agent_context_compaction_window_scope_id(*, run: AgentRun) -> str:
+    return request_fingerprint({
+        "project_id": run.project_id,
+        "conversation_id": run.conversation_id or run.run_id,
+    })[:16]
+
+
+def _agent_context_compaction_window_id(*, scope_id: str, window_number: int) -> str:
+    return f"{AGENT_HISTORY_COMPACTION_WINDOW_ID_PREFIX}://{scope_id}/{window_number}"
 
 
 def _utcnow() -> datetime:

@@ -123,6 +123,10 @@ class WebSocketTestCaseExecutionRead(BaseModel):
     websocket_test_case_id: int | None
     environment_id: int | None
     executed_by_id: int
+    trigger_source: str
+    agent_run_id: str | None
+    agent_tool_call_id: str | None
+    trigger_tool_name: str | None
     status: str
     session_snapshot: dict[str, Any]
     response_snapshot: dict[str, Any] | None

@@ -12,6 +12,9 @@ from sqlalchemy.orm import Session
 
 from app.core.sensitive_data import mask_sensitive, request_fingerprint
 from app.models.agent import (
+    AGENT_MEMORY_STALENESS_EVENT_ITEM_ID_PREFIX as AGENT_MEMORY_STALENESS_EVENT_MODEL_ITEM_ID_PREFIX,
+    AGENT_MEMORY_USAGE_EVENT_ITEM_ID_PREFIX as AGENT_MEMORY_USAGE_EVENT_MODEL_ITEM_ID_PREFIX,
+    AGENT_MEMORY_VALIDATION_EVENT_ITEM_ID_PREFIX as AGENT_MEMORY_VALIDATION_EVENT_MODEL_ITEM_ID_PREFIX,
     AgentMemoryContradictionEvent,
     AgentMemoryEvidenceLink,
     AgentMemoryRetrievalProfile,
@@ -39,6 +42,10 @@ NON_STALE_MEMORY_EVENTS = {
     "permission.changed",
     "memory.status_changed",
 }
+AGENT_MEMORY_USAGE_EVENT_ITEM_ID_PREFIX = AGENT_MEMORY_USAGE_EVENT_MODEL_ITEM_ID_PREFIX
+AGENT_MEMORY_STALENESS_EVENT_ITEM_ID_PREFIX = AGENT_MEMORY_STALENESS_EVENT_MODEL_ITEM_ID_PREFIX
+AGENT_MEMORY_VALIDATION_EVENT_ITEM_ID_PREFIX = AGENT_MEMORY_VALIDATION_EVENT_MODEL_ITEM_ID_PREFIX
+AGENT_MEMORY_FEEDBACK_RESULT_ITEM_ID_PREFIX = "agent-memory-feedback-result"
 
 MEMORY_FEEDBACK_PROCESS_FIELDS = (
     "attempted",
@@ -50,6 +57,7 @@ MEMORY_FEEDBACK_PROCESS_FIELDS = (
 )
 
 MEMORY_FEEDBACK_RESULT_BASE_FIELDS = (
+    "item_id",
     "usage_event_id",
     "processed",
     "decision",
@@ -85,6 +93,7 @@ MEMORY_CANDIDATE_EVIDENCE_REF_FIELDS = (
 )
 
 MEMORY_USAGE_EVENT_FIELDS = (
+    "item_id",
     "id",
     "memory_id",
     "run_id",
@@ -108,6 +117,7 @@ MEMORY_USAGE_EVENT_FIELDS = (
 MEMORY_USAGE_EVENT_EVIDENCE_REF_FIELDS = MEMORY_CANDIDATE_EVIDENCE_REF_FIELDS
 
 MEMORY_STALENESS_EVENT_FIELDS = (
+    "item_id",
     "id",
     "project_id",
     "memory_id",
@@ -122,6 +132,7 @@ MEMORY_STALENESS_EVENT_FIELDS = (
 )
 
 MEMORY_VALIDATION_EVENT_FIELDS = (
+    "item_id",
     "id",
     "project_id",
     "memory_id",
@@ -199,6 +210,28 @@ MEMORY_ENTITY_FIELDS = (
     "created_at",
     "updated_at",
 )
+
+
+def _memory_feedback_result_item_id(usage_event_id: int | str) -> str:
+    return f"{AGENT_MEMORY_FEEDBACK_RESULT_ITEM_ID_PREFIX}://{usage_event_id}"
+
+
+def _memory_feedback_result_payload(
+    result: dict[str, Any],
+    *,
+    usage_event_id: int | str,
+) -> dict[str, Any]:
+    payload = {
+        "item_id": _memory_feedback_result_item_id(usage_event_id),
+        "usage_event_id": usage_event_id,
+    }
+    for field in ("processed", "decision"):
+        if field in result:
+            payload[field] = result[field]
+    for key, value in result.items():
+        if key not in payload:
+            payload[key] = value
+    return payload
 
 
 @dataclass(frozen=True)
@@ -1040,13 +1073,22 @@ class MemoryFeedbackWorker:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found")
         self.permission_service.require_project_access(current_user, memory.project_id)
         if usage.feedback_state == "processed":
+            result = _memory_feedback_result_payload(
+                usage.feedback_result_json
+                or {
+                    "usage_event_id": usage.id,
+                    "processed": False,
+                    "decision": "already_processed",
+                },
+                usage_event_id=usage.id,
+            )
             return {
                 "attempted": 1,
                 "processed": 0,
                 "skipped": 1,
                 "contradictions_recorded": 0,
                 "validations_recorded": 0,
-                "results": [usage.feedback_result_json or {"usage_event_id": usage.id, "decision": "already_processed"}],
+                "results": [result],
             }
         usage.outcome = outcome
         if caused_tool_input_change is not None:
@@ -1107,7 +1149,10 @@ class MemoryFeedbackWorker:
         outcome = (usage.outcome or "").strip().lower()
         memory = self.db.scalar(select(ProjectMemory).where(ProjectMemory.id == usage.memory_id).with_for_update())
         if memory is None or memory.status == "rejected":
-            result = {"usage_event_id": usage.id, "processed": False, "decision": "memory_missing_or_rejected"}
+            result = _memory_feedback_result_payload(
+                {"usage_event_id": usage.id, "processed": False, "decision": "memory_missing_or_rejected"},
+                usage_event_id=usage.id,
+            )
             self._mark_processed(usage, now=now, result=result)
             return result
 
@@ -1151,14 +1196,17 @@ class MemoryFeedbackWorker:
                     usage_event_id=usage.id,
                     evidence_ref_json=usage.evidence_ref_json,
                 )
-            result = {
-                "usage_event_id": usage.id,
-                "processed": True,
-                "decision": "memory_validated" if validated else "confidence_adjusted",
-                "confidence_delta": round(memory.confidence - before_confidence, 6),
-                "stale_delta": round(memory.stale_score - before_stale, 6),
-                "memory_status": memory.status,
-            }
+            result = _memory_feedback_result_payload(
+                {
+                    "usage_event_id": usage.id,
+                    "processed": True,
+                    "decision": "memory_validated" if validated else "confidence_adjusted",
+                    "confidence_delta": round(memory.confidence - before_confidence, 6),
+                    "stale_delta": round(memory.stale_score - before_stale, 6),
+                    "memory_status": memory.status,
+                },
+                usage_event_id=usage.id,
+            )
             if validated:
                 result["validation_count"] = memory.validation_count
             self._mark_processed(usage, now=now, result={**metadata, **result})
@@ -1174,13 +1222,16 @@ class MemoryFeedbackWorker:
             }
             if usage.active_for_policy or memory.stale_score >= 0.8:
                 memory.status = "needs_revalidation"
-            result = {
-                "usage_event_id": usage.id,
-                "processed": True,
-                "decision": "marked_stale",
-                "stale_delta": round(memory.stale_score - before_stale, 6),
-                "memory_status": memory.status,
-            }
+            result = _memory_feedback_result_payload(
+                {
+                    "usage_event_id": usage.id,
+                    "processed": True,
+                    "decision": "marked_stale",
+                    "stale_delta": round(memory.stale_score - before_stale, 6),
+                    "memory_status": memory.status,
+                },
+                usage_event_id=usage.id,
+            )
             self._mark_processed(usage, now=now, result={**metadata, **result})
             return result
 
@@ -1216,29 +1267,35 @@ class MemoryFeedbackWorker:
                 memory.status = "needs_revalidation"
             elif severity == "high" or same_failure_repeated:
                 memory.status = "suspect"
-            result = {
-                "usage_event_id": usage.id,
-                "processed": True,
-                "decision": "contradiction_recorded",
-                "confidence_delta": round(memory.confidence - before_confidence, 6),
-                "stale_delta": round(memory.stale_score - before_stale, 6),
-                "memory_status": memory.status,
-                "contradiction_type": contradiction_type,
-                "severity": severity,
-                "same_failure_repeated": same_failure_repeated,
-            }
+            result = _memory_feedback_result_payload(
+                {
+                    "usage_event_id": usage.id,
+                    "processed": True,
+                    "decision": "contradiction_recorded",
+                    "confidence_delta": round(memory.confidence - before_confidence, 6),
+                    "stale_delta": round(memory.stale_score - before_stale, 6),
+                    "memory_status": memory.status,
+                    "contradiction_type": contradiction_type,
+                    "severity": severity,
+                    "same_failure_repeated": same_failure_repeated,
+                },
+                usage_event_id=usage.id,
+            )
             self._mark_processed(usage, now=now, result={**metadata, **result})
             return result
 
         decision = "neutral_outcome" if outcome in self.NEUTRAL_OUTCOMES else "unknown_outcome_ignored"
-        result = {"usage_event_id": usage.id, "processed": outcome in self.NEUTRAL_OUTCOMES, "decision": decision}
+        result = _memory_feedback_result_payload(
+            {"usage_event_id": usage.id, "processed": outcome in self.NEUTRAL_OUTCOMES, "decision": decision},
+            usage_event_id=usage.id,
+        )
         self._mark_processed(usage, now=now, result={**metadata, **result})
         return result
 
     def _mark_processed(self, usage: AgentMemoryUsageEvent, *, now: datetime, result: dict[str, Any]) -> None:
         usage.feedback_state = "processed"
         usage.feedback_processed_at = now
-        usage.feedback_result_json = result
+        usage.feedback_result_json = _memory_feedback_result_payload(result, usage_event_id=usage.id)
 
     def _record_validation_event(
         self,

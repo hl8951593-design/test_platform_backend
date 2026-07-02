@@ -14,6 +14,7 @@ http://127.0.0.1:8000/api/v1
 - 查询需要项目 `report:view` 权限；管理员和项目创建者自动具备该权限。
 - 复合展示 ID 格式为 `{execution_type}:{execution_id}`，例如 `scenario:21`。
 - 数据库主键仍使用各执行表原有整数 ID，详情路由分别传递类型和整数 ID。
+- HTTP 与 WebSocket 执行记录会保留业务触发来源：人工点击/接口执行写入 `trigger_source=manual`，Agent 工具执行写入 `trigger_source=agent`，并记录 `agent_run_id`、`agent_tool_call_id` 与 `trigger_tool_name`。统一执行中心如需展示“人工执行/AI 执行”来源，应优先读取协议专属 `detail` 中这些字段；列表公共摘要仍保持既有 `trigger_type` 兼容形态。
 
 支持的 `execution_type`：
 

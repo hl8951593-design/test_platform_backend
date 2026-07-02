@@ -35,9 +35,12 @@ routing_requires_tool:
 
 1. For conceptual HTTP API testing advice, answer directly without tools.
 2. For live project facts, use `project.read_context` or `testcase.query_project_cases` first.
-3. For HTTP test case draft generation or expansion, use `ai_skill.run_draft` with `skill_id=http-test-case` and operation `generate` or `expand`.
-4. For draft structure, field, assertion, extractor, or schema issues, use `testcase.validate_schema` when a concrete draft is available.
-5. Do not claim that a test case was saved, deleted, archived, copied, or executed unless an explicit platform tool for that action succeeds.
+3. For saved-case assertion follow-ups, first reuse same-conversation context or call `testcase.query_project_cases` for real ids and current case facts; generate conservative assertions from proven response samples, execution summaries, or safe baseline checks.
+4. To persist assertions on saved HTTP cases, use `testcase.update_assertions` for one case or `testcase.batch_update_assertions` for many cases after user approval. These tools patch only `assertions`; do not ask for full case JSON just to save assertions.
+5. Use `ai_skill.run_draft` with `skill_id=http-test-case` and `operation=generate` only when creating new unsaved HTTP case drafts from interface docs, curl, URL, request params, or business text. Its input requires `interface_text`.
+6. Do not use `ai_skill.run_draft` with `skill_id=http-test-case` and `operation=generate` for saved-case assertion follow-ups, saved-case assertion saving, or batch assertion patching; it is not a replacement for `testcase.update_assertions`.
+7. For draft structure, field, assertion, extractor, or schema issues, use `testcase.validate_schema` when a concrete draft is available.
+8. Do not claim that a test case was saved, deleted, archived, copied, or executed unless an explicit platform tool for that action succeeds.
 
 ## Draft Quality
 

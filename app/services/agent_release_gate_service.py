@@ -117,7 +117,11 @@ RELEASE_GATE_FIELDS = (
     "final_delivery",
     "violations",
 )
+AGENT_RELEASE_GATE_TOOL_ITEM_ID_PREFIX = "agent-release-gate-tool"
+AGENT_RELEASE_GATE_LEVEL_ITEM_ID_PREFIX = "agent-release-gate-level"
+AGENT_RELEASE_GATE_VIOLATION_ITEM_ID_PREFIX = "agent-release-gate-violation"
 RELEASE_GATE_TOOL_FIELDS = (
+    "item_id",
     "tool_name",
     "tool_version",
     "side_effect_class",
@@ -132,6 +136,7 @@ RELEASE_GATE_TOOL_FIELDS = (
     "rollout_decision",
 )
 RELEASE_GATE_LEVEL_FIELDS = (
+    "item_id",
     "level",
     "summary",
     "required_gates",
@@ -139,6 +144,7 @@ RELEASE_GATE_LEVEL_FIELDS = (
     "blocked_reasons",
 )
 RELEASE_GATE_VIOLATION_FIELDS = (
+    "item_id",
     "tool_name",
     "reason",
     "side_effect_class",
@@ -171,7 +177,9 @@ MINIMUM_GO_LIVE_FIELDS = (
     "checks",
     "business_create_expansion_prerequisite",
 )
+AGENT_MINIMUM_GO_LIVE_CHECK_ITEM_ID_PREFIX = "agent-minimum-go-live-check"
 MINIMUM_GO_LIVE_CHECK_FIELDS = (
+    "item_id",
     "requirement_id",
     "label",
     "status",
@@ -228,7 +236,9 @@ GO_LIVE_GATE_TIER_FIELDS = (
     "checks",
     "pass",
 )
+AGENT_GO_LIVE_GATE_CHECK_ITEM_ID_PREFIX = "agent-go-live-gate-check"
 GO_LIVE_GATE_CHECK_FIELDS = (
+    "item_id",
     "gate_id",
     "label",
     "status",
@@ -292,7 +302,10 @@ FINAL_DELIVERY_FIELDS = (
     "external_scope_categories",
     "missing_by_category",
 )
+AGENT_FINAL_DELIVERY_CATEGORY_ITEM_ID_PREFIX = "agent-final-delivery-category"
+AGENT_FINAL_DELIVERY_CHECK_ITEM_ID_PREFIX = "agent-final-delivery-check"
 FINAL_DELIVERY_CATEGORY_FIELDS = (
+    "item_id",
     "category",
     "external_scope",
     "required_artifact_ids",
@@ -303,6 +316,7 @@ FINAL_DELIVERY_CATEGORY_FIELDS = (
     "pass",
 )
 FINAL_DELIVERY_CHECK_FIELDS = (
+    "item_id",
     "artifact_id",
     "label",
     "status",
@@ -318,6 +332,13 @@ PROMOTION_ASSESSMENT_CHECKS = (
     "final_delivery_contract_pass",
     "release_gate_static_reasons_clear",
     "current_tool_matrix_clean",
+)
+AGENT_PROMOTION_CHECK_ITEM_ID_PREFIX = "agent-promotion-check"
+PROMOTION_ASSESSMENT_CHECK_FIELDS = (
+    "item_id",
+    "name",
+    "status",
+    "details",
 )
 PROMOTION_ASSESSMENT_FIELDS = (
     "project_id",
@@ -343,7 +364,9 @@ PROMOTION_BLOCKER_SOURCES = (
     "monitoring_alerts",
     "readiness_dashboard",
 )
+AGENT_PROMOTION_BLOCKER_ITEM_ID_PREFIX = "agent-promotion-blocker"
 PROMOTION_BLOCKER_FIELDS = (
+    "item_id",
     "source",
     "reason",
     "severity",
@@ -377,6 +400,7 @@ class AgentReleaseGateService:
             {field: violation[field] for field in RELEASE_GATE_VIOLATION_FIELDS}
             for violation in (
                 {
+                    "item_id": _release_gate_violation_item_id(item["tool_name"], RELEASE_GATE_VIOLATION_REASON),
                     "tool_name": item["tool_name"],
                     "reason": RELEASE_GATE_VIOLATION_REASON,
                     "side_effect_class": item["side_effect_class"],
@@ -405,7 +429,10 @@ class AgentReleaseGateService:
         if target_level not in ROLLOUT_LEVELS:
             raise ValueError(f"Unknown Agent rollout level: {target_level}")
         release_gate = self.snapshot()
-        dashboard = AgentReadinessDashboardService(self.db).snapshot(project_id=project_id)
+        dashboard = AgentReadinessDashboardService(self.db).snapshot(
+            project_id=project_id,
+            release_gate=release_gate,
+        )
         alert_summary = dashboard["alert_summary"]
         levels = list(ROLLOUT_LEVELS)
         current_index = levels.index(CURRENT_AGENT_ROLLOUT_LEVEL)
@@ -447,51 +474,54 @@ class AgentReleaseGateService:
             "can_promote": decision == "allowed",
             "blockers": blockers,
             "checks": [
-                {
-                    "name": "target_level_known",
-                    "status": "pass",
-                    "details": {"target_level": target_level},
-                },
-                {
-                    "name": "target_above_current",
-                    "status": "pass" if target_index > current_index else PROMOTION_ALREADY_UNLOCKED_CHECK_STATUS,
-                    "details": {"current_level": CURRENT_AGENT_ROLLOUT_LEVEL, "target_level": target_level},
-                },
-                {
-                    "name": "readiness_dashboard_pass",
-                    "status": "pass" if dashboard["readiness"] == "pass" else "blocked",
-                    "details": {"readiness": dashboard["readiness"], "alert_summary": alert_summary},
-                },
-                {
-                    "name": "monitoring_alerts_clear",
-                    "status": "pass" if self._promotion_alert_blocker_count(alert_summary) == 0 else "blocked",
-                    "details": alert_summary,
-                },
-                {
-                    "name": "minimum_go_live_contract_pass",
-                    "status": "pass" if minimum_go_live["pass"] else "blocked",
-                    "details": minimum_go_live,
-                },
-                {
-                    "name": "go_live_gate_contract_pass",
-                    "status": "pass" if go_live_gates["pass"] else "blocked",
-                    "details": go_live_gates,
-                },
-                {
-                    "name": "final_delivery_contract_pass",
-                    "status": "pass" if final_delivery["pass"] else "blocked",
-                    "details": final_delivery,
-                },
-                {
-                    "name": "release_gate_static_reasons_clear",
-                    "status": "pass" if not target_gate["blocked_reasons"] else "blocked",
-                    "details": {"blocked_reasons": target_gate["blocked_reasons"]},
-                },
-                {
-                    "name": "current_tool_matrix_clean",
-                    "status": "pass" if not release_gate["violations"] else "blocked",
-                    "details": {"violations": release_gate["violations"]},
-                },
+                AgentReleaseGateService._promotion_check(target_level=target_level, check=check)
+                for check in [
+                    {
+                        "name": "target_level_known",
+                        "status": "pass",
+                        "details": {"target_level": target_level},
+                    },
+                    {
+                        "name": "target_above_current",
+                        "status": "pass" if target_index > current_index else PROMOTION_ALREADY_UNLOCKED_CHECK_STATUS,
+                        "details": {"current_level": CURRENT_AGENT_ROLLOUT_LEVEL, "target_level": target_level},
+                    },
+                    {
+                        "name": "readiness_dashboard_pass",
+                        "status": "pass" if dashboard["readiness"] == "pass" else "blocked",
+                        "details": {"readiness": dashboard["readiness"], "alert_summary": alert_summary},
+                    },
+                    {
+                        "name": "monitoring_alerts_clear",
+                        "status": "pass" if self._promotion_alert_blocker_count(alert_summary) == 0 else "blocked",
+                        "details": alert_summary,
+                    },
+                    {
+                        "name": "minimum_go_live_contract_pass",
+                        "status": "pass" if minimum_go_live["pass"] else "blocked",
+                        "details": minimum_go_live,
+                    },
+                    {
+                        "name": "go_live_gate_contract_pass",
+                        "status": "pass" if go_live_gates["pass"] else "blocked",
+                        "details": go_live_gates,
+                    },
+                    {
+                        "name": "final_delivery_contract_pass",
+                        "status": "pass" if final_delivery["pass"] else "blocked",
+                        "details": final_delivery,
+                    },
+                    {
+                        "name": "release_gate_static_reasons_clear",
+                        "status": "pass" if not target_gate["blocked_reasons"] else "blocked",
+                        "details": {"blocked_reasons": target_gate["blocked_reasons"]},
+                    },
+                    {
+                        "name": "current_tool_matrix_clean",
+                        "status": "pass" if not release_gate["violations"] else "blocked",
+                        "details": {"violations": release_gate["violations"]},
+                    },
+                ]
             ],
             "dashboard_checks": dashboard["checks"],
             "fault_injection": dashboard["fault_injection"],
@@ -506,6 +536,16 @@ class AgentReleaseGateService:
         }
         return {field: assessment[field] for field in PROMOTION_ASSESSMENT_FIELDS}
 
+    @staticmethod
+    def _promotion_check(*, target_level: str, check: dict[str, Any]) -> dict[str, Any]:
+        payload = {
+            "item_id": _promotion_check_item_id(target_level, check["name"]),
+            "name": check["name"],
+            "status": check["status"],
+            "details": check["details"],
+        }
+        return {field: payload[field] for field in PROMOTION_ASSESSMENT_CHECK_FIELDS}
+
     def _tool_row(self, spec: ToolSpec) -> dict[str, Any]:
         contract = self._contract_for(spec)
         rollout_allowed = (
@@ -513,6 +553,7 @@ class AgentReleaseGateService:
             and (contract is None or contract.compatibility_status == "active")
         )
         row = {
+            "item_id": _release_gate_tool_item_id(spec.name, spec.version),
             "tool_name": spec.name,
             "tool_version": spec.version,
             "side_effect_class": spec.side_effect_class,
@@ -547,6 +588,7 @@ class AgentReleaseGateService:
             level_spec = ROLLOUT_LEVELS[level]
             unlocked = index <= current_index
             gate = {
+                "item_id": _release_gate_level_item_id(level),
                 "level": level,
                 "summary": level_spec["summary"],
                 "required_gates": list(level_spec["required_gates"]),
@@ -584,6 +626,7 @@ class AgentReleaseGateService:
                     "coverage_ratio": fault_coverage["coverage_ratio"],
                 }
             check = {
+                "item_id": _minimum_go_live_check_item_id(requirement_id),
                 "requirement_id": requirement_id,
                 "label": label,
                 "status": "pass" if requirement_id not in failed else "blocked",
@@ -609,6 +652,7 @@ class AgentReleaseGateService:
                 {field: check[field] for field in GO_LIVE_GATE_CHECK_FIELDS}
                 for check in (
                     {
+                        "item_id": _go_live_gate_check_item_id(priority, gate_id),
                         "gate_id": gate_id,
                         "label": label,
                         "status": "pass",
@@ -647,6 +691,7 @@ class AgentReleaseGateService:
                 {field: check[field] for field in FINAL_DELIVERY_CHECK_FIELDS}
                 for check in (
                     {
+                        "item_id": _final_delivery_check_item_id(category, artifact_id),
                         "artifact_id": artifact_id,
                         "label": label,
                         "status": "external_scope" if external_scope else "pass",
@@ -656,6 +701,7 @@ class AgentReleaseGateService:
                 )
             ]
             category_result = {
+                "item_id": _final_delivery_category_item_id(category),
                 "category": category,
                 "external_scope": external_scope,
                 "required_artifact_ids": list(artifacts),
@@ -787,6 +833,7 @@ class AgentReleaseGateService:
     @staticmethod
     def _promotion_blocker(*, source: str, reason: str, severity: str, details: dict[str, Any]) -> dict[str, Any]:
         blocker = {
+            "item_id": _promotion_blocker_item_id(source, reason, str(details["target_level"])),
             "source": source,
             "reason": reason,
             "severity": severity,
@@ -798,3 +845,39 @@ class AgentReleaseGateService:
     def _promotion_alert_blocker_count(alert_summary: dict[str, Any]) -> int:
         severity_counts = alert_summary.get("by_severity") or {}
         return int(severity_counts.get("P0") or 0) + int(severity_counts.get("P1") or 0)
+
+
+def _release_gate_tool_item_id(tool_name: str, tool_version: str) -> str:
+    return f"{AGENT_RELEASE_GATE_TOOL_ITEM_ID_PREFIX}://{tool_name}/{tool_version}"
+
+
+def _release_gate_level_item_id(level: str) -> str:
+    return f"{AGENT_RELEASE_GATE_LEVEL_ITEM_ID_PREFIX}://{level}"
+
+
+def _release_gate_violation_item_id(tool_name: str, reason: str) -> str:
+    return f"{AGENT_RELEASE_GATE_VIOLATION_ITEM_ID_PREFIX}://{tool_name}/{reason}"
+
+
+def _promotion_check_item_id(target_level: str, name: str) -> str:
+    return f"{AGENT_PROMOTION_CHECK_ITEM_ID_PREFIX}://{target_level}/{name}"
+
+
+def _minimum_go_live_check_item_id(requirement_id: str) -> str:
+    return f"{AGENT_MINIMUM_GO_LIVE_CHECK_ITEM_ID_PREFIX}://{requirement_id}"
+
+
+def _go_live_gate_check_item_id(priority: str, gate_id: str) -> str:
+    return f"{AGENT_GO_LIVE_GATE_CHECK_ITEM_ID_PREFIX}://{priority}/{gate_id}"
+
+
+def _final_delivery_category_item_id(category: str) -> str:
+    return f"{AGENT_FINAL_DELIVERY_CATEGORY_ITEM_ID_PREFIX}://{category}"
+
+
+def _final_delivery_check_item_id(category: str, artifact_id: str) -> str:
+    return f"{AGENT_FINAL_DELIVERY_CHECK_ITEM_ID_PREFIX}://{category}/{artifact_id}"
+
+
+def _promotion_blocker_item_id(source: str, reason: str, target_level: str) -> str:
+    return f"{AGENT_PROMOTION_BLOCKER_ITEM_ID_PREFIX}://{target_level}/{source}/{reason}"

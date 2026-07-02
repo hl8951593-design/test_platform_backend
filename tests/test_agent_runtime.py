@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
 from sqlalchemy import create_engine, func, inspect, select
+from sqlalchemy.exc import PendingRollbackError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -50,6 +51,7 @@ from app.schemas.agent import (
     AgentApprovalRead,
     AgentApprovalDecisionRequest,
     AgentApprovalExpireAuditRead,
+    AgentCapabilitiesRead,
     AgentContextBuildCreateRequest,
     AgentContextBuildRead,
     AgentConversationExportRead,
@@ -86,11 +88,13 @@ from app.schemas.agent import (
     AgentModelHealthRead,
     AgentOutboxPublishRead,
     AgentReadinessDashboardRead,
+    AgentReconcileAttemptRead,
     AgentRunActionRead,
     AgentRunActionStateRead,
     AgentRunCreateRequest,
     AgentRunEventSnapshotRead,
     AgentRunRead,
+    AgentRunResumeRead,
     AgentRunSummaryRead,
     AgentRuntimeSnapshotRead,
     AgentToolCallCreateRequest,
@@ -107,7 +111,8 @@ from app.schemas.agent import (
     AgentRunbookRecommendationRead,
     AgentWorkerQueueAuditRead,
 )
-from app.schemas.ai import AIChatResponse
+import app.schemas.agent as agent_schema
+from app.schemas.ai import AIChatMessage, AIChatResponse
 from app.services.agent_approval_service import (
     APPROVAL_CONFLICT_ERROR_CODES,
     APPROVAL_EVENT_TYPES,
@@ -129,6 +134,7 @@ from app.services.agent_fault_injection_service import (
     FAULT_INJECTION_RESULT_FIELDS,
     FAULT_INJECTION_RUN_FIELDS,
 )
+import app.services.agent_fault_injection_service as agent_fault_injection_service
 from app.services.agent_loop_service import (
     ACTIVE_POLICY_DEPENDENCY_ROLES,
     AUDIT_DEPENDENCY_ROLES,
@@ -154,6 +160,8 @@ from app.services.agent_loop_service import (
     RootCauseRuleEngine,
     VOLATILE_MUTABILITY_CLASSES,
 )
+import app.services.agent_loop_service as agent_loop_service
+import app.services.agent_memory_service as agent_memory_service
 from app.services.agent_memory_service import (
     MEMORY_CANDIDATE_EVIDENCE_REF_FIELDS,
     MEMORY_CANDIDATE_FIELDS,
@@ -178,6 +186,7 @@ from app.services.agent_memory_service import (
     compute_contradiction_penalty,
     memory_candidate_to_payload,
 )
+import app.services.agent_observability_service as agent_observability_service
 from app.services.agent_observability_service import (
     AgentAlertService,
     AgentBackendCompletionAuditService,
@@ -263,6 +272,8 @@ from app.services.agent_reconcile_service import (
     RUNTIME_SNAPSHOT_FRESHNESS_RESULT,
     STALE_EVIDENCE_WATCH_DETAIL_FIELDS,
 )
+import app.services.agent_reconcile_service as agent_reconcile_service
+import app.services.agent_release_gate_service as agent_release_gate_service
 from app.services.agent_release_gate_service import (
     AgentReleaseGateService,
     FINAL_DELIVERY_ARTIFACTS,
@@ -292,6 +303,7 @@ from app.services.agent_release_gate_service import (
     RELEASE_GATE_VIOLATION_REASON,
 )
 from app.services.agent_resume_service import AgentRunResumeService
+import app.services.agent_runbook_service as agent_runbook_service
 from app.services.agent_runbook_service import (
     CHECKPOINT_FRESHNESS_SAFE_ACTIONS,
     RUNBOOK_EVENT_PAYLOAD_PREVIEW_MAX_CHARS,
@@ -313,12 +325,15 @@ from app.services.agent_tool_result_policy import (
     ToolResultPolicy,
 )
 from app.services.agent_runtime_service import (
+    AGENT_CONVERSATION_CONTEXT_COMPACTION_FIELDS,
     AGENT_CONVERSATION_EXPORT_FIELDS,
     AGENT_CONVERSATION_FIELDS,
     AGENT_CONVERSATION_SMOKE_FIELDS,
     AGENT_CONVERSATION_TRANSCRIPT_FIELDS,
     AGENT_EVENT_FIELDS,
     AGENT_MODEL_HEALTH_FIELDS,
+    APPROVAL_FIELDS,
+    MIGRATION_BLOCK_FIELDS,
     AGENT_RUN_ACTION_FIELDS,
     AGENT_RUN_ACTION_STATE_FIELDS,
     AGENT_RUN_EVENT_SNAPSHOT_FIELDS,
@@ -345,6 +360,7 @@ from app.services.agent_runtime_service import (
     _unsupported_capability_guards_for_intent,
     _unsupported_capability_message,
 )
+import app.services.agent_runtime_service as agent_runtime_service
 
 
 class AgentRuntimeTests(unittest.TestCase):
@@ -447,6 +463,80 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual([item.event_type for item in events], ["run.queued", "run.started", "run.completed"])
         self.assertEqual([item.event_seq for item in events], [1, 2, 3])
 
+    def test_complete_run_does_not_override_cancelled_terminal_run(self):
+        runtime = AgentRuntimeService(self.db)
+        run = runtime.create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="cancel before completion"),
+            current_user=self.owner,
+        )
+        runtime.cancel_run(run_id=run.run_id, current_user=self.owner)
+
+        completed = runtime.complete_run(run, {"message": "should not complete"})
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        cancelled_index = event_types.index("run.cancelled")
+
+        self.assertEqual(completed.status, "cancelled")
+        self.assertNotIn("run.completed", event_types[cancelled_index + 1:])
+        self.assertNotEqual(completed.result_json, {"message": "should not complete"})
+
+    def test_fail_run_does_not_override_cancelled_terminal_run(self):
+        runtime = AgentRuntimeService(self.db)
+        run = runtime.create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="cancel before failure"),
+            current_user=self.owner,
+        )
+        runtime.cancel_run(run_id=run.run_id, current_user=self.owner)
+
+        failed = runtime.fail_run(
+            run,
+            error_code="agent_conversation_model_error",
+            error_message="should not fail",
+        )
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        cancelled_index = event_types.index("run.cancelled")
+
+        self.assertEqual(failed.status, "cancelled")
+        self.assertNotIn("run.failed", event_types[cancelled_index + 1:])
+        self.assertNotEqual(failed.error_code, "agent_conversation_model_error")
+
+    def test_append_event_does_not_append_non_terminal_event_after_cancelled_run(self):
+        runtime = AgentRuntimeService(self.db)
+        run = runtime.create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="cancel before late event"),
+            current_user=self.owner,
+        )
+        runtime.cancel_run(run_id=run.run_id, current_user=self.owner)
+        self.db.refresh(run)
+        last_sequence = run.last_event_sequence
+
+        returned = runtime.append_event(run, "model.delta", {"content": "late delta"}, commit=True)
+        self.db.refresh(run)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        cancelled_index = event_types.index("run.cancelled")
+
+        self.assertEqual(run.status, "cancelled")
+        self.assertEqual(run.last_event_sequence, last_sequence)
+        self.assertEqual(returned.event_type, "run.cancelled")
+        self.assertNotIn("model.delta", event_types[cancelled_index + 1:])
+
     def test_get_run_marks_stale_active_run_failed(self):
         runtime = AgentRuntimeService(self.db)
         run = runtime.create_run(
@@ -479,6 +569,7 @@ class AgentRuntimeTests(unittest.TestCase):
             payload=AgentRunCreateRequest(project_id=10, intent="cursor reset", auto_complete=True),
             current_user=self.owner,
         )
+        item_id_prefix = getattr(agent_runtime_service, "AGENT_EVENT_ITEM_ID_PREFIX", None)
 
         events, listed_run = AgentRuntimeService(self.db).list_events(
             run_id=run.run_id,
@@ -491,12 +582,19 @@ class AgentRuntimeTests(unittest.TestCase):
             current_user=self.member,
         )
 
+        self.assertIsNotNone(item_id_prefix)
         self.assertEqual(listed_run.run_id, run.run_id)
         self.assertEqual([item.event_seq for item in events], [1, 2, 3])
         self.assertEqual([item.event_type for item in events], ["run.queued", "run.started", "run.completed"])
+        first_event = AgentEventRead.model_validate(events[0]).model_dump()
+        self.assertEqual(list(first_event), list(AGENT_EVENT_FIELDS))
+        self.assertEqual(first_event["item_id"], f"{item_id_prefix}://{run.run_id}/1")
         self.assertEqual(snapshot["after_sequence"], 0)
         self.assertEqual(snapshot["next_after_sequence"], 3)
         self.assertEqual([item.event_seq for item in snapshot["events"]], [1, 2, 3])
+        first_snapshot_event = AgentRunEventSnapshotRead.model_validate(snapshot).model_dump()["events"][0]
+        self.assertEqual(list(first_snapshot_event), list(AGENT_EVENT_FIELDS))
+        self.assertEqual(first_snapshot_event["item_id"], f"{item_id_prefix}://{run.run_id}/1")
         self.assertTrue(snapshot["terminal"])
 
     def test_conversation_runner_streams_model_events_and_completes_run(self):
@@ -658,6 +756,92 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, log_output)
         self.assertNotIn(hidden_tail, log_output)
 
+    def test_conversation_runner_does_not_append_stream_interrupted_after_cancel(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="partial stream cancelled before interruption"),
+            current_user=self.owner,
+        )
+        self_db = self.db
+        owner = self.owner
+
+        def fake_stream(_self, _request):
+            yield {"type": "delta", "content": "partial reply"}
+            AgentRuntimeService(self_db).cancel_run(run_id=run.run_id, current_user=owner)
+            raise HTTPException(status_code=503, detail="stream interrupted after cancel")
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            cancelled = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        cancelled_index = event_types.index("run.cancelled")
+        events_after_cancel = event_types[cancelled_index + 1:]
+
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertNotIn("model.stream_interrupted", events_after_cancel)
+        self.assertNotIn("model.completed", events_after_cancel)
+        self.assertNotIn("run.completed", events_after_cancel)
+
+    def test_stream_model_response_does_not_start_model_for_cancelled_run(self):
+        runtime = AgentRuntimeService(self.db)
+        run = runtime.create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="cancel before model stream starts"),
+            current_user=self.owner,
+        )
+        runtime.cancel_run(run_id=run.run_id, current_user=self.owner)
+        self.db.refresh(run)
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", return_value=iter([])) as chat_stream:
+            content, chunks, payload = AgentConversationRunner(self.db)._stream_model_response(
+                run=run,
+                messages=[AIChatMessage(role="user", content="should not start")],
+                runtime=runtime,
+                iteration=0,
+            )
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        cancelled_index = event_types.index("run.cancelled")
+
+        self.assertEqual(content, "")
+        self.assertEqual(chunks, [])
+        self.assertEqual(payload, {})
+        chat_stream.assert_not_called()
+        self.assertNotIn("model.started", event_types[cancelled_index + 1:])
+
+    def test_stream_model_response_releases_db_transaction_before_provider_stream(self):
+        runtime = AgentRuntimeService(self.db)
+        run = runtime.create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="stream without holding db connection"),
+            current_user=self.owner,
+        )
+        transaction_states: list[bool] = []
+
+        def fake_stream(_self, _request):
+            transaction_states.append(self.db.in_transaction())
+            yield {"type": "delta", "content": "ok"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            content, chunks, payload = AgentConversationRunner(self.db)._stream_model_response(
+                run=run,
+                messages=[AIChatMessage(role="user", content="hello")],
+                runtime=runtime,
+                iteration=0,
+            )
+
+        self.assertEqual(content, "ok")
+        self.assertEqual(payload["finish_reason"], "stop")
+        self.assertEqual(transaction_states, [False])
+
     def test_conversation_runner_allows_software_testing_general_answers_without_tools(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="边界值分析和等价类划分有什么区别？"),
@@ -710,6 +894,28 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(completed_event.payload_json["loop_state"], expected_loop_state)
         self.assertEqual(delta_event.payload_json["model_call_id"], model_call_id)
         self.assertEqual(completed_event.payload_json["model_call_id"], model_call_id)
+        model_response_item_id_prefix = getattr(
+            agent_runtime_service,
+            "AGENT_MODEL_RESPONSE_ITEM_ID_PREFIX",
+            None,
+        )
+        expected_model_response_item_id = (
+            f"{model_response_item_id_prefix}://{run.run_id}/{model_call_id}"
+        )
+        self.assertEqual(model_response_item_id_prefix, "agent-model-response")
+        self.assertEqual(
+            started_event.payload_json["model_response_item_id"],
+            expected_model_response_item_id,
+        )
+        self.assertEqual(
+            delta_event.payload_json["model_response_item_id"],
+            expected_model_response_item_id,
+        )
+        self.assertEqual(
+            completed_event.payload_json["model_response_item_id"],
+            expected_model_response_item_id,
+        )
+        self.assertNotEqual(started_event.item_id, expected_model_response_item_id)
         self.assertEqual(completed.result_json["model_call_id"], model_call_id)
         self.assertIn('"name":"general-testing-answer"', system_prompt)
         self.assertIn("Agent Skill: general-testing-answer", system_prompt)
@@ -766,7 +972,8 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue(any("Conversation history compacted for prompt budget." in item for item in system_contents))
         self.assertEqual(compaction_event.payload_json["strategy"], "summarize_older_keep_recent")
         self.assertIn("compacted_run_count", compaction_event.payload_json)
-        self.assertIn("estimated_tokens_after", compaction_event.payload_json)
+        self.assertIn("estimated_input_units_after", compaction_event.payload_json)
+        self.assertNotIn("token_budget", compaction_event.payload_json)
         self.assertIn("current compacted history question", captured_messages[-1].content)
 
     def test_conversation_runner_normalizes_user_visible_markdown_tables(self):
@@ -809,6 +1016,10 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(completed_event.payload_json["content"], expected_markdown)
         self.assertEqual(normalized_event.payload_json["content"], expected_markdown)
         self.assertEqual(normalized_event.payload_json["model_call_id"], completed_event.payload_json["model_call_id"])
+        self.assertEqual(
+            normalized_event.payload_json["model_response_item_id"],
+            completed_event.payload_json["model_response_item_id"],
+        )
         self.assertTrue(normalized_event.payload_json["replace_content"])
         self.assertIn("GitHub Flavored Markdown", system_prompt)
         self.assertIn("表头、分隔行和每一条数据行都必须独占一行", system_prompt)
@@ -877,6 +1088,20 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue(payload["terminal"])
         self.assertFalse(payload["can_cancel"])
 
+    def test_run_summary_deduplicates_blocking_tool_call_ids(self):
+        run = self._create_run("summary blocking id dedupe")
+        call = self._create_uncertain_call(run.run_id, step_index=0)
+        run.status = "needs_human"
+        run.blocking_tool_call_ids_json = [call.tool_call_id, call.tool_call_id]
+        self.db.commit()
+
+        payload = AgentRunSummaryRead.model_validate(
+            AgentRuntimeService(self.db).get_run_summary(run_id=run.run_id, current_user=self.member)
+        ).model_dump(mode="python")
+
+        self.assertEqual(payload["blocking_tool_call_ids"], [call.tool_call_id])
+        self.assertTrue(payload["can_resume"])
+
     def test_run_summary_requires_project_access(self):
         outsider = User(
             id=4,
@@ -903,6 +1128,9 @@ class AgentRuntimeTests(unittest.TestCase):
         from app.api.v1.routers.agents import get_agent_run_actions
 
         run, call, approval = self._create_pending_approval()
+        run.status = "needs_human"
+        run.blocking_tool_call_ids_json = [call.tool_call_id]
+        self.db.commit()
 
         payload = get_agent_run_actions(run_id=run.run_id, db=self.db, current_user=self.member)["data"]
         actions = {item["action_id"]: item for item in payload["actions"]}
@@ -912,10 +1140,16 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(list(payload), list(AGENT_RUN_ACTION_STATE_FIELDS))
         self.assertEqual(list(payload["actions"][0]), list(AGENT_RUN_ACTION_FIELDS))
         self.assertEqual(payload["run_summary"]["run"]["run_id"], run.run_id)
+        self.assertFalse(payload["run_summary"]["can_resume"])
         self.assertIn("pending_approvals", payload["blocked_reasons"])
         self.assertIn("review_approvals", payload["primary_action_ids"])
+        self.assertEqual(payload["primary_action_ids"][0], "review_approvals")
         self.assertTrue(actions["review_approvals"]["enabled"])
         self.assertEqual(actions["review_approvals"]["resource_ids"], [approval.approval_id])
+        self.assertEqual(
+            actions["review_approvals"]["resource_item_ids"],
+            [f"agent-tool-call://{run.run_id}/{call.tool_call_id}"],
+        )
         self.assertFalse(actions["resume_run"]["enabled"])
         self.assertEqual(actions["resume_run"]["reason"], "pending_approvals_need_review")
         self.assertTrue(actions["cancel_run"]["enabled"])
@@ -933,11 +1167,133 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertIn("uncertain_tool_calls", payload["blocked_reasons"])
         self.assertIn("reconcile_run", payload["primary_action_ids"])
+        self.assertEqual(payload["primary_action_ids"][0], "reconcile_run")
         self.assertTrue(actions["reconcile_run"]["enabled"])
         self.assertEqual(actions["reconcile_run"]["resource_ids"], [call.tool_call_id])
+        self.assertEqual(
+            actions["reconcile_run"]["resource_item_ids"],
+            [f"agent-tool-call://{run.run_id}/{call.tool_call_id}"],
+        )
         self.assertEqual(actions["reconcile_run"]["details"]["uncertain_tool_call_count"], 1)
         self.assertFalse(actions["resume_run"]["enabled"])
         self.assertEqual(actions["resume_run"]["reason"], "no_resume_candidate")
+
+    def test_run_action_state_orders_uncertain_tool_resources_by_step(self):
+        run = self._create_run("action state uncertain order")
+        later_call = self._create_uncertain_call(run.run_id, step_index=1)
+        earlier_call = self._create_uncertain_call(run.run_id, step_index=0)
+        later_call.status = "reconciling"
+        earlier_call.status = "uncertain"
+        self.db.commit()
+
+        payload = AgentRunActionStateRead.model_validate(
+            AgentRuntimeService(self.db).get_run_action_state(run_id=run.run_id, current_user=self.member)
+        ).model_dump(mode="python")
+        actions = {item["action_id"]: item for item in payload["actions"]}
+
+        self.assertEqual(
+            actions["reconcile_run"]["resource_ids"],
+            [earlier_call.tool_call_id, later_call.tool_call_id],
+        )
+        self.assertEqual(
+            actions["reconcile_run"]["resource_item_ids"],
+            [
+                f"agent-tool-call://{run.run_id}/{earlier_call.tool_call_id}",
+                f"agent-tool-call://{run.run_id}/{later_call.tool_call_id}",
+            ],
+        )
+
+    def test_run_action_state_exposes_resume_for_failed_retryable_tool_call(self):
+        run = self._create_run("action state retryable")
+        call = self._create_uncertain_call(run.run_id, step_index=0, effect_state="send_intent_recorded")
+        call.status = "failed_retryable"
+        run.blocking_tool_call_ids_json = [call.tool_call_id]
+        self.db.commit()
+
+        payload = AgentRunActionStateRead.model_validate(
+            AgentRuntimeService(self.db).get_run_action_state(run_id=run.run_id, current_user=self.owner)
+        ).model_dump(mode="python")
+        actions = {item["action_id"]: item for item in payload["actions"]}
+
+        self.assertTrue(payload["run_summary"]["can_resume"])
+        self.assertIn("retryable_tool_calls", payload["blocked_reasons"])
+        self.assertIn("resume_run", payload["primary_action_ids"])
+        self.assertEqual(payload["primary_action_ids"][0], "resume_run")
+        self.assertTrue(actions["resume_run"]["enabled"])
+        self.assertEqual(actions["resume_run"]["resource_ids"], [call.tool_call_id])
+        self.assertEqual(
+            actions["resume_run"]["resource_item_ids"],
+            [f"agent-tool-call://{run.run_id}/{call.tool_call_id}"],
+        )
+        self.assertEqual(actions["resume_run"]["reason"], "resume_candidate_ready")
+        self.assertEqual(actions["resume_run"]["details"]["blocking_tool_call_ids"], [call.tool_call_id])
+        self.assertEqual(actions["resume_run"]["details"]["retryable_tool_call_ids"], [call.tool_call_id])
+
+    def test_run_action_state_exposes_resume_for_migration_blocked_without_open_block(self):
+        run = self._create_run("action state migration resolved")
+        run.status = "migration_blocked"
+        run.blocking_tool_call_ids_json = []
+        run.migration_block_count = 0
+        self.db.commit()
+
+        payload = AgentRunActionStateRead.model_validate(
+            AgentRuntimeService(self.db).get_run_action_state(run_id=run.run_id, current_user=self.owner)
+        ).model_dump(mode="python")
+        actions = {item["action_id"]: item for item in payload["actions"]}
+
+        self.assertTrue(payload["run_summary"]["can_resume"])
+        self.assertNotIn("open_migration_blocks", payload["blocked_reasons"])
+        self.assertIn("resume_run", payload["primary_action_ids"])
+        self.assertEqual(payload["primary_action_ids"][0], "resume_run")
+        self.assertTrue(actions["resume_run"]["enabled"])
+        self.assertEqual(actions["resume_run"]["reason"], "resume_candidate_ready")
+
+    def test_run_action_state_exposes_reconcile_for_terminal_uncertain_tool_call(self):
+        run = self._create_run("action state terminal uncertain")
+        call = self._create_uncertain_call(run.run_id, step_index=0, effect_state="effect_committed")
+        call.recovery_decision = "reconcile_required_after_run_terminal"
+        run.status = "cancelled"
+        run.completed_at = datetime.now(UTC).replace(tzinfo=None)
+        self.db.commit()
+
+        payload = AgentRunActionStateRead.model_validate(
+            AgentRuntimeService(self.db).get_run_action_state(run_id=run.run_id, current_user=self.member)
+        ).model_dump(mode="python")
+        actions = {item["action_id"]: item for item in payload["actions"]}
+
+        self.assertIn("run_cancelled", payload["blocked_reasons"])
+        self.assertIn("uncertain_tool_calls", payload["blocked_reasons"])
+        self.assertIn("reconcile_run", payload["primary_action_ids"])
+        self.assertEqual(payload["primary_action_ids"][0], "reconcile_run")
+        self.assertTrue(actions["reconcile_run"]["enabled"])
+        self.assertEqual(actions["reconcile_run"]["reason"], "uncertain_tool_calls")
+        self.assertEqual(actions["reconcile_run"]["resource_ids"], [call.tool_call_id])
+        self.assertFalse(actions["resume_run"]["enabled"])
+        self.assertEqual(actions["resume_run"]["reason"], "run_terminal")
+
+    def test_run_action_state_exposes_runbook_for_completed_run_with_uncertain_tool_call(self):
+        run = self._create_run("action state completed uncertain")
+        call = self._create_uncertain_call(run.run_id, step_index=0, effect_state="effect_committed")
+        call.recovery_decision = "reconcile_required_after_run_terminal"
+        run.status = "completed"
+        run.completed_at = datetime.now(UTC).replace(tzinfo=None)
+        self.db.commit()
+
+        payload = AgentRunActionStateRead.model_validate(
+            AgentRuntimeService(self.db).get_run_action_state(run_id=run.run_id, current_user=self.member)
+        ).model_dump(mode="python")
+        actions = {item["action_id"]: item for item in payload["actions"]}
+
+        self.assertIn("run_completed", payload["blocked_reasons"])
+        self.assertIn("uncertain_tool_calls", payload["blocked_reasons"])
+        self.assertIn("reconcile_run", payload["primary_action_ids"])
+        self.assertIn("open_runbook", payload["primary_action_ids"])
+        self.assertEqual(payload["primary_action_ids"][0], "reconcile_run")
+        self.assertTrue(actions["open_runbook"]["enabled"])
+        self.assertEqual(actions["open_runbook"]["reason"], "recovery_context_available")
+        self.assertEqual(actions["open_runbook"]["details"]["blocked_reasons"], payload["blocked_reasons"])
+        self.assertTrue(actions["reconcile_run"]["enabled"])
+        self.assertEqual(actions["reconcile_run"]["resource_ids"], [call.tool_call_id])
 
     def test_conversation_runner_writes_model_delta_before_stream_done(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -981,6 +1337,97 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(events[3].payload_json["content"], "第一段")
         self.assertEqual(completed.result_json["message"], "第一段第二段")
+
+    def test_conversation_runner_does_not_complete_after_cancel_during_post_stream_normalization(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="普通回复后处理期间取消"),
+            current_user=self.owner,
+        )
+        self_db = self.db
+        owner = self.owner
+
+        def fake_stream(_self, _payload):
+            yield {"type": "delta", "content": "这是一段普通回复。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def cancel_during_normalization(self, *, run, runtime, content, chunks, iteration, final_summary, trace_payload=None):
+            _ = self, runtime, iteration, final_summary, trace_payload
+            AgentRuntimeService(self_db).cancel_run(run_id=run.run_id, current_user=owner)
+            return content, chunks
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch.object(
+                AgentConversationRunner,
+                "_normalize_user_visible_markdown",
+                new=cancel_during_normalization,
+            ),
+        ):
+            cancelled = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        cancelled_index = event_types.index("run.cancelled")
+        events_after_cancel = event_types[cancelled_index + 1:]
+
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertNotIn("model.completed", events_after_cancel)
+        self.assertNotIn("run.completed", events_after_cancel)
+
+    def test_conversation_runner_does_not_fail_after_cancel_during_post_stream_exception(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="普通回复后处理期间取消并抛错"),
+            current_user=self.owner,
+        )
+        self_db = self.db
+        owner = self.owner
+
+        def fake_stream(_self, _payload):
+            yield {"type": "delta", "content": "这是一段普通回复。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def cancel_and_raise_during_normalization(
+            self,
+            *,
+            run,
+            runtime,
+            content,
+            chunks,
+            iteration,
+            final_summary,
+            trace_payload=None,
+        ):
+            _ = self, runtime, content, chunks, iteration, final_summary, trace_payload
+            AgentRuntimeService(self_db).cancel_run(run_id=run.run_id, current_user=owner)
+            raise HTTPException(status_code=500, detail="normalization failed after cancel")
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch.object(
+                AgentConversationRunner,
+                "_normalize_user_visible_markdown",
+                new=cancel_and_raise_during_normalization,
+            ),
+        ):
+            cancelled = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        cancelled_index = event_types.index("run.cancelled")
+        events_after_cancel = event_types[cancelled_index + 1:]
+
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertNotIn("run.failed", events_after_cancel)
+        self.assertNotIn("model.completed", events_after_cancel)
+        self.assertNotIn("run.completed", events_after_cancel)
 
     def test_conversation_runner_batches_small_model_deltas_after_first_visible_delta(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -1088,7 +1535,7 @@ class AgentRuntimeTests(unittest.TestCase):
         policy = ToolResultPolicy()
         decision = policy.evaluate(call)
         message = policy.build_message(call)
-        from app.services.agent_tool_service import ToolRegistry
+        from app.services.agent_tool_service import SAFE_SIDE_EFFECT_CLASSES, ToolRegistry
 
         self.assertIn("companyName", [item.display() for item in decision.auto_fixable][0])
         self.assertTrue(any("Lingxi-Auth" in item.display() for item in decision.blocked))
@@ -1346,6 +1793,40 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(events[-1].event_type, "run.failed")
         self.assertEqual(events[-1].payload_json["error_message"], "model unavailable")
 
+    def test_conversation_runner_recovers_failed_run_with_fresh_session_after_db_disconnect(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="模型流式过程中数据库连接断开"),
+            current_user=self.owner,
+        )
+        original_refresh = self.db.refresh
+        refresh_count = {"value": 0}
+
+        def flaky_refresh(instance, *args, **kwargs):
+            if isinstance(instance, AgentRun):
+                refresh_count["value"] += 1
+                if refresh_count["value"] >= 3:
+                    raise PendingRollbackError("lost connection requires rollback")
+            return original_refresh(instance, *args, **kwargs)
+
+        with (
+            patch.object(self.db, "refresh", side_effect=flaky_refresh),
+            patch("app.services.agent_runtime_service.SessionLocal", self.Session),
+            patch("app.services.agent_runtime_service.dispose_engine_after_disconnect"),
+        ):
+            failed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        self.db.expire_all()
+        persisted = self.db.scalar(select(AgentRun).where(AgentRun.run_id == run.run_id))
+        events = list(self.db.scalars(
+            select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+        ).all())
+
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(persisted.status, "failed")
+        self.assertEqual(persisted.error_code, "agent_conversation_unhandled_error")
+        self.assertEqual(events[-1].event_type, "run.failed")
+        self.assertEqual(events[-1].payload_json["error_code"], "agent_conversation_unhandled_error")
+
     def test_conversation_runner_bounds_long_failure_error_message(self):
         from app.services.agent_runtime_service import (
             AGENT_ERROR_MESSAGE_MAX_CHARS,
@@ -1461,6 +1942,424 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn(("user", "第一轮：我想做登录接口测试"), roles_and_content)
         self.assertIn(("assistant", "可以先准备登录接口的正向和异常用例。"), roles_and_content)
         self.assertEqual(roles_and_content[-1], ("user", "继续补充边界情况"))
+
+    def test_conversation_runner_injects_working_context_for_same_session_followups(self):
+        runtime = AgentRuntimeService(self.db)
+        conversation_id = "agent-conv-working-context"
+        first = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="帮我扩展所有测试用例的断言",
+            ),
+            current_user=self.owner,
+        )
+        runtime.complete_run(
+            first,
+            {
+                "message": "已为所有 17 个 HTTP 测试用例生成扩展了断言的草稿。草稿尚未保存，可直接保存断言。",
+                "assistant_visible": True,
+                "completion_source": "model",
+                "model_invoked": True,
+            },
+        )
+        second = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="直接保存",
+            ),
+            current_user=self.owner,
+        )
+
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.extend(payload.messages)
+            yield {"type": "delta", "content": "我会基于上一轮断言草稿发起保存审批。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=second.run_id, user_id=self.owner.id)
+
+        system_context = "\n\n".join(message.content for message in captured_messages if message.role == "system")
+        self.assertIn("同一会话工作上下文", system_context)
+        self.assertIn("当前用户请求可能是对上一轮产物的省略回指", system_context)
+        self.assertIn("帮我扩展所有测试用例的断言", system_context)
+        self.assertIn("断言", system_context)
+        self.assertIn("草稿尚未保存", system_context)
+        self.assertEqual(captured_messages[-1].content, "直接保存")
+
+    def test_conversation_runner_excludes_invisible_assistant_history_from_model_context(self):
+        runtime = AgentRuntimeService(self.db)
+        first = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="后台 smoke run，不应该成为用户可见回复",
+                auto_complete=True,
+            ),
+            current_user=self.owner,
+        )
+        second = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=first.conversation_id,
+                intent="继续真实对话",
+            ),
+            current_user=self.owner,
+        )
+
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.extend(payload.messages)
+            yield {"type": "delta", "content": "真实回复。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=second.run_id, user_id=self.owner.id)
+
+        roles_and_content = [(message.role, message.content) for message in captured_messages]
+        self.assertIn(("user", "后台 smoke run，不应该成为用户可见回复"), roles_and_content)
+        self.assertNotIn(
+            ("assistant", "Agent smoke run completed without model invocation."),
+            roles_and_content,
+        )
+        self.assertEqual(roles_and_content[-1], ("user", "继续真实对话"))
+
+    def test_conversation_runner_excludes_unfinished_runs_from_model_context(self):
+        runtime = AgentRuntimeService(self.db)
+        first = runtime.create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="还没有完成的上一轮请求"),
+            current_user=self.owner,
+        )
+        second = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=first.conversation_id,
+                intent="当前这一轮才需要模型处理",
+            ),
+            current_user=self.owner,
+        )
+
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.extend(payload.messages)
+            yield {"type": "delta", "content": "当前轮回复。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=second.run_id, user_id=self.owner.id)
+
+        roles_and_content = [(message.role, message.content) for message in captured_messages]
+        self.assertNotIn(("user", "还没有完成的上一轮请求"), roles_and_content)
+        self.assertEqual(roles_and_content[-1], ("user", "当前这一轮才需要模型处理"))
+
+    def test_harness_conversation_history_context_contract_matches_runner_prompt(self):
+        from pathlib import Path
+        import re
+
+        def _parse_payload_contract(text: str) -> dict[str, list[str] | str]:
+            section = text[text.index("Required Agent conversation history context contract:"):]
+            block = re.search(r"```text\n(.*?)\n```", section, re.S)
+            self.assertIsNotNone(block)
+            parsed: dict[str, list[str] | str] = {}
+            for line in block.group(1).splitlines():
+                if not line.strip():
+                    continue
+                key, value = line.strip().split("=", 1)
+                if "," in value:
+                    parsed[key] = value.split(",")
+                else:
+                    parsed[key] = value
+            return parsed
+
+        source_status = getattr(agent_runtime_service, "AGENT_HISTORY_CONTEXT_SOURCE_STATUS", None)
+        excluded_statuses = getattr(agent_runtime_service, "AGENT_HISTORY_CONTEXT_EXCLUDED_STATUSES", None)
+        assistant_visibility_rule = getattr(
+            agent_runtime_service,
+            "AGENT_HISTORY_CONTEXT_ASSISTANT_VISIBILITY_RULE",
+            None,
+        )
+        user_intent_rule = getattr(agent_runtime_service, "AGENT_HISTORY_CONTEXT_USER_INTENT_RULE", None)
+        history_order = getattr(agent_runtime_service, "AGENT_HISTORY_CONTEXT_ORDER", None)
+        compaction_strategy = getattr(agent_runtime_service, "AGENT_HISTORY_CONTEXT_COMPACTION_STRATEGY", None)
+        compaction_event = getattr(agent_runtime_service, "AGENT_HISTORY_CONTEXT_COMPACTION_EVENT", None)
+        compaction_payload_fields = getattr(
+            agent_runtime_service,
+            "AGENT_HISTORY_COMPACTION_PAYLOAD_FIELDS",
+            None,
+        )
+        window_id_prefix = getattr(agent_runtime_service, "AGENT_HISTORY_COMPACTION_WINDOW_ID_PREFIX", None)
+        summary_role = getattr(agent_runtime_service, "AGENT_HISTORY_CONTEXT_SUMMARY_ROLE", None)
+        current_user_position = getattr(agent_runtime_service, "AGENT_HISTORY_CONTEXT_CURRENT_USER_POSITION", None)
+
+        self.assertIsNotNone(source_status)
+        self.assertIsNotNone(excluded_statuses)
+        self.assertIsNotNone(assistant_visibility_rule)
+        self.assertIsNotNone(user_intent_rule)
+        self.assertIsNotNone(history_order)
+        self.assertIsNotNone(compaction_strategy)
+        self.assertIsNotNone(compaction_event)
+        self.assertIsNotNone(compaction_payload_fields)
+        self.assertIsNotNone(window_id_prefix)
+        self.assertIsNotNone(summary_role)
+        self.assertIsNotNone(current_user_position)
+
+        docs_dir = Path(__file__).resolve().parents[1] / "docs"
+        documented_payload_contracts = [
+            _parse_payload_contract(path.read_text(encoding="utf-8"))
+            for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
+            if "Required Agent conversation history context contract:" in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(len(documented_payload_contracts), 2)
+        for contract in documented_payload_contracts:
+            self.assertEqual(contract["source_status"], source_status)
+            self.assertEqual(contract["excluded_statuses"], list(excluded_statuses))
+            self.assertEqual(contract["assistant_visibility_rule"], assistant_visibility_rule)
+            self.assertEqual(contract["user_intent_rule"], user_intent_rule)
+            self.assertEqual(contract["history_order"], history_order)
+            self.assertEqual(contract["max_runs_constant"], "AGENT_HISTORY_CONTEXT_MAX_RUNS")
+            self.assertEqual(contract["max_runs_value"], str(agent_runtime_service.AGENT_HISTORY_CONTEXT_MAX_RUNS))
+            self.assertEqual(contract["compaction_strategy"], compaction_strategy)
+            self.assertEqual(contract["compaction_event"], compaction_event)
+            self.assertEqual(contract["compaction_payload_fields"], list(compaction_payload_fields))
+            self.assertEqual(contract["summary_role"], summary_role)
+            self.assertEqual(contract["current_user_message_position"], current_user_position)
+            self.assertEqual(contract["source"], "AgentConversationRunner._build_chat_messages")
+
+        runtime = AgentRuntimeService(self.db)
+        conversation_id = "agent-conv-history-contract"
+        first = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="第一轮可见历史用户问题",
+            ),
+            current_user=self.owner,
+        )
+        runtime.complete_run(
+            first,
+            {"message": "第一轮可见 assistant 回复", "assistant_visible": True},
+            commit=True,
+        )
+        invisible = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="第二轮只有用户历史可回放",
+            ),
+            current_user=self.owner,
+        )
+        runtime.complete_run(
+            invisible,
+            {"message": "第二轮不可见 assistant 回复", "assistant_visible": False},
+            commit=True,
+        )
+        failed = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="失败历史不应进入模型 prompt",
+            ),
+            current_user=self.owner,
+        )
+        runtime.fail_run(failed, error_code="history_contract_failure", error_message="failed history", commit=True)
+        current = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="当前轮用户问题",
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.extend(payload.messages)
+            yield {"type": "delta", "content": "当前轮回复。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=current.run_id, user_id=self.owner.id)
+
+        roles_and_content = [(message.role, message.content) for message in captured_messages]
+        self.assertIn(("user", "第一轮可见历史用户问题"), roles_and_content)
+        self.assertIn(("assistant", "第一轮可见 assistant 回复"), roles_and_content)
+        self.assertIn(("user", "第二轮只有用户历史可回放"), roles_and_content)
+        self.assertNotIn(("assistant", "第二轮不可见 assistant 回复"), roles_and_content)
+        self.assertNotIn(("user", "失败历史不应进入模型 prompt"), roles_and_content)
+        self.assertEqual(roles_and_content[-1], ("user", "当前轮用户问题"))
+        self.assertLess(
+            roles_and_content.index(("user", "第一轮可见历史用户问题")),
+            roles_and_content.index(("user", "第二轮只有用户历史可回放")),
+        )
+
+        first.intent = "第一轮可见历史用户问题 " + ("长历史用户内容 " * 500)
+        first.result_json = {
+            "message": "第一轮可见 assistant 回复 " + ("长历史 assistant 内容 " * 500),
+            "assistant_visible": True,
+        }
+        compact_messages, compaction_payload = AgentConversationRunner(self.db)._conversation_history_messages(
+            previous_runs=[first] * 10,
+            compaction_window_metadata={
+                "window_number": 1,
+                "first_window_id": f"{window_id_prefix}://test/1",
+                "previous_window_id": None,
+                "window_id": f"{window_id_prefix}://test/1",
+            },
+        )
+        self.assertIsNotNone(compaction_payload)
+        self.assertEqual(list(compaction_payload), list(compaction_payload_fields))
+        self.assertEqual(compaction_payload["strategy"], compaction_strategy)
+        self.assertTrue(any(message.role == summary_role for message in compact_messages))
+
+    def test_harness_history_compaction_envelope_contract_matches_event_payload(self):
+        from pathlib import Path
+        import re
+
+        def _parse_payload_contract(text: str) -> dict[str, list[str] | str]:
+            section = text[text.index("Required Agent history compaction envelope contract:"):]
+            block = re.search(r"```text\n(.*?)\n```", section, re.S)
+            self.assertIsNotNone(block)
+            parsed: dict[str, list[str] | str] = {}
+            for line in block.group(1).splitlines():
+                if not line.strip():
+                    continue
+                key, value = line.strip().split("=", 1)
+                if "," in value:
+                    parsed[key] = value.split(",")
+                else:
+                    parsed[key] = value
+            return parsed
+
+        envelope_fields = getattr(
+            agent_runtime_service,
+            "AGENT_HISTORY_COMPACTION_ENVELOPE_FIELDS",
+            None,
+        )
+        trigger = getattr(agent_runtime_service, "AGENT_HISTORY_COMPACTION_TRIGGER", None)
+        reason = getattr(agent_runtime_service, "AGENT_HISTORY_COMPACTION_REASON", None)
+        phase = getattr(agent_runtime_service, "AGENT_HISTORY_COMPACTION_PHASE", None)
+        implementation = getattr(agent_runtime_service, "AGENT_HISTORY_COMPACTION_IMPLEMENTATION", None)
+        replacement_history = getattr(agent_runtime_service, "AGENT_HISTORY_COMPACTION_REPLACEMENT_HISTORY", None)
+        initial_context_injection = getattr(
+            agent_runtime_service,
+            "AGENT_HISTORY_COMPACTION_INITIAL_CONTEXT_INJECTION",
+            None,
+        )
+        reference_context_item = getattr(
+            agent_runtime_service,
+            "AGENT_HISTORY_COMPACTION_REFERENCE_CONTEXT_ITEM",
+            None,
+        )
+        context_baseline = getattr(agent_runtime_service, "AGENT_HISTORY_COMPACTION_CONTEXT_BASELINE", None)
+        window_id_prefix = getattr(agent_runtime_service, "AGENT_HISTORY_COMPACTION_WINDOW_ID_PREFIX", None)
+        codex_alignment = getattr(agent_runtime_service, "AGENT_HISTORY_COMPACTION_CODEX_ALIGNMENT", None)
+        source = getattr(agent_runtime_service, "AGENT_HISTORY_COMPACTION_SOURCE", None)
+
+        self.assertIsNotNone(envelope_fields)
+        self.assertIsNotNone(trigger)
+        self.assertIsNotNone(reason)
+        self.assertIsNotNone(phase)
+        self.assertIsNotNone(implementation)
+        self.assertIsNotNone(replacement_history)
+        self.assertIsNotNone(initial_context_injection)
+        self.assertIsNotNone(reference_context_item)
+        self.assertIsNotNone(context_baseline)
+        self.assertIsNotNone(window_id_prefix)
+        self.assertIsNotNone(codex_alignment)
+        self.assertIsNotNone(source)
+
+        docs_dir = Path(__file__).resolve().parents[1] / "docs"
+        documented_payload_contracts = [
+            _parse_payload_contract(path.read_text(encoding="utf-8"))
+            for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
+            if "Required Agent history compaction envelope contract:" in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(len(documented_payload_contracts), 2)
+        for contract in documented_payload_contracts:
+            self.assertEqual(contract["envelope_fields"], list(envelope_fields))
+            self.assertEqual(contract["trigger"], trigger)
+            self.assertEqual(contract["reason"], reason)
+            self.assertEqual(contract["phase"], phase)
+            self.assertEqual(contract["implementation"], implementation)
+            self.assertEqual(contract["replacement_history"], replacement_history)
+            self.assertEqual(contract["initial_context_injection"], initial_context_injection)
+            self.assertEqual(contract["reference_context_item"], reference_context_item)
+            self.assertEqual(contract["context_baseline"], context_baseline)
+            self.assertEqual(contract["window_id_prefix"], window_id_prefix)
+            self.assertEqual(contract["codex_alignment"], codex_alignment)
+            self.assertEqual(contract["source"], source)
+
+        runtime = AgentRuntimeService(self.db)
+        conversation_id = "agent-conv-history-compaction-envelope"
+        for index in range(7):
+            previous = runtime.create_run(
+                payload=AgentRunCreateRequest(
+                    project_id=10,
+                    conversation_id=conversation_id,
+                    intent=f"history envelope intent {index} " + ("input detail " * 220),
+                ),
+                current_user=self.owner,
+            )
+            runtime.complete_run(
+                previous,
+                {
+                    "message": f"history envelope assistant {index} " + ("assistant detail " * 260),
+                    "assistant_visible": True,
+                },
+                commit=True,
+            )
+        current = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="current history compaction envelope question",
+            ),
+            current_user=self.owner,
+        )
+
+        def fake_stream(service_self, payload):
+            yield {"type": "delta", "content": "ok"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=current.run_id, user_id=self.owner.id)
+
+        event = self.db.scalar(
+            select(AgentEvent).where(
+                AgentEvent.run_id == current.run_id,
+                AgentEvent.event_type == agent_runtime_service.AGENT_HISTORY_CONTEXT_COMPACTION_EVENT,
+            )
+        )
+        self.assertIsNotNone(event)
+        payload = event.payload_json
+        self.assertEqual([field for field in payload if field in envelope_fields], list(envelope_fields))
+        self.assertEqual(payload["trigger"], trigger)
+        self.assertEqual(payload["reason"], reason)
+        self.assertEqual(payload["phase"], phase)
+        self.assertEqual(payload["implementation"], implementation)
+        self.assertEqual(payload["strategy"], agent_runtime_service.AGENT_HISTORY_CONTEXT_COMPACTION_STRATEGY)
+        self.assertEqual(payload["original_run_count"], 7)
+        self.assertEqual(payload["compacted_run_count"], 3)
+        self.assertEqual(payload["kept_full_run_count"], 4)
+        self.assertGreater(payload["estimated_input_units_before"], payload["estimated_input_units_after"])
+        self.assertEqual(payload["budget_limit_units"], agent_runtime_service.AGENT_HISTORY_CONTEXT_TOKEN_BUDGET)
+        self.assertEqual(payload["summary_role"], agent_runtime_service.AGENT_HISTORY_CONTEXT_SUMMARY_ROLE)
+        self.assertEqual(payload["replacement_history"], replacement_history)
+        self.assertEqual(payload["initial_context_injection"], initial_context_injection)
+        self.assertEqual(payload["reference_context_item"], reference_context_item)
+        self.assertEqual(payload["context_baseline"], context_baseline)
+        self.assertEqual(payload["window_number"], 1)
+        self.assertEqual(payload["first_window_id"], payload["window_id"])
+        self.assertIsNone(payload["previous_window_id"])
+        self.assertTrue(payload["window_id"].startswith(f"{window_id_prefix}://"))
+        self.assertEqual(payload["source"], source)
+        self.assertNotIn("token_budget", payload)
+        self.assertNotIn("estimated_tokens_before", payload)
+        self.assertNotIn("estimated_tokens_after", payload)
 
     def test_conversation_runner_injects_run_context_with_project_id(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -1661,6 +2560,188 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("工具执行结果如下", captured_messages[1][-1].content)
         self.assertIn("TestAuto", captured_messages[1][-1].content)
 
+    def test_tool_request_reason_events_are_bounded(self):
+        from app.services.agent_runtime_service import AGENT_ERROR_MESSAGE_TRUNCATION_MARKER
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="先读取项目上下文再告诉我能做什么"),
+            current_user=self.owner,
+        )
+        hidden_tail = "TOOL_REQUEST_REASON_SECRET_TAIL"
+        long_reason = f"Need project context {'x' * 900}{hidden_tail}"
+        tool_request_content = "```agent_tool_request\n" + json.dumps(
+            {
+                "tool_name": "project.read_context",
+                "input": {},
+                "reason": long_reason,
+                "evidence_refs": [],
+            },
+            ensure_ascii=False,
+        ) + "\n```"
+        stream_calls: list[str] = []
+
+        def fake_stream(service_self, payload):
+            if not stream_calls:
+                stream_calls.append("requested")
+                yield {"type": "delta", "content": tool_request_content}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "我已读取项目 TestAuto，可以继续生成接口测试方案。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_runtime_service.AgentToolBackend.execute",
+                return_value={"project": {"id": 10, "name": "TestAuto"}},
+            ),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        event_rows = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        tool_request_event = next(item for item in event_rows if item.event_type == "model.tool_request_detected")
+        tool_result_event = next(item for item in event_rows if item.event_type == "tool.result_observed")
+        detected_reason = tool_request_event.payload_json["reason"]
+        detected_decision_reason = tool_request_event.payload_json["decision_reason"]
+        observed_decision_reason = tool_result_event.payload_json["decision_reason"]
+
+        self.assertEqual(completed.status, "completed")
+        for value in (
+            detected_reason,
+            detected_decision_reason,
+            observed_decision_reason,
+            tool_result_event.payload_json["loop_state"]["decision_reason"],
+        ):
+            self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, value)
+            self.assertIn("error_summary_version=agent_error_message_summary_v1", value)
+            self.assertIn("error_hash=", value)
+            self.assertNotIn(hidden_tail, value)
+        self.assertIn(
+            "full_error_reference=AgentConversationRunner.model.tool_request_detected.reason",
+            detected_reason,
+        )
+        self.assertIn(
+            "full_error_reference=AgentConversationRunner.tool_trace.decision_reason",
+            observed_decision_reason,
+        )
+
+    def test_tool_request_model_completed_content_is_bounded(self):
+        from app.services.agent_runtime_service import AGENT_CONTENT_PREVIEW_MAX_CHARS
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="先读取项目上下文再告诉我能做什么"),
+            current_user=self.owner,
+        )
+        hidden_tail = "MODEL_COMPLETED_TOOL_REQUEST_SECRET_TAIL"
+        long_reason = f"Need project context {'x' * 900}{hidden_tail}"
+        tool_request_content = "```agent_tool_request\n" + json.dumps(
+            {
+                "tool_name": "project.read_context",
+                "input": {},
+                "reason": long_reason,
+                "evidence_refs": [],
+            },
+            ensure_ascii=False,
+        ) + "\n```"
+        stream_calls: list[str] = []
+
+        def fake_stream(service_self, payload):
+            if not stream_calls:
+                stream_calls.append("requested")
+                yield {"type": "delta", "content": tool_request_content}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "我已读取项目 TestAuto，可以继续生成接口测试方案。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_runtime_service.AgentToolBackend.execute",
+                return_value={"project": {"id": 10, "name": "TestAuto"}},
+            ),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        event_rows = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        tool_completed_event = next(
+            item
+            for item in event_rows
+            if item.event_type == "model.completed" and item.payload_json.get("requested_tool") is True
+        )
+        event_content = tool_completed_event.payload_json["content"]
+
+        self.assertEqual(completed.status, "completed")
+        self.assertLessEqual(len(event_content), AGENT_CONTENT_PREVIEW_MAX_CHARS)
+        self.assertIn("agent_content_preview_truncated", event_content)
+        self.assertIn("content_summary_version=agent_content_preview_summary_v1", event_content)
+        self.assertIn("content_hash=", event_content)
+        self.assertIn("content_size_chars=", event_content)
+        self.assertIn(
+            "full_content_reference=AgentConversationRunner.model.completed.tool_request.content",
+            event_content,
+        )
+        self.assertNotIn(hidden_tail, event_content)
+        self.assertEqual(completed.result_json["message"], "我已读取项目 TestAuto，可以继续生成接口测试方案。")
+
+    def test_tool_request_model_context_replay_is_bounded(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="先读取项目上下文再告诉我能做什么"),
+            current_user=self.owner,
+        )
+        hidden_tail = "MODEL_CONTEXT_TOOL_REQUEST_SECRET_TAIL"
+        long_reason = f"Need project context {'x' * 900}{hidden_tail}"
+        tool_request_content = "```agent_tool_request\n" + json.dumps(
+            {
+                "tool_name": "project.read_context",
+                "input": {},
+                "reason": long_reason,
+                "evidence_refs": [],
+            },
+            ensure_ascii=False,
+        ) + "\n```"
+        captured_messages = []
+
+        def fake_stream(service_self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {"type": "delta", "content": tool_request_content}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "我已读取项目 TestAuto，可以继续生成接口测试方案。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_runtime_service.AgentToolBackend.execute",
+                return_value={"project": {"id": 10, "name": "TestAuto"}},
+            ),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        replay_context = "\n".join(message.content for message in captured_messages[1])
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(len(captured_messages), 2)
+        self.assertIn("agent_tool_request_context_summary_v1", replay_context)
+        self.assertIn("project.read_context", replay_context)
+        self.assertIn("agent_content_preview_truncated", replay_context)
+        self.assertIn(
+            "full_content_reference=AgentConversationRunner.model_context.tool_request.content",
+            replay_context,
+        )
+        self.assertNotIn(hidden_tail, replay_context)
+        self.assertEqual(completed.result_json["message"], "我已读取项目 TestAuto，可以继续生成接口测试方案。")
+
     def test_scenario_compose_tool_uses_default_environment_when_omitted(self):
         from app.models.project import ProjectEnvironment
         from app.models.test_case import TestCase
@@ -1723,6 +2804,780 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(captured_payload["payload"].input["http_test_case_ids"], [200])
         self.assertEqual(captured_payload["payload"].input["websocket_test_case_ids"], [])
         self.assertEqual(result["draft"]["scenario"]["name"], "Enterprise Scenario")
+
+    def test_agent_testcase_execution_tools_record_agent_business_source(self):
+        from app.core.permissions import ProjectPermission
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase, TestCaseExecution
+        from app.models.websocket_test_case import WebSocketTestCase, WebSocketTestCaseExecution
+        from app.services.agent_tool_service import AgentToolBackend, ToolRegistry
+
+        environment = ProjectEnvironment(
+            id=101,
+            project_id=10,
+            name="agent execution env",
+            base_url="https://api.example.test",
+            description="agent execution env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        http_case_1 = TestCase(
+            id=201,
+            project_id=10,
+            environment_id=101,
+            name="HTTP Case 1",
+            description="case",
+            method="GET",
+            path="/health",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        http_case_2 = TestCase(
+            id=202,
+            project_id=10,
+            environment_id=101,
+            name="HTTP Case 2",
+            description="case",
+            method="GET",
+            path="/ready",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        ws_case_1 = WebSocketTestCase(
+            id=301,
+            project_id=10,
+            environment_id=101,
+            name="WS Case 1",
+            description="case",
+            path="/ws",
+            headers={},
+            subprotocols=[],
+            messages=[],
+            receive_count=0,
+            connect_timeout_ms=1000,
+            receive_timeout_ms=1000,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        ws_case_2 = WebSocketTestCase(
+            id=302,
+            project_id=10,
+            environment_id=101,
+            name="WS Case 2",
+            description="case",
+            path="/events",
+            headers={},
+            subprotocols=[],
+            messages=[],
+            receive_count=0,
+            connect_timeout_ms=1000,
+            receive_timeout_ms=1000,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, http_case_1, http_case_2, ws_case_1, ws_case_2])
+        self.db.commit()
+
+        registry = ToolRegistry()
+        tool_specs = {spec.name: spec for spec in registry.list_specs()}
+        for tool_name in [
+            "testcase.execute_saved",
+            "testcase.batch_execute",
+            "websocket_testcase.execute_saved",
+            "websocket_testcase.batch_execute",
+        ]:
+            self.assertIn(tool_name, tool_specs)
+            self.assertEqual(tool_specs[tool_name].side_effect_class, "execution_record")
+            self.assertEqual(tool_specs[tool_name].replay_policy, "require_revalidation")
+
+        backend = AgentToolBackend(self.db)
+        with (
+            patch("app.services.agent_tool_service.TestCaseService.execute_queued_execution"),
+            patch("app.services.agent_tool_service.WebSocketTestCaseService.execute_queued_execution"),
+        ):
+            http_single = backend.execute(
+                tool_name="testcase.execute_saved",
+                payload={
+                    "project_id": 10,
+                    "test_case_id": 201,
+                    "environment_id": 101,
+                    "_agent_run_id": "agent-run-1",
+                    "_agent_tool_call_id": "tool-call-1",
+                },
+                current_user=self.owner,
+            )
+            http_batch = backend.execute(
+                tool_name="testcase.batch_execute",
+                payload={
+                    "project_id": 10,
+                    "test_case_ids": [202],
+                    "environment_id": 101,
+                    "_agent_run_id": "agent-run-1",
+                    "_agent_tool_call_id": "tool-call-2",
+                },
+                current_user=self.owner,
+            )
+            ws_single = backend.execute(
+                tool_name="websocket_testcase.execute_saved",
+                payload={
+                    "project_id": 10,
+                    "test_case_id": 301,
+                    "environment_id": 101,
+                    "_agent_run_id": "agent-run-1",
+                    "_agent_tool_call_id": "tool-call-3",
+                },
+                current_user=self.owner,
+            )
+            ws_batch = backend.execute(
+                tool_name="websocket_testcase.batch_execute",
+                payload={
+                    "project_id": 10,
+                    "websocket_test_case_ids": [302],
+                    "environment_id": 101,
+                    "_agent_run_id": "agent-run-1",
+                    "_agent_tool_call_id": "tool-call-4",
+                },
+                current_user=self.owner,
+            )
+
+        self.assertEqual(http_single["execution"]["trigger_source"], "agent")
+        self.assertEqual(http_single["execution"]["agent_run_id"], "agent-run-1")
+        self.assertEqual(http_single["execution"]["agent_tool_call_id"], "tool-call-1")
+        self.assertEqual(http_single["execution"]["trigger_tool_name"], "testcase.execute_saved")
+        self.assertEqual(http_batch["requested_count"], 1)
+        self.assertEqual(http_batch["executions"][0]["trigger_tool_name"], "testcase.batch_execute")
+        self.assertEqual(ws_single["execution"]["trigger_source"], "agent")
+        self.assertEqual(ws_single["execution"]["trigger_tool_name"], "websocket_testcase.execute_saved")
+        self.assertEqual(ws_batch["requested_count"], 1)
+        self.assertEqual(ws_batch["executions"][0]["trigger_tool_name"], "websocket_testcase.batch_execute")
+
+        http_records = self.db.query(TestCaseExecution).order_by(TestCaseExecution.id.asc()).all()
+        ws_records = self.db.query(WebSocketTestCaseExecution).order_by(WebSocketTestCaseExecution.id.asc()).all()
+        self.assertEqual([item.trigger_source for item in http_records], ["agent", "agent"])
+        self.assertEqual([item.trigger_tool_name for item in http_records], ["testcase.execute_saved", "testcase.batch_execute"])
+        self.assertEqual([item.trigger_source for item in ws_records], ["agent", "agent"])
+        self.assertEqual(
+            [item.trigger_tool_name for item in ws_records],
+            ["websocket_testcase.execute_saved", "websocket_testcase.batch_execute"],
+        )
+
+    def test_agent_testcase_save_tools_require_human_approval(self):
+        from app.core.permissions import ProjectPermission
+        from app.services.agent_tool_service import ToolPolicyResolver, ToolRegistry
+
+        registry = ToolRegistry()
+        resolver = ToolPolicyResolver()
+        for tool_name in [
+            "testcase.create_saved",
+            "testcase.update_saved",
+            "testcase.update_assertions",
+            "testcase.batch_update_assertions",
+            "websocket_testcase.create_saved",
+            "websocket_testcase.update_saved",
+            "websocket_testcase.update_assertions",
+            "websocket_testcase.batch_update_assertions",
+        ]:
+            with self.subTest(tool_name=tool_name):
+                spec = registry.get(tool_name)
+                policy = resolver.resolve(spec=spec, evidence_refs=[])
+                manifest = spec.to_json()
+
+                self.assertEqual(spec.side_effect_class, "business_update")
+                self.assertEqual(spec.replay_policy, "require_revalidation")
+                self.assertEqual(spec.required_permissions, (ProjectPermission.MANAGE_CASE.value,))
+                self.assertTrue(policy.approval_required)
+                self.assertEqual(policy.policy_reason["approval_required_reason"], "unsafe_side_effect")
+                self.assertEqual(manifest["backend_contract"]["effect_capability"], "idempotency_index_only")
+                self.assertNotIn("backend_handler", manifest)
+
+    def test_agent_testcase_assertion_patch_tools_preserve_saved_case_payloads(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+        from app.models.websocket_test_case import WebSocketTestCase
+        from app.services.agent_tool_service import AgentToolBackend
+
+        environment = ProjectEnvironment(
+            id=107,
+            project_id=10,
+            name="agent assertion patch env",
+            base_url="https://api.example.test",
+            description="agent assertion patch env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        http_case = TestCase(
+            id=207,
+            project_id=10,
+            environment_id=107,
+            name="HTTP assertion patch case",
+            description="preserve all non-assertion fields",
+            method="POST",
+            path="/business/search",
+            headers={"Authorization": "Bearer {{Lingxi-Auth}}", "X-Keep": "yes"},
+            query_params={"page": 1},
+            body_type="json",
+            body={"keyword": "acme"},
+            assertions=[{"type": "status_code", "expected": 201}],
+            extractors=[{"name": "company_id", "path": "data.dataList.0.companyId"}],
+            retry_policy={"max_retries": 2, "retry_interval_ms": 500, "retry_on_statuses": [502]},
+            created_by_id=self.owner.id,
+        )
+        websocket_case = WebSocketTestCase(
+            id=307,
+            project_id=10,
+            environment_id=107,
+            name="WS assertion patch case",
+            description="preserve ws fields",
+            path="/ws/business",
+            headers={"Authorization": "Bearer {{Lingxi-Auth}}"},
+            subprotocols=["json"],
+            messages=[{"type": "json", "data": {"subscribe": "company"}}],
+            receive_count=2,
+            connect_timeout_ms=3000,
+            receive_timeout_ms=4000,
+            assertions=[{"type": "message_count", "expected": 2, "message_index": 0, "path": None}],
+            extractors=[{"name": "event_id", "message_index": 0, "path": "data.id"}],
+            retry_policy={"max_retries": 1, "retry_interval_ms": 250, "retry_on_statuses": []},
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, http_case, websocket_case])
+        self.db.commit()
+
+        backend = AgentToolBackend(self.db)
+        http_result = backend.execute(
+            tool_name="testcase.update_assertions",
+            payload={
+                "project_id": 10,
+                "test_case_id": 207,
+                "assertions": [
+                    {"type": "status_code", "expected": 200},
+                    {"type": "json_equals", "path": "code", "expected": 200},
+                ],
+            },
+            current_user=self.owner,
+        )
+        ws_result = backend.execute(
+            tool_name="websocket_testcase.update_assertions",
+            payload={
+                "project_id": 10,
+                "test_case_id": 307,
+                "assertions": [
+                    {"type": "message_count", "expected": 1, "message_index": 0},
+                    {"type": "message_json_equals", "path": "code", "expected": 200, "message_index": 0},
+                ],
+            },
+            current_user=self.owner,
+        )
+
+        refreshed_http = self.db.get(TestCase, 207)
+        refreshed_ws = self.db.get(WebSocketTestCase, 307)
+        self.assertEqual(http_result["operation"], "update_assertions")
+        self.assertEqual(ws_result["operation"], "update_assertions")
+        self.assertEqual(refreshed_http.assertions[0]["expected"], 200)
+        self.assertEqual(refreshed_http.assertions[1]["path"], "code")
+        self.assertEqual(refreshed_http.headers, {"Authorization": "Bearer {{Lingxi-Auth}}", "X-Keep": "yes"})
+        self.assertEqual(refreshed_http.query_params, {"page": 1})
+        self.assertEqual(refreshed_http.body, {"keyword": "acme"})
+        self.assertEqual(refreshed_http.extractors, [{"name": "company_id", "path": "data.dataList.0.companyId"}])
+        self.assertEqual(refreshed_http.retry_policy, {"max_retries": 2, "retry_interval_ms": 500, "retry_on_statuses": [502]})
+        self.assertEqual(refreshed_ws.assertions[0]["expected"], 1)
+        self.assertEqual(refreshed_ws.assertions[1]["type"], "message_json_equals")
+        self.assertEqual(refreshed_ws.headers, {"Authorization": "Bearer {{Lingxi-Auth}}"})
+        self.assertEqual(refreshed_ws.subprotocols, ["json"])
+        self.assertEqual(refreshed_ws.messages, [{"type": "json", "data": {"subscribe": "company"}}])
+        self.assertEqual(refreshed_ws.connect_timeout_ms, 3000)
+        self.assertEqual(refreshed_ws.receive_timeout_ms, 4000)
+        self.assertEqual(refreshed_ws.extractors, [{"name": "event_id", "message_index": 0, "path": "data.id"}])
+        self.assertEqual(refreshed_ws.retry_policy, {"max_retries": 1, "retry_interval_ms": 250, "retry_on_statuses": []})
+
+    def test_agent_testcase_save_tool_handlers_create_and_update_saved_cases(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+        from app.models.websocket_test_case import WebSocketTestCase
+        from app.services.agent_tool_service import AgentToolBackend
+
+        environment = ProjectEnvironment(
+            id=105,
+            project_id=10,
+            name="agent save env",
+            base_url="https://api.example.test",
+            description="agent save env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        self.db.add(environment)
+        self.db.commit()
+
+        backend = AgentToolBackend(self.db)
+        http_created = backend.execute(
+            tool_name="testcase.create_saved",
+            payload={
+                "project_id": 10,
+                "case": {
+                    "environment_id": 105,
+                    "environment_ids": [105],
+                    "name": "AI saved HTTP case",
+                    "description": "created by approved Agent tool",
+                    "method": "GET",
+                    "path": "/ai/saved",
+                    "headers": {},
+                    "query_params": {},
+                    "body_type": "none",
+                    "body": None,
+                    "assertions": [],
+                    "extractors": [],
+                    "retry_policy": {"max_retries": 0, "retry_interval_ms": 1000, "retry_on_statuses": []},
+                },
+            },
+            current_user=self.owner,
+        )
+        http_id = http_created["test_case"]["id"]
+        http_updated = backend.execute(
+            tool_name="testcase.update_saved",
+            payload={
+                "project_id": 10,
+                "test_case_id": http_id,
+                "case": {
+                    "environment_id": 105,
+                    "environment_ids": [105],
+                    "name": "AI updated HTTP case",
+                    "description": "updated by approved Agent tool",
+                    "method": "POST",
+                    "path": "/ai/updated",
+                    "headers": {"X-Agent": "true"},
+                    "query_params": {},
+                    "body_type": "json",
+                    "body": {"ok": True},
+                    "assertions": [],
+                    "extractors": [],
+                    "retry_policy": {"max_retries": 0, "retry_interval_ms": 1000, "retry_on_statuses": []},
+                },
+            },
+            current_user=self.owner,
+        )
+        ws_created = backend.execute(
+            tool_name="websocket_testcase.create_saved",
+            payload={
+                "project_id": 10,
+                "case": {
+                    "environment_id": 105,
+                    "environment_ids": [105],
+                    "name": "AI saved WS case",
+                    "description": "created by approved Agent tool",
+                    "path": "/ws/ai",
+                    "headers": {},
+                    "subprotocols": [],
+                    "messages": [],
+                    "receive_count": 0,
+                    "connect_timeout_ms": 1000,
+                    "receive_timeout_ms": 1000,
+                    "assertions": [],
+                    "extractors": [],
+                    "retry_policy": {"max_retries": 0, "retry_interval_ms": 1000, "retry_on_statuses": []},
+                },
+            },
+            current_user=self.owner,
+        )
+        ws_id = ws_created["websocket_test_case"]["id"]
+        ws_updated = backend.execute(
+            tool_name="websocket_testcase.update_saved",
+            payload={
+                "project_id": 10,
+                "test_case_id": ws_id,
+                "case": {
+                    "environment_id": 105,
+                    "environment_ids": [105],
+                    "name": "AI updated WS case",
+                    "description": "updated by approved Agent tool",
+                    "path": "/ws/updated",
+                    "headers": {"X-Agent": "true"},
+                    "subprotocols": ["json"],
+                    "messages": [{"type": "json", "data": {"ping": True}}],
+                    "receive_count": 1,
+                    "connect_timeout_ms": 1000,
+                    "receive_timeout_ms": 1000,
+                    "assertions": [],
+                    "extractors": [],
+                    "retry_policy": {"max_retries": 0, "retry_interval_ms": 1000, "retry_on_statuses": []},
+                },
+            },
+            current_user=self.owner,
+        )
+
+        self.assertEqual(http_created["operation"], "create_saved")
+        self.assertEqual(http_updated["operation"], "update_saved")
+        self.assertEqual(http_updated["test_case"]["name"], "AI updated HTTP case")
+        self.assertEqual(http_updated["test_case"]["method"], "POST")
+        self.assertEqual(ws_created["operation"], "create_saved")
+        self.assertEqual(ws_updated["operation"], "update_saved")
+        self.assertEqual(ws_updated["websocket_test_case"]["name"], "AI updated WS case")
+        self.assertEqual(ws_updated["websocket_test_case"]["subprotocols"], ["json"])
+        self.assertEqual(self.db.get(TestCase, http_id).name, "AI updated HTTP case")
+        self.assertEqual(self.db.get(WebSocketTestCase, ws_id).name, "AI updated WS case")
+
+    def test_conversation_runner_blocks_testcase_save_tool_until_approved(self):
+        from app.core.permissions import ProjectPermission
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+
+        environment = ProjectEnvironment(
+            id=106,
+            project_id=10,
+            name="agent approval env",
+            base_url="https://api.example.test",
+            description="agent approval env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        self.db.add(environment)
+        self.db.commit()
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="保存一个 HTTP 测试用例", max_iterations=1),
+            current_user=self.owner,
+        )
+        tool_request = {
+            "tool_name": "testcase.create_saved",
+            "input": {
+                "project_id": 10,
+                "case": {
+                    "environment_id": 106,
+                    "environment_ids": [106],
+                    "name": "Approval gated HTTP case",
+                    "description": "must not persist before approval",
+                    "method": "GET",
+                    "path": "/approval/gated",
+                    "headers": {},
+                    "query_params": {},
+                    "body_type": "none",
+                    "body": None,
+                    "assertions": [],
+                    "extractors": [],
+                    "retry_policy": {"max_retries": 0, "retry_interval_ms": 1000, "retry_on_statuses": []},
+                },
+            },
+            "reason": "User asked Agent to save a test case",
+            "evidence_refs": [],
+        }
+        stream_events = [
+            {"type": "delta", "content": "```agent_tool_request\n" + json.dumps(tool_request) + "\n```"},
+            {"type": "done", "finish_reason": "stop", "model": "deepseek-test"},
+        ]
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", return_value=iter(stream_events)):
+            blocked = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.run_id))
+        approval = self.db.scalar(select(AgentApproval).where(AgentApproval.run_id == run.run_id))
+        saved_count = self.db.scalar(
+            select(func.count()).select_from(TestCase).where(TestCase.name == "Approval gated HTTP case")
+        )
+        queued = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+
+        self.assertEqual(blocked.status, "needs_human")
+        self.assertEqual(blocked.blocking_tool_call_ids_json, [call.tool_call_id])
+        self.assertEqual(call.tool_name, "testcase.create_saved")
+        self.assertEqual(call.status, "planned")
+        self.assertTrue(call.approval_required)
+        self.assertEqual(call.resolved_side_effect_class, "business_update")
+        self.assertIsNone(call.approved_approval_id)
+        self.assertEqual(approval.approval_status, "pending")
+        self.assertEqual(approval.required_permissions_json, [ProjectPermission.MANAGE_CASE.value])
+        self.assertEqual(saved_count, 0)
+        self.assertIsNone(queued)
+
+    def test_agent_query_project_cases_returns_explicit_case_id_lists(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+        from app.models.websocket_test_case import WebSocketTestCase
+        from app.services.agent_tool_service import AgentToolBackend
+
+        environment = ProjectEnvironment(
+            id=104,
+            project_id=10,
+            name="agent query env",
+            base_url="https://api.example.test",
+            description="agent query env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        http_case_1 = TestCase(
+            id=204,
+            project_id=10,
+            environment_id=104,
+            name="HTTP Query Case 1",
+            description="case",
+            method="GET",
+            path="/health",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        http_case_2 = TestCase(
+            id=205,
+            project_id=10,
+            environment_id=104,
+            name="HTTP Query Case 2",
+            description="case",
+            method="GET",
+            path="/ready",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        ws_case = WebSocketTestCase(
+            id=304,
+            project_id=10,
+            environment_id=104,
+            name="WS Query Case",
+            description="case",
+            path="/ws",
+            headers={},
+            subprotocols=[],
+            messages=[],
+            receive_count=0,
+            connect_timeout_ms=1000,
+            receive_timeout_ms=1000,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, http_case_1, http_case_2, ws_case])
+        self.db.commit()
+
+        result = AgentToolBackend(self.db).execute(
+            tool_name="testcase.query_project_cases",
+            payload={"project_id": 10, "environment_id": 104, "include_websocket": True},
+            current_user=self.owner,
+        )
+
+        self.assertEqual(result["http_test_case_ids"], [204, 205])
+        self.assertEqual(result["websocket_test_case_ids"], [304])
+        self.assertEqual(
+            result["http_batch_execute_input"],
+            {"project_id": 10, "environment_id": 104, "test_case_ids": [204, 205]},
+        )
+        self.assertEqual(
+            result["websocket_batch_execute_input"],
+            {"project_id": 10, "environment_id": 104, "websocket_test_case_ids": [304]},
+        )
+
+    def test_agent_batch_execute_prevalidates_ids_without_partial_execution_records(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase, TestCaseExecution
+        from app.models.websocket_test_case import WebSocketTestCase, WebSocketTestCaseExecution
+        from app.services.agent_tool_service import AgentToolBackend
+
+        environment = ProjectEnvironment(
+            id=105,
+            project_id=10,
+            name="agent batch prevalidate env",
+            base_url="https://api.example.test",
+            description="agent batch prevalidate env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        http_case = TestCase(
+            id=206,
+            project_id=10,
+            environment_id=105,
+            name="HTTP Batch Case",
+            description="case",
+            method="GET",
+            path="/health",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        ws_case = WebSocketTestCase(
+            id=305,
+            project_id=10,
+            environment_id=105,
+            name="WS Batch Case",
+            description="case",
+            path="/ws",
+            headers={},
+            subprotocols=[],
+            messages=[],
+            receive_count=0,
+            connect_timeout_ms=1000,
+            receive_timeout_ms=1000,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, http_case, ws_case])
+        self.db.commit()
+
+        backend = AgentToolBackend(self.db)
+        with self.assertRaises(HTTPException) as http_ctx:
+            backend.execute(
+                tool_name="testcase.batch_execute",
+                payload={
+                    "project_id": 10,
+                    "test_case_ids": [206, 999206],
+                    "environment_id": 105,
+                    "_agent_run_id": "agent-run-prevalidate",
+                    "_agent_tool_call_id": "tool-call-http-prevalidate",
+                },
+                current_user=self.owner,
+            )
+        with self.assertRaises(HTTPException) as ws_ctx:
+            backend.execute(
+                tool_name="websocket_testcase.batch_execute",
+                payload={
+                    "project_id": 10,
+                    "websocket_test_case_ids": [305, 999305],
+                    "environment_id": 105,
+                    "_agent_run_id": "agent-run-prevalidate",
+                    "_agent_tool_call_id": "tool-call-ws-prevalidate",
+                },
+                current_user=self.owner,
+            )
+
+        self.assertEqual(http_ctx.exception.status_code, 422)
+        self.assertEqual(http_ctx.exception.detail["invalid_test_case_ids"], [999206])
+        self.assertEqual(
+            http_ctx.exception.detail["retry_batch_execute_input"],
+            {"project_id": 10, "environment_id": 105, "test_case_ids": [206]},
+        )
+        self.assertEqual(ws_ctx.exception.status_code, 422)
+        self.assertEqual(ws_ctx.exception.detail["invalid_websocket_test_case_ids"], [999305])
+        self.assertEqual(
+            ws_ctx.exception.detail["retry_batch_execute_input"],
+            {"project_id": 10, "environment_id": 105, "websocket_test_case_ids": [305]},
+        )
+        self.assertEqual(
+            self.db.scalar(
+                select(func.count())
+                .select_from(TestCaseExecution)
+                .where(TestCaseExecution.agent_run_id == "agent-run-prevalidate")
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.db.scalar(
+                select(func.count())
+                .select_from(WebSocketTestCaseExecution)
+                .where(WebSocketTestCaseExecution.agent_run_id == "agent-run-prevalidate")
+            ),
+            0,
+        )
+
+    def test_manual_testcase_execution_records_keep_manual_business_source(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+        from app.models.websocket_test_case import WebSocketTestCase
+        from app.services.test_case_service import TestCaseService
+        from app.services.websocket_test_case_service import WebSocketTestCaseService
+
+        environment = ProjectEnvironment(
+            id=102,
+            project_id=10,
+            name="manual execution env",
+            base_url="https://api.example.test",
+            description="manual execution env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        http_case = TestCase(
+            id=203,
+            project_id=10,
+            environment_id=102,
+            name="Manual HTTP Case",
+            description="case",
+            method="GET",
+            path="/health",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        ws_case = WebSocketTestCase(
+            id=303,
+            project_id=10,
+            environment_id=102,
+            name="Manual WS Case",
+            description="case",
+            path="/ws",
+            headers={},
+            subprotocols=[],
+            messages=[],
+            receive_count=0,
+            connect_timeout_ms=1000,
+            receive_timeout_ms=1000,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, http_case, ws_case])
+        self.db.commit()
+
+        http_execution = TestCaseService(self.db).enqueue_saved_case(
+            project_id=10,
+            test_case_id=203,
+            environment_id=102,
+            current_user=self.owner,
+        )
+        ws_execution = WebSocketTestCaseService(self.db).enqueue_saved_case(
+            project_id=10,
+            test_case_id=303,
+            environment_id=102,
+            current_user=self.owner,
+        )
+
+        self.assertEqual(http_execution.trigger_source, "manual")
+        self.assertIsNone(http_execution.agent_run_id)
+        self.assertIsNone(http_execution.agent_tool_call_id)
+        self.assertIsNone(http_execution.trigger_tool_name)
+        self.assertEqual(ws_execution.trigger_source, "manual")
+        self.assertIsNone(ws_execution.agent_run_id)
+        self.assertIsNone(ws_execution.agent_tool_call_id)
+        self.assertIsNone(ws_execution.trigger_tool_name)
 
     def test_report_read_summary_tool_returns_recent_report_context(self):
         from app.models.test_plan import TestPlanRun
@@ -2438,6 +4293,66 @@ class AgentRuntimeTests(unittest.TestCase):
             for item in events_after_cancel
         ))
 
+    def test_conversation_runner_does_not_resample_after_cancel_during_tool_execution(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="工具执行期间取消后不要继续模型调用",
+                max_iterations=2,
+            ),
+            current_user=self.owner,
+        )
+        stream_call_count = {"value": 0}
+
+        def fake_stream(self, payload):
+            _ = self, payload
+            stream_call_count["value"] += 1
+            if stream_call_count["value"] == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{},"reason":"读取项目","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "不应在取消后继续总结。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def cancel_during_tool(self, *, call, current_user):
+            AgentRuntimeService(self.db).cancel_run(run_id=call.run_id, current_user=current_user)
+            return {"project": {"id": 10, "name": "TestAuto"}}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch("app.services.agent_runtime_service.AgentToolRuntime.execute", new=cancel_during_tool),
+        ):
+            cancelled = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.run_id))
+        event_types = [item.event_type for item in events]
+        cancelled_index = event_types.index("run.cancelled")
+        events_after_cancel = events[cancelled_index + 1:]
+
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertEqual(call.status, "obsolete")
+        self.assertEqual(call.error_code, "agent_run_cancelled_during_tool_execution")
+        self.assertEqual(call.recovery_decision, "run_cancelled_before_tool_completion")
+        self.assertEqual(stream_call_count["value"], 1)
+        self.assertNotIn("run.completed", [item.event_type for item in events_after_cancel])
+        self.assertNotIn("tool.completed", [item.event_type for item in events_after_cancel])
+        self.assertFalse(any(
+            item.event_type == "model.started" and item.payload_json.get("iteration") == 1
+            for item in events_after_cancel
+        ))
+
     def test_conversation_runner_records_max_iteration_observation_before_final_summary(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(
@@ -2681,6 +4596,70 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("格式无效", captured_messages[1][-1].content)
         self.assertIn("工具执行结果如下", captured_messages[2][-1].content)
 
+    def test_conversation_runner_does_not_continue_after_cancel_during_invalid_tool_repair_parse(self):
+        from app.services.agent_runtime_service import AgentToolRequest
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="读取项目上下文后再回答"),
+            current_user=self.owner,
+        )
+        parse_calls = {"value": 0}
+        self_db = self.db
+        owner = self.owner
+
+        def fake_stream(self, payload):
+            _ = self, payload
+            if parse_calls["value"] == 0:
+                yield {"type": "delta", "content": "bad tool request"}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {
+                "type": "delta",
+                "content": (
+                    "```agent_tool_request\n"
+                    '{"tool_name":"project.read_context","input":{},"reason":"需要项目上下文","evidence_refs":[]}'
+                    "\n```"
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def cancel_during_repaired_parse(self, content, **kwargs):
+            _ = self, content, kwargs
+            parse_calls["value"] += 1
+            if parse_calls["value"] == 1:
+                raise HTTPException(status_code=422, detail="格式无效")
+            AgentRuntimeService(self_db).cancel_run(run_id=run.run_id, current_user=owner)
+            return AgentToolRequest(
+                tool_name="project.read_context",
+                tool_input={},
+                reason="需要项目上下文",
+                evidence_refs=(),
+            )
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch.object(AgentConversationRunner, "_parse_tool_request", new=cancel_during_repaired_parse),
+        ):
+            cancelled = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        cancelled_index = event_types.index("run.cancelled")
+        events_after_cancel = event_types[cancelled_index + 1:]
+        calls = list(self.db.scalars(select(AgentToolCall).where(AgentToolCall.run_id == run.run_id)).all())
+
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertIn("model.tool_request_invalid", event_types)
+        self.assertNotIn("model.tool_request_repaired", events_after_cancel)
+        self.assertNotIn("model.completed", events_after_cancel)
+        self.assertNotIn("model.tool_request_detected", events_after_cancel)
+        self.assertNotIn("run.completed", events_after_cancel)
+        self.assertEqual(calls, [])
+
     def test_conversation_runner_bounds_invalid_tool_request_repair_context(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="读取项目上下文后再回答"),
@@ -2764,6 +4743,7 @@ class AgentRuntimeTests(unittest.TestCase):
             raise result
 
         with (
+            self.assertLogs("app.services.agent_runtime_service", level="WARNING"),
             patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
             patch.object(AgentConversationRunner, "_parse_tool_request", new=fake_parse),
         ):
@@ -2800,6 +4780,128 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn(repair_tail, repair_failed_message)
         self.assertNotIn(invalid_tail, captured_messages[1][-1].content)
         self.assertEqual(observation.observation_json["error_message"], invalid_message)
+
+    def test_invalid_tool_request_content_preview_is_bounded(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="读取项目上下文后再回答"),
+            current_user=self.owner,
+        )
+        hidden_tail = "INVALID_TOOL_REQUEST_CONTENT_SECRET_TAIL"
+        invalid_content = f"bad tool request content {'x' * 900}{hidden_tail}"
+        captured_messages = []
+        original_parse = AgentConversationRunner._parse_tool_request
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {"type": "delta", "content": invalid_content}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {
+                "type": "delta",
+                "content": (
+                    "```agent_tool_request\n"
+                    '{"tool_name":"project.read_context","input":{},"reason":"读取项目","evidence_refs":[]}'
+                    "\n```"
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def fake_parse(self, content, **kwargs):
+            if content == invalid_content:
+                raise HTTPException(status_code=422, detail="模型工具请求格式错误")
+            return original_parse(self, content, **kwargs)
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch.object(AgentConversationRunner, "_parse_tool_request", new=fake_parse),
+            patch(
+                "app.services.agent_runtime_service.AgentToolBackend.execute",
+                return_value={"project": {"id": 10, "name": "TestAuto"}},
+            ),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        invalid_event = next(item for item in events if item.event_type == "model.tool_request_invalid")
+        observation = self.db.scalar(
+            select(AgentLoopObservation).where(AgentLoopObservation.run_id == run.run_id)
+        )
+        event_preview = invalid_event.payload_json["content_preview"]
+        observation_preview = observation.observation_json["content_preview"]
+
+        self.assertEqual(completed.status, "completed")
+        for preview in (event_preview, observation_preview):
+            self.assertIn("agent_content_preview_truncated", preview)
+            self.assertIn("content_summary_version=agent_content_preview_summary_v1", preview)
+            self.assertIn("content_hash=", preview)
+            self.assertIn("content_size_chars=", preview)
+            self.assertNotIn(hidden_tail, preview)
+        self.assertIn(
+            "full_content_reference=AgentConversationRunner.model.tool_request_invalid.content",
+            event_preview,
+        )
+        self.assertIn(
+            "full_content_reference=AgentConversationRunner.loop_observation.tool_request_invalid.content",
+            observation_preview,
+        )
+
+    def test_tool_request_repair_failed_content_preview_is_bounded(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="读取项目上下文后再回答"),
+            current_user=self.owner,
+        )
+        hidden_tail = "TOOL_REQUEST_REPAIR_FAILED_CONTENT_SECRET_TAIL"
+        repaired_content = f"still invalid tool request {'y' * 900}{hidden_tail}"
+        parse_results = [
+            HTTPException(status_code=422, detail="模型工具请求格式错误"),
+            HTTPException(status_code=422, detail="修复后的工具请求仍然格式错误"),
+        ]
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {"type": "delta", "content": "bad tool request"}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": repaired_content}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def fake_parse(self, content, **kwargs):
+            _ = content, kwargs
+            result = parse_results.pop(0)
+            raise result
+
+        with (
+            self.assertLogs("app.services.agent_runtime_service", level="WARNING"),
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch.object(AgentConversationRunner, "_parse_tool_request", new=fake_parse),
+        ):
+            failed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        repair_failed_event = next(item for item in events if item.event_type == "model.tool_request_repair_failed")
+        preview = repair_failed_event.payload_json["content_preview"]
+
+        self.assertEqual(failed.status, "failed")
+        self.assertIn("agent_content_preview_truncated", preview)
+        self.assertIn("content_summary_version=agent_content_preview_summary_v1", preview)
+        self.assertIn("content_hash=", preview)
+        self.assertIn("content_size_chars=", preview)
+        self.assertIn(
+            "full_content_reference=AgentConversationRunner.model.tool_request_repair_failed.content",
+            preview,
+        )
+        self.assertNotIn(hidden_tail, preview)
 
     def test_conversation_runner_salvages_mixed_tool_block_without_extra_repair_call(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -2918,11 +5020,67 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(retraction.payload_json["content"], "")
         self.assertTrue(retraction.payload_json["replace_content"])
         self.assertEqual(retraction.payload_json["model_call_id"], visible_preamble.payload_json["model_call_id"])
+        self.assertEqual(
+            retraction.payload_json["model_response_item_id"],
+            visible_preamble.payload_json["model_response_item_id"],
+        )
         self.assertLess(visible_preamble.event_seq, retraction.event_seq)
         self.assertLess(
             retraction.event_seq,
             next(item.event_seq for item in events if item.event_type == "model.tool_request_detected"),
         )
+
+    def test_conversation_runner_does_not_append_tool_request_suppressed_after_cancel(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="Read project context before answering"),
+            current_user=self.owner,
+        )
+        self_db = self.db
+        owner = self.owner
+        original_append_event = AgentRuntimeService.append_event
+
+        def fake_stream(_self, _payload):
+            yield {"type": "delta", "content": "I will inspect the project first.\n\n"}
+            yield {
+                "type": "delta",
+                "content": (
+                    "```agent_tool_request\n"
+                    '{"tool_name":"project.read_context","input":{},'
+                    '"reason":"Need project context","evidence_refs":[]}'
+                    "\n```"
+                ),
+            }
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def cancel_after_retraction(runtime_self, event_run, event_type, payload, *, commit=True):
+            event = original_append_event(runtime_self, event_run, event_type, payload, commit=commit)
+            if (
+                event_type == "model.markdown_normalized"
+                and payload.get("normalization_reason") == "tool_request_stream_suppressed"
+            ):
+                AgentRuntimeService(self_db).cancel_run(run_id=run.run_id, current_user=owner)
+            return event
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch.object(AgentRuntimeService, "append_event", new=cancel_after_retraction),
+        ):
+            cancelled = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        cancelled_index = event_types.index("run.cancelled")
+        events_after_cancel = event_types[cancelled_index + 1:]
+
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertIn("model.markdown_normalized", event_types)
+        self.assertNotIn("model.tool_request_stream_suppressed", events_after_cancel)
+        self.assertNotIn("model.tool_request_detected", events_after_cancel)
+        self.assertNotIn("run.completed", events_after_cancel)
 
     def test_conversation_runner_short_circuits_unsupported_scenario_save(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -2960,6 +5118,48 @@ class AgentRuntimeTests(unittest.TestCase):
         chat.assert_called_once()
         chat_stream.assert_not_called()
 
+    def test_conversation_runner_does_not_complete_unsupported_guard_after_cancel_during_classifier(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="把刚才的场景直接保存成正式场景，不要问我。",
+            ),
+            current_user=self.owner,
+        )
+        self_db = self.db
+        owner = self.owner
+
+        def cancel_during_classifier(_self, _payload):
+            AgentRuntimeService(self_db).cancel_run(run_id=run.run_id, current_user=owner)
+            return AIChatResponse(
+                provider="deepseek",
+                model="deepseek-test",
+                content='{"requires_scenario_persistence": true, "confidence": 0.98, "reason": "用户要求保存为正式场景"}',
+                finish_reason="stop",
+            )
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat", new=cancel_during_classifier),
+            patch("app.services.agent_runtime_service.AIService.chat_stream") as chat_stream,
+        ):
+            cancelled = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        cancelled_index = event_types.index("run.cancelled")
+        events_after_cancel = event_types[cancelled_index + 1:]
+
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertNotIn("model.started", events_after_cancel)
+        self.assertNotIn("model.delta", events_after_cancel)
+        self.assertNotIn("model.completed", events_after_cancel)
+        self.assertNotIn("run.completed", events_after_cancel)
+        chat_stream.assert_not_called()
+
     def test_conversation_runner_does_not_short_circuit_negated_scenario_save_intent(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(
@@ -2988,6 +5188,143 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(completed.status, "completed")
         self.assertNotEqual(completed.result_json.get("completion_source"), "unsupported_scenario_save_guard")
         self.assertEqual(completed.result_json["message"], "我会继续生成场景草稿，但不会保存正式场景。")
+        chat.assert_called_once()
+
+    def test_unsupported_capability_classifier_failure_log_is_bounded(self):
+        from app.services.agent_runtime_service import AGENT_ERROR_MESSAGE_TRUNCATION_MARKER
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="把刚才的场景直接保存成正式场景。",
+            ),
+            current_user=self.owner,
+        )
+        hidden_tail = "UNSUPPORTED_CLASSIFIER_SECRET_TAIL"
+        long_error = f"classifier provider failed: {'x' * 900}{hidden_tail}"
+
+        def fake_stream(self, payload):
+            yield {"type": "delta", "content": "我可以继续生成场景草稿，但不会保存正式场景。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            self.assertLogs("app.services.agent_runtime_service", level="WARNING") as captured_logs,
+            patch(
+                "app.services.agent_runtime_service.AIService.chat",
+                side_effect=HTTPException(status_code=503, detail=long_error),
+            ) as chat,
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertEqual(completed.status, "completed")
+        self.assertIn("agent_unsupported_capability_classification_failed", log_output)
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, log_output)
+        self.assertIn("error_summary_version=agent_error_message_summary_v1", log_output)
+        self.assertIn("error_hash=", log_output)
+        self.assertIn(
+            "full_error_reference=AgentConversationRunner.unsupported_capability_classifier",
+            log_output,
+        )
+        self.assertNotIn(hidden_tail, log_output)
+        chat.assert_called_once()
+
+    def test_unsupported_capability_classifier_invalid_json_log_is_bounded(self):
+        from app.services.agent_runtime_service import AGENT_ERROR_MESSAGE_TRUNCATION_MARKER
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="把刚才的场景直接保存成正式场景。",
+            ),
+            current_user=self.owner,
+        )
+        hidden_tail = "UNSUPPORTED_CLASSIFIER_INVALID_JSON_SECRET_TAIL"
+        classifier_response = AIChatResponse(
+            provider="deepseek",
+            model="deepseek-test",
+            content=f"not json classifier output {'x' * 900}{hidden_tail}",
+            finish_reason="stop",
+        )
+
+        def fake_stream(self, payload):
+            yield {"type": "delta", "content": "我可以继续生成场景草稿，但不会保存正式场景。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            self.assertLogs("app.services.agent_runtime_service", level="WARNING") as captured_logs,
+            patch(
+                "app.services.agent_runtime_service.AIService.chat",
+                return_value=classifier_response,
+            ) as chat,
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertEqual(completed.status, "completed")
+        self.assertIn("agent_unsupported_capability_classification_invalid_json", log_output)
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, log_output)
+        self.assertIn("error_summary_version=agent_error_message_summary_v1", log_output)
+        self.assertIn("error_hash=", log_output)
+        self.assertIn(
+            "full_error_reference=AgentConversationRunner.unsupported_capability_classifier.invalid_json",
+            log_output,
+        )
+        self.assertNotIn(hidden_tail, log_output)
+        chat.assert_called_once()
+
+    def test_unsupported_capability_classifier_reason_log_is_bounded(self):
+        from app.services.agent_runtime_service import AGENT_ERROR_MESSAGE_TRUNCATION_MARKER
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="把刚才的场景直接保存成正式场景。",
+            ),
+            current_user=self.owner,
+        )
+        hidden_tail = "UNSUPPORTED_CLASSIFIER_REASON_SECRET_TAIL"
+        classifier_response = AIChatResponse(
+            provider="deepseek",
+            model="deepseek-test",
+            content=json.dumps(
+                {
+                    "requires_scenario_persistence": False,
+                    "confidence": 0.12,
+                    "reason": f"classifier reason {'x' * 900}{hidden_tail}",
+                },
+                ensure_ascii=False,
+            ),
+            finish_reason="stop",
+        )
+
+        def fake_stream(self, payload):
+            yield {"type": "delta", "content": "我可以继续生成场景草稿，但不会保存正式场景。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            self.assertLogs("app.services.agent_runtime_service", level="INFO") as captured_logs,
+            patch(
+                "app.services.agent_runtime_service.AIService.chat",
+                return_value=classifier_response,
+            ) as chat,
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertEqual(completed.status, "completed")
+        self.assertIn("agent_unsupported_capability_classified", log_output)
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, log_output)
+        self.assertIn("error_summary_version=agent_error_message_summary_v1", log_output)
+        self.assertIn("error_hash=", log_output)
+        self.assertIn(
+            "full_error_reference=AgentConversationRunner.unsupported_capability_classifier.reason",
+            log_output,
+        )
+        self.assertNotIn(hidden_tail, log_output)
         chat.assert_called_once()
 
     def test_conversation_runner_suppresses_mixed_tool_request_stream_and_repairs(self):
@@ -3098,6 +5435,8 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         captured_messages = []
         test_case = self
+        hidden_tail = "REQUIRED_TOOL_MISSING_CONTENT_SECRET_TAIL"
+        missing_required_content = f"我已经分析完候选用例，企业列表可作为第一步。{'x' * 900}{hidden_tail}"
 
         def fake_stream(self, payload):
             captured_messages.append(payload.messages)
@@ -3114,7 +5453,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
                 return
             if len(captured_messages) == 2:
-                yield {"type": "delta", "content": "我已经分析完候选用例，企业列表可作为第一步。"}
+                yield {"type": "delta", "content": missing_required_content}
                 yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
                 return
             if len(captured_messages) == 3:
@@ -3187,6 +5526,22 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(observations[0].observation_json["source"], "required_tool_followup_guard")
         self.assertEqual(observations[0].observation_json["after_tool"], missing_event.payload_json["after_tool"])
         self.assertEqual(observations[0].observation_json["required_tool"], missing_event.payload_json["required_tool"])
+        missing_preview = missing_event.payload_json["content_preview"]
+        observation_preview = observations[0].observation_json["content_preview"]
+        for preview in (missing_preview, observation_preview):
+            self.assertIn("agent_content_preview_truncated", preview)
+            self.assertIn("content_summary_version=agent_content_preview_summary_v1", preview)
+            self.assertIn("content_hash=", preview)
+            self.assertIn("content_size_chars=", preview)
+            self.assertNotIn(hidden_tail, preview)
+        self.assertIn(
+            "full_content_reference=AgentConversationRunner.model.required_tool_missing.content",
+            missing_preview,
+        )
+        self.assertIn(
+            "full_content_reference=AgentConversationRunner.loop_observation.required_tool_missing.content",
+            observation_preview,
+        )
         repair_context = self.db.scalar(
             select(AgentContextBuild).where(
                 AgentContextBuild.context_build_id == observations[0].decision_context_build_id
@@ -3263,7 +5618,9 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         captured_messages = []
         hidden_tail = "REQUIRED_TOOL_REPAIR_SECRET_TAIL"
+        content_hidden_tail = "REQUIRED_TOOL_REPAIR_FAILED_CONTENT_SECRET_TAIL"
         long_error = f"required tool repair parse failed: {'z' * 900}{hidden_tail}"
+        repaired_content = f"still invalid required repair {'y' * 900}{content_hidden_tail}"
         original_parse = AgentConversationRunner._parse_tool_request
 
         def fake_stream(self, payload):
@@ -3284,11 +5641,11 @@ class AgentRuntimeTests(unittest.TestCase):
                 yield {"type": "delta", "content": "我已经分析完候选用例，企业列表可作为第一步。"}
                 yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
                 return
-            yield {"type": "delta", "content": "still invalid required repair"}
+            yield {"type": "delta", "content": repaired_content}
             yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
 
         def fake_parse(self, content, **kwargs):
-            if content == "still invalid required repair":
+            if content == repaired_content:
                 raise HTTPException(status_code=422, detail=long_error)
             return original_parse(self, content, **kwargs)
 
@@ -3306,6 +5663,7 @@ class AgentRuntimeTests(unittest.TestCase):
         event_types = [item.event_type for item in events]
         repair_failed = next(item for item in events if item.event_type == "model.required_tool_repair_failed")
         error_message = repair_failed.payload_json["error_message"]
+        content_preview = repair_failed.payload_json["content_preview"]
 
         self.assertEqual(failed.status, "failed")
         self.assertIn("model.required_tool_missing", event_types)
@@ -3318,6 +5676,83 @@ class AgentRuntimeTests(unittest.TestCase):
             error_message,
         )
         self.assertNotIn(hidden_tail, error_message)
+        self.assertIn("agent_content_preview_truncated", content_preview)
+        self.assertIn("content_summary_version=agent_content_preview_summary_v1", content_preview)
+        self.assertIn("content_hash=", content_preview)
+        self.assertIn("content_size_chars=", content_preview)
+        self.assertIn(
+            "full_content_reference=AgentConversationRunner.model.required_tool_repair_failed.content",
+            content_preview,
+        )
+        self.assertNotIn(content_hidden_tail, content_preview)
+
+    def test_conversation_runner_repairs_internal_tool_context_leak_before_completion(self):
+        from app.services.agent_runtime_service import AGENT_TOOL_REQUEST_CONTEXT_SUMMARY_VERSION
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="read project context before replying",
+                max_iterations=2,
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+        leak_content = (
+            "Previous model call requested a tool. "
+            f'{{"summary_version":"{AGENT_TOOL_REQUEST_CONTEXT_SUMMARY_VERSION}",'
+            '"tool_name":"project.read_context"}}'
+        )
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{"project_id":10},'
+                        '"reason":"read context","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 2:
+                yield {"type": "delta", "content": leak_content}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "Project context has been read."}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_runtime_service.AgentToolBackend.execute",
+                return_value={"project": {"id": 10, "name": "Agent Project"}},
+            ),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        completed_events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id, AgentEvent.event_type == "model.completed")
+            ).all()
+        )
+        visible_completed = [
+            item.payload_json.get("content", "")
+            for item in completed_events
+            if item.payload_json.get("requested_tool") is False
+        ]
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(completed.result_json["message"], "Project context has been read.")
+        self.assertNotIn(AGENT_TOOL_REQUEST_CONTEXT_SUMMARY_VERSION, completed.result_json["message"])
+        self.assertTrue(visible_completed)
+        self.assertTrue(all(AGENT_TOOL_REQUEST_CONTEXT_SUMMARY_VERSION not in content for content in visible_completed))
+        self.assertTrue(
+            any(item.event_type == "model.tool_request_invalid" for item in self.db.query(AgentEvent).all())
+        )
 
     def test_conversation_runner_retries_fixable_failed_compose_tool(self):
         from app.models.project import ProjectEnvironment
@@ -3577,10 +6012,257 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual([turn["run"]["run_id"] for turn in export_payload["turns"]], [first.run_id, second.run_id])
         self.assertGreaterEqual(len(export_payload["events_by_run_id"][first.run_id]), 2)
         self.assertEqual(export_payload["tool_calls_by_run_id"][first.run_id][0]["tool_call_id"], call.tool_call_id)
+        self.assertEqual(
+            export_payload["tool_calls_by_run_id"][first.run_id][0]["item_id"],
+            f"agent-tool-call://{first.run_id}/{call.tool_call_id}",
+        )
         self.assertEqual(export_payload["tool_calls_by_run_id"][first.run_id][0]["output_json_redacted"], call.output_json_redacted)
         self.assertEqual(export_payload["approvals_by_run_id"][first.run_id][0]["approval_id"], approval.approval_id)
-        self.assertEqual(export_payload["migration_blocks_by_run_id"][first.run_id][0]["block_id"], block.block_id)
+        self.assertEqual(
+            export_payload["approvals_by_run_id"][first.run_id][0]["item_id"],
+            f"agent-approval://{first.run_id}/{approval.approval_id}",
+        )
+        self.assertEqual(
+            export_payload["approvals_by_run_id"][first.run_id][0]["tool_call_item_id"],
+            f"agent-tool-call://{first.run_id}/{call.tool_call_id}",
+        )
+        migration_block_payload = export_payload["migration_blocks_by_run_id"][first.run_id][0]
+        self.assertEqual(migration_block_payload["block_id"], block.block_id)
+        self.assertEqual(
+            migration_block_payload["item_id"],
+            f"agent-migration-block://{first.run_id}/{block.block_id}",
+        )
+        self.assertEqual(
+            migration_block_payload["tool_call_item_id"],
+            f"agent-tool-call://{first.run_id}/{call.tool_call_id}",
+        )
         self.assertEqual(export_payload["derived_from"]["run_ids"], [first.run_id, second.run_id])
+
+    def test_conversation_transcript_and_export_index_context_compactions(self):
+        from app.api.v1.routers.agents import (
+            export_agent_conversation,
+            get_agent_conversation_transcript,
+        )
+
+        compaction_fields = getattr(
+            agent_runtime_service,
+            "AGENT_CONVERSATION_CONTEXT_COMPACTION_FIELDS",
+            None,
+        )
+        item_id_prefix = getattr(agent_runtime_service, "AGENT_CONTEXT_COMPACTION_ITEM_ID_PREFIX", None)
+        compaction_schema = getattr(agent_schema, "AgentConversationContextCompactionRead", None)
+
+        self.assertIsNotNone(compaction_fields)
+        self.assertIsNotNone(item_id_prefix)
+        self.assertIsNotNone(compaction_schema)
+        self.assertEqual(list(compaction_schema.model_fields), list(compaction_fields))
+
+        runtime = AgentRuntimeService(self.db)
+        conversation_id = "agent-conv-export-compaction-index"
+        for index in range(7):
+            previous = runtime.create_run(
+                payload=AgentRunCreateRequest(
+                    project_id=10,
+                    conversation_id=conversation_id,
+                    intent=f"indexed compaction previous intent {index} " + ("input detail " * 220),
+                ),
+                current_user=self.owner,
+            )
+            runtime.complete_run(
+                previous,
+                {
+                    "message": f"indexed compaction previous assistant {index} "
+                    + ("assistant detail " * 260),
+                    "assistant_visible": True,
+                },
+                commit=True,
+            )
+        current = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="current turn should expose context compaction index",
+            ),
+            current_user=self.owner,
+        )
+
+        def fake_stream(service_self, payload):
+            yield {"type": "delta", "content": "ok"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=current.run_id, user_id=self.owner.id)
+
+        transcript = get_agent_conversation_transcript(
+            conversation_id=conversation_id,
+            project_id=10,
+            db=self.db,
+            current_user=self.member,
+        )["data"]
+
+        self.assertEqual(list(AgentConversationTranscriptRead.model_fields), list(AGENT_CONVERSATION_TRANSCRIPT_FIELDS))
+        self.assertEqual(list(transcript), list(AGENT_CONVERSATION_TRANSCRIPT_FIELDS))
+        self.assertIn("context_compactions", transcript)
+        self.assertEqual(len(transcript["context_compactions"]), 1)
+        compaction = transcript["context_compactions"][0]
+        self.assertEqual(list(compaction), list(compaction_fields))
+        self.assertEqual(compaction["item_id"], f"{item_id_prefix}://{current.run_id}/{compaction['event_seq']}")
+        self.assertEqual(compaction["run_id"], current.run_id)
+        self.assertEqual(compaction["event_type"], agent_runtime_service.AGENT_HISTORY_CONTEXT_COMPACTION_EVENT)
+        self.assertEqual(compaction["payload_json"]["replacement_history"], "summary_plus_recent_turns")
+        self.assertEqual(compaction["payload_json"]["reference_context_item"], "not_persisted")
+        self.assertEqual(compaction["payload_json"]["original_run_count"], 7)
+        self.assertEqual(compaction["payload_json"]["compacted_run_count"], 3)
+        self.assertNotIn("token_budget", compaction["payload_json"])
+
+        export_payload = export_agent_conversation(
+            conversation_id=conversation_id,
+            project_id=10,
+            db=self.db,
+            current_user=self.member,
+        )["data"]
+
+        self.assertEqual(list(AgentConversationExportRead.model_fields), list(AGENT_CONVERSATION_EXPORT_FIELDS))
+        self.assertEqual(list(export_payload), list(AGENT_CONVERSATION_EXPORT_FIELDS))
+        self.assertEqual(export_payload["context_compactions"], transcript["context_compactions"])
+        self.assertEqual(
+            export_payload["derived_from"]["context_compactions"],
+            "ai_agent_events.context.history_compacted",
+        )
+
+    def test_run_event_snapshot_exposes_context_compaction_index_for_recovery(self):
+        from app.api.v1.routers.agents import get_agent_run_event_snapshot
+
+        compaction_fields = getattr(
+            agent_runtime_service,
+            "AGENT_CONVERSATION_CONTEXT_COMPACTION_FIELDS",
+            None,
+        )
+        item_id_prefix = getattr(agent_runtime_service, "AGENT_CONTEXT_COMPACTION_ITEM_ID_PREFIX", None)
+        self.assertIsNotNone(compaction_fields)
+        self.assertIsNotNone(item_id_prefix)
+
+        runtime = AgentRuntimeService(self.db)
+        conversation_id = "agent-conv-snapshot-compaction-index"
+        for index in range(7):
+            previous = runtime.create_run(
+                payload=AgentRunCreateRequest(
+                    project_id=10,
+                    conversation_id=conversation_id,
+                    intent=f"snapshot compaction previous intent {index} " + ("input detail " * 220),
+                ),
+                current_user=self.owner,
+            )
+            runtime.complete_run(
+                previous,
+                {
+                    "message": f"snapshot compaction previous assistant {index} "
+                    + ("assistant detail " * 260),
+                    "assistant_visible": True,
+                },
+                commit=True,
+            )
+        current = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="current turn should expose snapshot compaction index",
+            ),
+            current_user=self.owner,
+        )
+
+        def fake_stream(service_self, payload):
+            yield {"type": "delta", "content": "ok"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=current.run_id, user_id=self.owner.id)
+        self.db.refresh(current)
+
+        snapshot = get_agent_run_event_snapshot(
+            run_id=current.run_id,
+            after_sequence=current.last_event_sequence,
+            limit=1,
+            db=self.db,
+            current_user=self.member,
+        )["data"]
+
+        self.assertEqual(snapshot["events"], [])
+        self.assertIn("context_compactions", snapshot)
+        self.assertEqual(len(snapshot["context_compactions"]), 1)
+        compaction = snapshot["context_compactions"][0]
+        self.assertEqual(list(compaction), list(compaction_fields))
+        self.assertEqual(compaction["item_id"], f"{item_id_prefix}://{current.run_id}/{compaction['event_seq']}")
+        self.assertEqual(compaction["run_id"], current.run_id)
+        self.assertEqual(compaction["event_type"], agent_runtime_service.AGENT_HISTORY_CONTEXT_COMPACTION_EVENT)
+        self.assertEqual(compaction["payload_json"]["replacement_history"], "summary_plus_recent_turns")
+        self.assertEqual(compaction["payload_json"]["reference_context_item"], "not_persisted")
+        self.assertNotIn("token_budget", compaction["payload_json"])
+
+    def test_history_compaction_events_include_conversation_window_chain(self):
+        runtime = AgentRuntimeService(self.db)
+        conversation_id = "agent-conv-compaction-window-chain"
+        for index in range(7):
+            previous = runtime.create_run(
+                payload=AgentRunCreateRequest(
+                    project_id=10,
+                    conversation_id=conversation_id,
+                    intent=f"window chain previous intent {index} " + ("input detail " * 220),
+                ),
+                current_user=self.owner,
+            )
+            runtime.complete_run(
+                previous,
+                {
+                    "message": f"window chain previous assistant {index} "
+                    + ("assistant detail " * 260),
+                    "assistant_visible": True,
+                },
+                commit=True,
+            )
+        current = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="current turn should chain repeated compaction windows",
+            ),
+            current_user=self.owner,
+        )
+        runner = AgentConversationRunner(self.db)
+
+        runner._build_chat_messages(current, current_user=self.owner, runtime=runtime)
+        runner._build_chat_messages(current, current_user=self.owner, runtime=runtime)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent)
+                .where(
+                    AgentEvent.run_id == current.run_id,
+                    AgentEvent.event_type == agent_runtime_service.AGENT_HISTORY_CONTEXT_COMPACTION_EVENT,
+                )
+                .order_by(AgentEvent.event_seq.asc())
+            ).all()
+        )
+        self.assertEqual(len(events), 2)
+        first_payload = events[0].payload_json
+        second_payload = events[1].payload_json
+
+        self.assertEqual(first_payload["window_number"], 1)
+        self.assertEqual(first_payload["first_window_id"], first_payload["window_id"])
+        self.assertIsNone(first_payload["previous_window_id"])
+        self.assertTrue(first_payload["window_id"].startswith("agent-window://"))
+        self.assertEqual(second_payload["window_number"], 2)
+        self.assertEqual(second_payload["first_window_id"], first_payload["first_window_id"])
+        self.assertEqual(second_payload["previous_window_id"], first_payload["window_id"])
+        self.assertNotEqual(second_payload["window_id"], first_payload["window_id"])
+
+        checkpoint = self.db.get(AgentCheckpoint, current.last_checkpoint_id)
+        self.assertIsNotNone(checkpoint)
+        self.assertEqual(
+            checkpoint.context_compaction_object_key,
+            f"{agent_runtime_service.AGENT_CONTEXT_COMPACTION_OBJECT_KEY_PREFIX}://"
+            f"{current.run_id}/{events[-1].event_seq}",
+        )
 
     def test_conversation_transcript_requires_project_access(self):
         outsider = User(
@@ -3642,14 +6324,18 @@ class AgentRuntimeTests(unittest.TestCase):
         )["data"]
         get_payload = get_agent_run(run_id=created_payload["run_id"], db=self.db, current_user=self.member)["data"]
         cancel_payload = cancel_agent_run(run_id=created_payload["run_id"], db=self.db, current_user=self.owner)["data"]
+        run_item_id_prefix = getattr(agent_runtime_service, "AGENT_RUN_ITEM_ID_PREFIX", None)
+        self.assertEqual(run_item_id_prefix, "agent-run")
 
         self.assertEqual(len(documented_payload_contracts), 2)
         for contract in documented_payload_contracts:
             self.assertEqual(contract["fields"], list(AGENT_RUN_FIELDS))
+            self.assertEqual(contract["run_item_prefix"], "agent-run")
             self.assertEqual(contract["source"], "AgentRunRead")
         self.assertEqual(list(AgentRunRead.model_fields), list(AGENT_RUN_FIELDS))
         for payload in (created_payload, get_payload, cancel_payload):
             self.assertEqual(list(payload), list(AGENT_RUN_FIELDS))
+            self.assertEqual(payload["item_id"], f"{run_item_id_prefix}://{payload['run_id']}")
             self.assertEqual(payload["project_id"], 10)
             self.assertEqual(payload["intent"], "run payload contract")
             self.assertTrue(payload["runtime_snapshot_id"].startswith("agent-snap-"))
@@ -3694,19 +6380,71 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(len(documented_payload_contracts), 2)
         for contract in documented_payload_contracts:
             self.assertEqual(contract["fields"], list(AGENT_RUN_SUMMARY_FIELDS))
+            self.assertEqual(contract["blocking_tool_call_ids"], "stable_ordered_deduplicated")
             self.assertEqual(contract["source"], "AgentRunSummaryRead")
         self.assertEqual(list(AgentRunSummaryRead.model_fields), list(AGENT_RUN_SUMMARY_FIELDS))
         self.assertEqual(list(payload), list(AGENT_RUN_SUMMARY_FIELDS))
         self.assertEqual(payload["run"]["run_id"], run.run_id)
+        self.assertEqual(payload["run"]["item_id"], f"agent-run://{run.run_id}")
         self.assertEqual(payload["event_count"], 2)
         self.assertEqual(payload["latest_event_types"], ["run.queued", "run.started"])
         self.assertFalse(payload["terminal"])
         self.assertTrue(payload["can_cancel"])
 
+    def test_harness_agent_run_resume_payload_contract_matches_route_and_service(self):
+        from pathlib import Path
+        import re
+
+        from app.api.v1.routers.agents import resume_agent_run
+
+        def _parse_payload_contract(text: str) -> dict[str, list[str] | str]:
+            section = text[text.index("Required Agent Run resume payload contract:"):]
+            block = re.search(r"```text\n(.*?)\n```", section, re.S)
+            self.assertIsNotNone(block)
+            parsed: dict[str, list[str] | str] = {}
+            for line in block.group(1).splitlines():
+                if not line.strip():
+                    continue
+                key, value = line.strip().split("=", 1)
+                if "," in value:
+                    parsed[key] = value.split(",")
+                else:
+                    parsed[key] = value
+            return parsed
+
+        docs_dir = Path(__file__).resolve().parents[1] / "docs"
+        documented_payload_contracts = [
+            _parse_payload_contract(path.read_text(encoding="utf-8"))
+            for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
+            if "Required Agent Run resume payload contract:" in path.read_text(encoding="utf-8")
+        ]
+        run = self._create_run("resume payload contract")
+        AgentRuntimeService(self.db).complete_run(run, {"message": "done"})
+
+        route_payload = resume_agent_run(run_id=run.run_id, db=self.db, current_user=self.owner)["data"]
+        service_payload = AgentRunResumeService(self.db).resume_run(run_id=run.run_id, current_user=self.owner)
+
+        self.assertEqual(len(documented_payload_contracts), 2)
+        for contract in documented_payload_contracts:
+            self.assertEqual(contract["fields"], list(AgentRunResumeRead.model_fields))
+            self.assertEqual(
+                contract["stable_array_fields"],
+                ["scheduled_tool_call_ids", "executed_tool_call_ids", "observed_tool_call_ids"],
+            )
+            self.assertEqual(contract["source"], "AgentRunResumeRead")
+        self.assertEqual(list(route_payload), list(AgentRunResumeRead.model_fields))
+        self.assertEqual(list(service_payload), list(AgentRunResumeRead.model_fields))
+        self.assertEqual(route_payload["run"]["run_id"], run.run_id)
+        self.assertEqual(service_payload["run"].run_id, run.run_id)
+        for field in ("scheduled_tool_call_ids", "executed_tool_call_ids", "observed_tool_call_ids"):
+            self.assertEqual(route_payload[field], [])
+            self.assertEqual(service_payload[field], [])
+
     def test_harness_agent_run_action_state_payload_contract_matches_route(self):
         from pathlib import Path
         import re
 
+        import app.services.agent_runtime_service as runtime_service
         from app.api.v1.routers.agents import get_agent_run_actions
 
         def _parse_payload_contract(text: str) -> dict[str, list[str] | str]:
@@ -3737,10 +6475,32 @@ class AgentRuntimeTests(unittest.TestCase):
         payload = get_agent_run_actions(run_id=run.run_id, db=self.db, current_user=self.member)["data"]
 
         self.assertEqual(len(documented_payload_contracts), 2)
+        self.assertTrue(hasattr(runtime_service, "AGENT_RUN_ACTION_PRIMARY_PRIORITY"))
+        self.assertTrue(hasattr(runtime_service, "AGENT_RUN_ACTION_RESOURCE_ORDER_TOOL_CALL"))
+        self.assertTrue(hasattr(runtime_service, "AGENT_RUN_ACTION_RESOURCE_ORDER_APPROVAL"))
+        self.assertTrue(hasattr(runtime_service, "AGENT_RUN_ACTION_RESOURCE_ORDER_MIGRATION_BLOCK"))
         for contract in documented_payload_contracts:
             self.assertEqual(contract["fields"], list(AGENT_RUN_ACTION_STATE_FIELDS))
             self.assertEqual(contract["action_fields"], list(AGENT_RUN_ACTION_FIELDS))
             self.assertEqual(contract["action_ids"], [item["action_id"] for item in payload["actions"]])
+            self.assertEqual(
+                contract["primary_action_priority"],
+                list(runtime_service.AGENT_RUN_ACTION_PRIMARY_PRIORITY),
+            )
+            self.assertEqual(
+                contract["resource_order_tool_call"],
+                list(runtime_service.AGENT_RUN_ACTION_RESOURCE_ORDER_TOOL_CALL),
+            )
+            self.assertEqual(
+                contract["resource_order_approval"],
+                list(runtime_service.AGENT_RUN_ACTION_RESOURCE_ORDER_APPROVAL),
+            )
+            self.assertEqual(
+                contract["resource_order_migration_block"],
+                list(runtime_service.AGENT_RUN_ACTION_RESOURCE_ORDER_MIGRATION_BLOCK),
+            )
+            self.assertEqual(contract["resource_ids"], "stable_ordered_deduplicated")
+            self.assertEqual(contract["resource_item_ids"], "stable_ordered_deduplicated_item_ids")
             self.assertEqual(contract["source"], "AgentRunActionStateRead")
         self.assertEqual(list(AgentRunActionStateRead.model_fields), list(AGENT_RUN_ACTION_STATE_FIELDS))
         self.assertEqual(list(AgentRunActionRead.model_fields), list(AGENT_RUN_ACTION_FIELDS))
@@ -3799,11 +6559,17 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(contract["fields"], list(AGENT_CONVERSATION_TRANSCRIPT_FIELDS))
             self.assertEqual(contract["conversation_fields"], list(AGENT_CONVERSATION_FIELDS))
             self.assertEqual(contract["turn_fields"], list(AGENT_RUN_SUMMARY_FIELDS))
+            self.assertEqual(contract["context_compaction_fields"], list(AGENT_CONVERSATION_CONTEXT_COMPACTION_FIELDS))
             self.assertEqual(contract["source"], "AgentConversationTranscriptRead")
         self.assertEqual(list(AgentConversationTranscriptRead.model_fields), list(AGENT_CONVERSATION_TRANSCRIPT_FIELDS))
+        self.assertEqual(
+            list(agent_schema.AgentConversationContextCompactionRead.model_fields),
+            list(AGENT_CONVERSATION_CONTEXT_COMPACTION_FIELDS),
+        )
         self.assertEqual(list(payload), list(AGENT_CONVERSATION_TRANSCRIPT_FIELDS))
         self.assertEqual(list(payload["conversation"]), list(AGENT_CONVERSATION_FIELDS))
         self.assertEqual(list(payload["turns"][0]), list(AGENT_RUN_SUMMARY_FIELDS))
+        self.assertEqual(payload["context_compactions"], [])
         self.assertEqual([turn["run"]["run_id"] for turn in payload["turns"]], [first.run_id, second.run_id])
 
     def test_harness_agent_conversation_export_payload_contract_matches_route(self):
@@ -3857,13 +6623,23 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(contract["fields"], list(AGENT_CONVERSATION_EXPORT_FIELDS))
             self.assertEqual(contract["conversation_fields"], list(AGENT_CONVERSATION_FIELDS))
             self.assertEqual(contract["turn_fields"], list(AGENT_RUN_SUMMARY_FIELDS))
+            self.assertEqual(contract["context_compaction_fields"], list(AGENT_CONVERSATION_CONTEXT_COMPACTION_FIELDS))
             self.assertEqual(contract["event_fields"], list(AGENT_EVENT_FIELDS))
             self.assertEqual(contract["tool_call_fields"], list(TOOL_CALL_FIELDS))
+            self.assertEqual(contract["approval_fields"], list(APPROVAL_FIELDS))
+            self.assertEqual(contract["migration_block_fields"], list(MIGRATION_BLOCK_FIELDS))
             self.assertEqual(contract["source"], "AgentConversationExportRead")
         self.assertEqual(list(AgentConversationExportRead.model_fields), list(AGENT_CONVERSATION_EXPORT_FIELDS))
+        self.assertEqual(list(AgentApprovalRead.model_fields), list(APPROVAL_FIELDS))
+        self.assertEqual(list(agent_schema.AgentMigrationBlockRead.model_fields), list(MIGRATION_BLOCK_FIELDS))
+        self.assertEqual(
+            list(agent_schema.AgentConversationContextCompactionRead.model_fields),
+            list(AGENT_CONVERSATION_CONTEXT_COMPACTION_FIELDS),
+        )
         self.assertEqual(list(payload), list(AGENT_CONVERSATION_EXPORT_FIELDS))
         self.assertEqual(list(payload["conversation"]), list(AGENT_CONVERSATION_FIELDS))
         self.assertEqual(list(payload["turns"][0]), list(AGENT_RUN_SUMMARY_FIELDS))
+        self.assertEqual(payload["context_compactions"], [])
         self.assertEqual(list(payload["events_by_run_id"][first.run_id][0]), list(AGENT_EVENT_FIELDS))
         self.assertEqual(payload["export_format"], "agent_conversation_export_v1")
         self.assertEqual(payload["derived_from"]["run_ids"], [first.run_id, second.run_id])
@@ -3922,7 +6698,9 @@ class AgentRuntimeTests(unittest.TestCase):
         from pathlib import Path
         import re
 
+        import app.services.agent_tool_service as agent_tool_service
         from app.api.v1.routers.agents import create_agent_run, get_agent_runtime_snapshot
+        from app.services.agent_tool_service import SAFE_SIDE_EFFECT_CLASSES, ToolRegistry
 
         def _parse_payload_contract(text: str) -> dict[str, list[str] | str]:
             section = text[text.index("Required RuntimeSnapshot entity payload contract:"):]
@@ -3955,19 +6733,76 @@ class AgentRuntimeTests(unittest.TestCase):
             db=self.db,
             current_user=self.member,
         )["data"]
+        item_id_prefix = getattr(agent_runtime_service, "AGENT_RUNTIME_SNAPSHOT_ITEM_ID_PREFIX", None)
+        tool_item_prefix = getattr(agent_tool_service, "AGENT_TOOL_SPEC_ITEM_ID_PREFIX", None)
+        registry = ToolRegistry()
+        registry_tools = registry.registry_json()
+        expected_tool_fields = list(registry_tools[0])
+        private_tool_fields = [
+            "backend_handler",
+            "required_successful_tool_before",
+            "missing_prerequisite_error_code",
+            "missing_prerequisite_next_action",
+            "tool_result_repair_guidance",
+        ]
 
         self.assertEqual(len(documented_payload_contracts), 2)
         for contract in documented_payload_contracts:
+            for required_key in (
+                "fields",
+                "tool_fields",
+                "private_tool_fields",
+                "source",
+                "tool_item_prefix",
+                "tools_source",
+                "manifests_tools_source",
+                "runtime_hash_source",
+                "tool_registry_hash_source",
+                "manifest_bundle_hash_source",
+            ):
+                self.assertIn(required_key, contract)
             self.assertEqual(contract["fields"], list(RUNTIME_SNAPSHOT_FIELDS))
+            self.assertEqual(contract.get("runtime_snapshot_item_prefix"), "agent-runtime-snapshot")
+            self.assertEqual(contract["tool_fields"], expected_tool_fields)
+            self.assertEqual(contract["tool_item_prefix"], "agent-tool-spec")
+            self.assertEqual(contract["private_tool_fields"], private_tool_fields)
             self.assertEqual(contract["source"], "AgentRuntimeSnapshotRead")
+            self.assertEqual(contract["tools_source"], "ToolRegistry.registry_json")
+            self.assertEqual(contract["manifests_tools_source"], "tools_json_by_name")
+            self.assertEqual(contract["runtime_hash_source"], "ToolRegistry.runtime_hash")
+            self.assertEqual(contract["tool_registry_hash_source"], "ToolRegistry.registry_hash")
+            self.assertEqual(contract["manifest_bundle_hash_source"], "ToolRegistry.manifest_bundle_hash")
+        self.assertEqual(item_id_prefix, "agent-runtime-snapshot")
+        self.assertEqual(tool_item_prefix, "agent-tool-spec")
+        self.assertEqual(expected_tool_fields[0], "item_id")
         self.assertEqual(list(AgentRuntimeSnapshotRead.model_fields), list(RUNTIME_SNAPSHOT_FIELDS))
         self.assertEqual(list(snapshot_payload), list(RUNTIME_SNAPSHOT_FIELDS))
+        self.assertEqual(
+            snapshot_payload.get("item_id"),
+            f"agent-runtime-snapshot://{snapshot_payload['snapshot_id']}",
+        )
         self.assertEqual(snapshot_payload["snapshot_id"], run_payload["runtime_snapshot_id"])
         self.assertEqual(snapshot_payload["project_id"], 10)
         self.assertEqual(snapshot_payload["created_by"], self.owner.id)
-        self.assertTrue(snapshot_payload["runtime_hash"])
+        self.assertEqual(snapshot_payload["runtime_hash"], registry.runtime_hash())
+        self.assertEqual(snapshot_payload["tool_registry_hash"], registry.registry_hash())
+        self.assertEqual(snapshot_payload["manifest_bundle_hash"], registry.manifest_bundle_hash())
+        self.assertEqual(snapshot_payload["tools_json"], registry_tools)
+        self.assertEqual(
+            snapshot_payload["manifests_json"]["tools"],
+            {item["name"]: item for item in registry_tools},
+        )
         self.assertGreaterEqual(len(snapshot_payload["tools_json"]), 1)
-        self.assertIn("tools", snapshot_payload["manifests_json"])
+        for tool in snapshot_payload["tools_json"]:
+            self.assertEqual(list(tool), expected_tool_fields)
+            self.assertEqual(
+                tool["item_id"],
+                f"{tool_item_prefix}://{tool['name']}/{tool['version']}",
+            )
+            self.assertTrue(tool["schema_hash"])
+            self.assertTrue(tool["manifest_hash"])
+            for private_field in private_tool_fields:
+                self.assertNotIn(private_field, tool)
 
     def test_harness_agent_event_payload_contract_matches_event_store(self):
         from pathlib import Path
@@ -4055,15 +6890,26 @@ class AgentRuntimeTests(unittest.TestCase):
             db=self.db,
             current_user=self.member,
         )["data"]
+        item_id_prefix = getattr(agent_runtime_service, "AGENT_EVENT_ITEM_ID_PREFIX", None)
 
         self.assertEqual(len(documented_payload_contracts), 2)
         for contract in documented_payload_contracts:
             self.assertEqual(contract["fields"], list(AGENT_RUN_EVENT_SNAPSHOT_FIELDS))
             self.assertEqual(contract["event_fields"], list(AGENT_EVENT_FIELDS))
+            self.assertEqual(contract["context_compaction_fields"], list(AGENT_CONVERSATION_CONTEXT_COMPACTION_FIELDS))
             self.assertEqual(contract["source"], "AgentRunEventSnapshotRead")
         self.assertEqual(list(AgentRunEventSnapshotRead.model_fields), list(AGENT_RUN_EVENT_SNAPSHOT_FIELDS))
+        self.assertEqual(
+            list(agent_schema.AgentConversationContextCompactionRead.model_fields),
+            list(AGENT_CONVERSATION_CONTEXT_COMPACTION_FIELDS),
+        )
+        self.assertEqual(list(AgentEventRead.model_fields), list(AGENT_EVENT_FIELDS))
+        self.assertIsNotNone(item_id_prefix)
         self.assertEqual(list(payload), list(AGENT_RUN_EVENT_SNAPSHOT_FIELDS))
+        self.assertEqual(payload["run"]["item_id"], f"agent-run://{run.run_id}")
         self.assertEqual(list(payload["events"][0]), list(AGENT_EVENT_FIELDS))
+        self.assertEqual(payload["events"][0]["item_id"], f"{item_id_prefix}://{run.run_id}/1")
+        self.assertEqual(payload["context_compactions"], [])
         self.assertEqual(payload["latest_event_sequence"], run.last_event_sequence)
         self.assertEqual(payload["next_after_sequence"], run.last_event_sequence)
         self.assertTrue(payload["terminal"])
@@ -4110,14 +6956,21 @@ class AgentRuntimeTests(unittest.TestCase):
             current_user=self.owner,
         )["data"]
         list_payload = list_agent_context_builds(run_id=run.run_id, db=self.db, current_user=self.member)["data"][0]
+        item_id_prefix = getattr(agent_loop_service, "AGENT_CONTEXT_BUILD_ITEM_ID_PREFIX", None)
 
         self.assertEqual(len(documented_payload_contracts), 2)
         for contract in documented_payload_contracts:
             self.assertEqual(contract["fields"], list(CONTEXT_BUILD_FIELDS))
+            self.assertEqual(contract.get("context_build_item_prefix"), "agent-context-build")
             self.assertEqual(contract["source"], "AgentContextBuildRead")
+        self.assertEqual(item_id_prefix, "agent-context-build")
         self.assertEqual(list(AgentContextBuildRead.model_fields), list(CONTEXT_BUILD_FIELDS))
         for payload in (create_payload, list_payload):
             self.assertEqual(list(payload), list(CONTEXT_BUILD_FIELDS))
+            self.assertEqual(
+                payload["item_id"],
+                f"{item_id_prefix}://{run.run_id}/{payload['context_build_id']}",
+            )
             self.assertEqual(payload["run_id"], run.run_id)
             self.assertEqual(payload["build_purpose"], "repair")
             self.assertEqual(payload["model_name"], "contract-model")
@@ -4128,6 +6981,198 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(payload["prompt_object_key"], "prompts/agent/context-contract.json")
             self.assertTrue(payload["prompt_hash"])
         self.assertEqual(list_payload["context_build_id"], create_payload["context_build_id"])
+
+    def test_harness_context_build_metadata_contract_matches_builder_output(self):
+        from pathlib import Path
+        import re
+
+        def _parse_payload_contract(text: str) -> dict[str, list[str] | str]:
+            section = text[text.index("Required ContextBuild metadata contract:"):]
+            block = re.search(r"```text\n(.*?)\n```", section, re.S)
+            self.assertIsNotNone(block)
+            parsed: dict[str, list[str] | str] = {}
+            for line in block.group(1).splitlines():
+                if not line.strip():
+                    continue
+                key, value = line.strip().split("=", 1)
+                if "," in value:
+                    parsed[key] = value.split(",")
+                else:
+                    parsed[key] = value
+            return parsed
+
+        def _metadata_key_names(value) -> set[str]:
+            if isinstance(value, dict):
+                keys = set(value)
+                for nested in value.values():
+                    keys.update(_metadata_key_names(nested))
+                return keys
+            if isinstance(value, list):
+                keys: set[str] = set()
+                for nested in value:
+                    keys.update(_metadata_key_names(nested))
+                return keys
+            return set()
+
+        metadata_keys = getattr(agent_loop_service, "CONTEXT_BUILD_METADATA_KEYS", None)
+        selected_skill_fields = getattr(
+            agent_loop_service,
+            "CONTEXT_BUILD_SELECTED_AGENT_SKILL_FIELDS",
+            None,
+        )
+        routing_rule_fields = getattr(
+            agent_loop_service,
+            "CONTEXT_BUILD_AGENT_SKILL_ROUTING_RULE_FIELDS",
+            None,
+        )
+        runtime_snapshot_fields = getattr(
+            agent_loop_service,
+            "CONTEXT_BUILD_RUNTIME_SNAPSHOT_METADATA_FIELDS",
+            None,
+        )
+        runtime_snapshot_missing_fields = getattr(
+            agent_loop_service,
+            "CONTEXT_BUILD_RUNTIME_SNAPSHOT_MISSING_METADATA_FIELDS",
+            None,
+        )
+        permission_context_fields = getattr(
+            agent_loop_service,
+            "CONTEXT_BUILD_PERMISSION_CONTEXT_FIELDS",
+            None,
+        )
+        private_excluded_fields = getattr(
+            agent_loop_service,
+            "CONTEXT_BUILD_METADATA_PRIVATE_EXCLUDED_FIELDS",
+            None,
+        )
+        self.assertIsNotNone(metadata_keys)
+        self.assertIsNotNone(selected_skill_fields)
+        self.assertIsNotNone(routing_rule_fields)
+        self.assertIsNotNone(runtime_snapshot_fields)
+        self.assertIsNotNone(runtime_snapshot_missing_fields)
+        self.assertIsNotNone(permission_context_fields)
+        self.assertIsNotNone(private_excluded_fields)
+
+        docs_dir = Path(__file__).resolve().parents[1] / "docs"
+        documented_payload_contracts = [
+            _parse_payload_contract(path.read_text(encoding="utf-8"))
+            for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
+            if "Required ContextBuild metadata contract:" in path.read_text(encoding="utf-8")
+        ]
+        run = self._create_run("请基于已有用例生成企业场景草稿。")
+        build = ContextBuilder(self.db).build(
+            run_id=run.run_id,
+            payload=AgentContextBuildCreateRequest(build_purpose="repair", step_index=0),
+            current_user=self.member,
+        )
+        metadata = build.build_metadata_json or {}
+
+        self.assertEqual(len(documented_payload_contracts), 2)
+        for contract in documented_payload_contracts:
+            self.assertEqual(contract["metadata_keys"], list(metadata_keys))
+            self.assertEqual(contract["selected_agent_skill_fields"], list(selected_skill_fields))
+            self.assertEqual(contract["matched_agent_skill_routing_rule_fields"], list(routing_rule_fields))
+            self.assertEqual(contract["runtime_snapshot_fields"], list(runtime_snapshot_fields))
+            self.assertEqual(contract["runtime_snapshot_missing_fields"], list(runtime_snapshot_missing_fields))
+            self.assertEqual(contract["permission_context_fields"], list(permission_context_fields))
+            self.assertEqual(contract["private_excluded_fields"], list(private_excluded_fields))
+            self.assertEqual(contract["source"], "ContextBuilder.build_metadata_json")
+        self.assertEqual(list(metadata), list(metadata_keys))
+        self.assertTrue(metadata["selected_agent_skills"])
+        for skill in metadata["selected_agent_skills"]:
+            self.assertEqual(list(skill), list(selected_skill_fields))
+        self.assertTrue(metadata["matched_agent_skill_routing_rules"])
+        for rule in metadata["matched_agent_skill_routing_rules"]:
+            self.assertEqual(list(rule), list(routing_rule_fields))
+        self.assertEqual(list(metadata["runtime_snapshot"]), list(runtime_snapshot_fields))
+        self.assertEqual(list(metadata["permission_context"]), list(permission_context_fields))
+        self.assertIsInstance(metadata["policy_refs"], list)
+
+        metadata_key_names = _metadata_key_names(metadata)
+        for private_field in private_excluded_fields:
+            self.assertNotIn(private_field, metadata_key_names)
+
+    def test_harness_context_build_token_window_contract_matches_degraded_build(self):
+        from pathlib import Path
+        import re
+
+        def _parse_payload_contract(text: str) -> dict[str, list[str] | str]:
+            section = text[text.index("Required ContextBuild token window contract:"):]
+            block = re.search(r"```text\n(.*?)\n```", section, re.S)
+            self.assertIsNotNone(block)
+            parsed: dict[str, list[str] | str] = {}
+            for line in block.group(1).splitlines():
+                if not line.strip():
+                    continue
+                key, value = line.strip().split("=", 1)
+                if "," in value:
+                    parsed[key] = value.split(",")
+                else:
+                    parsed[key] = value
+            return parsed
+
+        token_window_fields = getattr(agent_loop_service, "CONTEXT_BUILD_TOKEN_WINDOW_FIELDS", None)
+        budget_scope = getattr(agent_loop_service, "CONTEXT_BUILD_TOKEN_WINDOW_BUDGET_SCOPE", None)
+        degraded_event = getattr(agent_loop_service, "CONTEXT_BUILD_DEGRADED_EVENT", None)
+        degraded_event_fields = getattr(agent_loop_service, "CONTEXT_BUILD_DEGRADED_EVENT_FIELDS", None)
+        source = getattr(agent_loop_service, "CONTEXT_BUILD_TOKEN_WINDOW_SOURCE", None)
+
+        self.assertIsNotNone(token_window_fields)
+        self.assertIsNotNone(budget_scope)
+        self.assertIsNotNone(degraded_event)
+        self.assertIsNotNone(degraded_event_fields)
+        self.assertIsNotNone(source)
+
+        docs_dir = Path(__file__).resolve().parents[1] / "docs"
+        documented_payload_contracts = [
+            _parse_payload_contract(path.read_text(encoding="utf-8"))
+            for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
+            if "Required ContextBuild token window contract:" in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(len(documented_payload_contracts), 2)
+        for contract in documented_payload_contracts:
+            self.assertEqual(contract["compressed_sections_fields"], list(token_window_fields))
+            self.assertEqual(contract["budget_scope"], budget_scope)
+            self.assertEqual(contract["degraded_event"], degraded_event)
+            self.assertEqual(contract["degraded_event_fields"], list(degraded_event_fields))
+            self.assertEqual(contract["source"], source)
+            self.assertEqual(contract["codex_alignment"], "ContextWindowTokenStatus")
+
+        run = self._create_run("context build token window contract")
+        build = ContextBuilder(self.db).build(
+            run_id=run.run_id,
+            payload=AgentContextBuildCreateRequest(
+                build_purpose="repair",
+                step_index=0,
+                token_budget=128,
+                evidence_refs=self._large_evidence_refs(count=10),
+                required_evidence_ref_ids=["evidence-9"],
+            ),
+            current_user=self.owner,
+        )
+        event = self.db.scalar(
+            select(AgentEvent).where(
+                AgentEvent.run_id == run.run_id,
+                AgentEvent.event_type == degraded_event,
+            )
+        )
+
+        self.assertIsNotNone(event)
+        token_window = build.compressed_sections_json
+        self.assertEqual(list(token_window), list(token_window_fields))
+        self.assertEqual(token_window["budget_scope"], budget_scope)
+        self.assertEqual(token_window["estimated_input_units"], build.estimated_input_tokens)
+        self.assertEqual(token_window["budget_limit_units"], build.token_budget)
+        self.assertEqual(token_window["units_until_budget"], 0)
+        self.assertTrue(token_window["budget_limit_reached"])
+        self.assertEqual(token_window["degradation"], build.context_degradation_level)
+        self.assertEqual(token_window["kept_evidence_ref_count"], 1)
+        self.assertEqual(token_window["omitted_evidence_ref_count"], 9)
+        self.assertFalse(token_window["required_evidence_complete"])
+        self.assertEqual(list(event.payload_json), list(degraded_event_fields))
+        self.assertEqual(event.payload_json["context_build_id"], build.context_build_id)
+        self.assertEqual(event.payload_json["degradation"], build.context_degradation_level)
+        self.assertEqual(event.payload_json["context_window"], token_window)
 
     def test_harness_loop_observation_payload_contract_matches_routes(self):
         from pathlib import Path
@@ -4160,6 +7205,7 @@ class AgentRuntimeTests(unittest.TestCase):
             for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
             if "Required LoopObservation entity payload contract:" in path.read_text(encoding="utf-8")
         ]
+        item_id_prefix = getattr(agent_loop_service, "AGENT_LOOP_OBSERVATION_ITEM_ID_PREFIX", None)
         run = self._create_run("loop observation payload contract")
         context_payload = create_agent_context_build(
             run_id=run.run_id,
@@ -4185,9 +7231,15 @@ class AgentRuntimeTests(unittest.TestCase):
         for contract in documented_payload_contracts:
             self.assertEqual(contract["fields"], list(LOOP_OBSERVATION_FIELDS))
             self.assertEqual(contract["source"], "AgentLoopObservationRead")
+            self.assertEqual(contract.get("loop_observation_item_prefix"), "agent-loop-observation")
+        self.assertEqual(item_id_prefix, "agent-loop-observation")
         self.assertEqual(list(AgentLoopObservationRead.model_fields), list(LOOP_OBSERVATION_FIELDS))
         for payload in (create_payload, list_payload):
             self.assertEqual(list(payload), list(LOOP_OBSERVATION_FIELDS))
+            self.assertEqual(
+                payload.get("item_id"),
+                f"agent-loop-observation://{run.run_id}/{payload['observation_id']}",
+            )
             self.assertEqual(payload["run_id"], run.run_id)
             self.assertEqual(payload["decision_context_build_id"], context_payload["context_build_id"])
             self.assertEqual(payload["decision_context_degradation_level"], context_payload["context_degradation_level"])
@@ -4248,7 +7300,18 @@ class AgentRuntimeTests(unittest.TestCase):
             for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
             if "Required ToolCall entity payload contract:" in path.read_text(encoding="utf-8")
         ]
-        _, approved_call, approval = self._create_pending_approval()
+        approved_run, approved_call, approval = self._create_pending_approval()
+        self.db.add(AgentReconcileAttempt(
+            tool_call_id=approved_call.tool_call_id,
+            attempt_seq=1,
+            backend_name="project-service",
+            backend_operation="read_context",
+            backend_contract_version="v1",
+            result_status="not_found",
+            error_code="reconcile_not_found",
+            error_message="Backend did not find the effect yet",
+        ))
+        self.db.commit()
         get_payload = get_agent_tool_call(
             tool_call_id=approved_call.tool_call_id,
             db=self.db,
@@ -4260,17 +7323,33 @@ class AgentRuntimeTests(unittest.TestCase):
             db=self.db,
             current_user=self.owner,
         )["data"]
-        _, rejected_call, rejected_approval = self._create_pending_approval()
+        rejected_run, rejected_call, rejected_approval = self._create_pending_approval()
         reject_payload = reject_agent_tool_call(
             tool_call_id=rejected_call.tool_call_id,
             payload=self._approval_decision(rejected_approval, reason="contract reject"),
             db=self.db,
             current_user=self.owner,
         )["data"]
+        approve_mutation = self.db.scalar(
+            select(AgentApprovalMutationLog).where(
+                AgentApprovalMutationLog.approval_id == approval.approval_id,
+                AgentApprovalMutationLog.mutation_type == "approve",
+            )
+        )
+        reject_mutation = self.db.scalar(
+            select(AgentApprovalMutationLog).where(
+                AgentApprovalMutationLog.approval_id == rejected_approval.approval_id,
+                AgentApprovalMutationLog.mutation_type == "reject",
+            )
+        )
+        self.assertIsNotNone(approve_mutation)
+        self.assertIsNotNone(reject_mutation)
 
         self.assertEqual(len(documented_payload_contracts), 2)
         for contract in documented_payload_contracts:
             self.assertEqual(contract["fields"], list(TOOL_CALL_FIELDS))
+            self.assertEqual(contract.get("reconcile_attempt_fields"), list(AgentReconcileAttemptRead.model_fields))
+            self.assertEqual(contract.get("reconcile_attempt_item_prefix"), "agent-reconcile-attempt")
             self.assertEqual(contract["source"], "AgentToolCallRead")
         self.assertEqual(list(AgentToolCallRead.model_fields), list(TOOL_CALL_FIELDS))
         for payload in (get_payload, approve_payload["tool_call"], reject_payload["tool_call"]):
@@ -4278,11 +7357,76 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(payload["tool_name"], "project.read_context")
         self.assertEqual(get_payload["current_approval"]["approval_id"], approval.approval_id)
         self.assertEqual(get_payload["approval_lineage"]["approval_lineage_id"], approval.approval_lineage_id)
-        self.assertEqual(get_payload["recent_reconcile_attempts"], [])
+        self.assertEqual(len(get_payload["recent_reconcile_attempts"]), 1)
+        recent_reconcile_attempt = get_payload["recent_reconcile_attempts"][0]
+        self.assertEqual(list(recent_reconcile_attempt), list(AgentReconcileAttemptRead.model_fields))
+        self.assertEqual(recent_reconcile_attempt["attempt_seq"], 1)
+        self.assertEqual(recent_reconcile_attempt["result_status"], "not_found")
         self.assertEqual(approve_payload["tool_call"]["runtime_snapshot_id"], get_payload["runtime_snapshot_id"])
         self.assertEqual(reject_payload["tool_call"]["runtime_snapshot_id"], reject_payload["approval"]["runtime_snapshot_id"])
         self.assertEqual(approve_payload["tool_call"]["status"], "planned")
         self.assertEqual(reject_payload["tool_call"]["status"], "manual_intervention")
+        tool_call_item_id_prefix = getattr(agent_runtime_service, "AGENT_TOOL_CALL_ITEM_ID_PREFIX", None)
+        self.assertEqual(tool_call_item_id_prefix, "agent-tool-call")
+        reconcile_attempt_item_id_prefix = getattr(agent_runtime_service, "AGENT_RECONCILE_ATTEMPT_ITEM_ID_PREFIX", None)
+        self.assertEqual(reconcile_attempt_item_id_prefix, "agent-reconcile-attempt")
+        approval_lineage_item_id_prefix = getattr(agent_runtime_service, "AGENT_APPROVAL_LINEAGE_ITEM_ID_PREFIX", None)
+        self.assertEqual(approval_lineage_item_id_prefix, "agent-approval-lineage")
+        approval_item_id_prefix = getattr(agent_runtime_service, "AGENT_APPROVAL_ITEM_ID_PREFIX", None)
+        self.assertEqual(approval_item_id_prefix, "agent-approval")
+        self.assertEqual(get_payload["item_id"], f"{tool_call_item_id_prefix}://{approved_run.run_id}/{approved_call.tool_call_id}")
+        self.assertEqual(
+            recent_reconcile_attempt["item_id"],
+            f"{reconcile_attempt_item_id_prefix}://{approved_call.tool_call_id}/1",
+        )
+        self.assertEqual(
+            get_payload["approval_lineage"]["item_id"],
+            f"{approval_lineage_item_id_prefix}://{approved_run.run_id}/{approval.approval_lineage_id}",
+        )
+        self.assertEqual(get_payload["approval_lineage"]["tool_call_item_id"], get_payload["item_id"])
+        self.assertEqual(
+            get_payload["current_approval"]["item_id"],
+            f"{approval_item_id_prefix}://{approved_run.run_id}/{approval.approval_id}",
+        )
+        self.assertEqual(get_payload["current_approval"]["tool_call_item_id"], get_payload["item_id"])
+        self.assertEqual(approve_payload["approval"]["item_id"], get_payload["current_approval"]["item_id"])
+        self.assertEqual(approve_payload["approval"]["tool_call_item_id"], get_payload["item_id"])
+        self.assertEqual(approve_payload["lineage"]["item_id"], get_payload["approval_lineage"]["item_id"])
+        self.assertEqual(approve_payload["lineage"]["tool_call_item_id"], get_payload["item_id"])
+        self.assertEqual(approve_payload["tool_call"]["item_id"], get_payload["item_id"])
+        self.assertEqual(
+            approve_payload["mutation_log"]["item_id"],
+            f"agent-approval-mutation://{approved_run.run_id}/{approve_mutation.id}",
+        )
+        self.assertEqual(approve_payload["mutation_log"]["tool_call_item_id"], get_payload["item_id"])
+        self.assertEqual(
+            reject_payload["tool_call"]["item_id"],
+            f"{tool_call_item_id_prefix}://{rejected_run.run_id}/{rejected_call.tool_call_id}",
+        )
+        self.assertEqual(
+            reject_payload["approval"]["tool_call_item_id"],
+            f"{tool_call_item_id_prefix}://{rejected_run.run_id}/{rejected_call.tool_call_id}",
+        )
+        self.assertEqual(
+            reject_payload["approval"]["item_id"],
+            f"{approval_item_id_prefix}://{rejected_run.run_id}/{rejected_approval.approval_id}",
+        )
+        self.assertEqual(
+            reject_payload["lineage"]["item_id"],
+            f"{approval_lineage_item_id_prefix}://{rejected_run.run_id}/{rejected_approval.approval_lineage_id}",
+        )
+        self.assertEqual(
+            reject_payload["lineage"]["tool_call_item_id"],
+            f"{tool_call_item_id_prefix}://{rejected_run.run_id}/{rejected_call.tool_call_id}",
+        )
+        self.assertEqual(
+            reject_payload["mutation_log"]["item_id"],
+            f"agent-approval-mutation://{rejected_run.run_id}/{reject_mutation.id}",
+        )
+        self.assertEqual(
+            reject_payload["mutation_log"]["tool_call_item_id"],
+            f"{tool_call_item_id_prefix}://{rejected_run.run_id}/{rejected_call.tool_call_id}",
+        )
 
     def test_append_event_outbox_write_failure_returns_frozen_error_code_and_rolls_back(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -4390,7 +7534,9 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(contract["run_fields"], list(EVENT_REPLAY_AUDIT_FIELDS))
             self.assertEqual(contract["stress_fields"], list(EVENT_REPLAY_STRESS_AUDIT_FIELDS))
             self.assertEqual(contract["stress_run_fields"], list(EVENT_REPLAY_STRESS_RUN_FIELDS))
+            self.assertEqual(contract.get("event_replay_stress_run_item_prefix"), "agent-event-replay-run")
             self.assertEqual(contract["cursor_fields"], list(EVENT_REPLAY_CURSOR_AUDIT_FIELDS))
+            self.assertEqual(contract.get("event_replay_cursor_item_prefix"), "agent-event-replay-cursor")
             self.assertEqual(contract["derived_from_fields"], list(EVENT_REPLAY_DERIVED_FROM_FIELDS))
             self.assertEqual(contract["source"], "AgentEventReplayAuditService")
         self.assertEqual(list(AgentEventReplayAuditRead.model_fields), list(EVENT_REPLAY_AUDIT_FIELDS))
@@ -4407,6 +7553,44 @@ class AgentRuntimeTests(unittest.TestCase):
             all(
                 list(cursor) == list(EVENT_REPLAY_CURSOR_AUDIT_FIELDS)
                 for item in stress_audit["run_audits"]
+                for cursor in item["cursor_audits"]
+            )
+        )
+        stress_run_item_prefix = getattr(
+            agent_observability_service,
+            "AGENT_EVENT_REPLAY_STRESS_RUN_ITEM_ID_PREFIX",
+            None,
+        )
+        cursor_item_prefix = getattr(
+            agent_observability_service,
+            "AGENT_EVENT_REPLAY_CURSOR_ITEM_ID_PREFIX",
+            None,
+        )
+        self.assertEqual(stress_run_item_prefix, "agent-event-replay-run")
+        self.assertEqual(cursor_item_prefix, "agent-event-replay-cursor")
+        self.assertTrue(
+            all(
+                item["item_id"] == f"{stress_run_item_prefix}://{item['run_id']}"
+                for item in stress_audit["run_audits"]
+            )
+        )
+        self.assertTrue(
+            all(
+                item["item_id"] == f"{stress_run_item_prefix}://{item['run_id']}"
+                for item in stress_route_payload["run_audits"]
+            )
+        )
+        self.assertTrue(
+            all(
+                cursor["item_id"] == f"{cursor_item_prefix}://{item['run_id']}/{cursor['after_sequence']}"
+                for item in stress_audit["run_audits"]
+                for cursor in item["cursor_audits"]
+            )
+        )
+        self.assertTrue(
+            all(
+                cursor["item_id"] == f"{cursor_item_prefix}://{item['run_id']}/{cursor['after_sequence']}"
+                for item in stress_route_payload["run_audits"]
                 for cursor in item["cursor_audits"]
             )
         )
@@ -4441,6 +7625,22 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(dashboard["readiness"], "attention")
         self.assertEqual(checks["monitoring_alerts_clear"]["status"], "attention")
 
+    def test_event_replay_gap_metric_uses_aggregate_without_per_run_audit(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="aggregate replay gap", auto_complete=True),
+            current_user=self.owner,
+        )
+        missing = self.db.scalar(
+            select(AgentEvent).where(AgentEvent.run_id == run.run_id, AgentEvent.event_seq == 2)
+        )
+        self.db.delete(missing)
+        self.db.commit()
+
+        with patch.object(AgentEventReplayAuditService, "audit_run", side_effect=AssertionError("per-run audit called")):
+            gap_total = AgentMetricsService(self.db)._count_event_replay_gaps(project_id=10)
+
+        self.assertEqual(gap_total, 1)
+
     def test_event_replay_stress_audit_samples_multiple_runs_and_cursors(self):
         for index in range(5):
             AgentRuntimeService(self.db).create_run(
@@ -4460,6 +7660,21 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(metrics["event_replay_stress_failed_total"], 0)
         self.assertEqual(metrics["event_replay_stress_cursor_window_total"], 15)
         self.assertEqual(metrics["event_replay_stress_max_window_events"], 3)
+
+    def test_event_replay_stress_audit_batches_events_without_per_cursor_audit_run(self):
+        for index in range(3):
+            AgentRuntimeService(self.db).create_run(
+                payload=AgentRunCreateRequest(project_id=10, intent=f"batched replay stress {index}", auto_complete=True),
+                current_user=self.owner,
+            )
+
+        with patch.object(AgentEventReplayAuditService, "audit_run", side_effect=AssertionError("per-cursor audit called")):
+            audit = AgentEventReplayAuditService(self.db).audit_project(project_id=10, sample_limit=3, cursor_count=3)
+
+        self.assertTrue(audit["high_concurrency_replayable"])
+        self.assertEqual(audit["audited_run_count"], 3)
+        self.assertEqual(audit["cursor_window_count"], 9)
+        self.assertEqual(audit["failed_run_count"], 0)
 
     def test_event_replay_stress_audit_reports_failed_run_and_alert(self):
         ok_run = AgentRuntimeService(self.db).create_run(
@@ -4506,6 +7721,38 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(dashboard["readiness"], "attention")
         self.assertEqual(checks["monitoring_alerts_clear"]["status"], "attention")
 
+    def test_readiness_dashboard_reuses_metrics_snapshot_for_nested_alerts(self):
+        calls = 0
+        original_snapshot = AgentMetricsService.snapshot
+
+        def counted_snapshot(service, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original_snapshot(service, *args, **kwargs)
+
+        with patch.object(AgentMetricsService, "snapshot", counted_snapshot):
+            dashboard = AgentReadinessDashboardService(self.db).snapshot(project_id=10)
+
+        self.assertEqual(calls, 1)
+        self.assertIn("metrics", dashboard)
+        self.assertIn("alerts", dashboard)
+
+    def test_promotion_assessment_reuses_dashboard_metrics_snapshot(self):
+        calls = 0
+        original_snapshot = AgentMetricsService.snapshot
+
+        def counted_snapshot(service, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original_snapshot(service, *args, **kwargs)
+
+        with patch.object(AgentMetricsService, "snapshot", counted_snapshot):
+            assessment = AgentReleaseGateService(self.db).promotion_assessment(target_level="L3", project_id=10)
+
+        self.assertEqual(calls, 1)
+        self.assertIn("dashboard_checks", assessment)
+        self.assertIn("alert_summary", assessment)
+
     def test_create_run_reuses_snapshot_for_same_runtime_hash(self):
         first = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="first"),
@@ -4537,6 +7784,163 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertLess(first_prompt.index('"input_schema"'), first_prompt.index('"name"'))
         self.assertIn('"name":"scenario-composition"', first_prompt)
         self.assertIn("Codex 式渐进加载", first_prompt)
+
+    def test_harness_initial_tool_prompt_contract_matches_system_prompt(self):
+        from pathlib import Path
+        import re
+
+        from app.services.agent_tool_service import SAFE_SIDE_EFFECT_CLASSES, ToolRegistry
+
+        def _parse_payload_contract(text: str) -> dict[str, list[str] | str]:
+            section = text[text.index("Required Agent initial tool prompt contract:"):]
+            block = re.search(r"```text\n(.*?)\n```", section, re.S)
+            self.assertIsNotNone(block)
+            parsed: dict[str, list[str] | str] = {}
+            for line in block.group(1).splitlines():
+                if not line.strip():
+                    continue
+                key, value = line.strip().split("=", 1)
+                if "," in value:
+                    parsed[key] = value.split(",")
+                else:
+                    parsed[key] = value
+            return parsed
+
+        docs_dir = Path(__file__).resolve().parents[1] / "docs"
+        documented_payload_contracts = [
+            _parse_payload_contract(path.read_text(encoding="utf-8"))
+            for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
+            if "Required Agent initial tool prompt contract:" in path.read_text(encoding="utf-8")
+        ]
+        prompt = _conversation_system_prompt()
+        tool_json_match = re.search(r"可用工具如下：\n(?P<tools>\[.*?\])\n\n如果需要调用工具", prompt, re.S)
+        self.assertIsNotNone(tool_json_match)
+        prompt_tools = json.loads(tool_json_match.group("tools"))
+        expected_tools = [
+            {
+                "name": spec.name,
+                "summary": spec.summary,
+                "input_schema": spec.input_schema,
+                "side_effect_class": spec.side_effect_class,
+                "approval_required": spec.side_effect_class not in SAFE_SIDE_EFFECT_CLASSES,
+            }
+            for spec in ToolRegistry().list_specs()
+        ]
+        expected_tool_fields = ["approval_required", "input_schema", "name", "side_effect_class", "summary"]
+        private_tool_fields = [
+            "backend_handler",
+            "required_successful_tool_before",
+            "missing_prerequisite_error_code",
+            "missing_prerequisite_next_action",
+            "tool_result_repair_guidance",
+        ]
+        excluded_full_manifest_fields = [
+            "version",
+            "replay_policy",
+            "required_permissions",
+            "output_schema",
+            "backend_contract",
+            "schema_hash",
+            "manifest_hash",
+        ]
+
+        self.assertEqual(len(documented_payload_contracts), 2)
+        for contract in documented_payload_contracts:
+            for required_key in (
+                "tool_fields",
+                "private_tool_fields",
+                "excluded_full_manifest_fields",
+                "tool_source",
+                "prompt_source",
+                "serialization",
+            ):
+                self.assertIn(required_key, contract)
+            self.assertEqual(contract["tool_fields"], expected_tool_fields)
+            self.assertEqual(contract["private_tool_fields"], private_tool_fields)
+            self.assertEqual(contract["excluded_full_manifest_fields"], excluded_full_manifest_fields)
+            self.assertEqual(contract["tool_source"], "ToolRegistry.list_specs")
+            self.assertEqual(contract["prompt_source"], "_conversation_system_prompt")
+            self.assertEqual(contract["serialization"], "json.dumps_sort_keys_compact")
+        self.assertEqual(prompt_tools, expected_tools)
+        self.assertTrue(prompt_tools)
+        for tool in prompt_tools:
+            self.assertEqual(list(tool), expected_tool_fields)
+            for private_field in private_tool_fields:
+                self.assertNotIn(private_field, tool)
+            for full_manifest_field in excluded_full_manifest_fields:
+                self.assertNotIn(full_manifest_field, tool)
+
+    def test_harness_initial_skill_catalog_prompt_contract_matches_system_prompt(self):
+        from pathlib import Path
+        import re
+
+        from app.services.agent_skill_registry import AgentSkillRegistry
+
+        def _parse_payload_contract(text: str) -> dict[str, list[str] | str]:
+            section = text[text.index("Required Agent initial skill catalog prompt contract:"):]
+            block = re.search(r"```text\n(.*?)\n```", section, re.S)
+            self.assertIsNotNone(block)
+            parsed: dict[str, list[str] | str] = {}
+            for line in block.group(1).splitlines():
+                if not line.strip():
+                    continue
+                key, value = line.strip().split("=", 1)
+                if "," in value:
+                    parsed[key] = value.split(",")
+                else:
+                    parsed[key] = value
+            return parsed
+
+        docs_dir = Path(__file__).resolve().parents[1] / "docs"
+        documented_payload_contracts = [
+            _parse_payload_contract(path.read_text(encoding="utf-8"))
+            for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
+            if "Required Agent initial skill catalog prompt contract:" in path.read_text(encoding="utf-8")
+        ]
+        prompt = _conversation_system_prompt()
+        skill_json_match = re.search(
+            r"Agent Skill 目录如下.*?\n(?P<skills>\[.*?\])\n\n选择行为：",
+            prompt,
+            re.S,
+        )
+        self.assertIsNotNone(skill_json_match)
+        prompt_skills = json.loads(skill_json_match.group("skills"))
+        registry = AgentSkillRegistry()
+        expected_skills = registry.catalog()
+        expected_skill_fields = ["description", "name"]
+        private_skill_fields = [
+            "triggers",
+            "routing_hints",
+            "private_values",
+            "body",
+            "path",
+            "guard_unsupported_capability",
+            "routing_requires_tool",
+            "routing_required_tool_after_success",
+        ]
+
+        self.assertEqual(len(documented_payload_contracts), 2)
+        for contract in documented_payload_contracts:
+            for required_key in (
+                "skill_fields",
+                "private_skill_fields",
+                "skill_source",
+                "prompt_source",
+                "serialization",
+            ):
+                self.assertIn(required_key, contract)
+            self.assertEqual(contract["skill_fields"], expected_skill_fields)
+            self.assertEqual(contract["private_skill_fields"], private_skill_fields)
+            self.assertEqual(contract["skill_source"], "AgentSkillRegistry.catalog")
+            self.assertEqual(contract["prompt_source"], "_conversation_system_prompt")
+            self.assertEqual(contract["serialization"], "json.dumps_sort_keys_compact")
+        self.assertEqual(prompt_skills, expected_skills)
+        self.assertTrue(prompt_skills)
+        self.assertEqual([item["name"] for item in prompt_skills], sorted(item["name"] for item in prompt_skills))
+        for skill in prompt_skills:
+            self.assertEqual(list(skill), expected_skill_fields)
+            for private_field in private_skill_fields:
+                self.assertNotIn(private_field, skill)
 
     def test_tool_registry_builtin_specs_declare_executable_backend_handlers(self):
         from app.services.agent_tool_service import AgentToolBackend, ToolRegistry
@@ -4704,6 +8108,26 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn("routing_requires_tool", http_case[0].metadata())
         self.assertNotIn("routing_requires_tool", http_case[0].prompt_block())
 
+    def test_saved_case_assertion_followup_skill_routes_to_assertion_patch_tools(self):
+        from app.services.agent_skill_registry import AgentSkillRegistry
+
+        registry = AgentSkillRegistry()
+        selected = registry.select_for_intent("直接保存刚才为已保存接口用例生成的断言")
+        selected_names = [skill.name for skill in selected]
+
+        self.assertIn("http-test-case-design", selected_names)
+        self.assertIn("assertion-extractor-binding", selected_names)
+
+        prompt = "\n\n".join(skill.prompt_block() for skill in selected)
+        self.assertIn("testcase.query_project_cases", prompt)
+        self.assertIn("testcase.update_assertions", prompt)
+        self.assertIn("testcase.batch_update_assertions", prompt)
+        self.assertIn("websocket_testcase.update_assertions", prompt)
+        self.assertIn("websocket_testcase.batch_update_assertions", prompt)
+        self.assertIn("interface_text", prompt)
+        self.assertIn("Do not use `ai_skill.run_draft` with `skill_id=http-test-case` and `operation=generate`", prompt)
+        self.assertIn("For saved-case assertion follow-ups", prompt)
+
     def test_required_tool_routing_uses_skill_private_hints(self):
         self.assertTrue(_intent_likely_requires_agent_tool("请读取当前项目上下文和真实用例"))
         self.assertTrue(_intent_likely_requires_agent_tool("请总结当前项目最近报告摘要"))
@@ -4758,6 +8182,13 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(guards[0].requires_field, "requires_scenario_persistence")
         self.assertEqual(guards[0].completion_source, "unsupported_scenario_save_guard")
         self.assertEqual(_unsupported_capability_guards_for_intent("请保存这份报告摘要"), ())
+        self.assertEqual(_unsupported_capability_guards_for_intent("直接保存"), ())
+        self.assertEqual(_unsupported_capability_guards_for_intent("保存上面的内容"), ())
+        self.assertEqual(_unsupported_capability_guards_for_intent("直接保存断言"), ())
+        self.assertEqual(_unsupported_capability_guards_for_intent("保存刚才生成的测试用例断言"), ())
+        explicit_scenario_guards = _unsupported_capability_guards_for_intent("直接保存这个场景")
+        self.assertEqual(len(explicit_scenario_guards), 1)
+        self.assertEqual(explicit_scenario_guards[0].name, "scenario_save")
         self.assertIn("requires_scenario_persistence", _unsupported_capability_classifier_prompt(guards[0]) or "")
         self.assertIn("没有“保存正式场景”的后端工具", _unsupported_capability_message(guards[0]) or "")
 
@@ -5201,6 +8632,9 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(documented["level_fields"], list(RELEASE_GATE_LEVEL_FIELDS))
             self.assertEqual(documented["violation_fields"], list(RELEASE_GATE_VIOLATION_FIELDS))
             self.assertEqual(documented["rollout_decision_values"], list(RELEASE_GATE_ROLLOUT_DECISION_VALUES))
+            self.assertEqual(documented.get("tool_item_prefix"), "agent-release-gate-tool")
+            self.assertEqual(documented.get("level_item_prefix"), "agent-release-gate-level")
+            self.assertEqual(documented.get("violation_item_prefix"), "agent-release-gate-violation")
             self.assertEqual(
                 documented["rollout_allowed_rule"],
                 "current_side_effect_allowed_and_backend_contract_active_or_missing",
@@ -5214,11 +8648,21 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(list(route_payload), list(RELEASE_GATE_FIELDS))
         self.assertTrue(snapshot["tool_matrix"])
         self.assertTrue(snapshot["expansion_gates"])
+        tool_item_prefix = getattr(agent_release_gate_service, "AGENT_RELEASE_GATE_TOOL_ITEM_ID_PREFIX", None)
+        level_item_prefix = getattr(agent_release_gate_service, "AGENT_RELEASE_GATE_LEVEL_ITEM_ID_PREFIX", None)
+        violation_item_prefix = getattr(agent_release_gate_service, "AGENT_RELEASE_GATE_VIOLATION_ITEM_ID_PREFIX", None)
+        self.assertEqual(tool_item_prefix, "agent-release-gate-tool")
+        self.assertEqual(level_item_prefix, "agent-release-gate-level")
+        self.assertEqual(violation_item_prefix, "agent-release-gate-violation")
         self.assertTrue(all(list(item) == list(RELEASE_GATE_TOOL_FIELDS) for item in snapshot["tool_matrix"]))
         self.assertTrue(all(list(item) == list(RELEASE_GATE_TOOL_FIELDS) for item in route_payload["tool_matrix"]))
         self.assertTrue({item["rollout_decision"] for item in snapshot["tool_matrix"]}.issubset(RELEASE_GATE_ROLLOUT_DECISION_VALUES))
         self.assertTrue(all(list(item) == list(RELEASE_GATE_LEVEL_FIELDS) for item in snapshot["expansion_gates"]))
         self.assertTrue(all(list(item) == list(RELEASE_GATE_LEVEL_FIELDS) for item in route_payload["expansion_gates"]))
+        first_tool = snapshot["tool_matrix"][0]
+        self.assertEqual(first_tool["item_id"], f"{tool_item_prefix}://{first_tool['tool_name']}/{first_tool['tool_version']}")
+        route_first_tool = route_payload["tool_matrix"][0]
+        self.assertEqual(route_first_tool["item_id"], f"{tool_item_prefix}://{route_first_tool['tool_name']}/{route_first_tool['tool_version']}")
         self.assertEqual(snapshot["current_level"], CURRENT_AGENT_ROLLOUT_LEVEL)
         self.assertEqual(snapshot["allowed_side_effect_classes"], sorted(expected[CURRENT_AGENT_ROLLOUT_LEVEL]["allowed_side_effect_classes"]))
         self.assertEqual(snapshot["blocked_side_effect_classes"], sorted(expected[CURRENT_AGENT_ROLLOUT_LEVEL]["blocked_side_effect_classes"]))
@@ -5226,6 +8670,7 @@ class AgentRuntimeTests(unittest.TestCase):
             with self.subTest(level=level):
                 self.assertEqual(expansion_gates[level]["summary"], expected[level]["summary"])
                 self.assertEqual(expansion_gates[level]["required_gates"], expected[level]["required_gates"])
+                self.assertEqual(expansion_gates[level]["item_id"], f"{level_item_prefix}://{level}")
                 self.assertEqual(expansion_gates[level]["unlocked"], index <= current_index)
         blocked_spec = ToolSpec(
             name="project.create_business_record",
@@ -5242,6 +8687,10 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(list(blocked_snapshot["violations"][0]), list(RELEASE_GATE_VIOLATION_FIELDS))
         self.assertEqual(blocked_snapshot["violations"][0]["tool_name"], "project.create_business_record")
         self.assertEqual(blocked_snapshot["violations"][0]["reason"], RELEASE_GATE_VIOLATION_REASON)
+        self.assertEqual(
+            blocked_snapshot["violations"][0]["item_id"],
+            f"{violation_item_prefix}://project.create_business_record/{RELEASE_GATE_VIOLATION_REASON}",
+        )
         blocked_tool = next(item for item in blocked_snapshot["tool_matrix"] if item["tool_name"] == blocked_spec.name)
         self.assertFalse(blocked_tool["rollout_allowed"])
         self.assertEqual(blocked_tool["rollout_decision"], RELEASE_GATE_ROLLOUT_DECISION_VALUES[1])
@@ -5625,6 +9074,8 @@ class AgentRuntimeTests(unittest.TestCase):
                 documented_decision_contracts.append(_parse_decision_contract(text))
         expected_contract = {
             "checks": list(PROMOTION_ASSESSMENT_CHECKS),
+            "check_fields": ["item_id", "name", "status", "details"],
+            "promotion_check_item_prefix": ["agent-promotion-check"],
             "blocker_sources": list(PROMOTION_BLOCKER_SOURCES),
             "release_gate_fields": list(PROMOTION_RELEASE_GATE_FIELDS),
         }
@@ -5644,6 +9095,16 @@ class AgentRuntimeTests(unittest.TestCase):
             "already_unlocked_blockers": "empty",
             "target_above_current_status": PROMOTION_ALREADY_UNLOCKED_CHECK_STATUS,
         }
+        promotion_blocker_item_prefix = getattr(
+            agent_release_gate_service,
+            "AGENT_PROMOTION_BLOCKER_ITEM_ID_PREFIX",
+            None,
+        )
+        promotion_check_item_prefix = getattr(
+            agent_release_gate_service,
+            "AGENT_PROMOTION_CHECK_ITEM_ID_PREFIX",
+            None,
+        )
         AgentRuntimeService(self.db).ensure_backend_contracts()
 
         assessment = AgentReleaseGateService(self.db).promotion_assessment(target_level="L3", project_id=10)
@@ -5660,6 +9121,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(len(documented_blocker_payload_contracts), 2)
         for documented in documented_blocker_payload_contracts:
             self.assertEqual(documented["fields"], list(PROMOTION_BLOCKER_FIELDS))
+            self.assertEqual(documented.get("promotion_blocker_item_prefix"), "agent-promotion-blocker")
             self.assertEqual(documented["details_required_field"], "target_level")
             for source, fields in expected_details_by_source.items():
                 self.assertEqual(documented[f"{source}_details"], fields)
@@ -5667,20 +9129,40 @@ class AgentRuntimeTests(unittest.TestCase):
         for documented in documented_decision_contracts:
             self.assertEqual(documented, expected_decision_contract)
         self.assertEqual(list(AgentReleaseGatePromotionRead.model_fields), list(PROMOTION_ASSESSMENT_FIELDS))
+        self.assertEqual(promotion_blocker_item_prefix, "agent-promotion-blocker")
+        self.assertEqual(promotion_check_item_prefix, "agent-promotion-check")
+        self.assertEqual(
+            list(getattr(agent_release_gate_service, "PROMOTION_ASSESSMENT_CHECK_FIELDS", ())),
+            ["item_id", "name", "status", "details"],
+        )
         self.assertEqual(list(assessment), list(PROMOTION_ASSESSMENT_FIELDS))
         self.assertEqual([item["name"] for item in assessment["checks"]], list(PROMOTION_ASSESSMENT_CHECKS))
+        for check in assessment["checks"]:
+            self.assertEqual(list(check), ["item_id", "name", "status", "details"])
+            self.assertEqual(check["item_id"], f"{promotion_check_item_prefix}://L3/{check['name']}")
         self.assertEqual(list(assessment["release_gate"]), list(PROMOTION_RELEASE_GATE_FIELDS))
         self.assertTrue(assessment["blockers"])
         for blocker in assessment["blockers"]:
             self.assertEqual(list(blocker), list(PROMOTION_BLOCKER_FIELDS))
+            self.assertEqual(
+                blocker["item_id"],
+                f"{promotion_blocker_item_prefix}://L3/{blocker['source']}/{blocker['reason']}",
+            )
             self.assertIn(blocker["source"], PROMOTION_BLOCKER_SOURCES)
             self.assertEqual(blocker["details"]["target_level"], "L3")
             self.assertTrue(set(expected_details_by_source[blocker["source"]]).issubset(blocker["details"]))
         self.assertEqual([item["name"] for item in payload["checks"]], list(PROMOTION_ASSESSMENT_CHECKS))
+        for check in payload["checks"]:
+            self.assertEqual(list(check), ["item_id", "name", "status", "details"])
+            self.assertEqual(check["item_id"], f"{promotion_check_item_prefix}://L3/{check['name']}")
         self.assertEqual(list(payload), list(PROMOTION_ASSESSMENT_FIELDS))
         self.assertEqual(list(payload["release_gate"]), list(PROMOTION_RELEASE_GATE_FIELDS))
         for blocker in payload["blockers"]:
             self.assertEqual(list(blocker), list(PROMOTION_BLOCKER_FIELDS))
+            self.assertEqual(
+                blocker["item_id"],
+                f"{promotion_blocker_item_prefix}://L3/{blocker['source']}/{blocker['reason']}",
+            )
         self.assertEqual(already_unlocked["decision"], "already_unlocked")
         self.assertFalse(already_unlocked["can_promote"])
         self.assertEqual(already_unlocked["blockers"], [])
@@ -5688,6 +9170,9 @@ class AgentRuntimeTests(unittest.TestCase):
             already_unlocked_checks["target_above_current"]["status"],
             PROMOTION_ALREADY_UNLOCKED_CHECK_STATUS,
         )
+        for check in already_unlocked["checks"]:
+            self.assertEqual(list(check), ["item_id", "name", "status", "details"])
+            self.assertEqual(check["item_id"], f"{promotion_check_item_prefix}://L2/{check['name']}")
         self.assertIn(already_unlocked["decision"], PROMOTION_DECISION_VALUES)
 
         run = AgentRuntimeService(self.db).create_run(
@@ -5704,6 +9189,10 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue({"monitoring_alerts", "readiness_dashboard"}.issubset(blocked_by_source))
         for source in ("monitoring_alerts", "readiness_dashboard"):
             self.assertEqual(list(blocked_by_source[source]), list(PROMOTION_BLOCKER_FIELDS))
+            self.assertEqual(
+                blocked_by_source[source]["item_id"],
+                f"{promotion_blocker_item_prefix}://L3/{source}/{blocked_by_source[source]['reason']}",
+            )
             self.assertTrue(set(expected_details_by_source[source]).issubset(blocked_by_source[source]["details"]))
 
     def test_harness_minimum_go_live_contract_matches_release_gate(self):
@@ -5744,6 +9233,11 @@ class AgentRuntimeTests(unittest.TestCase):
 
         release_gate = AgentReleaseGateService(self.db).snapshot()
         minimum = release_gate["minimum_go_live"]
+        minimum_go_live_check_item_prefix = getattr(
+            agent_release_gate_service,
+            "AGENT_MINIMUM_GO_LIVE_CHECK_ITEM_ID_PREFIX",
+            None,
+        )
         promotion = AgentReleaseGateService(self.db).promotion_assessment(target_level="L3", project_id=10)
         promotion_checks = {item["name"]: item for item in promotion["checks"]}
         route_payload = get_agent_release_gates(db=self.db, current_user=self.admin)["data"]
@@ -5755,10 +9249,27 @@ class AgentRuntimeTests(unittest.TestCase):
         for documented in documented_payload_contracts:
             self.assertEqual(documented["fields"], list(MINIMUM_GO_LIVE_FIELDS))
             self.assertEqual(documented["check_fields"], list(MINIMUM_GO_LIVE_CHECK_FIELDS))
+            self.assertEqual(documented.get("minimum_go_live_check_item_prefix"), "agent-minimum-go-live-check")
             self.assertEqual(documented["expansion_prerequisite"], "business_create")
+        self.assertEqual(minimum_go_live_check_item_prefix, "agent-minimum-go-live-check")
+        self.assertEqual(
+            list(MINIMUM_GO_LIVE_CHECK_FIELDS),
+            ["item_id", "requirement_id", "label", "status", "details"],
+        )
         self.assertIn("minimum_go_live", AgentReleaseGateRead.model_fields)
         self.assertEqual(list(minimum), list(MINIMUM_GO_LIVE_FIELDS))
         self.assertTrue(all(list(item) == list(MINIMUM_GO_LIVE_CHECK_FIELDS) for item in minimum["checks"]))
+        for item in minimum["checks"]:
+            self.assertEqual(
+                item["item_id"],
+                f"{minimum_go_live_check_item_prefix}://{item['requirement_id']}",
+            )
+        for item in route_payload["minimum_go_live"]["checks"]:
+            self.assertEqual(list(item), list(MINIMUM_GO_LIVE_CHECK_FIELDS))
+            self.assertEqual(
+                item["item_id"],
+                f"{minimum_go_live_check_item_prefix}://{item['requirement_id']}",
+            )
         self.assertEqual(route_payload["minimum_go_live"]["required_requirement_ids"], list(MINIMUM_GO_LIVE_REQUIREMENTS))
         self.assertEqual(minimum["required_requirement_ids"], list(MINIMUM_GO_LIVE_REQUIREMENTS))
         self.assertEqual(set(minimum["passed_requirement_ids"]), set(MINIMUM_GO_LIVE_REQUIREMENTS))
@@ -5832,6 +9343,11 @@ class AgentRuntimeTests(unittest.TestCase):
 
         release_gate = AgentReleaseGateService(self.db).snapshot()
         go_live_gates = release_gate["go_live_gates"]
+        go_live_gate_check_item_prefix = getattr(
+            agent_release_gate_service,
+            "AGENT_GO_LIVE_GATE_CHECK_ITEM_ID_PREFIX",
+            None,
+        )
         promotion = AgentReleaseGateService(self.db).promotion_assessment(target_level="L3", project_id=10)
         promotion_checks = {item["name"]: item for item in promotion["checks"]}
         route_payload = get_agent_release_gates(db=self.db, current_user=self.admin)["data"]
@@ -5844,13 +9360,23 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(documented["fields"], list(GO_LIVE_GATE_FIELDS))
             self.assertEqual(documented["tier_fields"], list(GO_LIVE_GATE_TIER_FIELDS))
             self.assertEqual(documented["check_fields"], list(GO_LIVE_GATE_CHECK_FIELDS))
+            self.assertEqual(documented.get("go_live_gate_check_item_prefix"), "agent-go-live-gate-check")
             self.assertEqual(documented["evidence"], "covered_by_agent_runtime_regression_suite")
+        self.assertEqual(go_live_gate_check_item_prefix, "agent-go-live-gate-check")
+        self.assertEqual(
+            list(GO_LIVE_GATE_CHECK_FIELDS),
+            ["item_id", "gate_id", "label", "status", "evidence"],
+        )
         self.assertIn("go_live_gates", AgentReleaseGateRead.model_fields)
         self.assertEqual(list(go_live_gates), list(GO_LIVE_GATE_FIELDS))
         self.assertEqual(route_payload["go_live_gates"]["priorities"], list(GO_LIVE_GATE_REQUIREMENTS))
         self.assertEqual(go_live_gates["priorities"], list(GO_LIVE_GATE_REQUIREMENTS))
         self.assertTrue(go_live_gates["pass"])
         self.assertEqual(go_live_gates["missing_by_priority"], {})
+        route_tiers_by_priority = {
+            tier["priority"]: tier
+            for tier in route_payload["go_live_gates"]["tiers"]
+        }
         for tier in go_live_gates["tiers"]:
             self.assertEqual(list(tier), list(GO_LIVE_GATE_TIER_FIELDS))
             expected_gates = GO_LIVE_GATE_REQUIREMENTS[tier["priority"]]
@@ -5859,6 +9385,19 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(tier["missing_gate_ids"], [])
             self.assertTrue(tier["pass"])
             self.assertTrue(all(list(item) == list(GO_LIVE_GATE_CHECK_FIELDS) for item in tier["checks"]))
+            for item in tier["checks"]:
+                self.assertEqual(
+                    item["item_id"],
+                    f"{go_live_gate_check_item_prefix}://{tier['priority']}/{item['gate_id']}",
+                )
+            self.assertTrue(
+                all(list(item) == list(GO_LIVE_GATE_CHECK_FIELDS) for item in route_tiers_by_priority[tier["priority"]]["checks"])
+            )
+            for item in route_tiers_by_priority[tier["priority"]]["checks"]:
+                self.assertEqual(
+                    item["item_id"],
+                    f"{go_live_gate_check_item_prefix}://{tier['priority']}/{item['gate_id']}",
+                )
             self.assertEqual(
                 {item["gate_id"]: item["label"] for item in tier["checks"]},
                 expected_gates,
@@ -5918,6 +9457,16 @@ class AgentRuntimeTests(unittest.TestCase):
         AgentRuntimeService(self.db).ensure_backend_contracts()
         release_gate = AgentReleaseGateService(self.db).snapshot()
         final_delivery = release_gate["final_delivery"]
+        final_delivery_category_item_prefix = getattr(
+            agent_release_gate_service,
+            "AGENT_FINAL_DELIVERY_CATEGORY_ITEM_ID_PREFIX",
+            None,
+        )
+        final_delivery_check_item_prefix = getattr(
+            agent_release_gate_service,
+            "AGENT_FINAL_DELIVERY_CHECK_ITEM_ID_PREFIX",
+            None,
+        )
         promotion = AgentReleaseGateService(self.db).promotion_assessment(target_level="L3", project_id=10)
         promotion_checks = {item["name"]: item for item in promotion["checks"]}
         dashboard = AgentReadinessDashboardService(self.db).snapshot(project_id=10)
@@ -5931,8 +9480,30 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(documented["fields"], list(FINAL_DELIVERY_FIELDS))
             self.assertEqual(documented["category_fields"], list(FINAL_DELIVERY_CATEGORY_FIELDS))
             self.assertEqual(documented["check_fields"], list(FINAL_DELIVERY_CHECK_FIELDS))
+            self.assertEqual(documented.get("category_item_prefix"), "agent-final-delivery-category")
+            self.assertEqual(documented.get("check_item_prefix"), "agent-final-delivery-check")
             self.assertEqual(documented["external_scope_status"], "external_scope")
             self.assertEqual(documented["backend_owned_status"], "pass")
+        self.assertEqual(final_delivery_category_item_prefix, "agent-final-delivery-category")
+        self.assertEqual(final_delivery_check_item_prefix, "agent-final-delivery-check")
+        self.assertEqual(
+            list(FINAL_DELIVERY_CATEGORY_FIELDS),
+            [
+                "item_id",
+                "category",
+                "external_scope",
+                "required_artifact_ids",
+                "delivered_artifact_ids",
+                "external_scope_artifact_ids",
+                "missing_artifact_ids",
+                "checks",
+                "pass",
+            ],
+        )
+        self.assertEqual(
+            list(FINAL_DELIVERY_CHECK_FIELDS),
+            ["item_id", "artifact_id", "label", "status", "evidence"],
+        )
         self.assertIn("final_delivery", AgentReleaseGateRead.model_fields)
         self.assertEqual(list(final_delivery), list(FINAL_DELIVERY_FIELDS))
         self.assertEqual(route_payload["final_delivery"]["external_scope_categories"], ["frontend"])
@@ -5948,13 +9519,35 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(dashboard["promotion_assessment"]["final_delivery_missing_by_category"], {})
         self.assertEqual(dashboard["promotion_assessment"]["final_delivery_external_scope_categories"], ["frontend"])
         categories = {item["category"]: item for item in final_delivery["categories"]}
+        route_categories = {
+            item["category"]: item
+            for item in route_payload["final_delivery"]["categories"]
+        }
         self.assertEqual(set(categories), set(FINAL_DELIVERY_ARTIFACTS))
         for category, artifacts in FINAL_DELIVERY_ARTIFACTS.items():
             item = categories[category]
+            route_item = route_categories[category]
             self.assertEqual(list(item), list(FINAL_DELIVERY_CATEGORY_FIELDS))
+            self.assertEqual(list(route_item), list(FINAL_DELIVERY_CATEGORY_FIELDS))
+            self.assertEqual(
+                item["item_id"],
+                f"{final_delivery_category_item_prefix}://{category}",
+            )
+            self.assertEqual(route_item["item_id"], item["item_id"])
             self.assertEqual(item["required_artifact_ids"], list(artifacts))
             self.assertEqual(item["missing_artifact_ids"], [])
             self.assertTrue(all(list(check) == list(FINAL_DELIVERY_CHECK_FIELDS) for check in item["checks"]))
+            self.assertTrue(all(list(check) == list(FINAL_DELIVERY_CHECK_FIELDS) for check in route_item["checks"]))
+            for check in item["checks"]:
+                self.assertEqual(
+                    check["item_id"],
+                    f"{final_delivery_check_item_prefix}://{category}/{check['artifact_id']}",
+                )
+            for check in route_item["checks"]:
+                self.assertEqual(
+                    check["item_id"],
+                    f"{final_delivery_check_item_prefix}://{category}/{check['artifact_id']}",
+                )
             self.assertEqual(
                 {check["artifact_id"]: check["label"] for check in item["checks"]},
                 artifacts,
@@ -6156,6 +9749,7 @@ class AgentRuntimeTests(unittest.TestCase):
             payload=AgentRunCreateRequest(project_id=10, intent="sse cursor reset", auto_complete=True),
             current_user=self.owner,
         )
+        item_id_prefix = getattr(agent_runtime_service, "AGENT_EVENT_ITEM_ID_PREFIX", None)
 
         async def read_stream(response) -> str:
             chunks = []
@@ -6172,9 +9766,23 @@ class AgentRuntimeTests(unittest.TestCase):
             )
             body = asyncio.run(read_stream(response))
 
+        data_payloads = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ") and line != "data: {}"
+        ]
+        first_stored_event = self.db.scalar(
+            select(AgentEvent)
+            .where(AgentEvent.run_id == run.run_id)
+            .order_by(AgentEvent.event_seq)
+        )
+
+        self.assertIsNotNone(item_id_prefix)
         self.assertIn("event: run.queued", body)
         self.assertIn("event: run.started", body)
         self.assertIn("event: run.completed", body)
+        self.assertEqual(data_payloads[0]["item_id"], f"{item_id_prefix}://{run.run_id}/1")
+        self.assertNotIn("item_id", first_stored_event.payload_json)
         self.assertNotIn("event: heartbeat", body)
 
     def test_run_event_snapshot_route_returns_cursor_state_and_requires_project_access(self):
@@ -6369,7 +9977,7 @@ class AgentRuntimeTests(unittest.TestCase):
             list_agent_loop_observations(run_id=run.run_id, db=self.db, current_user=outsider)
         loop_list_response = list_agent_loop_observations(run_id=run.run_id, db=self.db, current_user=self.member)
 
-        approval_run, _, approval = self._create_pending_approval()
+        approval_run, approval_call, approval = self._create_pending_approval()
         with self.assertRaises(HTTPException) as outsider_approvals_ctx:
             list_agent_run_approvals(run_id=approval_run.run_id, db=self.db, current_user=outsider)
         approvals_response = list_agent_run_approvals(
@@ -6414,6 +10022,10 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(loop_response["data"]["run_id"], run.run_id)
         self.assertEqual(loop_list_response["data"][0]["observation_id"], loop_response["data"]["observation_id"])
         self.assertEqual(approvals_response["data"][0]["approval_id"], approval.approval_id)
+        self.assertEqual(
+            approvals_response["data"][0]["tool_call_item_id"],
+            f"agent-tool-call://{approval_run.run_id}/{approval_call.tool_call_id}",
+        )
         self.assertEqual(blocks_response["data"][0]["block_id"], block.block_id)
         self.assertEqual(resolve_response["data"]["block"]["block_id"], block.block_id)
 
@@ -9505,6 +13117,7 @@ class AgentRuntimeTests(unittest.TestCase):
         for contract in documented_contracts:
             self.assertEqual(contract["fields"], list(AGENT_LAUNCH_AUDIT_FIELDS))
             self.assertEqual(contract["check_fields"], list(DASHBOARD_CHECK_FIELDS))
+            self.assertEqual(contract.get("dashboard_check_item_prefix"), "agent-dashboard-check")
             self.assertEqual(contract["checks"], list(AGENT_LAUNCH_AUDIT_CHECK_NAMES))
             self.assertEqual(contract["status_values"], list(READINESS_STATUS_VALUES))
             self.assertEqual(contract["source"], "AgentLaunchAuditService.audit")
@@ -9513,6 +13126,21 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(list(route_payload), list(AGENT_LAUNCH_AUDIT_FIELDS))
         self.assertEqual([item["name"] for item in snapshot["checks"]], list(AGENT_LAUNCH_AUDIT_CHECK_NAMES))
         self.assertEqual([item["name"] for item in route_payload["checks"]], list(AGENT_LAUNCH_AUDIT_CHECK_NAMES))
+        dashboard_check_item_prefix = getattr(
+            agent_observability_service,
+            "AGENT_DASHBOARD_CHECK_ITEM_ID_PREFIX",
+            None,
+        )
+        self.assertEqual(dashboard_check_item_prefix, "agent-dashboard-check")
+        self.assertTrue(
+            all(item["item_id"] == f"{dashboard_check_item_prefix}://{item['name']}" for item in snapshot["checks"])
+        )
+        self.assertTrue(
+            all(
+                item["item_id"] == f"{dashboard_check_item_prefix}://{item['name']}"
+                for item in route_payload["checks"]
+            )
+        )
 
     def test_harness_backend_completion_audit_payload_contract_matches_service(self):
         from pathlib import Path
@@ -9573,6 +13201,7 @@ class AgentRuntimeTests(unittest.TestCase):
         for contract in documented_contracts:
             self.assertEqual(contract["fields"], list(AGENT_BACKEND_COMPLETION_AUDIT_FIELDS))
             self.assertEqual(contract["check_fields"], list(DASHBOARD_CHECK_FIELDS))
+            self.assertEqual(contract.get("dashboard_check_item_prefix"), "agent-dashboard-check")
             self.assertEqual(contract["checks"], list(AGENT_BACKEND_COMPLETION_AUDIT_CHECK_NAMES))
             self.assertEqual(contract["status_values"], list(READINESS_STATUS_VALUES))
             self.assertEqual(contract["runtime_contract_keys"], list(snapshot["runtime_contracts"]))
@@ -9643,6 +13272,21 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(
             [item["name"] for item in route_payload["checks"]],
             list(AGENT_BACKEND_COMPLETION_AUDIT_CHECK_NAMES),
+        )
+        dashboard_check_item_prefix = getattr(
+            agent_observability_service,
+            "AGENT_DASHBOARD_CHECK_ITEM_ID_PREFIX",
+            None,
+        )
+        self.assertEqual(dashboard_check_item_prefix, "agent-dashboard-check")
+        self.assertTrue(
+            all(item["item_id"] == f"{dashboard_check_item_prefix}://{item['name']}" for item in snapshot["checks"])
+        )
+        self.assertTrue(
+            all(
+                item["item_id"] == f"{dashboard_check_item_prefix}://{item['name']}"
+                for item in route_payload["checks"]
+            )
         )
 
     def test_harness_dashboard_promotion_summary_contract_matches_dashboard(self):
@@ -9922,6 +13566,7 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(contract["alert_fields"], list(ALERT_ITEM_FIELDS))
             self.assertEqual(contract["summary_fields"], list(ALERT_SUMMARY_FIELDS))
             self.assertEqual(contract["status_values"], list(ALERT_STATUS_VALUES))
+            self.assertEqual(contract.get("alert_item_prefix"), "agent-alert")
             self.assertEqual(contract["source"], "AgentAlertService.snapshot")
         self.assertEqual(list(AgentAlertSnapshotRead.model_fields), list(ALERT_SNAPSHOT_FIELDS))
         self.assertEqual(list(AgentAlertRead.model_fields), list(ALERT_ITEM_FIELDS))
@@ -9948,6 +13593,7 @@ class AgentRuntimeTests(unittest.TestCase):
         route_alerts = {item["alert_id"]: item for item in route_payload["alerts"]}
         memory_alert = alerts["agent_memory_bypassed_evidence_ref"]
         route_memory_alert = route_alerts["agent_memory_bypassed_evidence_ref"]
+        alert_item_prefix = getattr(agent_observability_service, "AGENT_ALERT_ITEM_ID_PREFIX", None)
 
         self.assertEqual(list(firing_snapshot), list(ALERT_SNAPSHOT_FIELDS))
         self.assertEqual(list(route_payload), list(ALERT_SNAPSHOT_FIELDS))
@@ -9960,6 +13606,9 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(list(firing_snapshot["summary"]), list(ALERT_SUMMARY_FIELDS))
         self.assertEqual(firing_snapshot["summary"]["highest_severity"], "P0")
         self.assertEqual(memory_alert["severity"], "P0")
+        self.assertEqual(alert_item_prefix, "agent-alert")
+        self.assertEqual(memory_alert["item_id"], f"{alert_item_prefix}://{memory_alert['alert_id']}")
+        self.assertEqual(route_memory_alert["item_id"], memory_alert["item_id"])
         self.assertEqual(memory_alert["metric_key"], "memory_bypassed_evidence_ref_total")
         self.assertEqual(memory_alert["runbook_id"], "memory_evidence_ref_violation")
         self.assertTrue(memory_alert["action"])
@@ -10008,6 +13657,7 @@ class AgentRuntimeTests(unittest.TestCase):
         for contract in documented_contracts:
             self.assertEqual(contract["fields"], list(READINESS_DASHBOARD_FIELDS))
             self.assertEqual(contract["check_fields"], list(DASHBOARD_CHECK_FIELDS))
+            self.assertEqual(contract.get("dashboard_check_item_prefix"), "agent-dashboard-check")
             self.assertEqual(contract["checks"], list(DASHBOARD_CHECK_NAMES))
             self.assertEqual(contract["readiness_values"], list(READINESS_STATUS_VALUES))
             self.assertEqual(contract["source"], "AgentReadinessDashboardService.snapshot")
@@ -10020,6 +13670,21 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in route_payload["checks"]], list(DASHBOARD_CHECK_NAMES))
         self.assertTrue(all(list(item) == list(DASHBOARD_CHECK_FIELDS) for item in snapshot["checks"]))
         self.assertTrue(all(list(item) == list(DASHBOARD_CHECK_FIELDS) for item in route_payload["checks"]))
+        dashboard_check_item_prefix = getattr(
+            agent_observability_service,
+            "AGENT_DASHBOARD_CHECK_ITEM_ID_PREFIX",
+            None,
+        )
+        self.assertEqual(dashboard_check_item_prefix, "agent-dashboard-check")
+        self.assertTrue(
+            all(item["item_id"] == f"{dashboard_check_item_prefix}://{item['name']}" for item in snapshot["checks"])
+        )
+        self.assertTrue(
+            all(
+                item["item_id"] == f"{dashboard_check_item_prefix}://{item['name']}"
+                for item in route_payload["checks"]
+            )
+        )
         self.assertIn(snapshot["readiness"], READINESS_STATUS_VALUES)
         self.assertIn(route_payload["readiness"], READINESS_STATUS_VALUES)
         self.assertEqual(list(snapshot["alert_summary"]), list(ALERT_SUMMARY_FIELDS))
@@ -10152,9 +13817,11 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(len(documented_payload_contracts), 2)
         for contract in documented_payload_contracts:
             self.assertEqual(contract["case_fields"], list(FAULT_INJECTION_CASE_FIELDS))
+            self.assertEqual(contract.get("fault_case_item_prefix"), "agent-fault-injection-case")
             self.assertEqual(contract["coverage_fields"], list(FAULT_INJECTION_COVERAGE_FIELDS))
             self.assertEqual(contract["run_fields"], list(FAULT_INJECTION_RUN_FIELDS))
             self.assertEqual(contract["result_fields"], list(FAULT_INJECTION_RESULT_FIELDS))
+            self.assertEqual(contract.get("fault_result_item_prefix"), "agent-fault-injection-result")
             self.assertEqual(contract["source"], "AgentFaultInjectionService_and_AgentFaultInjectionCoverageService")
         self.assertEqual(list(AgentFaultInjectionCaseRead.model_fields), list(FAULT_INJECTION_CASE_FIELDS))
         self.assertEqual(list(AgentFaultInjectionCoverageRead.model_fields), list(FAULT_INJECTION_COVERAGE_FIELDS))
@@ -10166,6 +13833,30 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(list(coverage_route_payload), list(FAULT_INJECTION_COVERAGE_FIELDS))
         self.assertEqual(list(run_route_payload), list(FAULT_INJECTION_RUN_FIELDS))
         self.assertTrue(all(list(item) == list(FAULT_INJECTION_RESULT_FIELDS) for item in run_route_payload["results"]))
+        fault_case_item_prefix = getattr(
+            agent_fault_injection_service,
+            "AGENT_FAULT_INJECTION_CASE_ITEM_ID_PREFIX",
+            None,
+        )
+        fault_result_item_prefix = getattr(
+            agent_fault_injection_service,
+            "AGENT_FAULT_INJECTION_RESULT_ITEM_ID_PREFIX",
+            None,
+        )
+        self.assertEqual(fault_case_item_prefix, "agent-fault-injection-case")
+        self.assertEqual(fault_result_item_prefix, "agent-fault-injection-result")
+        self.assertTrue(
+            all(item["item_id"] == f"{fault_case_item_prefix}://{item['case_id']}" for item in catalog)
+        )
+        self.assertTrue(
+            all(item["item_id"] == f"{fault_case_item_prefix}://{item['case_id']}" for item in catalog_route_payload)
+        )
+        self.assertTrue(
+            all(
+                item["item_id"] == f"{fault_result_item_prefix}://{item['run_id']}/{item['case_id']}"
+                for item in run_route_payload["results"]
+            )
+        )
         self.assertEqual(registered_cases, REQUIRED_FAULT_CASES)
         self.assertEqual(set(coverage["covered_required_case_ids"]), REQUIRED_FAULT_CASES)
         self.assertEqual(coverage["missing_required_case_ids"], [])
@@ -10322,6 +14013,7 @@ class AgentRuntimeTests(unittest.TestCase):
             for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
             if "Required Memory usage event payload contract:" in path.read_text(encoding="utf-8")
         ]
+        item_id_prefix = getattr(agent_memory_service, "AGENT_MEMORY_USAGE_EVENT_ITEM_ID_PREFIX", None)
         usage_event = self.db.scalar(select(AgentMemoryUsageEvent).where(AgentMemoryUsageEvent.run_id == run.run_id))
         run_scoped_payload = list_agent_memory_usage_events(
             run_id=run.run_id,
@@ -10335,10 +14027,14 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(contract["fields"], list(MEMORY_USAGE_EVENT_FIELDS))
             self.assertEqual(contract["evidence_ref_fields"], list(MEMORY_USAGE_EVENT_EVIDENCE_REF_FIELDS))
             self.assertEqual(contract["source"], "GET /api/v1/agents/memory-usage-events")
+            self.assertEqual(contract.get("memory_usage_event_item_prefix"), "agent-memory-usage-event")
+        self.assertEqual(item_id_prefix, "agent-memory-usage-event")
         self.assertEqual(list(AgentMemoryUsageEventRead.model_fields), list(MEMORY_USAGE_EVENT_FIELDS))
         self.assertEqual(list(run_scoped_payload), list(MEMORY_USAGE_EVENT_FIELDS))
         self.assertEqual(list(admin_global_payload), list(MEMORY_USAGE_EVENT_FIELDS))
         self.assertEqual(list(run_scoped_payload["evidence_ref_json"]), list(MEMORY_USAGE_EVENT_EVIDENCE_REF_FIELDS))
+        self.assertEqual(run_scoped_payload.get("item_id"), f"agent-memory-usage-event://{usage_event.id}")
+        self.assertEqual(admin_global_payload.get("item_id"), f"agent-memory-usage-event://{admin_global_payload['id']}")
         self.assertEqual(run_scoped_payload["id"], usage_event.id)
         self.assertEqual(run_scoped_payload["run_id"], run.run_id)
         self.assertEqual(run_scoped_payload["usage_role"], "policy_dependency")
@@ -11006,6 +14702,821 @@ class AgentRuntimeTests(unittest.TestCase):
         recovered = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == item.queue_id))
         self.assertEqual(recovered.status, "queued")
 
+    def test_worker_claim_rejects_queue_item_when_tool_call_is_missing(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="queued item points to missing tool call"),
+            current_user=self.owner,
+        )
+        queue_item = AgentWorkerQueue(
+            queue_id="agent-queue-missing-tool-call",
+            run_id=run.run_id,
+            tool_call_id="agent-tool-missing",
+            status="queued",
+            available_at=datetime.now(UTC).replace(tzinfo=None),
+        )
+        self.db.add(queue_item)
+        self.db.commit()
+
+        claimed = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-missing-tool-call")
+
+        refreshed = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == queue_item.queue_id))
+        self.assertIsNone(claimed)
+        self.assertEqual(refreshed.status, "failed")
+        self.assertEqual(refreshed.last_error_code, "tool_call_missing")
+        self.assertIsNone(refreshed.lease_owner)
+        self.assertIsNone(refreshed.lease_expires_at)
+
+    def test_worker_claim_obsoletes_queued_tool_when_run_cancelled(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="cancel queued tool before claim"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        AgentRuntimeService(self.db).cancel_run(run_id=run.run_id, current_user=self.owner)
+
+        claimed = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-claim-terminal")
+
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        self.assertIsNone(claimed)
+        self.assertEqual(queue_item.status, "failed")
+        self.assertIsNone(queue_item.lease_owner)
+        self.assertIsNone(queue_item.lease_expires_at)
+        self.assertEqual(queue_item.last_error_code, "agent_run_cancelled_before_tool_execution")
+        self.assertEqual(refreshed_call.status, "obsolete")
+        self.assertEqual(refreshed_call.execution_phase, "cancelled")
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_call.error_code, "agent_run_cancelled_before_tool_execution")
+        self.assertEqual(refreshed_call.recovery_decision, "run_cancelled_before_tool_execution")
+        self.assertEqual(refreshed_call.effect_submission_state, "none")
+        self.assertFalse(refreshed_call.effect_boundary_crossed)
+
+    def test_worker_claim_does_not_revive_obsolete_tool_call(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="stale queued tool should not revive"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        call.status = "obsolete"
+        call.execution_phase = "cancelled"
+        call.error_code = "superseded_by_replacement"
+        call.recovery_decision = "superseded_by_replacement"
+        self.db.commit()
+
+        claimed = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-stale-obsolete")
+
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        self.assertIsNone(claimed)
+        self.assertEqual(queue_item.status, "failed")
+        self.assertIsNone(queue_item.lease_owner)
+        self.assertIsNone(queue_item.lease_expires_at)
+        self.assertEqual(queue_item.last_error_code, "tool_call_not_claimable")
+        self.assertEqual(refreshed_call.status, "obsolete")
+        self.assertEqual(refreshed_call.execution_phase, "cancelled")
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_call.error_code, "superseded_by_replacement")
+        self.assertEqual(refreshed_call.recovery_decision, "superseded_by_replacement")
+
+    def test_orphan_recovery_obsoletes_leased_tool_when_run_cancelled(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="cancel leased orphan before recovery"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-orphan-terminal", lease_seconds=1)
+        self.assertIsNotNone(item)
+        AgentRuntimeService(self.db).cancel_run(run_id=run.run_id, current_user=self.owner)
+        item.lease_expires_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=1)
+        self.db.commit()
+
+        self.assertEqual(queue_service.recover_orphans(), 1)
+
+        recovered = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == item.queue_id))
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        self.assertEqual(recovered.status, "failed")
+        self.assertIsNone(recovered.lease_owner)
+        self.assertIsNone(recovered.lease_expires_at)
+        self.assertEqual(recovered.last_error_code, "agent_run_cancelled_before_tool_execution")
+        self.assertEqual(refreshed_call.status, "obsolete")
+        self.assertEqual(refreshed_call.execution_phase, "cancelled")
+        self.assertEqual(refreshed_call.error_code, "agent_run_cancelled_before_tool_execution")
+        self.assertEqual(refreshed_call.recovery_decision, "run_cancelled_before_tool_execution")
+        self.assertEqual(refreshed_call.effect_submission_state, "none")
+        self.assertFalse(refreshed_call.effect_boundary_crossed)
+
+    def test_orphan_recovery_does_not_requeue_succeeded_tool_call(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="succeeded tool should not be orphan requeued"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-orphan-succeeded", lease_seconds=1)
+        self.assertIsNotNone(item)
+        call.status = "succeeded"
+        call.execution_phase = "completed"
+        call.lease_owner = None
+        call.lease_expires_at = None
+        item.lease_expires_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=1)
+        self.db.commit()
+
+        self.assertEqual(queue_service.recover_orphans(), 1)
+
+        recovered = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == item.queue_id))
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        self.assertEqual(recovered.status, "failed")
+        self.assertEqual(recovered.last_error_code, "tool_call_not_recoverable_from_orphan")
+        self.assertIsNone(recovered.lease_owner)
+        self.assertIsNone(recovered.lease_expires_at)
+        self.assertEqual(refreshed_call.status, "succeeded")
+        self.assertEqual(refreshed_call.execution_phase, "completed")
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+
+    def test_orphan_recovery_requeues_running_pre_effect_before_send_intent(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="pre effect orphan can recover before send intent"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-orphan-pre-effect", lease_seconds=1)
+        self.assertIsNotNone(item)
+        call.status = "running_pre_effect"
+        call.execution_phase = "pre_effect"
+        call.effect_submission_state = "none"
+        item.lease_expires_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=1)
+        call.lease_expires_at = item.lease_expires_at
+        self.db.commit()
+
+        self.assertEqual(queue_service.recover_orphans(), 1)
+
+        recovered = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == item.queue_id))
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        self.assertEqual(recovered.status, "queued")
+        self.assertIsNone(recovered.lease_owner)
+        self.assertIsNone(recovered.lease_expires_at)
+        self.assertEqual(refreshed_call.status, "planned")
+        self.assertIsNone(refreshed_call.execution_phase)
+        self.assertEqual(refreshed_call.effect_submission_state, "none")
+        self.assertFalse(refreshed_call.effect_boundary_crossed)
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_call.recovery_decision, "lease_expired_requeued")
+
+    def test_orphan_recovery_marks_running_pre_effect_after_send_intent_uncertain(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="post send intent orphan requires reconcile"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-orphan-after-send-intent", lease_seconds=1)
+        self.assertIsNotNone(item)
+        expired_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=1)
+        call.status = "running_pre_effect"
+        call.execution_phase = "pre_effect"
+        call.effect_submission_state = "send_intent_recorded"
+        call.downstream_send_intent_at = expired_at
+        item.lease_expires_at = expired_at
+        call.lease_expires_at = expired_at
+        self.db.commit()
+
+        self.assertEqual(queue_service.recover_orphans(), 1)
+
+        recovered = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == item.queue_id))
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        self.assertEqual(recovered.status, "failed")
+        self.assertEqual(recovered.last_error_code, "tool_call_orphaned_after_effect_submission_started")
+        self.assertIsNone(recovered.lease_owner)
+        self.assertIsNone(recovered.lease_expires_at)
+        self.assertEqual(refreshed_call.status, "uncertain")
+        self.assertEqual(refreshed_call.execution_phase, "pre_effect")
+        self.assertEqual(refreshed_call.effect_submission_state, "send_intent_recorded")
+        self.assertFalse(refreshed_call.effect_boundary_crossed)
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_call.error_code, "tool_call_orphaned_after_effect_submission_started")
+        self.assertEqual(refreshed_call.recovery_decision, "reconcile_required_after_orphaned_tool_execution")
+
+    def test_orphan_recovery_marks_leased_tool_with_effect_evidence_uncertain(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="leased orphan with effect evidence requires reconcile"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-orphan-leased-with-effect-evidence", lease_seconds=1)
+        self.assertIsNotNone(item)
+        expired_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=1)
+        call.execution_phase = "pre_effect"
+        call.effect_submission_state = "transport_sent_observed"
+        call.downstream_request_observed_sent_at = expired_at
+        item.lease_expires_at = expired_at
+        call.lease_expires_at = expired_at
+        self.db.commit()
+
+        self.assertEqual(queue_service.recover_orphans(), 1)
+
+        recovered = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == item.queue_id))
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        self.assertEqual(recovered.status, "failed")
+        self.assertEqual(recovered.last_error_code, "tool_call_orphaned_after_effect_submission_started")
+        self.assertIsNone(recovered.lease_owner)
+        self.assertIsNone(recovered.lease_expires_at)
+        self.assertEqual(refreshed_call.status, "uncertain")
+        self.assertEqual(refreshed_call.execution_phase, "pre_effect")
+        self.assertEqual(refreshed_call.effect_submission_state, "transport_sent_observed")
+        self.assertFalse(refreshed_call.effect_boundary_crossed)
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_call.error_code, "tool_call_orphaned_after_effect_submission_started")
+        self.assertEqual(refreshed_call.recovery_decision, "reconcile_required_after_orphaned_tool_execution")
+
+    def test_worker_claim_rejects_queue_item_with_mismatched_tool_call_run(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="queue run mismatch must not mutate tool call"),
+            current_user=self.owner,
+        )
+        wrong_run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="wrong terminal run for queue row"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+        self.assertIsNotNone(queue_item)
+        queue_item.run_id = wrong_run.run_id
+        self.db.commit()
+        AgentRuntimeService(self.db).cancel_run(run_id=wrong_run.run_id, current_user=self.owner)
+
+        claimed = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-claim-mismatched-queue")
+
+        refreshed_queue = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == queue_item.queue_id))
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        events = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+
+        self.assertIsNone(claimed)
+        self.assertEqual(refreshed_queue.status, "failed")
+        self.assertEqual(refreshed_queue.last_error_code, "tool_call_queue_context_mismatch")
+        self.assertIsNone(refreshed_queue.lease_owner)
+        self.assertIsNone(refreshed_queue.lease_expires_at)
+        self.assertEqual(refreshed_call.status, "planned")
+        self.assertIsNone(refreshed_call.error_code)
+        self.assertIsNone(refreshed_call.recovery_decision)
+        self.assertNotIn("tool.failed", events)
+
+    def test_worker_heartbeat_marks_mismatched_queue_run_uncertain(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="heartbeat queue run mismatch requires reconcile"),
+            current_user=self.owner,
+        )
+        wrong_run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="wrong terminal run for heartbeat queue row"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-heartbeat-mismatched-queue", lease_seconds=30)
+        self.assertIsNotNone(item)
+        item.run_id = wrong_run.run_id
+        self.db.commit()
+        AgentRuntimeService(self.db).cancel_run(run_id=wrong_run.run_id, current_user=self.owner)
+
+        refreshed = queue_service.heartbeat(
+            queue_id=item.queue_id,
+            worker_id="worker-heartbeat-mismatched-queue",
+            lease_seconds=300,
+        )
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        events = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+        self.assertEqual(refreshed.status, "failed")
+        self.assertEqual(refreshed.last_error_code, "tool_call_queue_context_mismatch")
+        self.assertIsNone(refreshed.lease_owner)
+        self.assertIsNone(refreshed.lease_expires_at)
+        self.assertEqual(refreshed_call.status, "uncertain")
+        self.assertEqual(refreshed_call.effect_submission_state, "unknown")
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertIsNone(refreshed_call.last_heartbeat_at)
+        self.assertEqual(refreshed_call.error_code, "tool_call_queue_context_mismatch")
+        self.assertEqual(refreshed_call.recovery_decision, "reconcile_required_after_queue_context_mismatch")
+        self.assertNotIn("tool.failed", events)
+
+    def test_orphan_recovery_marks_mismatched_queue_run_uncertain(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="orphan queue run mismatch requires reconcile"),
+            current_user=self.owner,
+        )
+        wrong_run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="wrong terminal run for orphan queue row"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-orphan-mismatched-queue", lease_seconds=1)
+        self.assertIsNotNone(item)
+        expired_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=1)
+        item.run_id = wrong_run.run_id
+        item.lease_expires_at = expired_at
+        call.lease_expires_at = expired_at
+        self.db.commit()
+        AgentRuntimeService(self.db).cancel_run(run_id=wrong_run.run_id, current_user=self.owner)
+
+        self.assertEqual(queue_service.recover_orphans(), 1)
+
+        recovered = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == item.queue_id))
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        events = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+        self.assertEqual(recovered.status, "failed")
+        self.assertEqual(recovered.last_error_code, "tool_call_queue_context_mismatch")
+        self.assertIsNone(recovered.lease_owner)
+        self.assertIsNone(recovered.lease_expires_at)
+        self.assertEqual(refreshed_call.status, "uncertain")
+        self.assertEqual(refreshed_call.effect_submission_state, "unknown")
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_call.error_code, "tool_call_queue_context_mismatch")
+        self.assertEqual(refreshed_call.recovery_decision, "reconcile_required_after_queue_context_mismatch")
+        self.assertNotIn("tool.failed", events)
+
+    def test_worker_heartbeat_obsoletes_leased_tool_when_run_cancelled(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="cancel leased tool before heartbeat"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-heartbeat-terminal", lease_seconds=30)
+        self.assertIsNotNone(item)
+        AgentRuntimeService(self.db).cancel_run(run_id=run.run_id, current_user=self.owner)
+
+        refreshed = queue_service.heartbeat(
+            queue_id=item.queue_id,
+            worker_id="worker-heartbeat-terminal",
+            lease_seconds=60,
+        )
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        self.assertEqual(refreshed.status, "failed")
+        self.assertIsNone(refreshed.lease_owner)
+        self.assertIsNone(refreshed.lease_expires_at)
+        self.assertEqual(refreshed.last_error_code, "agent_run_cancelled_before_tool_execution")
+        self.assertEqual(refreshed_call.status, "obsolete")
+        self.assertEqual(refreshed_call.execution_phase, "cancelled")
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_call.error_code, "agent_run_cancelled_before_tool_execution")
+        self.assertEqual(refreshed_call.recovery_decision, "run_cancelled_before_tool_execution")
+        self.assertEqual(refreshed_call.effect_submission_state, "none")
+        self.assertFalse(refreshed_call.effect_boundary_crossed)
+
+    def test_worker_heartbeat_obsoletes_running_pre_effect_before_send_intent_when_run_cancelled(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="cancel running pre effect tool before heartbeat"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-heartbeat-terminal-pre-effect", lease_seconds=30)
+        self.assertIsNotNone(item)
+        call.status = "running_pre_effect"
+        call.execution_phase = "pre_effect"
+        call.effect_submission_state = "none"
+        call.lease_expires_at = item.lease_expires_at
+        self.db.commit()
+        AgentRuntimeService(self.db).cancel_run(run_id=run.run_id, current_user=self.owner)
+
+        refreshed = queue_service.heartbeat(
+            queue_id=item.queue_id,
+            worker_id="worker-heartbeat-terminal-pre-effect",
+            lease_seconds=60,
+        )
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        self.assertEqual(refreshed.status, "failed")
+        self.assertIsNone(refreshed.lease_owner)
+        self.assertIsNone(refreshed.lease_expires_at)
+        self.assertEqual(refreshed.last_error_code, "agent_run_cancelled_before_tool_execution")
+        self.assertEqual(refreshed_call.status, "obsolete")
+        self.assertEqual(refreshed_call.execution_phase, "cancelled")
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_call.error_code, "agent_run_cancelled_before_tool_execution")
+        self.assertEqual(refreshed_call.recovery_decision, "run_cancelled_before_tool_execution")
+        self.assertEqual(refreshed_call.effect_submission_state, "none")
+        self.assertFalse(refreshed_call.effect_boundary_crossed)
+
+    def test_worker_heartbeat_marks_leased_tool_with_effect_evidence_uncertain(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="leased heartbeat with effect evidence requires reconcile"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-heartbeat-leased-with-effect-evidence", lease_seconds=30)
+        self.assertIsNotNone(item)
+        observed_at = datetime.now(UTC).replace(tzinfo=None)
+        call.effect_submission_state = "transport_sent_observed"
+        call.downstream_request_observed_sent_at = observed_at
+        self.db.commit()
+
+        refreshed = queue_service.heartbeat(
+            queue_id=item.queue_id,
+            worker_id="worker-heartbeat-leased-with-effect-evidence",
+            lease_seconds=300,
+        )
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        self.assertEqual(refreshed.status, "failed")
+        self.assertEqual(refreshed.last_error_code, "tool_call_heartbeat_after_effect_submission_started")
+        self.assertIsNone(refreshed.lease_owner)
+        self.assertIsNone(refreshed.lease_expires_at)
+        self.assertEqual(refreshed_call.status, "uncertain")
+        self.assertEqual(refreshed_call.effect_submission_state, "transport_sent_observed")
+        self.assertFalse(refreshed_call.effect_boundary_crossed)
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_call.error_code, "tool_call_heartbeat_after_effect_submission_started")
+        self.assertEqual(refreshed_call.recovery_decision, "reconcile_required_after_invalid_tool_call_heartbeat")
+
+    def test_worker_heartbeat_rejects_completed_queue_item(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="reject completed queue heartbeat"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-heartbeat-completed", lease_seconds=30)
+        self.assertIsNotNone(item)
+        leased_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        original_call_lease_expires_at = leased_call.lease_expires_at
+        self.assertIsNone(leased_call.last_heartbeat_at)
+
+        queue_service.mark_completed(item)
+
+        with self.assertRaises(HTTPException) as ctx:
+            queue_service.heartbeat(
+                queue_id=item.queue_id,
+                worker_id="worker-heartbeat-completed",
+                lease_seconds=300,
+            )
+
+        refreshed_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == item.queue_id))
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(refreshed_item.status, "completed")
+        self.assertIsNone(refreshed_item.lease_owner)
+        self.assertIsNone(refreshed_item.lease_expires_at)
+        self.assertIsNone(refreshed_call.last_heartbeat_at)
+        self.assertEqual(refreshed_call.lease_expires_at, original_call_lease_expires_at)
+
+    def test_worker_heartbeat_does_not_refresh_succeeded_tool_call(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="reject stale heartbeat for succeeded tool"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-heartbeat-succeeded", lease_seconds=30)
+        self.assertIsNotNone(item)
+        call.status = "succeeded"
+        call.execution_phase = "completed"
+        call.lease_owner = None
+        call.lease_expires_at = None
+        self.db.commit()
+
+        refreshed = queue_service.heartbeat(
+            queue_id=item.queue_id,
+            worker_id="worker-heartbeat-succeeded",
+            lease_seconds=300,
+        )
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        self.assertEqual(refreshed.status, "failed")
+        self.assertEqual(refreshed.last_error_code, "tool_call_not_active_for_heartbeat")
+        self.assertIsNone(refreshed.lease_owner)
+        self.assertIsNone(refreshed.lease_expires_at)
+        self.assertEqual(refreshed_call.status, "succeeded")
+        self.assertEqual(refreshed_call.execution_phase, "completed")
+        self.assertIsNone(refreshed_call.last_heartbeat_at)
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+
+    def test_worker_mark_completed_clears_queue_lease(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="completed queue clears lease"),
+            current_user=self.owner,
+        )
+        ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-completed-cleanup", lease_seconds=30)
+        self.assertIsNotNone(item)
+        self.assertEqual(item.lease_owner, "worker-completed-cleanup")
+        self.assertIsNotNone(item.lease_expires_at)
+
+        queue_service.mark_completed(item)
+
+        refreshed_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == item.queue_id))
+        self.assertEqual(refreshed_item.status, "completed")
+        self.assertIsNone(refreshed_item.lease_owner)
+        self.assertIsNone(refreshed_item.lease_expires_at)
+
+    def test_worker_mark_failed_clears_queue_lease(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="failed queue clears lease"),
+            current_user=self.owner,
+        )
+        ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+
+        queue_service = AgentWorkerQueueService(self.db)
+        item = queue_service.claim_next(worker_id="worker-failed-cleanup", lease_seconds=30)
+        self.assertIsNotNone(item)
+        self.assertEqual(item.lease_owner, "worker-failed-cleanup")
+        self.assertIsNotNone(item.lease_expires_at)
+
+        queue_service.mark_failed(item, error_code="tool_execution_failed")
+
+        refreshed_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == item.queue_id))
+        self.assertEqual(refreshed_item.status, "failed")
+        self.assertEqual(refreshed_item.last_error_code, "tool_execution_failed")
+        self.assertIsNone(refreshed_item.lease_owner)
+        self.assertIsNone(refreshed_item.lease_expires_at)
+
+    def test_worker_claim_rejects_queue_item_when_run_context_is_missing(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="queued item points to missing run context"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        run_id = run.run_id
+        self.db.delete(run)
+        self.db.commit()
+
+        claimed = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-missing-run-claim")
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+
+        self.assertIsNone(claimed)
+        self.assertEqual(refreshed_call.run_id, run_id)
+        self.assertEqual(refreshed_call.status, "failed")
+        self.assertEqual(refreshed_call.execution_phase, "blocked")
+        self.assertEqual(refreshed_call.error_code, "run_missing")
+        self.assertEqual(refreshed_call.recovery_decision, "run_context_missing_before_execution")
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(queue_item.status, "failed")
+        self.assertEqual(queue_item.last_error_code, "run_missing")
+        self.assertIsNone(queue_item.lease_owner)
+        self.assertIsNone(queue_item.lease_expires_at)
+
+    def test_executor_does_not_receive_queue_item_when_claim_rejects_missing_run_context(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="missing run context after claim"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        run_id = run.run_id
+        self.db.delete(run)
+        self.db.commit()
+
+        result = ToolExecutor(self.db).execute_next(worker_id="worker-missing-run")
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+
+        self.assertIsNone(result)
+        self.assertEqual(refreshed_call.run_id, run_id)
+        self.assertEqual(refreshed_call.status, "failed")
+        self.assertEqual(refreshed_call.execution_phase, "blocked")
+        self.assertEqual(refreshed_call.error_code, "run_missing")
+        self.assertEqual(refreshed_call.recovery_decision, "run_context_missing_before_execution")
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(queue_item.status, "failed")
+        self.assertEqual(queue_item.last_error_code, "run_missing")
+        self.assertIsNone(queue_item.lease_owner)
+        self.assertIsNone(queue_item.lease_expires_at)
+
+    def test_executor_clears_tool_call_lease_when_user_context_is_missing(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="missing user context after claim"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        run.user_id = 999999
+        self.db.commit()
+
+        result = ToolExecutor(self.db).execute_next(worker_id="worker-missing-user")
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+
+        self.assertEqual(result.tool_call_id, call.tool_call_id)
+        self.assertEqual(refreshed_call.status, "failed")
+        self.assertEqual(refreshed_call.execution_phase, "blocked")
+        self.assertEqual(refreshed_call.error_code, "user_missing")
+        self.assertEqual(refreshed_call.recovery_decision, "run_user_missing_before_execution")
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(queue_item.status, "failed")
+        self.assertEqual(queue_item.last_error_code, "user_missing")
+        self.assertIsNone(queue_item.lease_owner)
+        self.assertIsNone(queue_item.lease_expires_at)
+
     def test_harness_worker_queue_audit_payload_contract_matches_service(self):
         from pathlib import Path
         import re
@@ -11073,7 +15584,15 @@ class AgentRuntimeTests(unittest.TestCase):
         for contract in documented_payload_contracts:
             self.assertEqual(contract["fields"], list(WORKER_QUEUE_AUDIT_FIELDS))
             self.assertEqual(contract["expired_lease_fields"], list(WORKER_QUEUE_EXPIRED_LEASE_FIELDS))
+            self.assertEqual(
+                contract.get("worker_queue_expired_lease_item_prefix"),
+                "agent-worker-queue-expired-lease",
+            )
             self.assertEqual(contract["duplicate_active_fields"], list(WORKER_QUEUE_DUPLICATE_ACTIVE_FIELDS))
+            self.assertEqual(
+                contract.get("worker_queue_duplicate_active_item_prefix"),
+                "agent-worker-queue-duplicate-active",
+            )
             self.assertEqual(contract["derived_from_fields"], list(WORKER_QUEUE_DERIVED_FROM_FIELDS))
             self.assertEqual(contract["source"], "AgentWorkerQueueAuditService.audit")
         self.assertEqual(list(AgentWorkerQueueAuditRead.model_fields), list(WORKER_QUEUE_AUDIT_FIELDS))
@@ -11083,6 +15602,34 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(list(route_payload["expired_leases"][0]), list(WORKER_QUEUE_EXPIRED_LEASE_FIELDS))
         self.assertEqual(list(audit["duplicate_active_leases"][0]), list(WORKER_QUEUE_DUPLICATE_ACTIVE_FIELDS))
         self.assertEqual(list(route_payload["duplicate_active_leases"][0]), list(WORKER_QUEUE_DUPLICATE_ACTIVE_FIELDS))
+        expired_lease_item_prefix = getattr(
+            agent_observability_service,
+            "AGENT_WORKER_QUEUE_EXPIRED_LEASE_ITEM_ID_PREFIX",
+            None,
+        )
+        duplicate_active_item_prefix = getattr(
+            agent_observability_service,
+            "AGENT_WORKER_QUEUE_DUPLICATE_ACTIVE_ITEM_ID_PREFIX",
+            None,
+        )
+        self.assertEqual(expired_lease_item_prefix, "agent-worker-queue-expired-lease")
+        self.assertEqual(duplicate_active_item_prefix, "agent-worker-queue-duplicate-active")
+        self.assertEqual(
+            audit["expired_leases"][0]["item_id"],
+            f"{expired_lease_item_prefix}://{audit['expired_leases'][0]['queue_id']}",
+        )
+        self.assertEqual(
+            route_payload["expired_leases"][0]["item_id"],
+            f"{expired_lease_item_prefix}://{route_payload['expired_leases'][0]['queue_id']}",
+        )
+        self.assertEqual(
+            audit["duplicate_active_leases"][0]["item_id"],
+            f"{duplicate_active_item_prefix}://{audit['duplicate_active_leases'][0]['tool_call_id']}",
+        )
+        self.assertEqual(
+            route_payload["duplicate_active_leases"][0]["item_id"],
+            f"{duplicate_active_item_prefix}://{route_payload['duplicate_active_leases'][0]['tool_call_id']}",
+        )
         self.assertEqual(list(audit["derived_from"]), list(WORKER_QUEUE_DERIVED_FROM_FIELDS))
         self.assertEqual(list(route_payload["derived_from"]), list(WORKER_QUEUE_DERIVED_FROM_FIELDS))
 
@@ -11349,7 +15896,533 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result.tool_call_id, call.tool_call_id)
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(result.effect_submission_state, "effect_committed")
+        self.assertIsNone(result.lease_owner)
+        self.assertIsNone(result.lease_expires_at)
         self.assertIn("tool.completed", events)
+
+    def test_executor_obsoletes_leased_safe_tool_when_run_cancelled_before_execution(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="leased safe tool cancelled before execution"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        queue_item = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-cancel-before-safe")
+        self.assertIsNotNone(queue_item)
+        AgentRuntimeService(self.db).cancel_run(run_id=run.run_id, current_user=self.owner)
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute") as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=queue_item,
+                current_user=self.owner,
+            )
+
+        events = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+        cancelled_index = events.index("run.cancelled")
+        events_after_cancel = events[cancelled_index + 1:]
+
+        execute.assert_not_called()
+        self.assertEqual(result.tool_call_id, call.tool_call_id)
+        self.assertEqual(result.status, "obsolete")
+        self.assertEqual(result.execution_phase, "cancelled")
+        self.assertEqual(result.error_code, "agent_run_cancelled_before_tool_execution")
+        self.assertEqual(result.recovery_decision, "run_cancelled_before_tool_execution")
+        self.assertEqual(result.effect_submission_state, "none")
+        self.assertFalse(result.effect_boundary_crossed)
+        self.assertIsNone(result.lease_owner)
+        self.assertIsNone(result.lease_expires_at)
+        self.assertEqual(queue_item.status, "failed")
+        self.assertEqual(queue_item.last_error_code, "agent_run_cancelled_before_tool_execution")
+        self.assertNotIn("tool.running", events_after_cancel)
+        self.assertNotIn("tool.send_intent_recorded", events_after_cancel)
+        self.assertNotIn("tool.transport_sent_observed", events_after_cancel)
+        self.assertNotIn("tool.completed", events_after_cancel)
+
+    def test_executor_obsoletes_leased_effectful_tool_when_run_cancelled_before_execution(self):
+        run, call, approval = self._create_pending_approval()
+        call.resolved_side_effect_class = "business_report"
+        call.backend_effect_capability = "legacy_reconcile_only"
+        self.db.commit()
+        ApprovalService(self.db).approve(
+            tool_call_id=call.tool_call_id,
+            payload=self._approval_decision(approval, reason="approved before queued cancel"),
+            current_user=self.owner,
+        )
+        queue_item = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-cancel-before-effectful")
+        self.assertIsNotNone(queue_item)
+        AgentRuntimeService(self.db).cancel_run(run_id=run.run_id, current_user=self.owner)
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute") as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=queue_item,
+                current_user=self.owner,
+            )
+
+        events = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+        cancelled_index = events.index("run.cancelled")
+        events_after_cancel = events[cancelled_index + 1:]
+
+        execute.assert_not_called()
+        self.assertEqual(result.tool_call_id, call.tool_call_id)
+        self.assertEqual(result.status, "obsolete")
+        self.assertEqual(result.execution_phase, "cancelled")
+        self.assertEqual(result.error_code, "agent_run_cancelled_before_tool_execution")
+        self.assertEqual(result.recovery_decision, "run_cancelled_before_tool_execution")
+        self.assertEqual(result.effect_submission_state, "none")
+        self.assertFalse(result.effect_boundary_crossed)
+        self.assertIsNone(result.lease_owner)
+        self.assertIsNone(result.lease_expires_at)
+        self.assertEqual(queue_item.status, "failed")
+        self.assertEqual(queue_item.last_error_code, "agent_run_cancelled_before_tool_execution")
+        self.assertNotIn("tool.running", events_after_cancel)
+        self.assertNotIn("tool.send_intent_recorded", events_after_cancel)
+        self.assertNotIn("tool.transport_sent_observed", events_after_cancel)
+        self.assertNotIn("tool.effect_committed", events_after_cancel)
+        self.assertNotIn("tool.completed", events_after_cancel)
+
+    def test_executor_marks_mismatched_queue_run_uncertain_before_execution(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="executor queue run mismatch requires reconcile"),
+            current_user=self.owner,
+        )
+        wrong_run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="wrong queue run for executor"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        queue_item = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-executor-mismatched-queue")
+        self.assertIsNotNone(queue_item)
+        queue_item.run_id = wrong_run.run_id
+        self.db.commit()
+        events_before = self.db.scalar(select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id))
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute", return_value={"unexpected": True}) as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=queue_item,
+                current_user=self.owner,
+            )
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        refreshed_queue = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == queue_item.queue_id))
+        events_after = self.db.scalar(select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id))
+
+        execute.assert_not_called()
+        self.assertEqual(result.tool_call_id, call.tool_call_id)
+        self.assertEqual(refreshed_queue.status, "failed")
+        self.assertEqual(refreshed_queue.last_error_code, "tool_call_queue_context_mismatch")
+        self.assertIsNone(refreshed_queue.lease_owner)
+        self.assertIsNone(refreshed_queue.lease_expires_at)
+        self.assertEqual(refreshed_call.status, "uncertain")
+        self.assertEqual(refreshed_call.effect_submission_state, "unknown")
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_call.error_code, "tool_call_queue_context_mismatch")
+        self.assertEqual(refreshed_call.recovery_decision, "reconcile_required_after_queue_context_mismatch")
+        self.assertEqual(events_after, events_before)
+
+    def test_executor_rejects_queue_item_for_different_tool_call(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="executor queue item must match tool call"),
+            current_user=self.owner,
+        )
+        leased_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        planned_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=1,
+            ),
+            current_user=self.owner,
+        )
+        queue_item = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-executor-wrong-call-queue")
+        self.assertIsNotNone(queue_item)
+        self.assertEqual(queue_item.tool_call_id, leased_call.tool_call_id)
+        events_before = self.db.scalar(select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id))
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute", return_value={"unexpected": True}) as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=planned_call,
+                run=run,
+                queue_item=queue_item,
+                current_user=self.owner,
+            )
+
+        refreshed_leased_call = self.db.scalar(
+            select(AgentToolCall).where(AgentToolCall.tool_call_id == leased_call.tool_call_id)
+        )
+        refreshed_planned_call = self.db.scalar(
+            select(AgentToolCall).where(AgentToolCall.tool_call_id == planned_call.tool_call_id)
+        )
+        refreshed_queue = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == queue_item.queue_id))
+        events_after = self.db.scalar(select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id))
+
+        execute.assert_not_called()
+        self.assertEqual(result.tool_call_id, planned_call.tool_call_id)
+        self.assertEqual(refreshed_queue.status, "failed")
+        self.assertEqual(refreshed_queue.last_error_code, "tool_call_queue_context_mismatch")
+        self.assertIsNone(refreshed_queue.lease_owner)
+        self.assertIsNone(refreshed_queue.lease_expires_at)
+        self.assertEqual(refreshed_leased_call.status, "uncertain")
+        self.assertEqual(refreshed_leased_call.error_code, "tool_call_queue_context_mismatch")
+        self.assertEqual(refreshed_leased_call.recovery_decision, "reconcile_required_after_queue_context_mismatch")
+        self.assertIsNone(refreshed_leased_call.lease_owner)
+        self.assertIsNone(refreshed_leased_call.lease_expires_at)
+        self.assertEqual(refreshed_planned_call.status, "planned")
+        self.assertIsNone(refreshed_planned_call.error_code)
+        self.assertIsNone(refreshed_planned_call.recovery_decision)
+        self.assertEqual(events_after, events_before)
+
+    def test_executor_does_not_reexecute_succeeded_tool_call_with_stale_queue_item(self):
+        from app.core.sensitive_data import request_fingerprint
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="stale queue must not reexecute succeeded tool"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        queue_item = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-stale-executor")
+        self.assertIsNotNone(queue_item)
+        output = {"project": {"id": 10, "name": "Already done"}}
+        call.status = "succeeded"
+        call.execution_phase = "completed"
+        call.effect_submission_state = "effect_committed"
+        call.output_json_redacted = output
+        call.output_hash = request_fingerprint(output)
+        call.lease_owner = None
+        call.lease_expires_at = None
+        self.db.commit()
+        events_before = self.db.scalar(select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id))
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute", return_value={"unexpected": True}) as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=queue_item,
+                current_user=self.owner,
+            )
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        refreshed_queue = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == queue_item.queue_id))
+        events_after = self.db.scalar(select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id))
+
+        execute.assert_not_called()
+        self.assertEqual(result.tool_call_id, call.tool_call_id)
+        self.assertEqual(refreshed_call.status, "succeeded")
+        self.assertEqual(refreshed_call.execution_phase, "completed")
+        self.assertEqual(refreshed_call.effect_submission_state, "effect_committed")
+        self.assertEqual(refreshed_call.output_json_redacted, output)
+        self.assertEqual(refreshed_call.output_hash, request_fingerprint(output))
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_queue.status, "failed")
+        self.assertEqual(refreshed_queue.last_error_code, "tool_call_not_executable")
+        self.assertIsNone(refreshed_queue.lease_owner)
+        self.assertIsNone(refreshed_queue.lease_expires_at)
+        self.assertEqual(events_after, events_before)
+
+    def test_executor_marks_leased_tool_with_effect_evidence_uncertain_before_execution(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="leased executor with effect evidence requires reconcile"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        queue_item = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-executor-leased-with-effect-evidence")
+        self.assertIsNotNone(queue_item)
+        observed_at = datetime.now(UTC).replace(tzinfo=None)
+        call.execution_phase = "pre_effect"
+        call.effect_submission_state = "transport_sent_observed"
+        call.downstream_request_observed_sent_at = observed_at
+        self.db.commit()
+        events_before = self.db.scalar(select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id))
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute", return_value={"unexpected": True}) as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=queue_item,
+                current_user=self.owner,
+            )
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        refreshed_queue = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == queue_item.queue_id))
+        events_after = self.db.scalar(select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id))
+
+        execute.assert_not_called()
+        self.assertEqual(result.tool_call_id, call.tool_call_id)
+        self.assertEqual(refreshed_call.status, "uncertain")
+        self.assertEqual(refreshed_call.execution_phase, "pre_effect")
+        self.assertEqual(refreshed_call.effect_submission_state, "transport_sent_observed")
+        self.assertFalse(refreshed_call.effect_boundary_crossed)
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_call.error_code, "tool_call_execution_after_effect_submission_started")
+        self.assertEqual(refreshed_call.recovery_decision, "reconcile_required_after_invalid_tool_call_execution")
+        self.assertEqual(refreshed_queue.status, "failed")
+        self.assertEqual(refreshed_queue.last_error_code, "tool_call_execution_after_effect_submission_started")
+        self.assertIsNone(refreshed_queue.lease_owner)
+        self.assertIsNone(refreshed_queue.lease_expires_at)
+        self.assertEqual(events_after, events_before)
+
+    def test_executor_marks_running_pre_effect_with_effect_evidence_uncertain_before_execution(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="running executor with send intent requires reconcile"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        queue_item = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-executor-running-with-effect-evidence")
+        self.assertIsNotNone(queue_item)
+        observed_at = datetime.now(UTC).replace(tzinfo=None)
+        call.status = "running_pre_effect"
+        call.execution_phase = "pre_effect"
+        call.effect_submission_state = "send_intent_recorded"
+        call.downstream_send_intent_at = observed_at
+        self.db.commit()
+        events_before = self.db.scalar(select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id))
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute", return_value={"unexpected": True}) as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=queue_item,
+                current_user=self.owner,
+            )
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        refreshed_queue = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == queue_item.queue_id))
+        events_after = self.db.scalar(select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id))
+
+        execute.assert_not_called()
+        self.assertEqual(result.tool_call_id, call.tool_call_id)
+        self.assertEqual(refreshed_call.status, "uncertain")
+        self.assertEqual(refreshed_call.execution_phase, "pre_effect")
+        self.assertEqual(refreshed_call.effect_submission_state, "send_intent_recorded")
+        self.assertFalse(refreshed_call.effect_boundary_crossed)
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_call.error_code, "tool_call_execution_after_effect_submission_started")
+        self.assertEqual(refreshed_call.recovery_decision, "reconcile_required_after_invalid_tool_call_execution")
+        self.assertEqual(refreshed_queue.status, "failed")
+        self.assertEqual(refreshed_queue.last_error_code, "tool_call_execution_after_effect_submission_started")
+        self.assertIsNone(refreshed_queue.lease_owner)
+        self.assertIsNone(refreshed_queue.lease_expires_at)
+        self.assertEqual(events_after, events_before)
+
+    def test_executor_preserves_succeeded_tool_call_with_stale_queue_item_after_run_cancelled(self):
+        from app.core.sensitive_data import request_fingerprint
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="cancelled run stale queue must preserve succeeded tool"),
+            current_user=self.owner,
+        )
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        queue_item = AgentWorkerQueueService(self.db).claim_next(worker_id="worker-stale-terminal-executor")
+        self.assertIsNotNone(queue_item)
+        output = {"project": {"id": 10, "name": "Already committed before cancel"}}
+        call.status = "succeeded"
+        call.execution_phase = "completed"
+        call.effect_submission_state = "effect_committed"
+        call.output_json_redacted = output
+        call.output_hash = request_fingerprint(output)
+        call.lease_owner = None
+        call.lease_expires_at = None
+        self.db.commit()
+        AgentRuntimeService(self.db).cancel_run(run_id=run.run_id, current_user=self.owner)
+        events_before = self.db.scalar(select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id))
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute", return_value={"unexpected": True}) as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=queue_item,
+                current_user=self.owner,
+            )
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        refreshed_queue = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == queue_item.queue_id))
+        events_after = self.db.scalar(select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id))
+
+        execute.assert_not_called()
+        self.assertEqual(result.tool_call_id, call.tool_call_id)
+        self.assertEqual(refreshed_call.status, "succeeded")
+        self.assertEqual(refreshed_call.execution_phase, "completed")
+        self.assertEqual(refreshed_call.effect_submission_state, "effect_committed")
+        self.assertEqual(refreshed_call.output_json_redacted, output)
+        self.assertEqual(refreshed_call.output_hash, request_fingerprint(output))
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertEqual(refreshed_queue.status, "failed")
+        self.assertEqual(refreshed_queue.last_error_code, "tool_call_not_executable")
+        self.assertIsNone(refreshed_queue.lease_owner)
+        self.assertIsNone(refreshed_queue.lease_expires_at)
+        self.assertEqual(events_after, events_before)
+
+    def test_executor_marks_effectful_tool_uncertain_after_cancel_during_execution(self):
+        run, call, approval = self._create_pending_approval()
+        call.resolved_side_effect_class = "business_report"
+        call.backend_effect_capability = "legacy_reconcile_only"
+        self.db.commit()
+        ApprovalService(self.db).approve(
+            tool_call_id=call.tool_call_id,
+            payload=self._approval_decision(approval, reason="approved before cancel during execution"),
+            current_user=self.owner,
+        )
+        cancel_seen = {"value": False}
+
+        def cancel_during_tool(self, *, call, current_user):
+            cancel_seen["value"] = True
+            AgentRuntimeService(self.db).cancel_run(run_id=call.run_id, current_user=current_user)
+            return {"created_id": 42, "status": "created"}
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute", new=cancel_during_tool):
+            result = ToolExecutor(self.db).execute_next(worker_id="worker-effect-cancel")
+
+        events = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+        cancelled_index = events.index("run.cancelled")
+        events_after_cancel = events[cancelled_index + 1:]
+
+        self.assertTrue(cancel_seen["value"])
+        self.assertEqual(result.tool_call_id, call.tool_call_id)
+        self.assertEqual(result.status, "uncertain")
+        self.assertEqual(result.error_code, "agent_run_cancelled_after_tool_effect")
+        self.assertEqual(result.recovery_decision, "reconcile_required_after_run_terminal")
+        self.assertEqual(result.effect_submission_state, "effect_committed")
+        self.assertTrue(result.effect_boundary_crossed)
+        self.assertIsNone(result.lease_owner)
+        self.assertIsNone(result.lease_expires_at)
+        self.assertEqual(result.output_json_redacted["created_id"], 42)
+        self.assertEqual(queue_item.status, "failed")
+        self.assertEqual(queue_item.last_error_code, "agent_run_cancelled_after_tool_effect")
+        self.assertNotIn("tool.effect_committed", events_after_cancel)
+        self.assertNotIn("tool.completed", events_after_cancel)
+
+    def test_reconcile_processes_terminal_run_uncertain_effectful_tool_call(self):
+        run, call, approval = self._create_pending_approval()
+        call.resolved_side_effect_class = "business_report"
+        call.backend_effect_capability = "legacy_reconcile_only"
+        self.db.commit()
+        ApprovalService(self.db).approve(
+            tool_call_id=call.tool_call_id,
+            payload=self._approval_decision(approval, reason="approved before terminal reconcile"),
+            current_user=self.owner,
+        )
+
+        def cancel_during_tool(self, *, call, current_user):
+            AgentRuntimeService(self.db).cancel_run(run_id=call.run_id, current_user=current_user)
+            return {"created_id": 42, "status": "created"}
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute", new=cancel_during_tool):
+            ToolExecutor(self.db).execute_next(worker_id="worker-terminal-reconcile")
+        event_count_before_reconcile = self.db.scalar(
+            select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id)
+        )
+        reconcile_result = ReconcileResult(
+            found=True,
+            status="succeeded",
+            backend_contract_version="v1",
+            external_resource_type="business_report",
+            external_resource_id="report-42",
+            canonical_summary_json={"created_id": 42, "status": "created"},
+        )
+
+        summary = ReconcileWorker(self.db, router=StaticReconcileRouter(reconcile_result)).reconcile_run(
+            run_id=run.run_id,
+            current_user=self.owner,
+        )
+        refreshed_run = self.db.get(AgentRun, run.id)
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        event_count_after_reconcile = self.db.scalar(
+            select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id)
+        )
+
+        self.assertEqual(summary["processed"], 1)
+        self.assertEqual(summary["reconciled"], 1)
+        self.assertEqual(summary["tool_call_ids"], [call.tool_call_id])
+        self.assertEqual(refreshed_run.status, "cancelled")
+        self.assertEqual(refreshed_call.status, "succeeded")
+        self.assertEqual(refreshed_call.recovery_decision, "mark_succeeded_from_reconcile")
+        self.assertEqual(refreshed_call.external_resource_id, "report-42")
+        self.assertEqual(refreshed_call.output_json_redacted, {"created_id": 42, "status": "created"})
+        self.assertEqual(event_count_after_reconcile, event_count_before_reconcile)
 
     def test_executor_records_execution_context_envelope_after_approved_tool(self):
         from app.core.sensitive_data import request_fingerprint
@@ -11517,6 +16590,8 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.status, "uncertain")
         self.assertEqual(result.error_code, "eventstore_write_failed_after_effect")
+        self.assertIsNone(result.lease_owner)
+        self.assertIsNone(result.lease_expires_at)
         self.assertEqual(
             {key: dispatch_trace[key] for key in expected_trace},
             expected_trace,
@@ -11643,6 +16718,8 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.error_code, "tool_execution_failed")
+        self.assertIsNone(result.lease_owner)
+        self.assertIsNone(result.lease_expires_at)
         self.assertEqual(
             {key: execution_context[key] for key in expected_context},
             expected_context,
@@ -11879,6 +16956,7 @@ class AgentRuntimeTests(unittest.TestCase):
             "result_envelope_fields": RECONCILE_RESULT_ENVELOPE_FIELDS,
             "summary_fields": RECONCILE_SUMMARY_FIELDS,
             "skipped_backoff_fields": RECONCILE_SKIPPED_BACKOFF_FIELDS,
+            "skipped_backoff_item_prefix": {"agent-reconcile-skipped-backoff"},
         }
         docs_dir = Path(__file__).resolve().parents[1] / "docs"
         documented_contracts = [
@@ -11888,6 +16966,7 @@ class AgentRuntimeTests(unittest.TestCase):
         ]
         schema = ReconcileResult.model_json_schema()
         skipped_payload = {
+            "item_id": "agent-reconcile-skipped-backoff://tool-1/1",
             "tool_call_id": "tool-1",
             "next_retry_at": "2026-06-26T00:00:00",
             "attempt_seq": 1,
@@ -11905,7 +16984,15 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(set(ReconcileResult.model_fields), RECONCILE_RESULT_ENVELOPE_FIELDS)
         self.assertEqual(set(summary), RECONCILE_SUMMARY_FIELDS)
+        self.assertEqual(
+            getattr(agent_reconcile_service, "AGENT_RECONCILE_SKIPPED_BACKOFF_ITEM_ID_PREFIX", None),
+            "agent-reconcile-skipped-backoff",
+        )
         self.assertEqual(set(summary["skipped_backoff_tool_calls"][0]), RECONCILE_SKIPPED_BACKOFF_FIELDS)
+        self.assertEqual(
+            summary["skipped_backoff_tool_calls"][0]["item_id"],
+            "agent-reconcile-skipped-backoff://tool-1/1",
+        )
 
     def test_reconcile_succeeded_marks_tool_call_succeeded(self):
         run = self._create_run("恢复成功")
@@ -12079,8 +17166,14 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(first["skipped_backoff"], 0)
         self.assertEqual(second["processed"], 0)
         self.assertEqual(second["skipped_backoff"], 1)
-        self.assertEqual(second["skipped_backoff_tool_calls"][0]["tool_call_id"], call.tool_call_id)
+        skipped_backoff = second["skipped_backoff_tool_calls"][0]
+        self.assertEqual(skipped_backoff["tool_call_id"], call.tool_call_id)
         self.assertEqual(len(attempts), 1)
+        self.assertIn("item_id", skipped_backoff)
+        self.assertEqual(
+            skipped_backoff["item_id"],
+            f"agent-reconcile-skipped-backoff://{call.tool_call_id}/{attempts[0].attempt_seq}",
+        )
         self.assertIsNotNone(attempts[0].next_retry_at)
         self.assertEqual(metrics["reconcile_backoff_active_total"], 1)
         self.assertIn("agent_reconcile_backoff_pending", alerts)
@@ -12106,15 +17199,32 @@ class AgentRuntimeTests(unittest.TestCase):
             current_user=self.owner,
         )
         refreshed_run = AgentRuntimeService(self.db).get_run(run_id=run.run_id, current_user=self.owner)
+        run_summary = AgentRuntimeService(self.db).get_run_summary(run_id=run.run_id, current_user=self.owner)
+        action_state = AgentRunActionStateRead.model_validate(
+            AgentRuntimeService(self.db).get_run_action_state(run_id=run.run_id, current_user=self.owner)
+        ).model_dump(mode="python")
+        actions = {item["action_id"]: item for item in action_state["actions"]}
         refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
         block = self.db.scalar(select(AgentMigrationBlock).where(AgentMigrationBlock.run_id == run.run_id))
 
         self.assertEqual(summary["needs_migration"], 1)
         self.assertEqual(refreshed_call.status, "needs_migration")
         self.assertEqual(refreshed_run.status, "migration_blocked")
+        self.assertFalse(run_summary["can_resume"])
+        self.assertFalse(actions["resume_run"]["enabled"])
+        self.assertEqual(actions["resume_run"]["reason"], "open_migration_blocks")
         self.assertEqual(refreshed_run.migration_block_count, 1)
         self.assertEqual(refreshed_run.blocking_tool_call_ids_json, [call.tool_call_id])
         self.assertEqual(block.status, "open")
+        self.assertEqual(actions["resolve_migration"]["resource_ids"], [block.block_id])
+        self.assertEqual(
+            actions["resolve_migration"]["resource_item_ids"],
+            [f"agent-migration-block://{run.run_id}/{block.block_id}"],
+        )
+        self.assertEqual(
+            actions["resume_run"]["resource_item_ids"],
+            [f"agent-tool-call://{run.run_id}/{call.tool_call_id}"],
+        )
         AgentOutboxPublisher(self.db, publisher=lambda event: None).publish_pending(limit=100)
         metrics = AgentMetricsService(self.db).snapshot(project_id=10)["metrics"]
         alert_snapshot = AgentAlertService(self.db).snapshot(project_id=10)
@@ -12142,6 +17252,188 @@ class AgentRuntimeTests(unittest.TestCase):
             checks["live_recovery_attention"]["details"]["migration_block_open_total"],
             1,
         )
+
+    def test_reconcile_terminal_unsupported_schema_keeps_run_terminal_with_migration_block(self):
+        run = self._create_run("terminal schema migration")
+        call = self._create_uncertain_call(run.run_id, step_index=0)
+        call.recovery_decision = "reconcile_required_after_run_terminal"
+        self.db.commit()
+        AgentRuntimeService(self.db).cancel_run(run_id=run.run_id, current_user=self.owner)
+        event_count_before = self.db.scalar(
+            select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id)
+        )
+        result = ReconcileResult(
+            found=False,
+            status="unsupported_schema_version",
+            schema_support="unsupported",
+            backend_contract_version="v1",
+            error_code="unsupported_schema_version",
+            error_message="adapter required",
+        )
+
+        summary = ReconcileWorker(self.db, router=StaticReconcileRouter(result)).reconcile_run(
+            run_id=run.run_id,
+            current_user=self.owner,
+        )
+        refreshed_run = AgentRuntimeService(self.db).get_run(run_id=run.run_id, current_user=self.owner)
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        block = self.db.scalar(select(AgentMigrationBlock).where(AgentMigrationBlock.run_id == run.run_id))
+        event_count_after = self.db.scalar(
+            select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id)
+        )
+        action_state = AgentRunActionStateRead.model_validate(
+            AgentRuntimeService(self.db).get_run_action_state(run_id=run.run_id, current_user=self.owner)
+        ).model_dump(mode="python")
+        actions = {item["action_id"]: item for item in action_state["actions"]}
+        resolve_details = actions["resolve_migration"]["details"]
+
+        self.assertEqual(summary["needs_migration"], 1)
+        self.assertEqual(refreshed_call.status, "needs_migration")
+        self.assertEqual(refreshed_run.status, "cancelled")
+        self.assertEqual(refreshed_run.migration_block_count, 1)
+        self.assertEqual(refreshed_run.blocking_tool_call_ids_json, [call.tool_call_id])
+        self.assertEqual(block.status, "open")
+        self.assertEqual(event_count_after, event_count_before)
+        self.assertIn("resolve_migration", action_state["primary_action_ids"])
+        self.assertTrue(actions["resolve_migration"]["enabled"])
+        self.assertEqual(resolve_details["run_status"], "cancelled")
+        self.assertTrue(resolve_details["run_terminal"])
+        self.assertTrue(resolve_details["resolve_preserves_terminal_run"])
+        self.assertEqual(resolve_details["post_resolve_next_action"], "reconcile_run")
+        self.assertEqual(resolve_details["tool_call_status_after_resolve"], "reconciling")
+
+    def test_resolve_terminal_migration_block_keeps_run_terminal_and_reenables_reconcile(self):
+        run = self._create_run("terminal migration resolve")
+        call = self._create_uncertain_call(run.run_id, step_index=0)
+        call.recovery_decision = "reconcile_required_after_run_terminal"
+        self.db.commit()
+        AgentRuntimeService(self.db).cancel_run(run_id=run.run_id, current_user=self.owner)
+        result = ReconcileResult(
+            found=False,
+            status="unsupported_schema_version",
+            schema_support="unsupported",
+            backend_contract_version="v1",
+            error_code="unsupported_schema_version",
+            error_message="adapter required",
+        )
+        ReconcileWorker(self.db, router=StaticReconcileRouter(result)).reconcile_run(
+            run_id=run.run_id,
+            current_user=self.owner,
+        )
+        block = self.db.scalar(select(AgentMigrationBlock).where(AgentMigrationBlock.run_id == run.run_id))
+        event_count_before = self.db.scalar(
+            select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id)
+        )
+
+        resolved, freshness = MigrationCoordinator(self.db).resolve_block(
+            run_id=run.run_id,
+            block_id=block.block_id,
+            current_user=self.owner,
+            resolution_note="adapter deployed after terminal",
+        )
+        refreshed_run = AgentRuntimeService(self.db).get_run(run_id=run.run_id, current_user=self.owner)
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        event_count_after = self.db.scalar(
+            select(func.count()).select_from(AgentEvent).where(AgentEvent.run_id == run.run_id)
+        )
+        action_state = AgentRunActionStateRead.model_validate(
+            AgentRuntimeService(self.db).get_run_action_state(run_id=run.run_id, current_user=self.owner)
+        ).model_dump(mode="python")
+        actions = {item["action_id"]: item for item in action_state["actions"]}
+
+        self.assertEqual(resolved.status, "resolved")
+        self.assertEqual(freshness["action"], "continue_from_checkpoint")
+        self.assertTrue(freshness["terminal_run_preserved"])
+        self.assertEqual(freshness["terminal_run_status"], "cancelled")
+        self.assertTrue(freshness["resolve_preserves_terminal_run"])
+        self.assertEqual(freshness["post_resolve_next_action"], "reconcile_run")
+        self.assertEqual(freshness["tool_call_status_after_resolve"], "reconciling")
+        self.assertEqual(refreshed_run.status, "cancelled")
+        self.assertEqual(refreshed_run.migration_block_count, 0)
+        self.assertEqual(refreshed_run.blocking_tool_call_ids_json, [])
+        self.assertEqual(refreshed_call.status, "reconciling")
+        self.assertIn("reconcile_run", action_state["primary_action_ids"])
+        self.assertTrue(actions["reconcile_run"]["enabled"])
+        self.assertEqual(actions["reconcile_run"]["resource_ids"], [call.tool_call_id])
+        self.assertEqual(event_count_after, event_count_before)
+
+    def test_resolve_already_resolved_terminal_migration_block_does_not_report_stale_reconcile(self):
+        run = self._create_run("terminal migration resolve idempotent")
+        call = self._create_uncertain_call(run.run_id, step_index=0)
+        call.recovery_decision = "reconcile_required_after_run_terminal"
+        self.db.commit()
+        AgentRuntimeService(self.db).cancel_run(run_id=run.run_id, current_user=self.owner)
+        result = ReconcileResult(
+            found=False,
+            status="unsupported_schema_version",
+            schema_support="unsupported",
+            backend_contract_version="v1",
+            error_code="unsupported_schema_version",
+            error_message="adapter required",
+        )
+        ReconcileWorker(self.db, router=StaticReconcileRouter(result)).reconcile_run(
+            run_id=run.run_id,
+            current_user=self.owner,
+        )
+        block = self.db.scalar(select(AgentMigrationBlock).where(AgentMigrationBlock.run_id == run.run_id))
+
+        MigrationCoordinator(self.db).resolve_block(
+            run_id=run.run_id,
+            block_id=block.block_id,
+            current_user=self.owner,
+            resolution_note="adapter deployed after terminal",
+        )
+        call.status = "succeeded"
+        call.recovery_decision = "mark_succeeded_from_reconcile"
+        self.db.commit()
+
+        resolved, freshness = MigrationCoordinator(self.db).resolve_block(
+            run_id=run.run_id,
+            block_id=block.block_id,
+            current_user=self.owner,
+            resolution_note="duplicate resolve after reconcile",
+        )
+
+        self.assertEqual(resolved.status, "resolved")
+        self.assertTrue(freshness["terminal_run_preserved"])
+        self.assertEqual(freshness["terminal_run_status"], "cancelled")
+        self.assertEqual(freshness["tool_call_status_after_resolve"], "succeeded")
+        self.assertEqual(freshness["post_resolve_next_action"], "none")
+
+    def test_runbook_terminal_migration_block_explains_resolve_preserves_terminal_run(self):
+        run = self._create_run("terminal migration runbook")
+        call = self._create_uncertain_call(run.run_id, step_index=0)
+        call.recovery_decision = "reconcile_required_after_run_terminal"
+        self.db.commit()
+        AgentRuntimeService(self.db).cancel_run(run_id=run.run_id, current_user=self.owner)
+        result = ReconcileResult(
+            found=False,
+            status="unsupported_schema_version",
+            schema_support="unsupported",
+            backend_contract_version="v1",
+            error_code="unsupported_schema_version",
+            error_message="adapter required",
+        )
+        ReconcileWorker(self.db, router=StaticReconcileRouter(result)).reconcile_run(
+            run_id=run.run_id,
+            current_user=self.owner,
+        )
+
+        diagnosis = AgentRunbookService(self.db).diagnose_run(run_id=run.run_id, current_user=self.owner)
+        recommendation = next(
+            item
+            for item in diagnosis["recommendations"]
+            if item["runbook_id"] == "migration_blocked"
+        )
+        details = recommendation["details"]
+
+        self.assertEqual(recommendation["reason"], "open_migration_block_on_terminal_run")
+        self.assertEqual(details["run_status"], "cancelled")
+        self.assertTrue(details["run_terminal"])
+        self.assertTrue(details["resolve_preserves_terminal_run"])
+        self.assertEqual(details["post_resolve_next_action"], "reconcile_run")
+        self.assertEqual(details["tool_call_status_after_resolve"], "reconciling")
+        self.assertEqual(details["tool_call_id"], call.tool_call_id)
 
     def test_reconcile_missing_backend_contract_alerts_tool_call_contract_unsupported(self):
         run = self._create_run("missing backend contract")
@@ -12249,6 +17541,72 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(freshness["result"], "too_old")
         self.assertEqual(freshness["action"], "replan_from_latest_safe_state")
+
+    def test_checkpoint_freshness_reports_context_compaction_reference(self):
+        compaction_fields = getattr(agent_reconcile_service, "CHECKPOINT_CONTEXT_COMPACTION_FIELDS", None)
+        object_key_prefix = getattr(agent_runtime_service, "AGENT_CONTEXT_COMPACTION_OBJECT_KEY_PREFIX", None)
+
+        self.assertIsNotNone(compaction_fields)
+        self.assertIsNotNone(object_key_prefix)
+
+        runtime = AgentRuntimeService(self.db)
+        conversation_id = "agent-conv-checkpoint-compaction-reference"
+        for index in range(7):
+            previous = runtime.create_run(
+                payload=AgentRunCreateRequest(
+                    project_id=10,
+                    conversation_id=conversation_id,
+                    intent=f"checkpoint compaction previous intent {index} " + ("input detail " * 220),
+                ),
+                current_user=self.owner,
+            )
+            runtime.complete_run(
+                previous,
+                {
+                    "message": f"checkpoint compaction previous assistant {index} "
+                    + ("assistant detail " * 260),
+                    "assistant_visible": True,
+                },
+                commit=True,
+            )
+        current = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="current turn should persist checkpoint compaction reference",
+            ),
+            current_user=self.owner,
+        )
+
+        def fake_stream(service_self, payload):
+            yield {"type": "delta", "content": "ok"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=current.run_id, user_id=self.owner.id)
+
+        compaction_event = self.db.scalar(
+            select(AgentEvent).where(
+                AgentEvent.run_id == current.run_id,
+                AgentEvent.event_type == agent_runtime_service.AGENT_HISTORY_CONTEXT_COMPACTION_EVENT,
+            )
+        )
+        checkpoint = self.db.get(AgentCheckpoint, current.last_checkpoint_id)
+        self.assertIsNotNone(compaction_event)
+        self.assertIsNotNone(checkpoint)
+
+        expected_object_key = f"{object_key_prefix}://{current.run_id}/{compaction_event.event_seq}"
+        self.assertEqual(checkpoint.context_compaction_object_key, expected_object_key)
+
+        freshness = CheckpointFreshnessGate(self.db).evaluate(run=current)
+
+        self.assertTrue(set(compaction_fields).issubset(freshness))
+        self.assertEqual(freshness["context_compaction_object_key"], expected_object_key)
+        self.assertEqual(freshness["context_compaction_event_seq"], compaction_event.event_seq)
+        self.assertEqual(freshness["context_compaction_event_type"], agent_runtime_service.AGENT_HISTORY_CONTEXT_COMPACTION_EVENT)
+        self.assertTrue(freshness["context_compaction_available"])
+        self.assertEqual(freshness["result"], "fresh")
+        self.assertEqual(freshness["action"], "continue_from_checkpoint")
 
     def test_resume_run_pauses_when_runtime_snapshot_mismatches_checkpoint(self):
         run = self._create_run("runtime snapshot mismatch")
@@ -12394,6 +17752,50 @@ class AgentRuntimeTests(unittest.TestCase):
             missing["checkpoint_freshness"]["checkpoint_runtime_snapshot_id"],
             missing_checkpoint.runtime_snapshot_id,
         )
+
+    def test_harness_checkpoint_context_compaction_freshness_contract_matches_gate(self):
+        from pathlib import Path
+
+        def _parse_contract(text: str) -> dict[str, object]:
+            section = text[text.index("Required checkpoint context compaction freshness contract:"):]
+            block = section.split("```text", 1)[1].split("```", 1)[0]
+            parsed: dict[str, object] = {}
+            for line in block.splitlines():
+                if "=" not in line:
+                    continue
+                key, value = [item.strip() for item in line.split("=", 1)]
+                if key in {"freshness_fields", "invalid_reasons"}:
+                    parsed[key] = [item.strip() for item in value.split(",") if item.strip()]
+                else:
+                    parsed[key] = value
+            return parsed
+
+        docs_dir = Path(__file__).resolve().parents[1] / "docs"
+        documented_contracts = [
+            _parse_contract(path.read_text(encoding="utf-8"))
+            for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
+            if "Required checkpoint context compaction freshness contract:" in path.read_text(encoding="utf-8")
+        ]
+        expected_contract = {
+            "freshness_fields": list(agent_reconcile_service.CHECKPOINT_CONTEXT_COMPACTION_FIELDS),
+            "object_key_prefix": agent_runtime_service.AGENT_CONTEXT_COMPACTION_OBJECT_KEY_PREFIX,
+            "event_type": agent_runtime_service.AGENT_HISTORY_CONTEXT_COMPACTION_EVENT,
+            "invalid_result": agent_reconcile_service.CHECKPOINT_CONTEXT_COMPACTION_RESULT,
+            "invalid_action": agent_reconcile_service.CHECKPOINT_CONTEXT_COMPACTION_ACTION,
+            "invalid_reasons": list(agent_reconcile_service.CHECKPOINT_CONTEXT_COMPACTION_REASONS),
+        }
+
+        run = self._create_run("checkpoint compaction contract defaults")
+        freshness = CheckpointFreshnessGate(self.db).evaluate(run=run)
+
+        self.assertEqual(len(documented_contracts), 2)
+        for documented in documented_contracts:
+            self.assertEqual(documented, expected_contract)
+        self.assertTrue(set(agent_reconcile_service.CHECKPOINT_CONTEXT_COMPACTION_FIELDS).issubset(freshness))
+        self.assertIsNone(freshness["context_compaction_object_key"])
+        self.assertIsNone(freshness["context_compaction_event_seq"])
+        self.assertIsNone(freshness["context_compaction_event_type"])
+        self.assertFalse(freshness["context_compaction_available"])
 
     def test_resume_run_pauses_when_backend_contract_is_missing(self):
         run = self._create_run("backend contract missing freshness")
@@ -13105,6 +18507,8 @@ class AgentRuntimeTests(unittest.TestCase):
             "recommendation_required_fields": RUNBOOK_RECOMMENDATION_REQUIRED_FIELDS,
             "recommendation_optional_fields": RUNBOOK_RECOMMENDATION_OPTIONAL_FIELDS,
             "recommendation_runbook_ids": RUNBOOK_DIAGNOSIS_RECOMMENDATION_RUNBOOK_IDS,
+            "runbook_item_prefix": "agent-runbook",
+            "recommendation_item_prefix": "agent-runbook-recommendation",
             "execution_context_summary_fields": set(RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS),
             "dispatch_trace_summary_fields": set(RUNBOOK_DISPATCH_TRACE_SUMMARY_FIELDS),
             "recommendation_action_contract": "openapi_agent_route",
@@ -13161,6 +18565,23 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue(all(list(item) == list(RUNBOOK_RECOMMENDATION_FIELDS) for item in diagnosis["recommendations"]))
         self.assertTrue(
             all(list(item) == list(RUNBOOK_RECOMMENDATION_FIELDS) for item in diagnosis_route_payload["recommendations"])
+        )
+        runbook_item_prefix = getattr(agent_runbook_service, "AGENT_RUNBOOK_ITEM_ID_PREFIX", None)
+        recommendation_item_prefix = getattr(agent_runbook_service, "AGENT_RUNBOOK_RECOMMENDATION_ITEM_ID_PREFIX", None)
+        self.assertEqual(runbook_item_prefix, "agent-runbook")
+        self.assertEqual(recommendation_item_prefix, "agent-runbook-recommendation")
+        self.assertEqual(
+            catalog_route_payload[0]["item_id"],
+            f"{runbook_item_prefix}://{catalog_route_payload[0]['runbook_id']}",
+        )
+        self.assertTrue(
+            checkpoint_recommendation["item_id"].startswith(
+                f"{recommendation_item_prefix}://{run.run_id}/checkpoint_stale/"
+            )
+        )
+        self.assertEqual(
+            checkpoint_recommendation["item_id"],
+            diagnosis_route_payload["recommendations"][0]["item_id"],
         )
         self.assertEqual(checkpoint_recommendation["action"], "POST /api/v1/agents/runs/{run_id}/context-builds")
         self.assertEqual(checkpoint_recommendation["details"]["action"], "replan_from_latest_safe_state")
@@ -13286,6 +18707,18 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result["checkpoint_freshness"]["action"], "continue_from_checkpoint")
         self.assertIn("run.resumed", events)
 
+    def test_resume_run_terminal_response_keeps_contract_shape(self):
+        run = self._create_run("resume terminal contract")
+        AgentRuntimeService(self.db).complete_run(run, {"message": "done"})
+
+        result = AgentRunResumeService(self.db).resume_run(run_id=run.run_id, current_user=self.owner)
+
+        self.assertFalse(result["resumed"])
+        self.assertEqual(result["run"].status, "completed")
+        self.assertEqual(result["checkpoint_freshness"]["result"], "terminal")
+        self.assertEqual(result["scheduled_tool_call_ids"], [])
+        self.assertEqual(result["executed_tool_call_ids"], [])
+
     def test_resume_run_executes_approved_blocking_tool_and_completes_conversation(self):
         run, call, approval = self._create_pending_approval()
         call.resolved_side_effect_class = "read_only"
@@ -13336,6 +18769,172 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("run.completed", events)
         self.assertIn("工具执行结果如下", captured_messages[-2].content)
         self.assertEqual(captured_messages[-1].content, "以上工具已完成审批和执行。请基于这些工具结果给用户最终回复，不要再请求工具。")
+
+    def test_resume_run_clears_approval_block_when_approved_tool_execution_fails(self):
+        run, call, approval = self._create_pending_approval()
+        call.resolved_side_effect_class = "read_only"
+        run.status = "needs_human"
+        run.blocking_tool_call_ids_json = [call.tool_call_id]
+        self.db.commit()
+        ApprovalService(self.db).approve(
+            tool_call_id=call.tool_call_id,
+            payload=self._approval_decision(approval),
+            current_user=self.owner,
+        )
+
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.extend(payload.messages)
+            yield {"type": "delta", "content": "Tool execution failed with 404; query valid case IDs before retrying."}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_runtime_service.AgentToolBackend.execute",
+                side_effect=HTTPException(status_code=404, detail="test case missing"),
+            ),
+        ):
+            result = AgentRunResumeService(self.db).resume_run(run_id=run.run_id, current_user=self.owner)
+
+        refreshed_run = self.db.get(AgentRun, run.id)
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        events = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+
+        self.assertTrue(result["resumed"])
+        self.assertEqual(result["observed_tool_call_ids"], [call.tool_call_id])
+        self.assertEqual(result["executed_tool_call_ids"], [])
+        self.assertEqual(refreshed_call.status, "failed")
+        self.assertEqual(refreshed_call.error_code, "tool_execution_failed")
+        self.assertEqual(refreshed_run.blocking_tool_call_ids_json, [])
+        self.assertEqual(refreshed_run.status, "completed")
+        self.assertIn("tool.failed", events)
+        self.assertIn("tool.result_observed", events)
+        self.assertIn("run.resumed", events)
+        self.assertIn("run.completed", events)
+        self.assertTrue(any("404" in (message.content or "") for message in captured_messages))
+
+    def test_resume_run_does_not_execute_approved_tool_from_unsafe_failed_queue(self):
+        run, call, approval = self._create_pending_approval()
+        call.resolved_side_effect_class = "read_only"
+        run.status = "needs_human"
+        run.blocking_tool_call_ids_json = [call.tool_call_id]
+        self.db.commit()
+        ApprovalService(self.db).approve(
+            tool_call_id=call.tool_call_id,
+            payload=self._approval_decision(approval),
+            current_user=self.owner,
+        )
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+        self.assertIsNotNone(queue_item)
+        queue_item.status = "failed"
+        queue_item.last_error_code = "agent_run_cancelled_before_tool_execution"
+        queue_item.lease_owner = None
+        queue_item.lease_expires_at = None
+        self.db.commit()
+
+        with (
+            patch("app.services.agent_runtime_service.AgentToolRuntime.execute", return_value={"unexpected": True}) as execute,
+            patch("app.services.agent_runtime_service.AIService.chat_stream") as chat_stream,
+        ):
+            result = AgentRunResumeService(self.db).resume_run(run_id=run.run_id, current_user=self.owner)
+
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        refreshed_queue = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.queue_id == queue_item.queue_id))
+
+        execute.assert_not_called()
+        chat_stream.assert_not_called()
+        self.assertFalse(result["resumed"])
+        self.assertEqual(result["executed_tool_call_ids"], [])
+        self.assertEqual(result["run"].status, "needs_human")
+        self.assertEqual(result["run"].blocking_tool_call_ids_json, [call.tool_call_id])
+        self.assertEqual(refreshed_call.status, "planned")
+        self.assertIsNone(refreshed_call.error_code)
+        self.assertIsNone(refreshed_call.recovery_decision)
+        self.assertEqual(refreshed_queue.status, "failed")
+        self.assertEqual(refreshed_queue.last_error_code, "agent_run_cancelled_before_tool_execution")
+
+    def test_resume_run_does_not_emit_resumed_event_for_unsafe_failed_queue(self):
+        run, call, approval = self._create_pending_approval()
+        call.resolved_side_effect_class = "read_only"
+        run.status = "needs_human"
+        run.blocking_tool_call_ids_json = [call.tool_call_id]
+        self.db.commit()
+        ApprovalService(self.db).approve(
+            tool_call_id=call.tool_call_id,
+            payload=self._approval_decision(approval),
+            current_user=self.owner,
+        )
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+        self.assertIsNotNone(queue_item)
+        queue_item.status = "failed"
+        queue_item.last_error_code = "agent_run_cancelled_before_tool_execution"
+        queue_item.lease_owner = None
+        queue_item.lease_expires_at = None
+        self.db.commit()
+
+        AgentRunResumeService(self.db).resume_run(run_id=run.run_id, current_user=self.owner)
+
+        event_types = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+
+        self.assertIn("checkpoint.freshness_checked", event_types)
+        self.assertNotIn("run.resumed", event_types)
+
+    def test_resume_run_does_not_start_final_summary_after_cancel_during_tool_execution(self):
+        run, call, approval = self._create_pending_approval()
+        call.resolved_side_effect_class = "read_only"
+        run.status = "needs_human"
+        run.blocking_tool_call_ids_json = [call.tool_call_id]
+        self.db.commit()
+        ApprovalService(self.db).approve(
+            tool_call_id=call.tool_call_id,
+            payload=self._approval_decision(approval),
+            current_user=self.owner,
+        )
+
+        def cancel_during_tool(self, *, call, current_user):
+            AgentRuntimeService(self.db).cancel_run(run_id=call.run_id, current_user=current_user)
+            return {"project": {"id": 10, "name": "TestAuto"}}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream") as chat_stream,
+            patch("app.services.agent_runtime_service.AgentToolRuntime.execute", new=cancel_during_tool),
+        ):
+            result = AgentRunResumeService(self.db).resume_run(run_id=run.run_id, current_user=self.owner)
+
+        events = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+        cancelled_index = events.index("run.cancelled")
+        events_after_cancel = events[cancelled_index + 1:]
+
+        self.assertFalse(result["resumed"])
+        self.assertEqual(result["run"].status, "cancelled")
+        self.assertEqual(result["executed_tool_call_ids"], [])
+        self.assertEqual(refreshed_call.status, "obsolete")
+        self.assertEqual(refreshed_call.error_code, "agent_run_cancelled_during_tool_execution")
+        self.assertEqual(refreshed_call.recovery_decision, "run_cancelled_before_tool_completion")
+        self.assertEqual(queue_item.status, "failed")
+        self.assertEqual(queue_item.last_error_code, "agent_run_cancelled_during_tool_execution")
+        chat_stream.assert_not_called()
+        self.assertNotIn("run.completed", events_after_cancel)
+        self.assertNotIn("model.started", events_after_cancel)
 
     def test_complete_after_tool_results_bounds_aggregate_tool_result_model_context(self):
         from app.core.sensitive_data import request_fingerprint
@@ -13868,6 +19467,16 @@ class AgentRuntimeTests(unittest.TestCase):
         run = self._create_run("resume retryable")
         call = self._create_uncertain_call(run.run_id, step_index=0, effect_state="send_intent_recorded")
         call.status = "failed_retryable"
+        call.execution_phase = "pre_effect"
+        observed_at = datetime.now(UTC).replace(tzinfo=None)
+        call.downstream_send_intent_at = observed_at
+        call.downstream_request_observed_sent_at = observed_at
+        call.effect_boundary_crossed = True
+        call.lease_owner = "stale-worker-before-resume"
+        call.lease_expires_at = observed_at + timedelta(seconds=30)
+        call.last_heartbeat_at = observed_at
+        call.error_code = "reconcile_not_found"
+        call.error_message = "Previous reconcile attempt did not find a downstream effect"
         run.status = "paused"
         self.db.commit()
 
@@ -13879,6 +19488,37 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result["scheduled_tool_call_ids"], [call.tool_call_id])
         self.assertEqual(queue_item.status, "queued")
         self.assertEqual(refreshed_call.status, "planned")
+        self.assertIsNone(refreshed_call.execution_phase)
+        self.assertEqual(refreshed_call.effect_submission_state, "none")
+        self.assertFalse(refreshed_call.effect_boundary_crossed)
+        self.assertIsNone(refreshed_call.downstream_send_intent_at)
+        self.assertIsNone(refreshed_call.downstream_request_observed_sent_at)
+        self.assertIsNone(refreshed_call.downstream_acceptance_id)
+        self.assertIsNone(refreshed_call.downstream_acceptance_at)
+        self.assertIsNone(refreshed_call.lease_owner)
+        self.assertIsNone(refreshed_call.lease_expires_at)
+        self.assertIsNone(refreshed_call.last_heartbeat_at)
+        self.assertIsNone(refreshed_call.error_code)
+        self.assertIsNone(refreshed_call.error_message)
+        self.assertEqual(refreshed_call.recovery_decision, "resume_retry_same_idempotency_key")
+
+    def test_resume_run_clears_blocking_id_for_scheduled_failed_retryable_tool_call(self):
+        run = self._create_run("resume retryable clears blocking")
+        call = self._create_uncertain_call(run.run_id, step_index=0, effect_state="send_intent_recorded")
+        call.status = "failed_retryable"
+        run.status = "needs_human"
+        run.blocking_tool_call_ids_json = [call.tool_call_id]
+        self.db.commit()
+
+        result = AgentRunResumeService(self.db).resume_run(run_id=run.run_id, current_user=self.owner)
+        refreshed_run = self.db.get(AgentRun, run.id)
+        queue_item = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+
+        self.assertTrue(result["resumed"])
+        self.assertEqual(result["scheduled_tool_call_ids"], [call.tool_call_id])
+        self.assertEqual(result["run"].status, "running")
+        self.assertEqual(refreshed_run.blocking_tool_call_ids_json, [])
+        self.assertEqual(queue_item.status, "queued")
 
     def test_backend_contracts_can_be_seeded_and_queried_by_operation(self):
         AgentRuntimeService(self.db).ensure_backend_contracts()
@@ -14035,6 +19675,8 @@ class AgentRuntimeTests(unittest.TestCase):
                 run = self._create_run(f"{call_status} queued by mistake")
                 call = self._create_uncertain_call(run.run_id, step_index=0)
                 call.status = call_status
+                call.lease_owner = f"stale-worker-{call_status}"
+                call.lease_expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(seconds=30)
                 self.db.commit()
                 AgentWorkerQueueService(self.db).enqueue_tool_call(call)
 
@@ -14058,6 +19700,8 @@ class AgentRuntimeTests(unittest.TestCase):
                 self.assertEqual(refreshed.status, call_status)
                 self.assertEqual(refreshed.error_code, "tool_call_uncertain_reconcile_required")
                 self.assertEqual(refreshed.recovery_decision, "reconcile_required_before_execution")
+                self.assertIsNone(refreshed.lease_owner)
+                self.assertIsNone(refreshed.lease_expires_at)
                 self.assertEqual(queue_item.status, "failed")
                 self.assertEqual(queue_item.last_error_code, "tool_call_uncertain_reconcile_required")
                 self.assertEqual(events[-1].payload_json["error_code"], "tool_call_uncertain_reconcile_required")
@@ -14102,6 +19746,40 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(mutation.mutation_type, "approve")
         self.assertEqual(queue_item.status, "queued")
         self.assertIn("approval.approved", events)
+
+    def test_approve_is_idempotent_after_same_approval_was_already_approved(self):
+        run, call, approval = self._create_pending_approval()
+        decision = self._approval_decision(approval)
+
+        first_approved, _, _, first_mutation = ApprovalService(self.db).approve(
+            tool_call_id=call.tool_call_id,
+            payload=decision,
+            current_user=self.owner,
+        )
+        second_approved, _, second_call, second_mutation = ApprovalService(self.db).approve(
+            tool_call_id=call.tool_call_id,
+            payload=decision,
+            current_user=self.owner,
+        )
+        conflict_events = list(self.db.scalars(
+            select(AgentEvent).where(
+                AgentEvent.run_id == run.run_id,
+                AgentEvent.event_type == "approval.approve_conflict",
+            )
+        ).all())
+        approve_mutations = list(self.db.scalars(
+            select(AgentApprovalMutationLog).where(
+                AgentApprovalMutationLog.approval_id == approval.approval_id,
+                AgentApprovalMutationLog.mutation_type == "approve",
+            )
+        ).all())
+
+        self.assertEqual(first_approved.approval_id, approval.approval_id)
+        self.assertEqual(second_approved.approval_status, "approved")
+        self.assertEqual(second_call.approved_approval_id, approval.approval_id)
+        self.assertEqual(second_mutation.id, first_mutation.id)
+        self.assertEqual(approve_mutations, [first_mutation])
+        self.assertEqual(conflict_events, [])
 
     def test_supersede_with_replacement_is_atomic_and_stales_old_approval(self):
         run, old_call, old_approval = self._create_pending_approval()
@@ -14460,6 +20138,84 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.error_code, "permission_revoked_before_execution")
 
+    def test_executor_blocks_testcase_update_ids_not_returned_by_query_tool(self):
+        run = self._create_run("update assertions from listed cases only")
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "http_test_case_ids": [204, 205],
+            "websocket_test_case_ids": [304],
+            "http_test_cases": [{"id": 204}, {"id": 205}],
+            "websocket_test_cases": [{"id": 304}],
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.batch_update_assertions",
+                input={
+                    "project_id": 10,
+                    "items": [
+                        {"test_case_id": 999, "assertions": [{"type": "status_code", "expected": 200}]}
+                    ],
+                },
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        call.resolved_side_effect_class = "business_update"
+        call.backend_effect_capability = "receipt_first"
+        call.approval_required = True
+        self.db.flush()
+        approval = ApprovalService(self.db).create_pending_approval(
+            call=call,
+            run=run,
+            current_user=self.owner,
+        )
+        run.status = "needs_human"
+        run.blocking_tool_call_ids_json = [call.tool_call_id]
+        self.db.commit()
+        ApprovalService(self.db).approve(
+            tool_call_id=call.tool_call_id,
+            payload=self._approval_decision(approval),
+            current_user=self.owner,
+        )
+        AgentWorkerQueueService(self.db).enqueue_tool_call(call)
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute") as execute:
+            result = ToolExecutor(self.db).execute_next(worker_id="worker-case-id-guard")
+
+        refreshed_queue = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+        event_types = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+
+        execute.assert_not_called()
+        self.assertEqual(result.tool_call_id, call.tool_call_id)
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.execution_phase, "blocked_by_harness")
+        self.assertEqual(result.error_code, "agent_testcase_ids_not_from_query_result")
+        self.assertEqual(result.recovery_decision, "query_project_cases_before_retry")
+        self.assertEqual(result.output_json_redacted["invalid_test_case_ids"], [999])
+        self.assertEqual(result.output_json_redacted["valid_test_case_ids"], [204, 205])
+        self.assertEqual(refreshed_queue.status, "failed")
+        self.assertEqual(refreshed_queue.last_error_code, "agent_testcase_ids_not_from_query_result")
+        self.assertIn("tool.failed", event_types)
+        self.assertIn("tool.result_observed", event_types)
+
     def test_harness_approval_expire_payload_contract_matches_service(self):
         from pathlib import Path
         import re
@@ -14787,6 +20543,48 @@ class AgentRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(request_schema["$ref"], "#/components/schemas/AgentApprovalDecisionRequest")
 
+    def test_harness_approval_decision_payload_contract_matches_schemas(self):
+        from pathlib import Path
+        import re
+
+        def _parse_payload_contract(text: str) -> dict[str, list[str] | str]:
+            section = text[text.index("Required Approval decision payload contract:"):]
+            block = re.search(r"```text\n(.*?)\n```", section, re.S)
+            self.assertIsNotNone(block)
+            parsed: dict[str, list[str] | str] = {}
+            for line in block.group(1).splitlines():
+                if not line.strip():
+                    continue
+                key, value = line.strip().split("=", 1)
+                if "," in value:
+                    parsed[key] = value.split(",")
+                else:
+                    parsed[key] = value
+            return parsed
+
+        docs_dir = Path(__file__).resolve().parents[1] / "docs"
+        documented_payload_contracts = [
+            _parse_payload_contract(path.read_text(encoding="utf-8"))
+            for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
+            if "Required Approval decision payload contract:" in path.read_text(encoding="utf-8")
+        ]
+
+        self.assertEqual(len(documented_payload_contracts), 2)
+        for contract in documented_payload_contracts:
+            self.assertEqual(contract["fields"], list(agent_schema.AgentApprovalDecisionRead.model_fields))
+            self.assertEqual(contract["approval_fields"], list(agent_schema.AgentApprovalRead.model_fields))
+            self.assertEqual(contract["lineage_fields"], list(agent_schema.AgentApprovalLineageRead.model_fields))
+            self.assertEqual(contract["tool_call_fields"], list(agent_schema.AgentToolCallRead.model_fields))
+            self.assertEqual(
+                contract["mutation_log_fields"],
+                list(agent_schema.AgentApprovalMutationLogRead.model_fields),
+            )
+            self.assertEqual(contract["approval_mutation_item_prefix"], "agent-approval-mutation")
+            self.assertEqual(contract["approval_lineage_item_prefix"], "agent-approval-lineage")
+            self.assertEqual(contract["approval_item_prefix"], "agent-approval")
+            self.assertEqual(contract["tool_call_item_prefix"], "agent-tool-call")
+            self.assertEqual(contract["source"], "AgentApprovalDecisionRead")
+
     def test_harness_approval_concurrency_contract_matches_guard_and_openapi(self):
         from pathlib import Path
 
@@ -14919,11 +20717,13 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(capabilities[key], values)
         self.assertIn("revoked", documented["approval_statuses"])
         AgentApprovalRead.model_validate({
+            "item_id": "agent-approval://agent-run-revoked/agent-appr-revoked",
             "approval_id": "agent-appr-revoked",
             "approval_lineage_id": "lineage-revoked",
             "approval_epoch": 1,
             "run_id": "agent-run-revoked",
             "tool_call_id": "agent-tool-revoked",
+            "tool_call_item_id": "agent-tool-call://agent-run-revoked/agent-tool-revoked",
             "project_id": 10,
             "approval_status": "revoked",
             "requested_by": self.owner.id,
@@ -14939,11 +20739,14 @@ class AgentRuntimeTests(unittest.TestCase):
             "created_at": datetime.now(UTC),
             "updated_at": datetime.now(UTC),
         })
+        self.assertEqual(list(AgentMigrationBlockRead.model_fields), list(MIGRATION_BLOCK_FIELDS))
         for status_value in documented["migration_block_statuses"]:
             AgentMigrationBlockRead.model_validate({
+                "item_id": f"agent-migration-block://agent-run-migration/block-{status_value}",
                 "block_id": f"block-{status_value}",
                 "run_id": "agent-run-migration",
                 "tool_call_id": None,
+                "tool_call_item_id": None,
                 "status": status_value,
                 "block_type": "run",
                 "reason": "contract test",
@@ -14958,6 +20761,74 @@ class AgentRuntimeTests(unittest.TestCase):
                 "updated_at": datetime.now(UTC),
                 "resolved_at": None,
             })
+
+    def test_harness_agent_capabilities_payload_contract_matches_route_and_tool_registry(self):
+        from pathlib import Path
+        import re
+
+        import app.services.agent_tool_service as agent_tool_service
+        from app.api.v1.routers.agents import get_agent_capabilities
+        from app.services.agent_tool_service import ToolRegistry
+
+        def _parse_payload_contract(text: str) -> dict[str, list[str] | str]:
+            section = text[text.index("Required Agent capabilities payload contract:"):]
+            block = re.search(r"```text\n(.*?)\n```", section, re.S)
+            self.assertIsNotNone(block)
+            parsed: dict[str, list[str] | str] = {}
+            for line in block.group(1).splitlines():
+                if not line.strip():
+                    continue
+                key, value = line.strip().split("=", 1)
+                if "," in value:
+                    parsed[key] = value.split(",")
+                else:
+                    parsed[key] = value
+            return parsed
+
+        docs_dir = Path(__file__).resolve().parents[1] / "docs"
+        documented_payload_contracts = [
+            _parse_payload_contract(path.read_text(encoding="utf-8"))
+            for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
+            if "Required Agent capabilities payload contract:" in path.read_text(encoding="utf-8")
+        ]
+        service_payload = AgentRuntimeService(self.db).capabilities()
+        route_payload = get_agent_capabilities(db=self.db, current_user=self.owner)["data"]
+        tool_item_prefix = getattr(agent_tool_service, "AGENT_TOOL_SPEC_ITEM_ID_PREFIX", None)
+        registry_tools = ToolRegistry().registry_json()
+        expected_tool_fields = list(registry_tools[0])
+        private_tool_fields = [
+            "backend_handler",
+            "required_successful_tool_before",
+            "missing_prerequisite_error_code",
+            "missing_prerequisite_next_action",
+            "tool_result_repair_guidance",
+        ]
+
+        self.assertEqual(len(documented_payload_contracts), 2)
+        for contract in documented_payload_contracts:
+            self.assertEqual(contract["fields"], list(AgentCapabilitiesRead.model_fields))
+            self.assertEqual(contract["tool_fields"], expected_tool_fields)
+            self.assertEqual(contract.get("tool_item_prefix"), "agent-tool-spec")
+            self.assertEqual(contract["private_tool_fields"], private_tool_fields)
+            self.assertEqual(contract["source"], "AgentCapabilitiesRead")
+            self.assertEqual(contract["tool_source"], "ToolSpec.to_json")
+        self.assertEqual(tool_item_prefix, "agent-tool-spec")
+        self.assertEqual(expected_tool_fields[0], "item_id")
+        self.assertEqual(list(service_payload), list(AgentCapabilitiesRead.model_fields))
+        self.assertEqual(list(route_payload), list(AgentCapabilitiesRead.model_fields))
+        self.assertEqual(route_payload["tools"], registry_tools)
+        self.assertTrue(route_payload["tools"])
+        for payload in (service_payload, route_payload):
+            for tool in payload["tools"]:
+                self.assertEqual(list(tool), expected_tool_fields)
+                self.assertEqual(
+                    tool["item_id"],
+                    f"{tool_item_prefix}://{tool['name']}/{tool['version']}",
+                )
+                self.assertTrue(tool["schema_hash"])
+                self.assertTrue(tool["manifest_hash"])
+                for private_field in private_tool_fields:
+                    self.assertNotIn(private_field, tool)
 
     def test_harness_frozen_api_error_codes_match_architecture_contract(self):
         from pathlib import Path
@@ -16165,6 +22036,8 @@ class AgentRuntimeTests(unittest.TestCase):
             "fallback_rule_id": ROOT_CAUSE_FALLBACK_RULE_ID,
             "accepted_unknown_rule_id": ROOT_CAUSE_ACCEPTED_UNKNOWN_RULE_ID,
             "missing_rule_metric": ROOT_CAUSE_MISSING_RULE_METRIC,
+            "violation_fields": {"item_id", "rule_id", "priority", "priority_band", "violation", "expected_range"},
+            "violation_item_prefix": "agent-root-cause-rule-violation",
         }
         docs_dir = Path(__file__).resolve().parents[1] / "docs"
         documented_contracts = [
@@ -16207,6 +22080,14 @@ class AgentRuntimeTests(unittest.TestCase):
             engine.evaluate(reasons=["not_registered_anywhere"], observation={}).rule_id,
             ROOT_CAUSE_FALLBACK_RULE_ID,
         )
+        violation_item_prefix = getattr(
+            agent_loop_service,
+            "AGENT_ROOT_CAUSE_RULE_VIOLATION_ITEM_ID_PREFIX",
+            None,
+        )
+        violation_fields = set(getattr(agent_loop_service, "ROOT_CAUSE_GOVERNANCE_VIOLATION_FIELDS", ()))
+        self.assertEqual(violation_item_prefix, "agent-root-cause-rule-violation")
+        self.assertEqual(violation_fields, expected_contract["violation_fields"])
 
         self.db.add(
             AgentRootCauseRule(
@@ -16227,6 +22108,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertFalse(failed["governance_pass"])
         self.assertIn(
             {
+                "item_id": f"{violation_item_prefix}://RC_UNKNOWN_PRIORITY_BAND/unknown_priority_band",
                 "rule_id": "RC_UNKNOWN_PRIORITY_BAND",
                 "priority": 50,
                 "priority_band": "not_a_band",
@@ -16295,6 +22177,10 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(failed["violation_count"], 1)
         self.assertEqual(failed["violations"][0]["rule_id"], "RC_BAD_BAND")
         self.assertEqual(failed["violations"][0]["violation"], "priority_outside_band")
+        self.assertEqual(
+            failed["violations"][0]["item_id"],
+            "agent-root-cause-rule-violation://RC_BAD_BAND/priority_outside_band",
+        )
 
     def test_root_cause_rule_governance_audit_route_requires_admin(self):
         from app.api.v1.routers.agents import audit_agent_root_cause_rules
@@ -16333,6 +22219,39 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.status, "manual_intervention")
         self.assertEqual(result.error_code, "context_decision_build_required")
+
+    def test_approval_required_high_risk_tool_call_binds_decision_context_before_approval(self):
+        run = self._create_run("approval high risk context")
+
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.batch_update_assertions",
+                input={
+                    "project_id": 10,
+                    "items": [
+                        {
+                            "test_case_id": 7,
+                            "assertions": [{"type": "status_code", "expected": "200"}],
+                        }
+                    ],
+                },
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+
+        self.assertTrue(call.approval_required)
+        self.assertEqual(call.resolved_side_effect_class, "business_update")
+        self.assertIsNotNone(call.decision_context_build_id)
+        self.assertTrue(call.policy_evidence_refs_json)
+        self.assertTrue(any(ref.get("ref_type") == "system_record" for ref in call.policy_evidence_refs_json))
+        build = self.db.scalar(
+            select(AgentContextBuild).where(AgentContextBuild.context_build_id == call.decision_context_build_id)
+        )
+        self.assertIsNotNone(build)
+        self.assertTrue(build.required_evidence_complete)
 
     def test_high_risk_tool_call_blocks_when_required_evidence_incomplete(self):
         run = self._create_run("high risk incomplete context")
@@ -17741,11 +23660,35 @@ class AgentRuntimeTests(unittest.TestCase):
         self.db.commit()
         process_route_payload = process_agent_memory_feedback(limit=10, db=self.db, current_user=self.admin)["data"]
 
+        usage_for_already_processed_route = _create_usage_for_feedback("Already processed feedback contract")
+        usage_for_already_processed_route.feedback_state = "processed"
+        usage_for_already_processed_route.feedback_result_json = {
+            "usage_event_id": usage_for_already_processed_route.id,
+            "processed": True,
+            "decision": "memory_validated",
+        }
+        self.db.commit()
+        already_processed_route_payload = record_agent_memory_usage_feedback(
+            usage_event_id=usage_for_already_processed_route.id,
+            payload=AgentMemoryFeedbackRequest(outcome="validated", reason="already processed contract validation"),
+            db=self.db,
+            current_user=self.owner,
+        )["data"]
+
+        result_item_prefix = getattr(
+            agent_memory_service,
+            "AGENT_MEMORY_FEEDBACK_RESULT_ITEM_ID_PREFIX",
+            None,
+        )
+
         self.assertEqual(len(documented_payload_contracts), 2)
         for contract in documented_payload_contracts:
             self.assertEqual(contract["fields"], list(MEMORY_FEEDBACK_PROCESS_FIELDS))
             self.assertEqual(contract["result_base_fields"], list(MEMORY_FEEDBACK_RESULT_BASE_FIELDS))
+            self.assertEqual(contract.get("result_item_prefix"), "agent-memory-feedback-result")
             self.assertEqual(contract["source"], "MemoryFeedbackWorker.process_due")
+        self.assertEqual(result_item_prefix, "agent-memory-feedback-result")
+        self.assertEqual(MEMORY_FEEDBACK_RESULT_BASE_FIELDS[0], "item_id")
         self.assertEqual(list(AgentMemoryFeedbackProcessRead.model_fields), list(MEMORY_FEEDBACK_PROCESS_FIELDS))
         self.assertEqual(list(service_summary), list(MEMORY_FEEDBACK_PROCESS_FIELDS))
         self.assertEqual(list(record_route_payload), list(MEMORY_FEEDBACK_PROCESS_FIELDS))
@@ -17753,7 +23696,22 @@ class AgentRuntimeTests(unittest.TestCase):
         for payload in (service_summary, record_route_payload, process_route_payload):
             self.assertEqual(payload["validations_recorded"], 1)
             self.assertEqual(list(payload["results"][0])[: len(MEMORY_FEEDBACK_RESULT_BASE_FIELDS)], list(MEMORY_FEEDBACK_RESULT_BASE_FIELDS))
+            self.assertEqual(
+                payload["results"][0]["item_id"],
+                f"{result_item_prefix}://{payload['results'][0]['usage_event_id']}",
+            )
             self.assertEqual(payload["results"][0]["decision"], "memory_validated")
+        self.assertEqual(list(already_processed_route_payload), list(MEMORY_FEEDBACK_PROCESS_FIELDS))
+        self.assertEqual(already_processed_route_payload["processed"], 0)
+        self.assertEqual(already_processed_route_payload["skipped"], 1)
+        self.assertEqual(
+            list(already_processed_route_payload["results"][0])[: len(MEMORY_FEEDBACK_RESULT_BASE_FIELDS)],
+            list(MEMORY_FEEDBACK_RESULT_BASE_FIELDS),
+        )
+        self.assertEqual(
+            already_processed_route_payload["results"][0]["item_id"],
+            f"{result_item_prefix}://{usage_for_already_processed_route.id}",
+        )
 
     def test_memory_maintenance_worker_marks_unvalidated_expired_ttl_for_revalidation(self):
         expired = MemoryManager(self.db).create_memory(
@@ -18431,6 +24389,7 @@ class AgentRuntimeTests(unittest.TestCase):
             for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
             if "Required Memory staleness event payload contract:" in path.read_text(encoding="utf-8")
         ]
+        item_id_prefix = getattr(agent_memory_service, "AGENT_MEMORY_STALENESS_EVENT_ITEM_ID_PREFIX", None)
         admin_payload = list_agent_memory_staleness_events(limit=100, db=self.db, current_user=self.admin)["data"][0]
         project_payload = list_agent_memory_staleness_events(
             project_id=10,
@@ -18452,10 +24411,14 @@ class AgentRuntimeTests(unittest.TestCase):
         for contract in documented_payload_contracts:
             self.assertEqual(contract["fields"], list(MEMORY_STALENESS_EVENT_FIELDS))
             self.assertEqual(contract["source"], "GET /api/v1/agents/memory-staleness-events")
+            self.assertEqual(contract.get("memory_staleness_event_item_prefix"), "agent-memory-staleness-event")
+        self.assertEqual(item_id_prefix, "agent-memory-staleness-event")
         self.assertEqual(list(AgentMemoryStalenessEventRead.model_fields), list(MEMORY_STALENESS_EVENT_FIELDS))
         self.assertEqual(list(admin_payload), list(MEMORY_STALENESS_EVENT_FIELDS))
         self.assertEqual(list(project_payload), list(MEMORY_STALENESS_EVENT_FIELDS))
         self.assertEqual(list(memory_payload), list(MEMORY_STALENESS_EVENT_FIELDS))
+        for payload in (admin_payload, project_payload, memory_payload):
+            self.assertEqual(payload.get("item_id"), f"agent-memory-staleness-event://{payload['id']}")
         self.assertEqual(admin_payload["memory_id"], memory.id)
         self.assertEqual(project_payload["evidence_ref_type"], "scenario")
         self.assertEqual(project_payload["evidence_ref_id"], "stale-contract")
@@ -18521,6 +24484,7 @@ class AgentRuntimeTests(unittest.TestCase):
             for path in docs_dir.glob("*Harness_Loop_Agent*Memory*.md")
             if "Required Memory validation event payload contract:" in path.read_text(encoding="utf-8")
         ]
+        item_id_prefix = getattr(agent_memory_service, "AGENT_MEMORY_VALIDATION_EVENT_ITEM_ID_PREFIX", None)
         admin_payload = list_agent_memory_validation_events(limit=100, db=self.db, current_user=self.admin)["data"][0]
         project_payload = list_agent_memory_validation_events(
             project_id=10,
@@ -18541,10 +24505,14 @@ class AgentRuntimeTests(unittest.TestCase):
         for contract in documented_payload_contracts:
             self.assertEqual(contract["fields"], list(MEMORY_VALIDATION_EVENT_FIELDS))
             self.assertEqual(contract["source"], "GET /api/v1/agents/memory-validation-events")
+            self.assertEqual(contract.get("memory_validation_event_item_prefix"), "agent-memory-validation-event")
+        self.assertEqual(item_id_prefix, "agent-memory-validation-event")
         self.assertEqual(list(AgentMemoryValidationEventRead.model_fields), list(MEMORY_VALIDATION_EVENT_FIELDS))
         self.assertEqual(list(admin_payload), list(MEMORY_VALIDATION_EVENT_FIELDS))
         self.assertEqual(list(project_payload), list(MEMORY_VALIDATION_EVENT_FIELDS))
         self.assertEqual(list(memory_payload), list(MEMORY_VALIDATION_EVENT_FIELDS))
+        for payload in (admin_payload, project_payload, memory_payload):
+            self.assertEqual(payload.get("item_id"), f"agent-memory-validation-event://{payload['id']}")
         self.assertEqual(admin_payload["memory_id"], memory.id)
         self.assertEqual(project_payload["validation_source"], "user_confirmed")
         self.assertEqual(memory_payload["reason"], "validation event payload contract")

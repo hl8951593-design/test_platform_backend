@@ -25,6 +25,7 @@ from app.runner.retry import (
 )
 from app.schemas.retry import RetryPolicyConfig
 from app.schemas.test_case import (
+    AssertionConfig,
     BatchExecuteRequest,
     TestCaseCreateRequest,
     TestCaseRequestConfig,
@@ -127,6 +128,25 @@ class TestCaseService:
             retry_policy=payload.retry_policy.model_dump(),
         )
 
+    def update_case_assertions(
+        self,
+        *,
+        project_id: int,
+        test_case_id: int,
+        assertions: list[AssertionConfig],
+        current_user: User,
+    ) -> TestCase:
+        self.permission_service.require_project_permission(
+            current_user,
+            project_id,
+            ProjectPermission.MANAGE_CASE.value,
+        )
+        test_case = self._get_case_or_404(project_id=project_id, test_case_id=test_case_id)
+        test_case.assertions = [item.model_dump() for item in assertions]
+        self.db.commit()
+        updated = self.repository.get_by_id(project_id=project_id, test_case_id=test_case_id)
+        return updated or test_case
+
     def delete_case(self, *, project_id: int, test_case_id: int, current_user: User) -> None:
         self.permission_service.require_project_permission(
             current_user,
@@ -193,6 +213,10 @@ class TestCaseService:
         test_case_id: int,
         environment_id: int | None,
         current_user: User,
+        trigger_source: str = "manual",
+        agent_run_id: str | None = None,
+        agent_tool_call_id: str | None = None,
+        trigger_tool_name: str | None = None,
     ) -> TestCaseExecution:
         self.permission_service.require_project_permission(
             current_user,
@@ -217,6 +241,10 @@ class TestCaseService:
             environment_id=payload.environment_id,
             scenario_run_id=None,
             executed_by_id=current_user.id,
+            trigger_source=trigger_source,
+            agent_run_id=agent_run_id,
+            agent_tool_call_id=agent_tool_call_id,
+            trigger_tool_name=trigger_tool_name,
             status="queued",
             request_snapshot=mask_sensitive(request_snapshot),
             response_snapshot=None,
@@ -325,6 +353,10 @@ class TestCaseService:
         payload: TestCaseRequestConfig | UnsavedTestCaseExecuteRequest,
         current_user: User,
         scenario_run_id: int | None = None,
+        trigger_source: str = "manual",
+        agent_run_id: str | None = None,
+        agent_tool_call_id: str | None = None,
+        trigger_tool_name: str | None = None,
         timeout_seconds: float | None = None,
         queued_execution_id: int | None = None,
     ) -> TestCaseExecution:
@@ -497,6 +529,10 @@ class TestCaseService:
             environment_id=payload.environment_id,
             scenario_run_id=scenario_run_id,
             executed_by_id=current_user.id,
+            trigger_source=trigger_source,
+            agent_run_id=agent_run_id,
+            agent_tool_call_id=agent_tool_call_id,
+            trigger_tool_name=trigger_tool_name,
             status=status_value,
             request_snapshot=mask_sensitive(request_snapshot),
             response_snapshot=response_snapshot,

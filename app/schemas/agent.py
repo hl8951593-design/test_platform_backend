@@ -69,6 +69,7 @@ class AgentRunCreateRequest(BaseModel):
 class AgentRunRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     run_id: str
     project_id: int
     user_id: int
@@ -132,6 +133,7 @@ class AgentRunActionRead(BaseModel):
     reason: str
     severity: str
     resource_ids: list[str] = Field(default_factory=list)
+    resource_item_ids: list[str] = Field(default_factory=list)
     details: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -154,15 +156,26 @@ class AgentConversationRead(BaseModel):
     updated_at: datetime
 
 
+class AgentConversationContextCompactionRead(BaseModel):
+    item_id: str
+    run_id: str
+    event_seq: int
+    event_type: str
+    payload_json: dict[str, Any]
+    created_at: datetime
+
+
 class AgentConversationTranscriptRead(BaseModel):
     conversation: AgentConversationRead
     turns: list[AgentRunSummaryRead]
+    context_compactions: list[AgentConversationContextCompactionRead]
     generated_at: datetime
 
 
 class AgentConversationExportRead(BaseModel):
     conversation: AgentConversationRead
     turns: list[AgentRunSummaryRead]
+    context_compactions: list[AgentConversationContextCompactionRead]
     events_by_run_id: dict[str, list["AgentEventRead"]]
     tool_calls_by_run_id: dict[str, list["AgentToolCallRead"]]
     approvals_by_run_id: dict[str, list["AgentApprovalRead"]]
@@ -220,6 +233,7 @@ class AgentConversationSmokeRead(BaseModel):
 class AgentRuntimeSnapshotRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     snapshot_id: str
     project_id: int
     created_by: int
@@ -238,6 +252,7 @@ class AgentRuntimeSnapshotRead(BaseModel):
 class AgentEventRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     event_seq: int
     event_type: str
     payload_json: dict[str, Any]
@@ -247,6 +262,7 @@ class AgentEventRead(BaseModel):
 class AgentRunEventSnapshotRead(BaseModel):
     run: AgentRunRead
     events: list[AgentEventRead]
+    context_compactions: list[AgentConversationContextCompactionRead]
     after_sequence: int
     event_count: int
     latest_event_sequence: int
@@ -317,6 +333,7 @@ class AgentToolCallCreateRequest(BaseModel):
 class AgentToolCallRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     tool_call_id: str
     run_id: str
     step_index: int
@@ -407,6 +424,7 @@ class ReconcileResult(BaseModel):
 class AgentReconcileAttemptRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     attempt_seq: int
     backend_name: str
     backend_operation: str
@@ -422,9 +440,11 @@ class AgentReconcileAttemptRead(BaseModel):
 class AgentApprovalLineageRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     approval_lineage_id: str
     run_id: str
     tool_call_id: str
+    tool_call_item_id: str
     project_id: int
     current_epoch: int
     status: str
@@ -439,11 +459,13 @@ class AgentApprovalLineageRead(BaseModel):
 class AgentApprovalRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     approval_id: str
     approval_lineage_id: str
     approval_epoch: int
     run_id: str
     tool_call_id: str
+    tool_call_item_id: str
     project_id: int
     approval_status: ApprovalStatus
     requested_by: int
@@ -463,9 +485,11 @@ class AgentApprovalRead(BaseModel):
 class AgentApprovalMutationLogRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     approval_lineage_id: str
     approval_id: str | None = None
     tool_call_id: str
+    tool_call_item_id: str
     run_id: str
     mutation_type: str
     from_status: str | None = None
@@ -506,6 +530,7 @@ class AgentContextBuildCreateRequest(BaseModel):
 class AgentContextBuildRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     context_build_id: str
     run_id: str
     iteration: int
@@ -580,6 +605,7 @@ class AgentLoopObservationCreateRequest(BaseModel):
 class AgentLoopObservationRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     observation_id: str
     run_id: str
     iteration: int
@@ -619,6 +645,7 @@ class AgentRunResumeRead(BaseModel):
     checkpoint_freshness: dict[str, Any]
     scheduled_tool_call_ids: list[str] = Field(default_factory=list)
     executed_tool_call_ids: list[str] = Field(default_factory=list)
+    observed_tool_call_ids: list[str] = Field(default_factory=list)
 
 
 class AgentBackendContractRead(BaseModel):
@@ -642,9 +669,11 @@ class AgentBackendContractRead(BaseModel):
 class AgentMigrationBlockRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     block_id: str
     run_id: str
     tool_call_id: str | None = None
+    tool_call_item_id: str | None = None
     status: MigrationBlockStatus
     block_type: str
     reason: str
@@ -786,6 +815,7 @@ class AgentMemoryRetrievalProfileRead(BaseModel):
 class AgentMemoryUsageEventRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     id: int
     memory_id: int
     run_id: str | None = None
@@ -809,6 +839,7 @@ class AgentMemoryUsageEventRead(BaseModel):
 class AgentMemoryStalenessEventRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     id: int
     project_id: int
     memory_id: int
@@ -825,6 +856,7 @@ class AgentMemoryStalenessEventRead(BaseModel):
 class AgentMemoryValidationEventRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    item_id: str
     id: int
     project_id: int
     memory_id: int
@@ -879,6 +911,7 @@ class AgentMetricsSnapshotRead(BaseModel):
 
 
 class AgentAlertRead(BaseModel):
+    item_id: str
     alert_id: str
     severity: str
     status: str
@@ -934,6 +967,7 @@ class AgentApprovalExpireProcessRead(BaseModel):
 
 
 class AgentDashboardCheckRead(BaseModel):
+    item_id: str
     name: str
     status: str
     severity: str
@@ -942,6 +976,7 @@ class AgentDashboardCheckRead(BaseModel):
 
 
 class AgentReleaseGateToolRead(BaseModel):
+    item_id: str
     tool_name: str
     tool_version: str
     side_effect_class: str
@@ -957,6 +992,7 @@ class AgentReleaseGateToolRead(BaseModel):
 
 
 class AgentReleaseGateLevelRead(BaseModel):
+    item_id: str
     level: str
     summary: str
     required_gates: list[str]
@@ -965,6 +1001,7 @@ class AgentReleaseGateLevelRead(BaseModel):
 
 
 class AgentReleaseGateViolationRead(BaseModel):
+    item_id: str
     tool_name: str
     reason: str
     side_effect_class: str
@@ -1041,6 +1078,7 @@ class AgentBackendCompletionAuditRead(BaseModel):
 
 
 class AgentRunbookRead(BaseModel):
+    item_id: str
     runbook_id: str
     title: str
     trigger: str
@@ -1050,6 +1088,7 @@ class AgentRunbookRead(BaseModel):
 
 
 class AgentRunbookRecommendationRead(BaseModel):
+    item_id: str
     runbook_id: str
     reason: str
     severity: str
@@ -1066,6 +1105,7 @@ class AgentRunbookDiagnosisRead(BaseModel):
 
 
 class AgentFaultInjectionCaseRead(BaseModel):
+    item_id: str
     case_id: str
     description: str
     expected: dict[str, Any]
@@ -1089,6 +1129,7 @@ class AgentFaultInjectionRequest(BaseModel):
 
 
 class AgentFaultInjectionResultRead(BaseModel):
+    item_id: str
     case_id: str
     run_id: str
     tool_call_id: str | None = None

@@ -382,6 +382,10 @@ class ApprovalMutationGuard:
         )
         self.policy_manager.require_run_access(run=run, current_user=current_user)
         self.policy_manager.require_approval_permissions(approval=approval, current_user=current_user)
+        if self._is_idempotent_approved_decision(approval=approval, call=call, payload=payload):
+            mutation = self._latest_mutation(approval=approval, mutation_type="approve")
+            if mutation is not None:
+                return approval, lineage, call, mutation
         try:
             self._validate_pending_immutable(approval=approval, payload=payload)
             self._expire_if_needed(
@@ -449,6 +453,39 @@ class ApprovalMutationGuard:
         self.db.refresh(call)
         self.db.refresh(mutation)
         return approval, lineage, call, mutation
+
+    def _is_idempotent_approved_decision(
+        self,
+        *,
+        approval: AgentApproval,
+        call: AgentToolCall,
+        payload: AgentApprovalDecisionRequest,
+    ) -> bool:
+        return (
+            approval.approval_status == "approved"
+            and call.approved_approval_id == approval.approval_id
+            and approval.input_hash == payload.input_hash
+            and approval.runtime_snapshot_id == payload.runtime_snapshot_id
+            and approval.resource_scope_hash == payload.resource_scope_hash
+            and approval.approval_lineage_id == payload.approval_lineage_id
+            and approval.approval_epoch == payload.approval_epoch
+        )
+
+    def _latest_mutation(
+        self,
+        *,
+        approval: AgentApproval,
+        mutation_type: str,
+    ) -> AgentApprovalMutationLog | None:
+        return self.db.scalar(
+            select(AgentApprovalMutationLog)
+            .where(
+                AgentApprovalMutationLog.approval_id == approval.approval_id,
+                AgentApprovalMutationLog.mutation_type == mutation_type,
+            )
+            .order_by(AgentApprovalMutationLog.created_at.desc(), AgentApprovalMutationLog.id.desc())
+            .limit(1)
+        )
 
     def reject(
         self,

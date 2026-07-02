@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -150,6 +150,24 @@ class ErrorResponseTests(unittest.TestCase):
         })
         self.assertNotIn("secret_value", response.text)
         dispose.assert_called_once()
+
+    def test_get_db_rolls_back_before_close_when_request_raises(self):
+        from app.api.v1.deps import get_db
+
+        db = MagicMock()
+        dependency = get_db()
+
+        with patch("app.api.v1.deps.SessionLocal", return_value=db):
+            next(dependency)
+            with self.assertRaises(RuntimeError):
+                dependency.throw(RuntimeError("handler failed"))
+
+        db.rollback.assert_called_once()
+        db.close.assert_called_once()
+        self.assertLess(
+            db.mock_calls.index(unittest.mock.call.rollback()),
+            db.mock_calls.index(unittest.mock.call.close()),
+        )
 
     def test_main_openapi_declares_standard_error_schema(self):
         from app.main import create_app

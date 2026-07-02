@@ -32,6 +32,33 @@ project
 - 执行记录保存
 - 环境变量维护
 
+## Agent 执行工具补充契约
+
+Agent 可通过 `testcase.execute_saved` 执行单个已保存 HTTP 用例，通过 `testcase.batch_execute` 批量执行已保存 HTTP 用例。两者都会复用正常执行服务并创建 `test_case_executions` 业务记录，记录来源字段为 `trigger_source=agent`、`agent_run_id`、`agent_tool_call_id`、`trigger_tool_name`；人工前端执行仍为 `trigger_source=manual` 且 Agent 关联字段为空。
+
+Agent 可通过 `testcase.create_saved` 新增已保存 HTTP 用例，通过 `testcase.update_saved` 完整更新已保存 HTTP 用例，也可通过 `testcase.update_assertions` / `testcase.batch_update_assertions` 只保存断言。四类写工具都复用现有用例服务，要求 `case:manage` 权限，`side_effect_class=business_update`，`replay_policy=require_revalidation`，必须先进入人工审批；审批前不会写入 `test_cases`。创建工具输入为 `{"project_id":1,"case": TestCaseCreateRequest}`，完整更新工具输入为 `{"project_id":1,"test_case_id":7,"case": TestCaseUpdateRequest}`；单个断言更新输入为 `{"project_id":1,"test_case_id":7,"assertions":[AssertionConfig]}`，批量断言更新输入为 `{"project_id":1,"items":[{"test_case_id":7,"assertions":[AssertionConfig]}]}`。断言更新工具只替换 `assertions` 字段，保留 method、path、headers、query_params、body、extractors 和 retry_policy。审批通过并 resume 执行成功后，ToolCall 输出包含 `operation`、`project_id`、`test_case_id` 和 `test_case` 详情。
+
+`testcase.query_project_cases` 返回项目下候选用例时，除 `http_test_cases` 明细外，还返回 `http_test_case_ids`，按当前 `project_id/environment_id` 过滤结果升序列出；同时返回 `http_batch_execute_input`，这是可直接传给 `testcase.batch_execute` 的推荐输入。Agent 或前端调试界面应使用该对象或 ID 数组选择批量执行目标，不要根据最小/最大 ID 推断连续区间。
+
+`testcase.batch_execute` 在创建任何执行记录前会先校验 `test_case_ids` 全部存在且属于当前项目。只要存在无效 ID，接口返回 `422`，detail 形如：
+
+```json
+{
+  "code": "agent_testcase_batch_invalid_ids",
+  "message": "Batch execution contains case IDs that do not exist in this project.",
+  "invalid_test_case_ids": [999],
+  "valid_case_ids": [1, 2],
+  "retry_batch_execute_input": {
+    "project_id": 1,
+    "environment_id": 1,
+    "test_case_ids": [1, 2]
+  },
+  "repair_instruction": "Use retry_batch_execute_input exactly if the user still wants to run the valid cases. Do not infer case IDs from numeric ranges."
+}
+```
+
+该失败不会留下部分 `queued` 执行记录，也不会触发后续真实请求。`retry_batch_execute_input` 只是下一次工具调用的建议输入，后端不会在失败响应里自动执行它。
+
 ## 查询测试用例列表
 
 | 项目 | 内容 |
@@ -265,6 +292,8 @@ raw 文本请求示例：
 | 成功响应 | HTTP `200`，返回最终状态为 `passed`、`failed` 或 `error` 的执行记录 |
 | 说明 | 后端内部先创建执行记录并提交共享执行工作池，接口等待执行完成后按原结构返回结果；队列状态不暴露给前端 |
 
+执行记录包含来源字段：人工通过该接口执行时 `trigger_source=manual`，`agent_run_id`、`agent_tool_call_id`、`trigger_tool_name` 为空；Agent 通过 `testcase.execute_saved` 或 `testcase.batch_execute` 工具触发执行时，业务执行记录会写入 `trigger_source=agent` 和对应 Agent 追踪字段，便于执行中心区分人工与 AI 来源。
+
 可选参数：
 
 | 参数 | 说明 |
@@ -293,6 +322,8 @@ raw 文本请求示例：
 | 权限 | 管理员、项目创建者，或拥有 `test:execute` 权限的普通测试人员 |
 | 成功响应 | HTTP `200`，返回多条最终状态为 `passed`、`failed` 或 `error` 的执行记录 |
 | 说明 | 根据用户选择的测试用例 ID 创建多条执行记录并提交共享执行工作池，接口等待本批次完成后按原结构返回结果 |
+
+批量执行返回的每条执行记录同样携带 `trigger_source`；人工批量执行为 `manual`，Agent 批量执行为 `agent` 并携带 `agent_run_id`、`agent_tool_call_id`、`trigger_tool_name=testcase.batch_execute`。
 
 请求示例：
 

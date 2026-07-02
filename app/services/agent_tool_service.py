@@ -19,15 +19,31 @@ from app.models.user import User
 from app.models.websocket_test_case import WebSocketTestCase
 from app.schemas.ai import AIScenarioComposeRequest, AISkillRunRequest
 from app.schemas.scenario import ScenarioRunRead
-from app.schemas.test_case import TestCaseCreateRequest
+from app.schemas.test_case import (
+    AssertionConfig,
+    TestCaseCreateRequest,
+    TestCaseExecutionRead,
+    TestCaseRead,
+    TestCaseUpdateRequest,
+)
+from app.schemas.websocket_test_case import (
+    WebSocketAssertionConfig,
+    WebSocketTestCaseCreateRequest,
+    WebSocketTestCaseExecutionRead,
+    WebSocketTestCaseRead,
+    WebSocketTestCaseUpdateRequest,
+)
 from app.services.agent_loop_service import EvidenceRefResolver
 from app.services.ai_skill_service import AISkillService
 from app.services.permission_service import PermissionService
 from app.services.scenario_service import ScenarioService
+from app.services.test_case_service import TestCaseService
 from app.services.test_report_service import TestReportService
+from app.services.websocket_test_case_service import WebSocketTestCaseService
 
 
 SAFE_SIDE_EFFECT_CLASSES = {"read_only", "deterministic_compute", "draft_only", "execution_record"}
+AGENT_TOOL_SPEC_ITEM_ID_PREFIX = "agent-tool-spec"
 AI_DRAFT_OPERATIONS = {
     "http-test-case": {"generate", "expand"},
     "websocket-test-case": {"generate", "expand"},
@@ -35,6 +51,10 @@ AI_DRAFT_OPERATIONS = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def _tool_spec_item_id(name: str, version: str) -> str:
+    return f"{AGENT_TOOL_SPEC_ITEM_ID_PREFIX}://{name}/{version}"
 
 
 @dataclass(frozen=True)
@@ -89,6 +109,7 @@ class ToolSpec:
 
     def _manifest_payload(self) -> dict[str, Any]:
         return {
+            "item_id": _tool_spec_item_id(self.name, self.version),
             "name": self.name,
             "version": self.version,
             "summary": self.summary,
@@ -393,14 +414,378 @@ class AgentToolBackend:
                     (WebSocketTestCase.environment_id == environment_id) | (WebSocketTestCase.environment_id.is_(None))
                 )
             websocket_cases = list(self.db.scalars(websocket_query.order_by(WebSocketTestCase.id.asc())).all())
+        http_ids = [item.id for item in http_cases]
+        websocket_ids = [item.id for item in websocket_cases]
+        http_batch_input: dict[str, Any] | None = None
+        websocket_batch_input: dict[str, Any] | None = None
+        if http_ids:
+            http_batch_input = {"project_id": project_id, "test_case_ids": http_ids}
+            if environment_id is not None:
+                http_batch_input["environment_id"] = environment_id
+        if websocket_ids:
+            websocket_batch_input = {"project_id": project_id, "websocket_test_case_ids": websocket_ids}
+            if environment_id is not None:
+                websocket_batch_input["environment_id"] = environment_id
         return {
             "project_id": project_id,
             "environment_id": environment_id,
             "http_total": len(http_cases),
             "websocket_total": len(websocket_cases),
+            "http_test_case_ids": http_ids,
+            "websocket_test_case_ids": websocket_ids,
+            "http_batch_execute_input": http_batch_input,
+            "websocket_batch_execute_input": websocket_batch_input,
             "http_test_cases": [self._http_case_payload(item) for item in http_cases],
             "websocket_test_cases": [self._websocket_case_payload(item) for item in websocket_cases],
         }
+
+    def _testcase_execute_saved(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        test_case_id = _require_int(payload, "test_case_id")
+        environment_id = _optional_int(payload, "environment_id")
+        source = _agent_execution_source(payload, tool_name="testcase.execute_saved")
+        service = TestCaseService(self.db)
+        execution = service.enqueue_saved_case(
+            project_id=project_id,
+            test_case_id=test_case_id,
+            environment_id=environment_id,
+            current_user=current_user,
+            **source,
+        )
+        TestCaseService.execute_queued_execution(execution.id)
+        self.db.refresh(execution)
+        return {
+            "project_id": project_id,
+            "test_case_id": test_case_id,
+            "execution": normalize_response_data(TestCaseExecutionRead.model_validate(execution)),
+        }
+
+    def _testcase_create_saved(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        case_payload = _require_dict(payload, "case")
+        try:
+            request = TestCaseCreateRequest.model_validate(case_payload)
+        except ValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors()) from exc
+        test_case = TestCaseService(self.db).create_case(
+            project_id=project_id,
+            payload=request,
+            current_user=current_user,
+        )
+        return {
+            "operation": "create_saved",
+            "project_id": project_id,
+            "test_case_id": test_case.id,
+            "test_case": normalize_response_data(TestCaseRead.model_validate(test_case)),
+        }
+
+    def _testcase_update_saved(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        test_case_id = _require_int(payload, "test_case_id")
+        case_payload = _require_dict(payload, "case")
+        try:
+            request = TestCaseUpdateRequest.model_validate(case_payload)
+        except ValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors()) from exc
+        test_case = TestCaseService(self.db).update_case(
+            project_id=project_id,
+            test_case_id=test_case_id,
+            payload=request,
+            current_user=current_user,
+        )
+        return {
+            "operation": "update_saved",
+            "project_id": project_id,
+            "test_case_id": test_case.id,
+            "test_case": normalize_response_data(TestCaseRead.model_validate(test_case)),
+        }
+
+    def _testcase_update_assertions(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        test_case_id = _require_int(payload, "test_case_id")
+        assertions = _validate_assertion_list(payload.get("assertions"), AssertionConfig)
+        test_case = TestCaseService(self.db).update_case_assertions(
+            project_id=project_id,
+            test_case_id=test_case_id,
+            assertions=assertions,
+            current_user=current_user,
+        )
+        return {
+            "operation": "update_assertions",
+            "project_id": project_id,
+            "test_case_id": test_case.id,
+            "assertions": normalize_response_data([item.model_dump() for item in assertions]),
+            "test_case": normalize_response_data(TestCaseRead.model_validate(test_case)),
+        }
+
+    def _testcase_batch_update_assertions(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        parsed_items: list[tuple[int, list[AssertionConfig]]] = []
+        for index, raw_item in enumerate(_require_non_empty_object_list(payload.get("items"), "items")):
+            parsed_items.append((
+                _require_int(raw_item, "test_case_id"),
+                _validate_assertion_list(raw_item.get("assertions"), AssertionConfig, path=f"items[{index}].assertions"),
+            ))
+        service = TestCaseService(self.db)
+        updated_cases = [
+            service.update_case_assertions(
+                project_id=project_id,
+                test_case_id=test_case_id,
+                assertions=assertions,
+                current_user=current_user,
+            )
+            for test_case_id, assertions in parsed_items
+        ]
+        return {
+            "operation": "batch_update_assertions",
+            "project_id": project_id,
+            "updated_count": len(updated_cases),
+            "test_case_ids": [item[0] for item in parsed_items],
+            "test_cases": normalize_response_data(
+                [TestCaseRead.model_validate(item) for item in updated_cases]
+            ),
+        }
+
+    def _testcase_batch_execute(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        raw_ids = payload.get("test_case_ids")
+        if not isinstance(raw_ids, list) or not raw_ids or any(not isinstance(item, int) for item in raw_ids):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="test_case_ids must be a non-empty integer array",
+            )
+        environment_id = _optional_int(payload, "environment_id")
+        self._require_valid_batch_case_ids(
+            project_id=project_id,
+            case_ids=raw_ids,
+            model=TestCase,
+            invalid_key="invalid_test_case_ids",
+            code="agent_testcase_batch_invalid_ids",
+            id_field="test_case_ids",
+            environment_id=environment_id,
+            current_user=current_user,
+        )
+        source = _agent_execution_source(payload, tool_name="testcase.batch_execute")
+        service = TestCaseService(self.db)
+        executions = [
+            service.enqueue_saved_case(
+                project_id=project_id,
+                test_case_id=test_case_id,
+                environment_id=environment_id,
+                current_user=current_user,
+                **source,
+            )
+            for test_case_id in raw_ids
+        ]
+        for execution in executions:
+            TestCaseService.execute_queued_execution(execution.id)
+            self.db.refresh(execution)
+        return {
+            "project_id": project_id,
+            "requested_count": len(raw_ids),
+            "test_case_ids": raw_ids,
+            "executions": normalize_response_data(
+                [TestCaseExecutionRead.model_validate(item) for item in executions]
+            ),
+        }
+
+    def _websocket_testcase_execute_saved(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        test_case_id = _require_int(payload, "test_case_id")
+        environment_id = _optional_int(payload, "environment_id")
+        source = _agent_execution_source(payload, tool_name="websocket_testcase.execute_saved")
+        service = WebSocketTestCaseService(self.db)
+        execution = service.enqueue_saved_case(
+            project_id=project_id,
+            test_case_id=test_case_id,
+            environment_id=environment_id,
+            current_user=current_user,
+            **source,
+        )
+        WebSocketTestCaseService.execute_queued_execution(execution.id)
+        self.db.refresh(execution)
+        return {
+            "project_id": project_id,
+            "websocket_test_case_id": test_case_id,
+            "execution": normalize_response_data(WebSocketTestCaseExecutionRead.model_validate(execution)),
+        }
+
+    def _websocket_testcase_create_saved(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        case_payload = _require_dict(payload, "case")
+        try:
+            request = WebSocketTestCaseCreateRequest.model_validate(case_payload)
+        except ValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors()) from exc
+        test_case = WebSocketTestCaseService(self.db).create_case(
+            project_id=project_id,
+            payload=request,
+            current_user=current_user,
+        )
+        return {
+            "operation": "create_saved",
+            "project_id": project_id,
+            "websocket_test_case_id": test_case.id,
+            "websocket_test_case": normalize_response_data(WebSocketTestCaseRead.model_validate(test_case)),
+        }
+
+    def _websocket_testcase_update_saved(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        test_case_id = _require_int(payload, "test_case_id")
+        case_payload = _require_dict(payload, "case")
+        try:
+            request = WebSocketTestCaseUpdateRequest.model_validate(case_payload)
+        except ValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors()) from exc
+        test_case = WebSocketTestCaseService(self.db).update_case(
+            project_id=project_id,
+            test_case_id=test_case_id,
+            payload=request,
+            current_user=current_user,
+        )
+        return {
+            "operation": "update_saved",
+            "project_id": project_id,
+            "websocket_test_case_id": test_case.id,
+            "websocket_test_case": normalize_response_data(WebSocketTestCaseRead.model_validate(test_case)),
+        }
+
+    def _websocket_testcase_update_assertions(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        test_case_id = _require_int(payload, "test_case_id")
+        assertions = _validate_assertion_list(payload.get("assertions"), WebSocketAssertionConfig)
+        test_case = WebSocketTestCaseService(self.db).update_case_assertions(
+            project_id=project_id,
+            test_case_id=test_case_id,
+            assertions=assertions,
+            current_user=current_user,
+        )
+        return {
+            "operation": "update_assertions",
+            "project_id": project_id,
+            "websocket_test_case_id": test_case.id,
+            "assertions": normalize_response_data([item.model_dump() for item in assertions]),
+            "websocket_test_case": normalize_response_data(WebSocketTestCaseRead.model_validate(test_case)),
+        }
+
+    def _websocket_testcase_batch_update_assertions(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        parsed_items: list[tuple[int, list[WebSocketAssertionConfig]]] = []
+        for index, raw_item in enumerate(_require_non_empty_object_list(payload.get("items"), "items")):
+            parsed_items.append((
+                _require_int(raw_item, "test_case_id"),
+                _validate_assertion_list(
+                    raw_item.get("assertions"),
+                    WebSocketAssertionConfig,
+                    path=f"items[{index}].assertions",
+                ),
+            ))
+        service = WebSocketTestCaseService(self.db)
+        updated_cases = [
+            service.update_case_assertions(
+                project_id=project_id,
+                test_case_id=test_case_id,
+                assertions=assertions,
+                current_user=current_user,
+            )
+            for test_case_id, assertions in parsed_items
+        ]
+        return {
+            "operation": "batch_update_assertions",
+            "project_id": project_id,
+            "updated_count": len(updated_cases),
+            "websocket_test_case_ids": [item[0] for item in parsed_items],
+            "websocket_test_cases": normalize_response_data(
+                [WebSocketTestCaseRead.model_validate(item) for item in updated_cases]
+            ),
+        }
+
+    def _websocket_testcase_batch_execute(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        raw_ids = payload.get("websocket_test_case_ids")
+        if not isinstance(raw_ids, list) or not raw_ids or any(not isinstance(item, int) for item in raw_ids):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="websocket_test_case_ids must be a non-empty integer array",
+            )
+        environment_id = _optional_int(payload, "environment_id")
+        self._require_valid_batch_case_ids(
+            project_id=project_id,
+            case_ids=raw_ids,
+            model=WebSocketTestCase,
+            invalid_key="invalid_websocket_test_case_ids",
+            code="agent_websocket_testcase_batch_invalid_ids",
+            id_field="websocket_test_case_ids",
+            environment_id=environment_id,
+            current_user=current_user,
+        )
+        source = _agent_execution_source(payload, tool_name="websocket_testcase.batch_execute")
+        service = WebSocketTestCaseService(self.db)
+        executions = [
+            service.enqueue_saved_case(
+                project_id=project_id,
+                test_case_id=test_case_id,
+                environment_id=environment_id,
+                current_user=current_user,
+                **source,
+            )
+            for test_case_id in raw_ids
+        ]
+        for execution in executions:
+            WebSocketTestCaseService.execute_queued_execution(execution.id)
+            self.db.refresh(execution)
+        return {
+            "project_id": project_id,
+            "requested_count": len(raw_ids),
+            "websocket_test_case_ids": raw_ids,
+            "executions": normalize_response_data(
+                [WebSocketTestCaseExecutionRead.model_validate(item) for item in executions]
+            ),
+        }
+
+    def _require_valid_batch_case_ids(
+        self,
+        *,
+        project_id: int,
+        case_ids: list[int],
+        model: type[TestCase] | type[WebSocketTestCase],
+        invalid_key: str,
+        code: str,
+        id_field: str,
+        environment_id: int | None,
+        current_user: User,
+    ) -> None:
+        self.permission_service.require_project_permission(
+            current_user,
+            project_id,
+            ProjectPermission.EXECUTE_TEST.value,
+        )
+        unique_ids = list(dict.fromkeys(case_ids))
+        existing_ids = set(
+            self.db.scalars(
+                select(model.id).where(model.project_id == project_id, model.id.in_(unique_ids))
+            ).all()
+        )
+        invalid_ids = [case_id for case_id in unique_ids if case_id not in existing_ids]
+        if invalid_ids:
+            valid_case_ids = [case_id for case_id in unique_ids if case_id in existing_ids]
+            retry_input: dict[str, Any] = {"project_id": project_id, id_field: valid_case_ids}
+            if environment_id is not None:
+                retry_input["environment_id"] = environment_id
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "code": code,
+                    "message": "Batch execution contains case IDs that do not exist in this project.",
+                    invalid_key: invalid_ids,
+                    "valid_case_ids": valid_case_ids,
+                    "retry_batch_execute_input": retry_input,
+                    "repair_instruction": (
+                        "Use retry_batch_execute_input exactly if the user still wants to run the valid cases. "
+                        "Do not infer case IDs from numeric ranges."
+                    ),
+                },
+            )
 
     @staticmethod
     def _http_case_payload(item: TestCase) -> dict[str, Any]:
@@ -584,6 +969,45 @@ def _optional_int(payload: dict[str, Any], key: str) -> int | None:
     return value
 
 
+def _require_dict(payload: dict[str, Any], key: str) -> dict[str, Any]:
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{key} must be an object",
+        )
+    return value
+
+
+def _require_non_empty_object_list(value: Any, key: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{key} must be a non-empty array",
+        )
+    items: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{key}[{index}] must be an object",
+            )
+        items.append(item)
+    return items
+
+
+def _validate_assertion_list(value: Any, schema_type: type, *, path: str = "assertions") -> list[Any]:
+    if not isinstance(value, list):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{path} must be an array",
+        )
+    try:
+        return [schema_type.model_validate(item) for item in value]
+    except ValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors()) from exc
+
+
 def _require_str(payload: dict[str, Any], key: str) -> str:
     value = payload.get(key)
     if not isinstance(value, str) or not value:
@@ -604,6 +1028,15 @@ def _optional_str(payload: dict[str, Any], key: str) -> str | None:
             detail=f"{key} must be a non-empty string",
         )
     return value
+
+
+def _agent_execution_source(payload: dict[str, Any], *, tool_name: str) -> dict[str, str | None]:
+    return {
+        "trigger_source": "agent",
+        "agent_run_id": _optional_str(payload, "_agent_run_id"),
+        "agent_tool_call_id": _optional_str(payload, "_agent_tool_call_id"),
+        "trigger_tool_name": tool_name,
+    }
 
 
 def _optional_report_source_type(payload: dict[str, Any], key: str) -> str | None:
@@ -685,6 +1118,165 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                     "description": "Optional environment filter. Omit it to return all project test cases.",
                 },
                 "include_websocket": {"type": "boolean", "default": True},
+            },
+        },
+        "testcase_execute_saved_input": {
+            "type": "object",
+            "required": ["project_id", "test_case_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "test_case_id": {"type": "integer"},
+                "environment_id": {"type": "integer"},
+            },
+        },
+        "testcase_create_saved_input": {
+            "type": "object",
+            "required": ["project_id", "case"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "case": TestCaseCreateRequest.model_json_schema(),
+            },
+        },
+        "testcase_update_saved_input": {
+            "type": "object",
+            "required": ["project_id", "test_case_id", "case"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "test_case_id": {"type": "integer"},
+                "case": TestCaseUpdateRequest.model_json_schema(),
+            },
+        },
+        "testcase_update_assertions_input": {
+            "type": "object",
+            "required": ["project_id", "test_case_id", "assertions"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "test_case_id": {"type": "integer"},
+                "assertions": {
+                    "type": "array",
+                    "items": AssertionConfig.model_json_schema(),
+                    "description": "Replacement assertions for this saved HTTP test case. Other case fields are preserved.",
+                },
+            },
+        },
+        "testcase_batch_update_assertions_input": {
+            "type": "object",
+            "required": ["project_id", "items"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "required": ["test_case_id", "assertions"],
+                        "properties": {
+                            "test_case_id": {"type": "integer"},
+                            "assertions": {
+                                "type": "array",
+                                "items": AssertionConfig.model_json_schema(),
+                            },
+                        },
+                    },
+                    "description": "Assertion patches for saved HTTP test cases. Use ids from testcase.query_project_cases.",
+                },
+            },
+        },
+        "testcase_batch_execute_input": {
+            "type": "object",
+            "required": ["project_id", "test_case_ids"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "test_case_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 1,
+                    "description": (
+                        "HTTP test case ids to execute in order. Use testcase.query_project_cases.http_test_case_ids "
+                        "or http_batch_execute_input exactly; never infer a continuous numeric range."
+                    ),
+                },
+                "environment_id": {"type": "integer"},
+            },
+        },
+        "websocket_testcase_execute_saved_input": {
+            "type": "object",
+            "required": ["project_id", "test_case_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "test_case_id": {"type": "integer"},
+                "environment_id": {"type": "integer"},
+            },
+        },
+        "websocket_testcase_create_saved_input": {
+            "type": "object",
+            "required": ["project_id", "case"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "case": WebSocketTestCaseCreateRequest.model_json_schema(),
+            },
+        },
+        "websocket_testcase_update_saved_input": {
+            "type": "object",
+            "required": ["project_id", "test_case_id", "case"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "test_case_id": {"type": "integer"},
+                "case": WebSocketTestCaseUpdateRequest.model_json_schema(),
+            },
+        },
+        "websocket_testcase_update_assertions_input": {
+            "type": "object",
+            "required": ["project_id", "test_case_id", "assertions"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "test_case_id": {"type": "integer"},
+                "assertions": {
+                    "type": "array",
+                    "items": WebSocketAssertionConfig.model_json_schema(),
+                    "description": "Replacement assertions for this saved WebSocket test case. Other case fields are preserved.",
+                },
+            },
+        },
+        "websocket_testcase_batch_update_assertions_input": {
+            "type": "object",
+            "required": ["project_id", "items"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "required": ["test_case_id", "assertions"],
+                        "properties": {
+                            "test_case_id": {"type": "integer"},
+                            "assertions": {
+                                "type": "array",
+                                "items": WebSocketAssertionConfig.model_json_schema(),
+                            },
+                        },
+                    },
+                    "description": "Assertion patches for saved WebSocket test cases. Use ids from testcase.query_project_cases.",
+                },
+            },
+        },
+        "websocket_testcase_batch_execute_input": {
+            "type": "object",
+            "required": ["project_id", "websocket_test_case_ids"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "websocket_test_case_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 1,
+                    "description": (
+                        "WebSocket test case ids to execute in order. Use "
+                        "testcase.query_project_cases.websocket_test_case_ids or websocket_batch_execute_input exactly; "
+                        "never infer a continuous numeric range."
+                    ),
+                },
+                "environment_id": {"type": "integer"},
             },
         },
         "testcase_validate_input": {
@@ -797,7 +1389,8 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
             version="1.0.0",
             summary=(
                 "Query all HTTP and WebSocket test cases in the current project for scenario composition planning. "
-                "Call this before scenario.compose_draft when the user asks to create or compose a scenario."
+                "Call this before scenario.compose_draft or batch execution. Use returned http_batch_execute_input "
+                "and websocket_batch_execute_input exactly; do not infer ids from ranges."
             ),
             side_effect_class="read_only",
             replay_policy="reuse_allowed",
@@ -813,6 +1406,310 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 output_schema_hash=request_fingerprint({"type": "object"}),
             ),
             backend_handler="_testcase_query_project_cases",
+        ),
+        "testcase.execute_saved": ToolSpec(
+            name="testcase.execute_saved",
+            version="1.0.0",
+            summary="Execute one saved HTTP test case and persist an auditable execution record.",
+            side_effect_class="execution_record",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.EXECUTE_TEST.value,),
+            input_schema=schemas["testcase_execute_saved_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="testcase-service",
+                backend_operation="execute_saved",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["testcase_execute_saved_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_testcase_execute_saved",
+            tool_result_repair_guidance=(
+                "真实执行会产生业务执行记录。不要重复执行同一用例；先读取返回的 execution.status、assertion_results 和 error_message "
+                "判断是否需要用户确认环境、鉴权或数据前置条件。"
+            ),
+        ),
+        "testcase.create_saved": ToolSpec(
+            name="testcase.create_saved",
+            version="1.0.0",
+            summary=(
+                "Create a saved HTTP test case through TestCaseService. This persists business data and requires "
+                "human approval before execution."
+            ),
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_CASE.value,),
+            input_schema=schemas["testcase_create_saved_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="testcase-service",
+                backend_operation="create_saved",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["testcase_create_saved_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_testcase_create_saved",
+            tool_result_repair_guidance=(
+                "该工具会新增已保存 HTTP 测试用例，必须等待用户审批；审批前不要声称已保存。"
+                "如果返回校验错误，先修正 case 字段结构，再重新提交审批。"
+            ),
+        ),
+        "testcase.update_saved": ToolSpec(
+            name="testcase.update_saved",
+            version="1.0.0",
+            summary=(
+                "Update a saved HTTP test case through TestCaseService. This persists business data and requires "
+                "human approval before execution."
+            ),
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_CASE.value,),
+            input_schema=schemas["testcase_update_saved_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="testcase-service",
+                backend_operation="update_saved",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["testcase_update_saved_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_testcase_update_saved",
+            tool_result_repair_guidance=(
+                "该工具会覆盖已保存 HTTP 测试用例，必须等待用户审批；审批前不要声称已更新。"
+                "更新前应使用真实 test_case_id，不能按范围或名称猜测 ID。"
+            ),
+        ),
+        "testcase.update_assertions": ToolSpec(
+            name="testcase.update_assertions",
+            version="1.0.0",
+            summary=(
+                "Patch only the assertions of one saved HTTP test case. This persists business data, preserves the "
+                "request configuration, and requires human approval before execution."
+            ),
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_CASE.value,),
+            input_schema=schemas["testcase_update_assertions_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="testcase-service",
+                backend_operation="update_assertions",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["testcase_update_assertions_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_testcase_update_assertions",
+            tool_result_repair_guidance=(
+                "该工具只替换 HTTP 测试用例 assertions 字段，不覆盖 method/path/headers/body/query_params/extractors。"
+                "必须使用真实 test_case_id，审批完成前不要声称已保存断言。"
+            ),
+        ),
+        "testcase.batch_update_assertions": ToolSpec(
+            name="testcase.batch_update_assertions",
+            version="1.0.0",
+            summary=(
+                "Patch assertions for multiple saved HTTP test cases. This persists business data, preserves each "
+                "request configuration, and requires human approval before execution."
+            ),
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_CASE.value,),
+            input_schema=schemas["testcase_batch_update_assertions_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="testcase-service",
+                backend_operation="batch_update_assertions",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["testcase_batch_update_assertions_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_testcase_batch_update_assertions",
+            tool_result_repair_guidance=(
+                "批量保存 HTTP 断言必须基于同一会话工作上下文或 testcase.query_project_cases 返回的真实 ID；"
+                "该工具仅替换 assertions，不覆盖请求配置。审批前不要声称已保存。"
+            ),
+        ),
+        "testcase.batch_execute": ToolSpec(
+            name="testcase.batch_execute",
+            version="1.0.0",
+            summary="Execute saved HTTP test cases in input order and persist auditable execution records.",
+            side_effect_class="execution_record",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.EXECUTE_TEST.value,),
+            input_schema=schemas["testcase_batch_execute_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="testcase-service",
+                backend_operation="batch_execute",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["testcase_batch_execute_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_testcase_batch_execute",
+            tool_result_repair_guidance=(
+                "批量真实执行会产生多条业务执行记录。输入 ID 必须来自 testcase.query_project_cases.http_test_case_ids "
+                "或 http_batch_execute_input；禁止按最小/最大 ID 推断连续区间。若返回 retry_batch_execute_input，"
+                "仅在用户仍要求执行有效用例时原样使用该对象重试；不要自行重组 ID。失败后先按 executions 中的 execution id "
+                "和 error/assertion 归因，不要无确认重复整批执行。"
+            ),
+        ),
+        "websocket_testcase.execute_saved": ToolSpec(
+            name="websocket_testcase.execute_saved",
+            version="1.0.0",
+            summary="Execute one saved WebSocket test case and persist an auditable execution record.",
+            side_effect_class="execution_record",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.EXECUTE_TEST.value,),
+            input_schema=schemas["websocket_testcase_execute_saved_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="websocket-testcase-service",
+                backend_operation="execute_saved",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["websocket_testcase_execute_saved_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_websocket_testcase_execute_saved",
+            tool_result_repair_guidance=(
+                "真实 WebSocket 执行会产生业务执行记录。不要重复执行同一用例；先检查连接错误、收到消息和断言结果。"
+            ),
+        ),
+        "websocket_testcase.create_saved": ToolSpec(
+            name="websocket_testcase.create_saved",
+            version="1.0.0",
+            summary=(
+                "Create a saved WebSocket test case through WebSocketTestCaseService. This persists business data "
+                "and requires human approval before execution."
+            ),
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_CASE.value,),
+            input_schema=schemas["websocket_testcase_create_saved_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="websocket-testcase-service",
+                backend_operation="create_saved",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["websocket_testcase_create_saved_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_websocket_testcase_create_saved",
+            tool_result_repair_guidance=(
+                "该工具会新增已保存 WebSocket 测试用例，必须等待用户审批；审批前不要声称已保存。"
+                "如果返回校验错误，先修正 case 字段结构，再重新提交审批。"
+            ),
+        ),
+        "websocket_testcase.update_saved": ToolSpec(
+            name="websocket_testcase.update_saved",
+            version="1.0.0",
+            summary=(
+                "Update a saved WebSocket test case through WebSocketTestCaseService. This persists business data "
+                "and requires human approval before execution."
+            ),
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_CASE.value,),
+            input_schema=schemas["websocket_testcase_update_saved_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="websocket-testcase-service",
+                backend_operation="update_saved",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["websocket_testcase_update_saved_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_websocket_testcase_update_saved",
+            tool_result_repair_guidance=(
+                "该工具会覆盖已保存 WebSocket 测试用例，必须等待用户审批；审批前不要声称已更新。"
+                "更新前应使用真实 test_case_id，不能按范围或名称猜测 ID。"
+            ),
+        ),
+        "websocket_testcase.update_assertions": ToolSpec(
+            name="websocket_testcase.update_assertions",
+            version="1.0.0",
+            summary=(
+                "Patch only the assertions of one saved WebSocket test case. This persists business data, preserves "
+                "connection/messages configuration, and requires human approval before execution."
+            ),
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_CASE.value,),
+            input_schema=schemas["websocket_testcase_update_assertions_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="websocket-testcase-service",
+                backend_operation="update_assertions",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["websocket_testcase_update_assertions_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_websocket_testcase_update_assertions",
+            tool_result_repair_guidance=(
+                "该工具只替换 WebSocket 测试用例 assertions 字段，不覆盖 path/headers/subprotocols/messages/timeout/extractors。"
+                "必须使用真实 test_case_id，审批完成前不要声称已保存断言。"
+            ),
+        ),
+        "websocket_testcase.batch_update_assertions": ToolSpec(
+            name="websocket_testcase.batch_update_assertions",
+            version="1.0.0",
+            summary=(
+                "Patch assertions for multiple saved WebSocket test cases. This persists business data, preserves "
+                "connection/messages configuration, and requires human approval before execution."
+            ),
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_CASE.value,),
+            input_schema=schemas["websocket_testcase_batch_update_assertions_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="websocket-testcase-service",
+                backend_operation="batch_update_assertions",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["websocket_testcase_batch_update_assertions_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_websocket_testcase_batch_update_assertions",
+            tool_result_repair_guidance=(
+                "批量保存 WebSocket 断言必须基于同一会话工作上下文或 testcase.query_project_cases 返回的真实 ID；"
+                "该工具仅替换 assertions，不覆盖连接配置。审批前不要声称已保存。"
+            ),
+        ),
+        "websocket_testcase.batch_execute": ToolSpec(
+            name="websocket_testcase.batch_execute",
+            version="1.0.0",
+            summary="Execute saved WebSocket test cases in input order and persist auditable execution records.",
+            side_effect_class="execution_record",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.EXECUTE_TEST.value,),
+            input_schema=schemas["websocket_testcase_batch_execute_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="websocket-testcase-service",
+                backend_operation="batch_execute",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["websocket_testcase_batch_execute_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_websocket_testcase_batch_execute",
+            tool_result_repair_guidance=(
+                "批量真实 WebSocket 执行会产生多条业务执行记录。输入 ID 必须来自 "
+                "testcase.query_project_cases.websocket_test_case_ids 或 websocket_batch_execute_input；"
+                "禁止按最小/最大 ID 推断连续区间。若返回 retry_batch_execute_input，"
+                "仅在用户仍要求执行有效用例时原样使用该对象重试；不要自行重组 ID。失败后先按 executions 中的 execution id "
+                "和连接/断言摘要归因，不要无确认重复整批执行。"
+            ),
         ),
         "testcase.validate_schema": ToolSpec(
             name="testcase.validate_schema",

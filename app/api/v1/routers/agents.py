@@ -666,6 +666,7 @@ def resume_agent_run(
             checkpoint_freshness=result["checkpoint_freshness"],
             scheduled_tool_call_ids=result["scheduled_tool_call_ids"],
             executed_tool_call_ids=result.get("executed_tool_call_ids", []),
+            observed_tool_call_ids=result.get("observed_tool_call_ids", []),
         ),
         message="Agent run resume checked",
     )
@@ -1026,10 +1027,12 @@ def stream_agent_run_events(
 
             for item in events:
                 sequence = item.event_seq
+                event_payload = dict(item.payload_json)
+                event_payload["item_id"] = item.item_id
                 yield (
                     f"id: {item.event_seq}\n"
                     f"event: {item.event_type}\n"
-                    f"data: {json.dumps(item.payload_json, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                    f"data: {json.dumps(event_payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
                 )
                 heartbeat_at = time.monotonic()
 

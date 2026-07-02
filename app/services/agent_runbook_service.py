@@ -22,6 +22,9 @@ from app.services.agent_reconcile_service import CheckpointFreshnessGate
 from app.services.permission_service import PermissionService
 
 
+AGENT_RUNBOOK_ITEM_ID_PREFIX = "agent-runbook"
+AGENT_RUNBOOK_RECOMMENDATION_ITEM_ID_PREFIX = "agent-runbook-recommendation"
+
 RUNBOOKS: dict[str, dict[str, Any]] = {
     "tool_call_uncertain": {
         "title": "Runbook: uncertain ToolCall recovery",
@@ -42,6 +45,7 @@ RUNBOOKS: dict[str, dict[str, Any]] = {
             "List migration blocks and inspect backend contract/schema details.",
             "Deploy or register a compatible adapter before resolving the block.",
             "Resolve the block and require checkpoint freshness gate before resume.",
+            "If the run is terminal, resolving the block preserves terminal status and re-enables reconcile instead of resume.",
         ],
         "safe_api_actions": [
             "GET /api/v1/agents/runs/{run_id}/migration-blocks",
@@ -216,6 +220,7 @@ RUNBOOKS: dict[str, dict[str, Any]] = {
 }
 
 RUNBOOK_FIELDS = (
+    "item_id",
     "runbook_id",
     "title",
     "trigger",
@@ -225,6 +230,7 @@ RUNBOOK_FIELDS = (
 )
 RUNBOOK_DIAGNOSIS_FIELDS = ("run_id", "run_status", "recommendations", "runbooks")
 RUNBOOK_RECOMMENDATION_FIELDS = (
+    "item_id",
     "runbook_id",
     "reason",
     "severity",
@@ -232,7 +238,7 @@ RUNBOOK_RECOMMENDATION_FIELDS = (
     "tool_call_id",
     "details",
 )
-RUNBOOK_RECOMMENDATION_REQUIRED_FIELDS = {"runbook_id", "reason", "severity", "action", "details"}
+RUNBOOK_RECOMMENDATION_REQUIRED_FIELDS = {"item_id", "runbook_id", "reason", "severity", "action", "details"}
 RUNBOOK_RECOMMENDATION_OPTIONAL_FIELDS = {"tool_call_id"}
 RUNBOOK_DIAGNOSIS_RECOMMENDATION_RUNBOOK_IDS = set(RUNBOOKS)
 RUNBOOK_EXECUTION_CONTEXT_SUMMARY_FIELDS = (
@@ -348,19 +354,30 @@ class AgentRunbookService:
         diagnosis = {
             "run_id": run.run_id,
             "run_status": run.status,
-            "recommendations": [self._recommendation_item(item) for item in recommendations],
+            "recommendations": [
+                self._recommendation_item(item, run_id=run.run_id)
+                for item in recommendations
+            ],
             "runbooks": self.list_runbooks(),
         }
         return {field: diagnosis[field] for field in RUNBOOK_DIAGNOSIS_FIELDS}
 
     @staticmethod
     def _runbook_item(runbook_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        item = {"runbook_id": runbook_id, **payload}
+        item = {
+            "item_id": f"{AGENT_RUNBOOK_ITEM_ID_PREFIX}://{runbook_id}",
+            "runbook_id": runbook_id,
+            **payload,
+        }
         return {field: item[field] for field in RUNBOOK_FIELDS}
 
     @staticmethod
-    def _recommendation_item(recommendation: dict[str, Any]) -> dict[str, Any]:
-        item = {**recommendation, "tool_call_id": recommendation.get("tool_call_id")}
+    def _recommendation_item(recommendation: dict[str, Any], *, run_id: str) -> dict[str, Any]:
+        item = {
+            **recommendation,
+            "item_id": _runbook_recommendation_item_id(run_id=run_id, recommendation=recommendation),
+            "tool_call_id": recommendation.get("tool_call_id"),
+        }
         return {field: item[field] for field in RUNBOOK_RECOMMENDATION_FIELDS}
 
     @staticmethod
@@ -465,6 +482,7 @@ class AgentRunbookService:
         ]
 
     def _migration_recommendations(self, run: AgentRun) -> list[dict[str, Any]]:
+        run_terminal = run.status in {"completed", "failed", "cancelled"}
         open_blocks = list(
             self.db.scalars(
                 select(AgentMigrationBlock)
@@ -477,14 +495,20 @@ class AgentRunbookService:
         return [
             {
                 "runbook_id": "migration_blocked",
-                "reason": "open_migration_block",
+                "reason": "open_migration_block_on_terminal_run" if run_terminal else "open_migration_block",
                 "severity": RUNBOOKS["migration_blocked"]["severity"],
                 "action": "GET /api/v1/agents/runs/{run_id}/migration-blocks",
                 "tool_call_id": block.tool_call_id,
                 "details": {
                     "block_id": block.block_id,
+                    "tool_call_id": block.tool_call_id,
                     "block_type": block.block_type,
                     "reason": block.reason,
+                    "run_status": run.status,
+                    "run_terminal": run_terminal,
+                    "resolve_preserves_terminal_run": run_terminal,
+                    "post_resolve_next_action": "reconcile_run" if run_terminal else "checkpoint_freshness_then_resume",
+                    "tool_call_status_after_resolve": "reconciling",
                     "backend_name": block.backend_name,
                     "backend_operation": block.backend_operation,
                     "backend_contract_version": block.backend_contract_version,
@@ -739,3 +763,37 @@ class AgentRunbookService:
                 "violations": violations[:5],
             },
         }]
+
+
+def _runbook_recommendation_item_id(*, run_id: str, recommendation: dict[str, Any]) -> str:
+    runbook_id = str(recommendation.get("runbook_id") or "unknown")
+    details = recommendation.get("details") or {}
+    stable_detail_keys = (
+        "action",
+        "approval_id",
+        "approval_lineage_id",
+        "block_id",
+        "context_build_id",
+        "current_level",
+        "event_id",
+        "event_seq",
+        "observation_id",
+        "result",
+        "root_cause_rule_id",
+        "run_status",
+        "violation_count",
+    )
+    material = {
+        "runbook_id": recommendation.get("runbook_id"),
+        "reason": recommendation.get("reason"),
+        "action": recommendation.get("action"),
+        "tool_call_id": recommendation.get("tool_call_id"),
+        "details": {
+            key: details[key]
+            for key in stable_detail_keys
+            if key in details
+        },
+    }
+    encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+    return f"{AGENT_RUNBOOK_RECOMMENDATION_ITEM_ID_PREFIX}://{run_id}/{runbook_id}/{digest}"

@@ -14,6 +14,7 @@ from app.models.agent import (
     AgentCheckpoint,
     AgentContextBuild,
     AgentEvidenceWatch,
+    AgentEvent,
     AgentMigrationBlock,
     AgentApproval,
     AgentReconcileAttempt,
@@ -24,7 +25,12 @@ from app.models.agent import (
 )
 from app.models.user import User
 from app.schemas.agent import ReconcileResult
-from app.services.agent_runtime_service import AgentRuntimeService, RUN_TERMINAL_STATUSES
+from app.services.agent_runtime_service import (
+    AGENT_CONTEXT_COMPACTION_OBJECT_KEY_PREFIX,
+    AGENT_HISTORY_CONTEXT_COMPACTION_EVENT,
+    AgentRuntimeService,
+    RUN_TERMINAL_STATUSES,
+)
 from app.services.agent_tool_service import SAFE_SIDE_EFFECT_CLASSES
 from app.services.permission_service import PermissionService
 
@@ -59,7 +65,8 @@ RECONCILE_SUMMARY_FIELDS = {
     "tool_call_ids",
     "skipped_backoff_tool_calls",
 }
-RECONCILE_SKIPPED_BACKOFF_FIELDS = {"tool_call_id", "next_retry_at", "attempt_seq", "result_status"}
+AGENT_RECONCILE_SKIPPED_BACKOFF_ITEM_ID_PREFIX = "agent-reconcile-skipped-backoff"
+RECONCILE_SKIPPED_BACKOFF_FIELDS = {"item_id", "tool_call_id", "next_retry_at", "attempt_seq", "result_status"}
 PERMISSION_FRESHNESS_TOOL_STATUSES = {
     "planned",
     "approved",
@@ -153,6 +160,18 @@ RUNTIME_SNAPSHOT_FRESHNESS_REASONS = (
     "runtime_snapshot_mismatch",
 )
 RUNTIME_SNAPSHOT_FRESHNESS_ERROR_CODE = "checkpoint_stale_replan_required"
+CHECKPOINT_CONTEXT_COMPACTION_FIELDS = (
+    "context_compaction_object_key",
+    "context_compaction_event_seq",
+    "context_compaction_event_type",
+    "context_compaction_available",
+)
+CHECKPOINT_CONTEXT_COMPACTION_RESULT = "too_old"
+CHECKPOINT_CONTEXT_COMPACTION_ACTION = "replan_from_latest_safe_state"
+CHECKPOINT_CONTEXT_COMPACTION_REASONS = (
+    "context_compaction_reference_malformed",
+    "context_compaction_reference_missing",
+)
 ACTIVE_POLICY_REF_ROLES = {"decision_dependency", "validation_evidence", "policy_dependency"}
 
 
@@ -286,6 +305,7 @@ class MigrationCoordinator:
         return block
 
     def _refresh_run_block_state(self, run: AgentRun) -> None:
+        terminal_status = run.status if run.status in RUN_TERMINAL_STATUSES else None
         open_blocks = list(self.db.scalars(
             select(AgentMigrationBlock).where(
                 AgentMigrationBlock.run_id == run.run_id,
@@ -296,7 +316,7 @@ class MigrationCoordinator:
         run.blocking_tool_call_ids_json = [
             item.tool_call_id for item in open_blocks if item.tool_call_id
         ]
-        if open_blocks:
+        if open_blocks and terminal_status is None:
             run.status = "migration_blocked"
 
     def list_blocks(self, *, run_id: str, current_user: User) -> list[AgentMigrationBlock]:
@@ -324,6 +344,7 @@ class MigrationCoordinator:
         if run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent run not found")
         self.permission_service.require_project_access(current_user, run.project_id)
+        terminal_status = run.status if run.status in RUN_TERMINAL_STATUSES else None
         block = self.db.scalar(
             select(AgentMigrationBlock)
             .where(AgentMigrationBlock.run_id == run_id, AgentMigrationBlock.block_id == block_id)
@@ -332,7 +353,12 @@ class MigrationCoordinator:
         if block is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent migration block not found")
         if block.status == "resolved":
-            return block, CheckpointFreshnessGate(self.db).evaluate(run=run, current_user=current_user)
+            freshness = CheckpointFreshnessGate(self.db).evaluate(run=run, current_user=current_user)
+            return block, self._terminal_resolve_freshness(
+                freshness,
+                terminal_status=terminal_status,
+                block=block,
+            )
 
         now = _utcnow()
         block.status = "resolved"
@@ -355,11 +381,18 @@ class MigrationCoordinator:
 
         self._refresh_run_block_state_after_resolution(run)
         freshness = CheckpointFreshnessGate(self.db).evaluate(run=run, current_user=current_user)
+        freshness = self._terminal_resolve_freshness(
+            freshness,
+            terminal_status=terminal_status,
+            block=block,
+        )
         checkpoint = self.db.get(AgentCheckpoint, run.last_checkpoint_id) if run.last_checkpoint_id else None
         if checkpoint is not None:
             checkpoint.freshness_metadata_json = freshness
         if run.migration_block_count == 0:
-            if freshness["action"] == "continue_from_checkpoint":
+            if terminal_status is not None:
+                run.status = terminal_status
+            elif freshness["action"] == "continue_from_checkpoint":
                 run.status = "running"
                 run.error_code = None
                 run.error_message = None
@@ -385,7 +418,38 @@ class MigrationCoordinator:
         self.db.refresh(block)
         return block, freshness
 
+    def _terminal_resolve_freshness(
+        self,
+        freshness: dict[str, Any],
+        *,
+        terminal_status: str | None,
+        block: AgentMigrationBlock,
+    ) -> dict[str, Any]:
+        if terminal_status is None:
+            return freshness
+        tool_call_status = None
+        if block.tool_call_id:
+            call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == block.tool_call_id))
+            if call is not None:
+                tool_call_status = call.status
+        post_resolve_next_action = (
+            "reconcile_run"
+            if tool_call_status in {"needs_migration", "uncertain", "reconciling"}
+            else "none"
+        )
+        decorated = dict(freshness)
+        decorated.update({
+            "terminal_run_preserved": True,
+            "terminal_run_status": terminal_status,
+            "resolve_preserves_terminal_run": True,
+            "post_resolve_next_action": post_resolve_next_action,
+        })
+        if tool_call_status is not None:
+            decorated["tool_call_status_after_resolve"] = tool_call_status
+        return decorated
+
     def _refresh_run_block_state_after_resolution(self, run: AgentRun) -> None:
+        terminal_status = run.status if run.status in RUN_TERMINAL_STATUSES else None
         open_blocks = list(self.db.scalars(
             select(AgentMigrationBlock).where(
                 AgentMigrationBlock.run_id == run.run_id,
@@ -394,7 +458,7 @@ class MigrationCoordinator:
         ).all())
         run.migration_block_count = len(open_blocks)
         run.blocking_tool_call_ids_json = [item.tool_call_id for item in open_blocks if item.tool_call_id]
-        if open_blocks:
+        if open_blocks and terminal_status is None:
             run.status = "migration_blocked"
 
 
@@ -429,6 +493,10 @@ class CheckpointFreshnessGate:
             "revoked_required_permission_count": 0,
             "revoked_required_permissions": [],
             "backend_contract_missing_count": 0,
+            "context_compaction_object_key": None,
+            "context_compaction_event_seq": None,
+            "context_compaction_event_type": None,
+            "context_compaction_available": False,
             "result": "fresh",
             "action": "continue_from_checkpoint",
             "reason": "fresh",
@@ -436,6 +504,16 @@ class CheckpointFreshnessGate:
         checkpoint = self.db.get(AgentCheckpoint, run.last_checkpoint_id) if run.last_checkpoint_id else None
         if checkpoint is None:
             checks.update(result="too_old", action="replan_from_latest_safe_state", reason="checkpoint_missing")
+            return checks
+        compaction_metadata = self._checkpoint_context_compaction_metadata(run=run, checkpoint=checkpoint)
+        compaction_invalid_reason = compaction_metadata.pop("_invalid_reason")
+        checks.update(compaction_metadata)
+        if compaction_invalid_reason is not None:
+            checks.update(
+                result=CHECKPOINT_CONTEXT_COMPACTION_RESULT,
+                action=CHECKPOINT_CONTEXT_COMPACTION_ACTION,
+                reason=compaction_invalid_reason,
+            )
             return checks
         checks["checkpoint_runtime_snapshot_id"] = checkpoint.runtime_snapshot_id
         checks["checkpoint_age_seconds"] = int((now - checkpoint.created_at).total_seconds())
@@ -571,6 +649,48 @@ class CheckpointFreshnessGate:
             return checks
 
         return checks
+
+    def _checkpoint_context_compaction_metadata(
+        self,
+        *,
+        run: AgentRun,
+        checkpoint: AgentCheckpoint,
+    ) -> dict[str, Any]:
+        object_key = checkpoint.context_compaction_object_key
+        metadata: dict[str, Any] = {
+            "context_compaction_object_key": object_key,
+            "context_compaction_event_seq": None,
+            "context_compaction_event_type": None,
+            "context_compaction_available": False,
+            "_invalid_reason": None,
+        }
+        if not object_key:
+            return metadata
+        prefix = f"{AGENT_CONTEXT_COMPACTION_OBJECT_KEY_PREFIX}://{run.run_id}/"
+        if not object_key.startswith(prefix):
+            metadata["_invalid_reason"] = CHECKPOINT_CONTEXT_COMPACTION_REASONS[0]
+            return metadata
+        try:
+            event_seq = int(object_key.removeprefix(prefix))
+        except ValueError:
+            metadata["_invalid_reason"] = CHECKPOINT_CONTEXT_COMPACTION_REASONS[0]
+            return metadata
+        event = self.db.scalar(
+            select(AgentEvent).where(
+                AgentEvent.run_id == run.run_id,
+                AgentEvent.event_seq == event_seq,
+                AgentEvent.event_type == AGENT_HISTORY_CONTEXT_COMPACTION_EVENT,
+            )
+        )
+        if event is None:
+            metadata["context_compaction_event_seq"] = event_seq
+            metadata["context_compaction_event_type"] = AGENT_HISTORY_CONTEXT_COMPACTION_EVENT
+            metadata["_invalid_reason"] = CHECKPOINT_CONTEXT_COMPACTION_REASONS[1]
+            return metadata
+        metadata["context_compaction_event_seq"] = event.event_seq
+        metadata["context_compaction_event_type"] = event.event_type
+        metadata["context_compaction_available"] = True
+        return metadata
 
     def _stale_evidence_freshness(self, *, run: AgentRun) -> dict[str, Any]:
         watches = list(
@@ -781,9 +901,6 @@ class ReconcileWorker:
         if run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent run 不存在")
         self.permission_service.require_project_access(current_user, run.project_id)
-        if run.status in RUN_TERMINAL_STATUSES:
-            return self._summary(run_id, [])
-
         calls = list(self.db.scalars(
             select(AgentToolCall)
             .where(
@@ -799,6 +916,7 @@ class ReconcileWorker:
             latest_attempt = self._latest_attempt(call.tool_call_id)
             if latest_attempt is not None and latest_attempt.next_retry_at is not None and latest_attempt.next_retry_at > now:
                 skipped_backoff.append({
+                    "item_id": _reconcile_skipped_backoff_item_id(call.tool_call_id, latest_attempt.attempt_seq),
                     "tool_call_id": call.tool_call_id,
                     "next_retry_at": latest_attempt.next_retry_at.isoformat(),
                     "attempt_seq": latest_attempt.attempt_seq,
@@ -1011,3 +1129,7 @@ class ReconcileWorker:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _reconcile_skipped_backoff_item_id(tool_call_id: str, attempt_seq: int) -> str:
+    return f"{AGENT_RECONCILE_SKIPPED_BACKOFF_ITEM_ID_PREFIX}://{tool_call_id}/{attempt_seq}"

@@ -6,6 +6,22 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 
 
+AGENT_RUN_ITEM_ID_PREFIX = "agent-run"
+AGENT_RUNTIME_SNAPSHOT_ITEM_ID_PREFIX = "agent-runtime-snapshot"
+AGENT_EVENT_ITEM_ID_PREFIX = "agent-event"
+AGENT_TOOL_CALL_ITEM_ID_PREFIX = "agent-tool-call"
+AGENT_RECONCILE_ATTEMPT_ITEM_ID_PREFIX = "agent-reconcile-attempt"
+AGENT_CONTEXT_BUILD_ITEM_ID_PREFIX = "agent-context-build"
+AGENT_LOOP_OBSERVATION_ITEM_ID_PREFIX = "agent-loop-observation"
+AGENT_MIGRATION_BLOCK_ITEM_ID_PREFIX = "agent-migration-block"
+AGENT_APPROVAL_ITEM_ID_PREFIX = "agent-approval"
+AGENT_APPROVAL_LINEAGE_ITEM_ID_PREFIX = "agent-approval-lineage"
+AGENT_APPROVAL_MUTATION_ITEM_ID_PREFIX = "agent-approval-mutation"
+AGENT_MEMORY_USAGE_EVENT_ITEM_ID_PREFIX = "agent-memory-usage-event"
+AGENT_MEMORY_STALENESS_EVENT_ITEM_ID_PREFIX = "agent-memory-staleness-event"
+AGENT_MEMORY_VALIDATION_EVENT_ITEM_ID_PREFIX = "agent-memory-validation-event"
+
+
 class AgentRuntimeSnapshot(Base):
     __tablename__ = "ai_agent_runtime_snapshots"
     __table_args__ = (
@@ -28,6 +44,10 @@ class AgentRuntimeSnapshot(Base):
     adapters_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     policies_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_RUNTIME_SNAPSHOT_ITEM_ID_PREFIX}://{self.snapshot_id}"
 
 
 class AgentRun(Base):
@@ -61,6 +81,10 @@ class AgentRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_RUN_ITEM_ID_PREFIX}://{self.run_id}"
+
 
 class AgentEvent(Base):
     __tablename__ = "ai_agent_events"
@@ -75,6 +99,10 @@ class AgentEvent(Base):
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     payload_json: Mapped[dict] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_EVENT_ITEM_ID_PREFIX}://{self.run_id}/{self.event_seq}"
 
 
 class AgentOutbox(Base):
@@ -191,6 +219,10 @@ class AgentToolCall(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_TOOL_CALL_ITEM_ID_PREFIX}://{self.run_id}/{self.tool_call_id}"
+
 
 class AgentWorkerQueue(Base):
     __tablename__ = "ai_agent_worker_queue"
@@ -262,6 +294,10 @@ class AgentReconcileAttempt(Base):
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_RECONCILE_ATTEMPT_ITEM_ID_PREFIX}://{self.tool_call_id}/{self.attempt_seq}"
+
 
 class AgentMigrationBlock(Base):
     __tablename__ = "ai_agent_migration_blocks"
@@ -289,6 +325,16 @@ class AgentMigrationBlock(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_MIGRATION_BLOCK_ITEM_ID_PREFIX}://{self.run_id}/{self.block_id}"
+
+    @property
+    def tool_call_item_id(self) -> str | None:
+        if self.tool_call_id is None:
+            return None
+        return f"{AGENT_TOOL_CALL_ITEM_ID_PREFIX}://{self.run_id}/{self.tool_call_id}"
+
 
 class AgentApprovalLineage(Base):
     __tablename__ = "ai_agent_approval_lineages"
@@ -311,6 +357,14 @@ class AgentApprovalLineage(Base):
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_APPROVAL_LINEAGE_ITEM_ID_PREFIX}://{self.run_id}/{self.approval_lineage_id}"
+
+    @property
+    def tool_call_item_id(self) -> str:
+        return f"{AGENT_TOOL_CALL_ITEM_ID_PREFIX}://{self.run_id}/{self.tool_call_id}"
 
 
 class AgentApproval(Base):
@@ -345,6 +399,14 @@ class AgentApproval(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_APPROVAL_ITEM_ID_PREFIX}://{self.run_id}/{self.approval_id}"
+
+    @property
+    def tool_call_item_id(self) -> str:
+        return f"{AGENT_TOOL_CALL_ITEM_ID_PREFIX}://{self.run_id}/{self.tool_call_id}"
+
 
 class AgentApprovalMutationLog(Base):
     __tablename__ = "ai_agent_approval_mutation_logs"
@@ -365,6 +427,14 @@ class AgentApprovalMutationLog(Base):
     reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
     details_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_APPROVAL_MUTATION_ITEM_ID_PREFIX}://{self.run_id}/{self.id}"
+
+    @property
+    def tool_call_item_id(self) -> str:
+        return f"{AGENT_TOOL_CALL_ITEM_ID_PREFIX}://{self.run_id}/{self.tool_call_id}"
 
 
 class AgentContextBuild(Base):
@@ -396,6 +466,10 @@ class AgentContextBuild(Base):
     build_metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_CONTEXT_BUILD_ITEM_ID_PREFIX}://{self.run_id}/{self.context_build_id}"
+
 
 class AgentLoopObservation(Base):
     __tablename__ = "ai_agent_loop_observations"
@@ -425,6 +499,10 @@ class AgentLoopObservation(Base):
     mitigation_action: Mapped[str] = mapped_column(String(128), nullable=False)
     observation_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_LOOP_OBSERVATION_ITEM_ID_PREFIX}://{self.run_id}/{self.observation_id}"
 
 
 class AgentEvidenceWatch(Base):
@@ -590,6 +668,10 @@ class AgentMemoryUsageEvent(Base):
     feedback_result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_MEMORY_USAGE_EVENT_ITEM_ID_PREFIX}://{self.id}"
+
 
 class AgentMemoryContradictionEvent(Base):
     __tablename__ = "ai_agent_memory_contradiction_events"
@@ -638,6 +720,10 @@ class AgentMemoryValidationEvent(Base):
     validation_count: Mapped[int] = mapped_column(nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_MEMORY_VALIDATION_EVENT_ITEM_ID_PREFIX}://{self.id}"
+
 
 class AgentMemoryStalenessEvent(Base):
     __tablename__ = "ai_agent_memory_staleness_events"
@@ -658,6 +744,10 @@ class AgentMemoryStalenessEvent(Base):
     previous_status: Mapped[str] = mapped_column(String(32), nullable=False)
     new_status: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_MEMORY_STALENESS_EVENT_ITEM_ID_PREFIX}://{self.id}"
 
 
 class AgentMemoryEvidenceLink(Base):

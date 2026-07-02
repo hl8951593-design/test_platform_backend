@@ -22,6 +22,7 @@ from app.schemas.retry import RetryPolicyConfig
 from app.schemas.websocket_test_case import (
     UnsavedWebSocketTestCaseExecuteRequest,
     WebSocketBatchExecuteRequest,
+    WebSocketAssertionConfig,
     WebSocketTestCaseConfig,
     WebSocketTestCaseCreateRequest,
     WebSocketTestCaseUpdateRequest,
@@ -74,6 +75,21 @@ class WebSocketTestCaseService:
         self._apply_payload(test_case, payload, environment_id)
         return self.repository.save(test_case=test_case, environment_ids=environment_ids)
 
+    def update_case_assertions(
+        self,
+        *,
+        project_id: int,
+        test_case_id: int,
+        assertions: list[WebSocketAssertionConfig],
+        current_user: User,
+    ) -> WebSocketTestCase:
+        self._require(current_user, project_id, ProjectPermission.MANAGE_CASE.value)
+        test_case = self._get_case(project_id, test_case_id)
+        test_case.assertions = [item.model_dump() for item in assertions]
+        self.repository.db.commit()
+        updated = self.repository.get_by_id(project_id=project_id, test_case_id=test_case_id)
+        return updated or test_case
+
     def delete_case(self, *, project_id: int, test_case_id: int, current_user: User) -> None:
         self._require(current_user, project_id, ProjectPermission.MANAGE_CASE.value)
         test_case = self._get_case(project_id, test_case_id)
@@ -115,6 +131,10 @@ class WebSocketTestCaseService:
         test_case_id: int,
         environment_id: int | None,
         current_user: User,
+        trigger_source: str = "manual",
+        agent_run_id: str | None = None,
+        agent_tool_call_id: str | None = None,
+        trigger_tool_name: str | None = None,
     ) -> WebSocketTestCaseExecution:
         self._require(current_user, project_id, ProjectPermission.EXECUTE_TEST.value)
         case = self._get_case(project_id, test_case_id)
@@ -127,6 +147,10 @@ class WebSocketTestCaseService:
             environment_id=payload.environment_id,
             scenario_run_id=None,
             executed_by_id=current_user.id,
+            trigger_source=trigger_source,
+            agent_run_id=agent_run_id,
+            agent_tool_call_id=agent_tool_call_id,
+            trigger_tool_name=trigger_tool_name,
             status="queued",
             session_snapshot=mask_sensitive(snapshot),
             response_snapshot=None,
@@ -190,6 +214,10 @@ class WebSocketTestCaseService:
         payload: WebSocketTestCaseConfig,
         current_user: User,
         scenario_run_id: int | None = None,
+        trigger_source: str = "manual",
+        agent_run_id: str | None = None,
+        agent_tool_call_id: str | None = None,
+        trigger_tool_name: str | None = None,
         timeout_seconds: float | None = None,
         queued_execution_id: int | None = None,
     ):
@@ -324,7 +352,12 @@ class WebSocketTestCaseService:
 
         return self.repository.create_execution(
             project_id=project_id, websocket_test_case_id=test_case_id, environment_id=payload.environment_id,
-            scenario_run_id=scenario_run_id, executed_by_id=current_user.id, status=status_value,
+            scenario_run_id=scenario_run_id, executed_by_id=current_user.id,
+            trigger_source=trigger_source,
+            agent_run_id=agent_run_id,
+            agent_tool_call_id=agent_tool_call_id,
+            trigger_tool_name=trigger_tool_name,
+            status=status_value,
             session_snapshot=mask_sensitive(snapshot),
             response_snapshot=response_snapshot, assertion_results=assertion_results,
             attempt_history=attempt_history, error_message=error_message,

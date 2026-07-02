@@ -7,11 +7,11 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 最近核对日期 | 2026-06-30 |
-| 开发基线 | `3.0.269-agent-skill-governance-coverage` |
+| 最近核对日期 | 2026-07-01 |
+| 开发基线 | `3.0.474-agent-observability-dashboard-performance` |
 | Alembic head | `0028_agent_memory_staleness_events` |
 | 回归命令 | `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v` |
-| 最近完整回归 | 本轮未重跑全量后端回归；已执行 `.\.venv\Scripts\python.exe -m unittest tests.test_ai_service tests.test_error_responses tests.test_agent_runtime`，291 项通过 |
+| 最近完整回归 | 本轮未重跑全量后端 discover；已执行 `.\.venv\Scripts\python.exe -m unittest tests.test_agent_runtime.AgentRuntimeTests`，通过；Windows 本地日志 rollover 仍有既有文件占用告警 |
 
 数字基线只能在实际执行命令后更新。数据库结构以 Alembic migration 和当前模型共同为准，
 不能只修改模型而遗漏迁移。

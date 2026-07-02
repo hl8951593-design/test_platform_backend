@@ -68,7 +68,10 @@ FAULT_CASES = (
     "root_cause_rule_missing",
     "high_risk_memory_only_blocked",
 )
+AGENT_FAULT_INJECTION_CASE_ITEM_ID_PREFIX = "agent-fault-injection-case"
+AGENT_FAULT_INJECTION_RESULT_ITEM_ID_PREFIX = "agent-fault-injection-result"
 FAULT_INJECTION_CASE_FIELDS = (
+    "item_id",
     "case_id",
     "description",
     "expected",
@@ -81,6 +84,7 @@ FAULT_INJECTION_RUN_FIELDS = (
     "results",
 )
 FAULT_INJECTION_RESULT_FIELDS = (
+    "item_id",
     "case_id",
     "run_id",
     "tool_call_id",
@@ -229,7 +233,11 @@ class AgentFaultInjectionService:
                 "expected": {"tool_status": "manual_intervention", "error_code": "high_risk_action_cannot_depend_only_on_memory"},
             },
         ]
-        return [{field: item[field] for field in FAULT_INJECTION_CASE_FIELDS} for item in cases]
+        catalog: list[dict[str, Any]] = []
+        for item in cases:
+            case_item = {**item, "item_id": _fault_injection_case_item_id(item["case_id"])}
+            catalog.append({field: case_item[field] for field in FAULT_INJECTION_CASE_FIELDS})
+        return catalog
 
     def run_cases(
         self,
@@ -1358,7 +1366,11 @@ class AgentFaultInjectionService:
 
     @staticmethod
     def _result_item(result: dict[str, Any]) -> dict[str, Any]:
-        item = {**result, "tool_call_id": result.get("tool_call_id")}
+        item = {
+            **result,
+            "item_id": _fault_injection_result_item_id(result["run_id"], result["case_id"]),
+            "tool_call_id": result.get("tool_call_id"),
+        }
         return {field: item[field] for field in FAULT_INJECTION_RESULT_FIELDS}
 
     def _get_call(self, tool_call_id: str) -> AgentToolCall:
@@ -1414,6 +1426,14 @@ class AgentFaultInjectionService:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _fault_injection_case_item_id(case_id: str) -> str:
+    return f"{AGENT_FAULT_INJECTION_CASE_ITEM_ID_PREFIX}://{case_id}"
+
+
+def _fault_injection_result_item_id(run_id: str, case_id: str) -> str:
+    return f"{AGENT_FAULT_INJECTION_RESULT_ITEM_ID_PREFIX}://{run_id}/{case_id}"
 
 
 class _StaticReconcileRouter:

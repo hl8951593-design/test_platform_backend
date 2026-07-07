@@ -1,0 +1,53 @@
+{
+  "conversation_id": "agent-conv-local-55c8919c-429a-49d7-81b8-3a3a431b3724",
+  "project_id": 1,
+  "generated_at": "2026-07-07T09:01:28.337538",
+  "files": [
+    {
+      "path": "output\\agent_conversation_logs\\agent-conv-local-55c8919c-429a-49d7-81b8-3a3a431b3724\\agent-conv-local-55c8919c-429a-49d7-81b8-3a3a431b3724_complete_log.json",
+      "sha256": "ac66cee80efe0947ed9121acdee7fdada6eb9173bb716fdf532cfd9ef03a039c",
+      "bytes": 3287051
+    },
+    {
+      "path": "output\\agent_conversation_logs\\agent-conv-local-55c8919c-429a-49d7-81b8-3a3a431b3724\\agent-conv-local-55c8919c-429a-49d7-81b8-3a3a431b3724_readable_timeline.md",
+      "sha256": "77aff08430a5bfc8002d1c9490a564ce2b0b268fc581111c77284955d13fe3b3",
+      "bytes": 257955
+    },
+    {
+      "path": "output\\agent_conversation_logs\\agent-conv-local-55c8919c-429a-49d7-81b8-3a3a431b3724\\agent-conv-local-55c8919c-429a-49d7-81b8-3a3a431b3724_app_log_lines.txt",
+      "sha256": "8107aa091608d34e46573eef8f99646ee232734761a3822ba5da35039bf53305",
+      "bytes": 1790302
+    }
+  ],
+  "summary": {
+    "run_count": 2,
+    "run_ids": [
+      "agent-run-1914761819b44a2799a744049d837d7c",
+      "agent-run-72ca285d46fe4755ba0e3e1da92d3fdc"
+    ],
+    "event_count": 151,
+    "tool_call_count": 12,
+    "app_log_line_count": 296,
+    "runtime_snapshot_count": 1,
+    "table_counts": {
+      "ai_agent_runs": 2,
+      "ai_agent_events": 151,
+      "ai_agent_tool_calls": 12,
+      "ai_agent_checkpoints": 2,
+      "ai_agent_context_builds": 4,
+      "ai_agent_loop_observations": 2,
+      "ai_agent_evidence_watches": 2,
+      "ai_agent_migration_blocks": 0,
+      "ai_agent_approvals": 1,
+      "ai_agent_approval_lineages": 1,
+      "ai_agent_approval_mutation_logs": 2,
+      "ai_agent_worker_queue": 1,
+      "ai_agent_memory_usage_events": 0,
+      "ai_agent_memory_contradiction_events": 0,
+      "ai_agent_memory_validation_events": 0,
+      "ai_agent_reconcile_attempts": 0,
+      "ai_agent_outbox": 151,
+      "ai_agent_runtime_snapshots": 1
+    }
+  }
+}

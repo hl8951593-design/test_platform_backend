@@ -665,6 +665,202 @@ class AISkillTests(unittest.TestCase):
         headers = result.scenario.nodes[1].test_case.config["headers"]
         self.assertEqual(headers["Authorization"], "Bearer {{token}}")
 
+    def test_scenario_composer_auto_adds_bindings_for_available_template_sources(self):
+        skill = get_ai_skill("scenario-composer")
+        payload = AIScenarioComposeRequest(
+            requirement="获取企业列表后查询商标信息",
+            scenario_name="企业商标链路",
+            http_test_case_ids=[20, 21],
+        )
+
+        result = skill.parse_response(
+            json.dumps({
+                "source_summary": "组合企业列表和商标查询",
+                "scenario": {
+                    "name": "企业商标链路",
+                    "description": "获取企业列表后使用企业 ID 查询商标",
+                    "nodes": [
+                        {
+                            "id": "PAGE",
+                            "name": "获取企业列表",
+                            "test_case": {
+                                "id": "PAGE-CASE",
+                                "kind": "api_case",
+                                "reference_id": 20,
+                                "extractors": [
+                                    {"id": "VAR-companyId", "name": "companyId", "path": "data.records.0.companyId"}
+                                ],
+                            },
+                        },
+                        {
+                            "id": "TRADEMARK",
+                            "name": "查询商标",
+                            "test_case": {
+                                "id": "TRADEMARK-CASE",
+                                "kind": "api_case",
+                                "reference_id": 21,
+                                "config": {"query_params": {"companyId": "{{companyId}}"}},
+                            },
+                        },
+                    ],
+                },
+                "warnings": [],
+            }, ensure_ascii=False),
+            {
+                "project_id": 1,
+                "environment_id": 2,
+                "payload": payload,
+                "candidate_cases": [],
+                "candidate_index": {
+                    ("api_case", 20): {
+                        "kind": "api_case",
+                        "name": "获取企业列表",
+                        "method": "POST",
+                        "path": "/getEntPageList",
+                        "assertions": [],
+                    },
+                    ("api_case", 21): {
+                        "kind": "api_case",
+                        "name": "查询商标",
+                        "method": "GET",
+                        "path": "/getTrademarkListPage",
+                        "query_params": {"companyId": "original"},
+                        "assertions": [],
+                    },
+                },
+            },
+        )
+
+        trademark_config = result.scenario.nodes[1].test_case.config
+        self.assertEqual(trademark_config["query_params"]["companyId"], "{{companyId}}")
+        bindings = trademark_config["_scenario_context"]["bindings"]
+        self.assertEqual(bindings[0]["name"], "companyId")
+        self.assertEqual(bindings[0]["source_step_id"], "PAGE-CASE")
+        self.assertEqual(bindings[0]["source_extraction_id"], "VAR-companyId")
+        self.assertEqual(bindings[0]["target"], "query_params")
+        self.assertEqual(bindings[0]["target_path"], "companyId")
+
+    def test_scenario_composer_adds_baseline_assertions_from_execution_sample(self):
+        skill = get_ai_skill("scenario-composer")
+        payload = AIScenarioComposeRequest(
+            requirement="查询商标信息并校验业务响应",
+            scenario_name="商标查询",
+            http_test_case_ids=[21],
+        )
+
+        result = skill.parse_response(
+            json.dumps({
+                "source_summary": "组合商标查询",
+                "scenario": {
+                    "name": "商标查询",
+                    "description": "查询商标信息",
+                    "nodes": [{
+                        "id": "TRADEMARK",
+                        "name": "查询商标",
+                        "test_case": {
+                            "id": "TRADEMARK-CASE",
+                            "kind": "api_case",
+                            "reference_id": 21,
+                        },
+                    }],
+                },
+                "warnings": [],
+            }, ensure_ascii=False),
+            {
+                "project_id": 1,
+                "environment_id": 2,
+                "payload": payload,
+                "candidate_cases": [],
+                "candidate_index": {
+                    ("api_case", 21): {
+                        "kind": "api_case",
+                        "name": "查询商标",
+                        "method": "GET",
+                        "path": "/getTrademarkListPage",
+                        "assertions": [],
+                        "execution_sample": {
+                            "response_snapshot": {
+                                "status_code": 200,
+                                "json": {"code": 200, "success": True, "msg": "操作成功"},
+                            }
+                        },
+                    },
+                },
+            },
+        )
+
+        assertions = result.scenario.nodes[0].test_case.config["assertions"]
+        self.assertIn({"type": "status_code", "expected": 200}, assertions)
+        self.assertIn({"type": "json_equals", "path": "code", "expected": 200}, assertions)
+        self.assertIn({"type": "json_equals", "path": "success", "expected": True}, assertions)
+
+    def test_scenario_composer_service_adds_candidate_composition_hints(self):
+        service = object.__new__(AIScenarioComposerService)
+        case = SimpleNamespace(
+            id=20,
+            name="获取企业列表",
+            description="分页查询企业，返回企业 ID 和名称",
+            method="POST",
+            path="/api/lingxi-chain/cloudentchain/getEntPageList",
+            headers={"Content-Type": "application/json"},
+            query_params={},
+            body_type="json",
+            body={"keyword": "灵犀"},
+            assertions=[],
+            extractors=[],
+            environment_id=4,
+            environment_ids=[4],
+        )
+
+        data = service._http_case_data(
+            case,
+            execution_sample={
+                "response_snapshot": {
+                    "status_code": 200,
+                    "json": {
+                        "code": 200,
+                        "success": True,
+                        "data": {
+                            "records": [
+                                {"companyId": "20012112150000146396", "companyName": "灵犀"}
+                            ]
+                        },
+                    },
+                }
+            },
+        )
+
+        hints = data["composition_hints"]
+        self.assertIn("data_provider", hints["role_candidates"])
+        self.assertIn("companyId", hints["response_fields"])
+        self.assertIn({"name": "companyId", "path": "data.records.0.companyId"}, hints["suggested_extractors"])
+        self.assertIn({"type": "status_code", "expected": 200}, hints["baseline_assertions"])
+        self.assertIn({"type": "json_equals", "path": "code", "expected": 200}, hints["baseline_assertions"])
+
+    def test_scenario_composer_prompt_context_declares_platform_action_capabilities(self):
+        skill = get_ai_skill("scenario-composer")
+
+        request = skill.build_chat_request({
+            "project_id": 1,
+            "environment_id": 2,
+            "environment": {"id": 2, "name": "test", "base_url": "https://api.test"},
+            "payload": AIScenarioComposeRequest(
+                requirement="创建包含等待和脚本计算的自动化流程",
+                scenario_name="脚本流程",
+                http_test_case_ids=[20],
+            ),
+            "candidate_cases": [],
+        })
+
+        user_content = request.messages[1].content
+        context = json.loads(user_content[user_content.index("{"):])
+        kinds = {item["kind"] for item in context["scenario_action_capabilities"]}
+        self.assertIn("delay", kinds)
+        self.assertIn("script", kinds)
+        script_capability = next(item for item in context["scenario_action_capabilities"] if item["kind"] == "script")
+        self.assertEqual(script_capability["languages"], ["python", "javascript"])
+        self.assertIn("outputs", script_capability["required_config"])
+
     def test_scenario_composer_service_repairs_after_failed_self_validation(self):
         scenario = {
             "name": "自验证场景",

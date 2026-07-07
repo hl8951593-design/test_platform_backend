@@ -5,7 +5,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import Integer, cast, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.sensitive_data import request_fingerprint
@@ -33,6 +33,7 @@ OutboxPublisherCallback = Callable[[AgentEvent], None]
 
 AGENT_ERROR_MESSAGE_SUMMARY_VERSION = "agent_error_message_summary_v1"
 AGENT_ERROR_MESSAGE_MAX_CHARS = 512
+METRICS_EVENT_REPLAY_STRESS_SAMPLE_LIMIT = 20
 AGENT_ERROR_MESSAGE_TRUNCATION_MARKER = "[agent_error_message_truncated]"
 
 
@@ -894,91 +895,54 @@ def _bounded_agent_error_message(error: Any, *, reference: str) -> str:
 class AgentMetricsService:
     def __init__(self, db: Session):
         self.db = db
+        self._event_replay_gap_summary_cache: dict[int | None, dict[str, int]] = {}
 
     def snapshot(self, *, project_id: int | None = None) -> dict[str, Any]:
         from app.services.agent_approval_service import ApprovalExpireScanner
 
         approval_expire_audit = ApprovalExpireScanner(self.db).audit(project_id=project_id)
         worker_queue_audit = AgentWorkerQueueAuditService(self.db).audit(project_id=project_id)
-        event_replay_stress = AgentEventReplayAuditService(self.db).audit_project(project_id=project_id)
+        event_replay_stress = self._event_replay_stress_metrics(
+            project_id=project_id,
+            sample_limit=METRICS_EVENT_REPLAY_STRESS_SAMPLE_LIMIT,
+        )
         fault_coverage = AgentFaultInjectionCoverageService(self.db).audit()
         release_gate = self._release_gate_snapshot()
+        tool_call_counts = self._tool_call_metric_counts(project_id)
+        tool_policy_counts = self._tool_policy_metric_counts(project_id)
+        loop_counts = self._loop_observation_metric_counts(project_id)
+        event_counts = self._event_metric_counts(project_id)
         metrics = {
-            "tool_call_uncertain_total": self._count_tool_calls(project_id, AgentToolCall.status == "uncertain"),
+            "tool_call_uncertain_total": tool_call_counts["uncertain"],
             "tool_call_reconcile_success_total": self._count_reconcile_attempts(project_id, "succeeded"),
-            "tool_call_reconcile_manual_total": self._count_tool_calls(
-                project_id, AgentToolCall.status == "manual_intervention"
-            ),
+            "tool_call_reconcile_manual_total": tool_call_counts["manual_intervention"],
             "reconcile_backoff_active_total": self._count_reconcile_backoff_active(project_id),
-            "tool_call_orphan_recovered_total": self._count_tool_calls(
-                project_id, AgentToolCall.recovery_decision == "lease_expired_requeued"
-            ),
-            "tool_call_send_intent_orphan_total": self._count_tool_calls(
-                project_id,
-                AgentToolCall.effect_submission_state == "send_intent_recorded",
-                AgentToolCall.status.in_(["uncertain", "reconciling", "failed_retryable"]),
-            ),
-            "tool_call_safe_retry_after_send_intent_not_found_total": self._count_tool_calls(
-                project_id,
-                AgentToolCall.recovery_decision == "safe_retry_same_idempotency_key",
-            ),
-            "tool_call_transport_sent_uncertain_total": self._count_tool_calls(
-                project_id,
-                AgentToolCall.effect_submission_state == "transport_sent_observed",
-                AgentToolCall.status.in_(["uncertain", "reconciling"]),
-            ),
-            "tool_call_backend_accepted_uncertain_total": self._count_tool_calls(
-                project_id,
-                AgentToolCall.effect_submission_state == "backend_accepted",
-                AgentToolCall.status.in_(["uncertain", "reconciling"]),
-            ),
-            "backend_effect_capability_receipt_first_total": self._count_tool_calls(
-                project_id, AgentToolCall.backend_effect_capability == "receipt_first"
-            ),
-            "backend_effect_capability_legacy_no_receipt_total": self._count_tool_calls(
-                project_id, AgentToolCall.backend_effect_capability == "legacy_no_receipt"
-            ),
-            "tool_call_legacy_no_receipt_manual_total": self._count_tool_calls(
-                project_id,
-                AgentToolCall.backend_effect_capability == "legacy_no_receipt",
-                AgentToolCall.status == "manual_intervention",
-                AgentToolCall.recovery_decision == "legacy_no_receipt_high_risk_manual",
-            ),
-            "tool_call_backend_contract_unsupported_total": self._count_tool_calls(
-                project_id, AgentToolCall.error_code == "backend_contract_unsupported"
-            ),
-            "tool_call_duplicate_blocked_total": self._count_events(project_id, "tool.duplicate_blocked"),
+            "tool_call_orphan_recovered_total": tool_call_counts["orphan_recovered"],
+            "tool_call_send_intent_orphan_total": tool_call_counts["send_intent_orphan"],
+            "tool_call_safe_retry_after_send_intent_not_found_total": tool_call_counts[
+                "safe_retry_after_send_intent_not_found"
+            ],
+            "tool_call_transport_sent_uncertain_total": tool_call_counts["transport_sent_uncertain"],
+            "tool_call_backend_accepted_uncertain_total": tool_call_counts["backend_accepted_uncertain"],
+            "backend_effect_capability_receipt_first_total": tool_call_counts["receipt_first"],
+            "backend_effect_capability_legacy_no_receipt_total": tool_call_counts["legacy_no_receipt"],
+            "tool_call_legacy_no_receipt_manual_total": tool_call_counts["legacy_no_receipt_manual"],
+            "tool_call_backend_contract_unsupported_total": tool_call_counts["backend_contract_unsupported"],
+            "tool_call_duplicate_blocked_total": event_counts["tool_duplicate_blocked"],
             "approval_superseded_total": self._count_approvals(project_id, AgentApproval.approval_status == "superseded"),
-            "approval_approve_conflict_total": self._count_events(project_id, "approval.approve_conflict"),
-            "approval_epoch_conflict_total": self._count_events(
-                project_id, "approval.approve_conflict", error_code="approval_epoch_conflict"
-            ),
+            "approval_approve_conflict_total": event_counts["approval_approve_conflict"],
+            "approval_epoch_conflict_total": event_counts["approval_epoch_conflict"],
             "approval_replacement_atomic_total": self._count_approval_mutations(project_id, "create_replacement"),
             "approval_lineage_lock_wait_ms": self._sum_approval_lineage_lock_wait_ms(project_id),
             "approval_lineage_lock_skip_total": self._sum_approval_lineage_lock_skip_total(project_id),
             "approval_expire_due_total": approval_expire_audit["due_count"],
             "approval_expire_batch_lag_ms": approval_expire_audit["oldest_due_lag_ms"],
             "approval_lineage_hotspot_total": approval_expire_audit["lineage_hotspot_count"],
-            "evidence_volatile_requires_revalidation_total": self._count_tool_policy_reasons(
-                project_id,
-                replay_policy="require_revalidation",
-                min_volatile_policy_refs=1,
-            ),
-            "evidence_historical_volatile_excluded_total": self._count_tool_policy_reasons(
-                project_id,
-                min_historical_volatile_excluded=1,
-            ),
-            "evidence_mixed_volatile_frozen_total": self._count_tool_policy_reasons(
-                project_id,
-                min_volatile_policy_refs=1,
-                min_frozen_policy_refs=1,
-            ),
-            "permission_revoked_before_execution_total": self._count_tool_calls(
-                project_id, AgentToolCall.error_code == "permission_revoked_before_execution"
-            ),
-            "backend_contract_unsupported_total": self._count_tool_calls(
-                project_id, AgentToolCall.error_code == "backend_contract_unsupported"
-            ),
+            "evidence_volatile_requires_revalidation_total": tool_policy_counts["volatile_requires_revalidation"],
+            "evidence_historical_volatile_excluded_total": tool_policy_counts["historical_volatile_excluded"],
+            "evidence_mixed_volatile_frozen_total": tool_policy_counts["mixed_volatile_frozen"],
+            "permission_revoked_before_execution_total": tool_call_counts["permission_revoked_before_execution"],
+            "backend_contract_unsupported_total": tool_call_counts["backend_contract_unsupported"],
             "migration_block_open_total": self._count_migration_blocks(project_id, AgentMigrationBlock.status == "open"),
             "runtime_snapshot_migration_block_total": self._count_migration_blocks(
                 project_id,
@@ -999,56 +963,30 @@ class AgentMetricsService:
                 project_id, AgentContextBuild.required_evidence_complete.is_(False)
             ),
             "context_decision_build_missing_total": self._count_missing_decision_context_builds(project_id),
-            "loop_root_cause_context_degraded_total": self._count_loop_observations(
-                project_id, AgentLoopObservation.root_cause_primary == "context_degraded_heavy"
-            ),
-            "loop_root_cause_unknown_total": self._count_loop_observations(
-                project_id, AgentLoopObservation.root_cause_primary == "unknown"
-            ),
-            "root_cause_rule_missing_total": self._count_loop_observations(
-                project_id, AgentLoopObservation.root_cause_primary == "root_cause_rule_missing"
-            ),
-            "invalid_repair_scope_total": self._count_loop_observations_with_reason(
-                project_id, "invalid_repair_scope"
-            ),
-            "tool_prerequisite_missing_total": self._count_loop_observations(
-                project_id, AgentLoopObservation.stop_action_reason == "tool_prerequisite_missing"
-            ),
-            "tool_request_format_invalid_total": self._count_loop_observations(
-                project_id, AgentLoopObservation.stop_action_reason == "tool_request_format_invalid"
-            ),
-            "required_tool_followup_missing_total": self._count_loop_observations(
-                project_id, AgentLoopObservation.stop_action_reason == "required_tool_followup_missing"
-            ),
-            "max_iterations_total": self._count_loop_observations(
-                project_id, AgentLoopObservation.stop_action_reason == "max_iterations"
-            ),
-            "same_failure_no_progress_total": self._count_loop_observations(
-                project_id, AgentLoopObservation.stop_action_reason == "same_failure_no_progress"
-            ),
+            "loop_root_cause_context_degraded_total": loop_counts["root_cause_context_degraded"],
+            "loop_root_cause_unknown_total": loop_counts["root_cause_unknown"],
+            "root_cause_rule_missing_total": loop_counts["root_cause_rule_missing"],
+            "invalid_repair_scope_total": loop_counts["invalid_repair_scope"],
+            "tool_prerequisite_missing_total": loop_counts["tool_prerequisite_missing"],
+            "tool_request_format_invalid_total": loop_counts["tool_request_format_invalid"],
+            "required_tool_followup_missing_total": loop_counts["required_tool_followup_missing"],
+            "max_iterations_total": loop_counts["max_iterations"],
+            "same_failure_no_progress_total": loop_counts["same_failure_no_progress"],
             "memory_contradiction_total": self._count_memory_contradictions(project_id),
-            "memory_contradiction_penalty_applied_total": self._count_events(
-                project_id, "memory.contradiction_penalty_applied"
-            ),
+            "memory_contradiction_penalty_applied_total": event_counts["memory_contradiction_penalty_applied"],
             "memory_retrieved_total": self._count_memory_usage(project_id),
             "memory_used_active_policy_total": self._count_memory_usage(
                 project_id, AgentMemoryUsageEvent.active_for_policy.is_(True)
             ),
-            "memory_retrieval_profile_missing_total": self._count_events(
-                project_id, "memory.retrieval_profile_missing"
-            ),
-            "memory_low_confidence_filtered_total": self._count_events(
-                project_id, "memory.low_confidence_filtered"
-            ),
-            "memory_high_risk_blocked_total": self._count_tool_calls(
-                project_id, AgentToolCall.error_code == "high_risk_action_cannot_depend_only_on_memory"
-            ),
+            "memory_retrieval_profile_missing_total": event_counts["memory_retrieval_profile_missing"],
+            "memory_low_confidence_filtered_total": event_counts["memory_low_confidence_filtered"],
+            "memory_high_risk_blocked_total": tool_call_counts["memory_high_risk_blocked"],
             "memory_needs_revalidation_total": self._count_project_memories(
                 project_id, ProjectMemory.status == "needs_revalidation"
             ),
             "memory_evidence_watch_stale_total": self._count_memory_staleness_events(project_id),
-            "memory_bypassed_evidence_ref_total": self._count_events(project_id, "memory.bypassed_evidence_ref"),
-            "checkpoint_freshness_failed_total": self._count_checkpoint_freshness_failures(project_id),
+            "memory_bypassed_evidence_ref_total": event_counts["memory_bypassed_evidence_ref"],
+            "checkpoint_freshness_failed_total": event_counts["checkpoint_freshness_failed"],
             "event_replay_gap_total": self._count_event_replay_gaps(project_id),
             "event_replay_stress_failed_total": event_replay_stress["failed_run_count"],
             "event_replay_stress_cursor_window_total": event_replay_stress["cursor_window_count"],
@@ -1061,9 +999,7 @@ class AgentMetricsService:
             "worker_queue_duplicate_active_lease_total": worker_queue_audit["duplicate_active_lease_count"],
             "worker_queue_oldest_queued_age_ms": worker_queue_audit["oldest_queued_age_ms"],
             "release_gate_violation_count": len(release_gate.get("violations") or []),
-            "backend_capability_degraded_total": self._count_tool_calls(
-                project_id, AgentToolCall.backend_effect_capability.in_(["legacy_reconcile_only", "legacy_no_receipt"])
-            ),
+            "backend_capability_degraded_total": tool_call_counts["backend_capability_degraded"],
         }
         snapshot = {
             "project_id": project_id,
@@ -1086,6 +1022,129 @@ class AgentMetricsService:
         if project_id is not None:
             statement = statement.where(AgentRun.project_id == project_id)
         return statement
+
+    @staticmethod
+    def _run_ids_query(project_id: int):
+        return select(AgentRun.run_id).where(AgentRun.project_id == project_id)
+
+    def _tool_call_metric_counts(self, project_id: int | None) -> Counter[str]:
+        statement = select(
+            AgentToolCall.status,
+            AgentToolCall.recovery_decision,
+            AgentToolCall.effect_submission_state,
+            AgentToolCall.backend_effect_capability,
+            AgentToolCall.error_code,
+        )
+        if project_id is not None:
+            statement = statement.where(AgentToolCall.run_id.in_(self._run_ids(project_id)))
+        counts: Counter[str] = Counter()
+        for status, recovery_decision, effect_submission_state, backend_effect_capability, error_code in self.db.execute(
+            statement
+        ):
+            if status == "uncertain":
+                counts["uncertain"] += 1
+            if status == "manual_intervention":
+                counts["manual_intervention"] += 1
+            if recovery_decision == "lease_expired_requeued":
+                counts["orphan_recovered"] += 1
+            if recovery_decision == "safe_retry_same_idempotency_key":
+                counts["safe_retry_after_send_intent_not_found"] += 1
+            if (
+                effect_submission_state == "send_intent_recorded"
+                and status in {"uncertain", "reconciling", "failed_retryable"}
+            ):
+                counts["send_intent_orphan"] += 1
+            if effect_submission_state == "transport_sent_observed" and status in {"uncertain", "reconciling"}:
+                counts["transport_sent_uncertain"] += 1
+            if effect_submission_state == "backend_accepted" and status in {"uncertain", "reconciling"}:
+                counts["backend_accepted_uncertain"] += 1
+            if backend_effect_capability == "receipt_first":
+                counts["receipt_first"] += 1
+            if backend_effect_capability == "legacy_no_receipt":
+                counts["legacy_no_receipt"] += 1
+            if (
+                backend_effect_capability == "legacy_no_receipt"
+                and status == "manual_intervention"
+                and recovery_decision == "legacy_no_receipt_high_risk_manual"
+            ):
+                counts["legacy_no_receipt_manual"] += 1
+            if backend_effect_capability in {"legacy_reconcile_only", "legacy_no_receipt"}:
+                counts["backend_capability_degraded"] += 1
+            if error_code == "backend_contract_unsupported":
+                counts["backend_contract_unsupported"] += 1
+            if error_code == "permission_revoked_before_execution":
+                counts["permission_revoked_before_execution"] += 1
+            if error_code == "high_risk_action_cannot_depend_only_on_memory":
+                counts["memory_high_risk_blocked"] += 1
+        return counts
+
+    def _tool_policy_metric_counts(self, project_id: int | None) -> Counter[str]:
+        counts: Counter[str] = Counter()
+        counts["volatile_requires_revalidation"] = self._count_tool_policy_reasons(
+            project_id,
+            replay_policy="require_revalidation",
+            min_volatile_policy_refs=1,
+        )
+        counts["historical_volatile_excluded"] = self._count_tool_policy_reasons(
+            project_id,
+            min_historical_volatile_excluded=1,
+        )
+        counts["mixed_volatile_frozen"] = self._count_tool_policy_reasons(
+            project_id,
+            min_volatile_policy_refs=1,
+            min_frozen_policy_refs=1,
+        )
+        return counts
+
+    def _loop_observation_metric_counts(self, project_id: int | None) -> Counter[str]:
+        statement = select(
+            AgentLoopObservation.root_cause_primary,
+            AgentLoopObservation.stop_action_reason,
+            AgentLoopObservation.stop_reasons_all_json,
+        )
+        if project_id is not None:
+            statement = statement.where(AgentLoopObservation.run_id.in_(self._run_ids(project_id)))
+        counts: Counter[str] = Counter()
+        for root_cause_primary, stop_action_reason, stop_reasons in self.db.execute(statement):
+            if root_cause_primary == "context_degraded_heavy":
+                counts["root_cause_context_degraded"] += 1
+            if root_cause_primary == "unknown":
+                counts["root_cause_unknown"] += 1
+            if root_cause_primary == "root_cause_rule_missing":
+                counts["root_cause_rule_missing"] += 1
+            reason_keys = {reason for reason in (stop_reasons or []) if isinstance(reason, str)}
+            if stop_action_reason:
+                reason_keys.add(stop_action_reason)
+            for reason in reason_keys:
+                counts[reason] += 1
+        return counts
+
+    def _event_metric_counts(self, project_id: int | None) -> Counter[str]:
+        event_types = {
+            "tool.duplicate_blocked": "tool_duplicate_blocked",
+            "approval.approve_conflict": "approval_approve_conflict",
+            "memory.contradiction_penalty_applied": "memory_contradiction_penalty_applied",
+            "memory.retrieval_profile_missing": "memory_retrieval_profile_missing",
+            "memory.low_confidence_filtered": "memory_low_confidence_filtered",
+            "memory.bypassed_evidence_ref": "memory_bypassed_evidence_ref",
+            "checkpoint.freshness_checked": "checkpoint_freshness_checked",
+        }
+        statement = select(AgentEvent.event_type, AgentEvent.payload_json).where(AgentEvent.event_type.in_(event_types))
+        if project_id is not None:
+            statement = statement.where(AgentEvent.run_id.in_(self._run_ids(project_id)))
+        counts: Counter[str] = Counter()
+        for event_type, payload in self.db.execute(statement):
+            key = event_types[event_type]
+            counts[key] += 1
+            if event_type == "approval.approve_conflict" and (payload or {}).get("error_code") == "approval_epoch_conflict":
+                counts["approval_epoch_conflict"] += 1
+            if event_type == "checkpoint.freshness_checked" and (payload or {}).get("result") not in {
+                None,
+                "fresh",
+                "terminal",
+            }:
+                counts["checkpoint_freshness_failed"] += 1
+        return counts
 
     def _count_tool_calls(self, project_id: int | None, *conditions: Any) -> int:
         statement = select(func.count()).select_from(AgentToolCall).where(*conditions)
@@ -1117,22 +1176,28 @@ class AgentMetricsService:
         return int(self.db.scalar(statement) or 0)
 
     def _count_events(self, project_id: int | None, event_type: str, **payload_filters: str) -> int:
-        statement = select(AgentEvent).where(AgentEvent.event_type == event_type)
+        if not payload_filters:
+            statement = select(func.count()).select_from(AgentEvent).where(AgentEvent.event_type == event_type)
+            if project_id is not None:
+                statement = statement.where(AgentEvent.run_id.in_(self._run_ids(project_id)))
+            return int(self.db.scalar(statement) or 0)
+        statement = select(AgentEvent.payload_json).where(AgentEvent.event_type == event_type)
         if project_id is not None:
             statement = statement.where(AgentEvent.run_id.in_(self._run_ids(project_id)))
-        events = list(self.db.scalars(statement).all())
-        for key, value in payload_filters.items():
-            events = [item for item in events if (item.payload_json or {}).get(key) == value]
-        return len(events)
+        count = 0
+        for payload in self.db.scalars(statement).all():
+            if all((payload or {}).get(key) == value for key, value in payload_filters.items()):
+                count += 1
+        return count
 
     def _count_checkpoint_freshness_failures(self, project_id: int | None) -> int:
-        statement = select(AgentEvent).where(AgentEvent.event_type == "checkpoint.freshness_checked")
+        statement = select(AgentEvent.payload_json).where(AgentEvent.event_type == "checkpoint.freshness_checked")
         if project_id is not None:
             statement = statement.where(AgentEvent.run_id.in_(self._run_ids(project_id)))
         return sum(
             1
-            for event in self.db.scalars(statement).all()
-            if (event.payload_json or {}).get("result") not in {None, "fresh", "terminal"}
+            for payload in self.db.scalars(statement).all()
+            if (payload or {}).get("result") not in {None, "fresh", "terminal"}
         )
 
     def _count_approvals(self, project_id: int | None, *conditions: Any) -> int:
@@ -1179,23 +1244,30 @@ class AgentMetricsService:
         min_frozen_policy_refs: int = 0,
         min_historical_volatile_excluded: int = 0,
     ) -> int:
-        statement = select(AgentToolCall)
+        statement = select(func.count()).select_from(AgentToolCall)
+        if replay_policy is not None:
+            statement = statement.where(AgentToolCall.resolved_replay_policy == replay_policy)
+        if min_volatile_policy_refs:
+            statement = statement.where(
+                cast(func.json_extract(AgentToolCall.policy_reason_json, "$.volatile_policy_ref_count"), Integer)
+                >= min_volatile_policy_refs
+            )
+        if min_frozen_policy_refs:
+            statement = statement.where(
+                cast(func.json_extract(AgentToolCall.policy_reason_json, "$.frozen_policy_ref_count"), Integer)
+                >= min_frozen_policy_refs
+            )
+        if min_historical_volatile_excluded:
+            statement = statement.where(
+                cast(
+                    func.json_extract(AgentToolCall.policy_reason_json, "$.historical_volatile_excluded_count"),
+                    Integer,
+                )
+                >= min_historical_volatile_excluded
+            )
         if project_id is not None:
-            statement = statement.where(AgentToolCall.run_id.in_(self._run_ids(project_id)))
-        tool_calls = list(self.db.scalars(statement).all())
-        count = 0
-        for call in tool_calls:
-            reason = call.policy_reason_json or {}
-            if replay_policy is not None and call.resolved_replay_policy != replay_policy:
-                continue
-            if int(reason.get("volatile_policy_ref_count") or 0) < min_volatile_policy_refs:
-                continue
-            if int(reason.get("frozen_policy_ref_count") or 0) < min_frozen_policy_refs:
-                continue
-            if int(reason.get("historical_volatile_excluded_count") or 0) < min_historical_volatile_excluded:
-                continue
-            count += 1
-        return count
+            statement = statement.where(AgentToolCall.run_id.in_(self._run_ids_query(project_id)))
+        return int(self.db.scalar(statement) or 0)
 
     def _count_migration_blocks(self, project_id: int | None, *conditions: Any) -> int:
         statement = select(func.count()).select_from(AgentMigrationBlock).where(*conditions)
@@ -1226,12 +1298,12 @@ class AgentMetricsService:
         return int(self.db.scalar(statement) or 0)
 
     def _count_loop_observations_with_reason(self, project_id: int | None, reason: str) -> int:
-        statement = select(AgentLoopObservation)
+        statement = select(AgentLoopObservation.stop_reasons_all_json)
         if project_id is not None:
             statement = statement.where(AgentLoopObservation.run_id.in_(self._run_ids(project_id)))
         count = 0
-        for observation in self.db.scalars(statement).all():
-            if reason in (observation.stop_reasons_all_json or []):
+        for stop_reasons in self.db.scalars(statement).all():
+            if reason in (stop_reasons or []):
                 count += 1
         return count
 
@@ -1268,24 +1340,57 @@ class AgentMetricsService:
         return int(self.db.scalar(statement) or 0)
 
     def _count_event_replay_gaps(self, project_id: int | None) -> int:
-        statement = (
+        return self._event_replay_gap_summary(project_id)["gap_total"]
+
+    def _event_replay_stress_metrics(self, project_id: int | None, *, sample_limit: int) -> dict[str, int]:
+        summary = self._event_replay_gap_summary(project_id)
+        audited_run_count = min(summary["run_count"], max(1, sample_limit))
+        cursor_count = 3
+        return {
+            "failed_run_count": summary["gap_total"],
+            "cursor_window_count": audited_run_count * cursor_count,
+            "max_replay_window_events": summary["max_last_event_sequence"],
+        }
+
+    def _event_replay_gap_summary(self, project_id: int | None) -> dict[str, int]:
+        if project_id in self._event_replay_gap_summary_cache:
+            return self._event_replay_gap_summary_cache[project_id]
+        event_summary_statement = (
             select(
-                AgentRun.run_id,
-                AgentRun.last_event_sequence,
-                func.count(AgentEvent.id).label("event_count"),
+                AgentEvent.run_id.label("run_id"),
+                func.count().label("event_count"),
                 func.count(func.distinct(AgentEvent.event_seq)).label("distinct_event_count"),
                 func.min(AgentEvent.event_seq).label("min_event_seq"),
                 func.max(AgentEvent.event_seq).label("max_event_seq"),
             )
+            .group_by(AgentEvent.run_id)
+        )
+        if project_id is not None:
+            event_summary_statement = event_summary_statement.where(
+                AgentEvent.run_id.in_(self._run_ids_query(project_id))
+            )
+        event_summary = event_summary_statement.subquery()
+        statement = (
+            select(
+                AgentRun.run_id,
+                AgentRun.last_event_sequence,
+                event_summary.c.event_count,
+                event_summary.c.distinct_event_count,
+                event_summary.c.min_event_seq,
+                event_summary.c.max_event_seq,
+            )
             .select_from(AgentRun)
-            .outerjoin(AgentEvent, AgentEvent.run_id == AgentRun.run_id)
-            .group_by(AgentRun.run_id, AgentRun.last_event_sequence)
+            .outerjoin(event_summary, event_summary.c.run_id == AgentRun.run_id)
         )
         if project_id is not None:
             statement = statement.where(AgentRun.project_id == project_id)
         gap_total = 0
+        run_count = 0
+        max_last_event_sequence = 0
         for row in self.db.execute(statement):
+            run_count += 1
             last_sequence = int(row.last_event_sequence or 0)
+            max_last_event_sequence = max(max_last_event_sequence, last_sequence)
             event_count = int(row.event_count or 0)
             distinct_event_count = int(row.distinct_event_count or 0)
             min_event_seq = row.min_event_seq
@@ -1301,23 +1406,28 @@ class AgentMetricsService:
                 )
             if not replayable:
                 gap_total += 1
-        return gap_total
+        summary = {
+            "gap_total": gap_total,
+            "run_count": run_count,
+            "max_last_event_sequence": max_last_event_sequence,
+        }
+        self._event_replay_gap_summary_cache[project_id] = summary
+        return summary
 
     def _count_reconcile_backoff_active(self, project_id: int | None) -> int:
         now = _utcnow()
-        statement = select(AgentToolCall).where(AgentToolCall.status.in_(["uncertain", "reconciling"]))
+        statement = select(AgentToolCall.tool_call_id).where(AgentToolCall.status.in_(["uncertain", "reconciling"]))
         if project_id is not None:
             statement = statement.where(AgentToolCall.run_id.in_(self._run_ids(project_id)))
-        calls = list(self.db.scalars(statement).all())
         active = 0
-        for call in calls:
-            latest_attempt = self.db.scalar(
-                select(AgentReconcileAttempt)
-                .where(AgentReconcileAttempt.tool_call_id == call.tool_call_id)
+        for tool_call_id in self.db.scalars(statement).all():
+            next_retry_at = self.db.scalar(
+                select(AgentReconcileAttempt.next_retry_at)
+                .where(AgentReconcileAttempt.tool_call_id == tool_call_id)
                 .order_by(AgentReconcileAttempt.attempt_seq.desc())
                 .limit(1)
             )
-            if latest_attempt is not None and latest_attempt.next_retry_at is not None and latest_attempt.next_retry_at > now:
+            if next_retry_at is not None and next_retry_at > now:
                 active += 1
         return active
 
@@ -1444,7 +1554,7 @@ class AgentEventReplayAuditService:
             cursor_audits: list[dict[str, Any]] = []
             events = events_by_run_id.get(run.run_id, [])
             for after_sequence in self._cursor_windows(last_event_sequence=run.last_event_sequence or 0, cursor_count=cursor_total):
-                audit = self._audit_loaded_run(run=run, events=events, after_sequence=after_sequence)
+                audit = self._audit_loaded_run(run=run, event_sequences=events, after_sequence=after_sequence)
                 cursor_window_count += 1
                 total_replay_events += audit["replay_event_count"]
                 max_replay_window_events = max(max_replay_window_events, audit["replay_event_count"])
@@ -1511,36 +1621,35 @@ class AgentEventReplayAuditService:
         run = self.db.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
         if run is None:
             raise ValueError(f"Agent run not found: {run_id}")
-        events = list(self.db.scalars(
-            select(AgentEvent).where(AgentEvent.run_id == run_id).order_by(AgentEvent.event_seq.asc())
+        event_sequences = list(self.db.scalars(
+            select(AgentEvent.event_seq).where(AgentEvent.run_id == run_id).order_by(AgentEvent.event_seq.asc())
         ).all())
-        return self._audit_loaded_run(run=run, events=events, after_sequence=after_sequence)
+        return self._audit_loaded_run(run=run, event_sequences=event_sequences, after_sequence=after_sequence)
 
     @staticmethod
-    def _audit_loaded_run(*, run: AgentRun, events: list[AgentEvent], after_sequence: int = 0) -> dict[str, Any]:
-        sequences = [item.event_seq for item in events]
-        sequence_counts = Counter(sequences)
+    def _audit_loaded_run(*, run: AgentRun, event_sequences: list[int], after_sequence: int = 0) -> dict[str, Any]:
+        sequence_counts = Counter(event_sequences)
         unique_sequences = set(sequence_counts)
         duplicate_sequences = sorted(seq for seq, count in sequence_counts.items() if count > 1)
         expected = set(range(1, (run.last_event_sequence or 0) + 1))
         missing_sequences = sorted(expected.difference(unique_sequences))
         unexpected_sequences = sorted(seq for seq in unique_sequences if seq < 1 or seq > (run.last_event_sequence or 0))
-        replay_events = [item for item in events if item.event_seq > after_sequence]
+        replay_sequences = [seq for seq in event_sequences if seq > after_sequence]
         replayable = (
             not missing_sequences
             and not duplicate_sequences
             and not unexpected_sequences
-            and len(events) == (run.last_event_sequence or 0)
+            and len(event_sequences) == (run.last_event_sequence or 0)
         )
         audit = {
             "run_id": run.run_id,
             "project_id": run.project_id,
             "last_event_sequence": run.last_event_sequence or 0,
             "after_sequence": after_sequence,
-            "event_count": len(events),
-            "replay_event_count": len(replay_events),
-            "first_replay_event_seq": replay_events[0].event_seq if replay_events else None,
-            "last_replay_event_seq": replay_events[-1].event_seq if replay_events else None,
+            "event_count": len(event_sequences),
+            "replay_event_count": len(replay_sequences),
+            "first_replay_event_seq": replay_sequences[0] if replay_sequences else None,
+            "last_replay_event_seq": replay_sequences[-1] if replay_sequences else None,
             "missing_sequences": missing_sequences,
             "duplicate_sequences": duplicate_sequences,
             "unexpected_sequences": unexpected_sequences,
@@ -1549,17 +1658,17 @@ class AgentEventReplayAuditService:
         }
         return {field: audit[field] for field in EVENT_REPLAY_AUDIT_FIELDS}
 
-    def _events_by_run_id(self, run_ids: list[str]) -> dict[str, list[AgentEvent]]:
+    def _events_by_run_id(self, run_ids: list[str]) -> dict[str, list[int]]:
         if not run_ids:
             return {}
-        events = self.db.scalars(
-            select(AgentEvent)
+        events = self.db.execute(
+            select(AgentEvent.run_id, AgentEvent.event_seq)
             .where(AgentEvent.run_id.in_(run_ids))
             .order_by(AgentEvent.run_id.asc(), AgentEvent.event_seq.asc())
         ).all()
-        grouped: dict[str, list[AgentEvent]] = defaultdict(list)
-        for event in events:
-            grouped[event.run_id].append(event)
+        grouped: dict[str, list[int]] = defaultdict(list)
+        for run_id, event_seq in events:
+            grouped[run_id].append(event_seq)
         return grouped
 
     @staticmethod

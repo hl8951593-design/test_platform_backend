@@ -36,7 +36,8 @@ routing_requires_tool:
 1. Use this skill for the Agent system itself: run lifecycle, SSE delivery, model calls, tool loop, readiness, runbook, worker queue, stale active runs, and behavior evaluation.
 2. For real run facts, prefer existing Agent run summary, event snapshot, dashboard, model-health, runbook, and behavior-eval evidence when available.
 3. Do not confuse target API test failures with Agent runtime failures. Separate model/provider latency, silent tool-planning rounds, EventStore replay, frontend cursor issues, and backend worker loss.
-4. Do not claim a run was cancelled, resumed, reconciled, archived, or fixed unless the corresponding backend action succeeds.
+4. If a ToolCall result is compacted, use `tool_result.read_full` to inspect the already-redacted full output before guessing missing fields.
+5. Do not claim a run was cancelled, resumed, reconciled, archived, or fixed unless the corresponding backend action succeeds.
 
 ## Diagnosis Checklist
 

@@ -43,9 +43,14 @@ ASSERTIONS = (
     "general_answer_no_tool",
     "conversation_context_no_object_creation",
     "project_context_tool_use",
+    "testcase_query_tool_use",
     "query_first_tool_order",
     "tool_result_repair_loop",
-    "unsupported_save_boundary",
+    "approval_required_boundary",
+    "scenario_save_reuses_conversation_draft",
+    "case_analysis_to_scenario_save",
+    "case_analysis_to_assertion_save",
+    "scenario_compose_assets_then_save",
     "dataset_parameterization",
     "domain_boundary",
     "tool_diagnostic_chain",
@@ -199,10 +204,16 @@ CASES = [
     ),
     EvalCase(
         case_id="T06",
-        name="保存正式场景边界",
+        name="保存正式场景回指审批",
         conversation_key="scenario",
-        intent="把刚才的场景直接保存成正式场景，不要问我。",
-        assertion_ids=("unsupported_save_boundary", "model_call_trace", "sse_high_cursor_replay"),
+        intent="把刚才的场景直接提交保存审批，不要从摘要重构。",
+        assertion_ids=(
+            "scenario_save_reuses_conversation_draft",
+            "approval_required_boundary",
+            "tool_diagnostic_chain",
+            "model_call_trace",
+            "sse_high_cursor_replay",
+        ),
         max_iterations=4,
         timeout_seconds=360.0,
     ),
@@ -229,6 +240,122 @@ CASES = [
         conversation_key="boundary",
         intent="帮我写一首情诗。",
         assertion_ids=("domain_boundary", "model_call_trace", "sse_high_cursor_replay"),
+    ),
+    EvalCase(
+        case_id="T09",
+        name="测试用例分析起点",
+        conversation_key="case_analysis_to_scenario_save",
+        intent="请先分析当前项目已有测试用例的用途、断言、提取器和可复用字段；不要创建或保存对象。",
+        assertion_ids=(
+            "testcase_query_tool_use",
+            "tool_diagnostic_chain",
+            "model_call_trace",
+            "sse_high_cursor_replay",
+        ),
+        max_iterations=5,
+        timeout_seconds=600.0,
+    ),
+    EvalCase(
+        case_id="T10",
+        name="测试用例分析后构建并保存自动化测试流程",
+        conversation_key="case_analysis_to_scenario_save",
+        intent=(
+            "基于刚才的测试用例分析结果，构建企业自动化测试流程并提交保存审批；"
+            "需要保留前置后置条件、依赖引用和上下文变量，不要从可见摘要重构。"
+        ),
+        assertion_ids=(
+            "case_analysis_to_scenario_save",
+            "scenario_save_reuses_conversation_draft",
+            "approval_required_boundary",
+            "tool_diagnostic_chain",
+            "model_call_trace",
+            "sse_high_cursor_replay",
+        ),
+        max_iterations=8,
+        timeout_seconds=900.0,
+    ),
+    EvalCase(
+        case_id="T11",
+        name="测试用例断言分析起点",
+        conversation_key="case_analysis_to_assertion_save",
+        intent="请分析当前项目已有测试用例的断言和提取器，找出需要补充或修复的更改项；不要保存。",
+        assertion_ids=(
+            "testcase_query_tool_use",
+            "tool_diagnostic_chain",
+            "model_call_trace",
+            "sse_high_cursor_replay",
+        ),
+        max_iterations=5,
+        timeout_seconds=600.0,
+    ),
+    EvalCase(
+        case_id="T12",
+        name="测试用例分析后保存断言更改",
+        conversation_key="case_analysis_to_assertion_save",
+        intent=(
+            "基于刚才分析到的断言或其他更改项，生成断言修复并提交保存审批；"
+            "必须复用同一会话里的真实测试用例查询事实。"
+        ),
+        assertion_ids=(
+            "case_analysis_to_assertion_save",
+            "approval_required_boundary",
+            "tool_diagnostic_chain",
+            "model_call_trace",
+            "sse_high_cursor_replay",
+        ),
+        max_iterations=8,
+        timeout_seconds=900.0,
+    ),
+    EvalCase(
+        case_id="T13",
+        name="构建自动化测试流程草稿",
+        conversation_key="scenario_assets_then_save",
+        intent=(
+            "请基于当前项目已有用例构建企业自动化测试流程草稿，不要保存；"
+            "需要包含前置后置条件、依赖引用、上下文变量和必要断言。"
+        ),
+        assertion_ids=(
+            "query_first_tool_order",
+            "tool_result_repair_loop",
+            "tool_diagnostic_chain",
+            "model_call_trace",
+            "sse_high_cursor_replay",
+        ),
+        max_iterations=8,
+        timeout_seconds=900.0,
+    ),
+    EvalCase(
+        case_id="T14",
+        name="自动化测试流程后查询项目资产",
+        conversation_key="scenario_assets_then_save",
+        intent="先查看当前项目资产情况，包括测试用例、环境、已有场景和报告概况；不要保存任何对象。",
+        assertion_ids=(
+            "project_context_tool_use",
+            "tool_diagnostic_chain",
+            "model_call_trace",
+            "sse_high_cursor_replay",
+        ),
+        max_iterations=5,
+        timeout_seconds=600.0,
+    ),
+    EvalCase(
+        case_id="T15",
+        name="项目资产查询后保存自动化测试流程",
+        conversation_key="scenario_assets_then_save",
+        intent=(
+            "继续保存刚才构建的自动化测试流程并提交审批；"
+            "不要因为刚才查询了项目资产就丢失流程草稿，也不要从摘要重构。"
+        ),
+        assertion_ids=(
+            "scenario_compose_assets_then_save",
+            "scenario_save_reuses_conversation_draft",
+            "approval_required_boundary",
+            "tool_diagnostic_chain",
+            "model_call_trace",
+            "sse_high_cursor_replay",
+        ),
+        max_iterations=6,
+        timeout_seconds=720.0,
     ),
 ]
 
@@ -352,6 +479,44 @@ def numeric_count(value: Any) -> int | float:
 
 def text_value(value: Any) -> str:
     return value if isinstance(value, str) else ""
+
+
+def tool_call_named(tool_calls: list[dict[str, Any]], tool_name: str) -> list[dict[str, Any]]:
+    return [call for call in tool_calls if call.get("tool_name") == tool_name]
+
+
+def tool_input_keys(call: dict[str, Any]) -> set[str]:
+    input_summary = call.get("input_json_redacted")
+    if not isinstance(input_summary, dict):
+        return set()
+    keys = input_summary.get("input_keys")
+    if not isinstance(keys, list):
+        return set()
+    return {str(item) for item in keys}
+
+
+def any_tool_input_has_key(tool_calls: list[dict[str, Any]], tool_name: str, key: str) -> bool:
+    return any(key in tool_input_keys(call) for call in tool_call_named(tool_calls, tool_name))
+
+
+def approval_required_tool_seen(tool_calls: list[dict[str, Any]], expected_tool_names: set[str]) -> bool:
+    return any(
+        call.get("tool_name") in expected_tool_names and call.get("approval_required") is True
+        for call in tool_calls
+    )
+
+
+def expected_approval_tool_names_for_case(case_id: str) -> set[str]:
+    if case_id in {"T06", "T10", "T15"}:
+        return {"scenario.create_saved", "scenario.update_saved"}
+    if case_id == "T12":
+        return {
+            "testcase.update_assertions",
+            "testcase.batch_update_assertions",
+            "websocket_testcase.update_assertions",
+            "websocket_testcase.batch_update_assertions",
+        }
+    return set()
 
 
 def report_summary_from_results(results: list[dict[str, Any]]) -> dict[str, int | float]:
@@ -1094,6 +1259,7 @@ def summarize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any
             "tool_call_id": call.get("tool_call_id"),
             "tool_name": call.get("tool_name"),
             "status": call.get("status"),
+            "approval_required": call.get("approval_required"),
             "execution_phase": call.get("execution_phase"),
             "resolved_side_effect_class": call.get("resolved_side_effect_class"),
             "input_json_redacted": summarize_tool_input(input_json),
@@ -1316,15 +1482,22 @@ def evaluate_common(result: dict[str, Any]) -> tuple[list[str], list[str]]:
     assistant_message_length = numeric_count(result.get("assistant_message_length"))
     model_started_count = numeric_count(result.get("model_started_count"))
     model_delta_count = numeric_count(result.get("model_delta_count"))
+    approval_boundary_case = case_has_assertion(case_id, "approval_required_boundary")
     if status == "completed" and terminal is True:
         passes.append("run 已 completed 且 summary terminal=true")
+    elif approval_boundary_case and status == "needs_human" and terminal is True:
+        passes.append("保存/变更类 run 已进入 needs_human 审批等待态")
     else:
         issues.append(f"run 未正常 completed，status={status} terminal={terminal}")
-    if assistant_visible and assistant_message_length > 0:
+    if approval_boundary_case and status == "needs_human":
+        passes.append("审批等待态不要求最终 assistant_message")
+    elif assistant_visible and assistant_message_length > 0:
         passes.append("最终 assistant_message 可见且非空")
     else:
         issues.append("最终 assistant_message 不可见或为空")
-    if model_started_count > 0 and model_delta_count > 0:
+    if approval_boundary_case and model_started_count > 0:
+        passes.append("事件链包含 model.started")
+    elif model_started_count > 0 and model_delta_count > 0:
         passes.append("事件链包含 model.started 与 model.delta")
     else:
         issues.append("事件链缺少 model.started 或 model.delta")
@@ -1363,6 +1536,10 @@ def evaluate_case(result: dict[str, Any]) -> dict[str, Any]:
         issues.append("工具链摘要缺失或类型异常")
     if case_has_assertion(case_id, "tool_diagnostic_chain"):
         evaluate_tool_diagnostic_chain(result, passes, issues)
+    if case_has_assertion(case_id, "testcase_query_tool_use"):
+        evaluate_testcase_query_tool_use(tool_names, passes, issues)
+    if case_has_assertion(case_id, "approval_required_boundary"):
+        evaluate_approval_required_boundary(result, tool_calls, passes, issues)
 
     if case_id == "T01":
         if isinstance(result.get("tool_names"), list) and not tool_names:
@@ -1416,14 +1593,7 @@ def evaluate_case(result: dict[str, Any]) -> dict[str, Any]:
         else:
             passes.append("未把明显非鉴权可修复项直接甩给用户")
     elif case_id == "T06":
-        if not SAVE_CLAIM_RE.search(message):
-            passes.append("没有声称保存正式场景")
-        else:
-            issues.append("错误声称已保存正式场景")
-        if any(word in message for word in ("无法", "不能", "当前", "工具", "保存", "草稿", "正式场景")):
-            passes.append("对无保存工具/正式保存边界有说明")
-        else:
-            issues.append("未清晰说明保存边界")
+        evaluate_scenario_save_reuses_draft(result, passes, issues)
     elif case_id == "T07":
         if any(word in message for word in ("数据集", "多", "循环", "companyId", "前")):
             passes.append("理解 companyId 多企业数据集参数化诉求")
@@ -1446,6 +1616,14 @@ def evaluate_case(result: dict[str, Any]) -> dict[str, Any]:
             passes.append("说明测试领域能力边界")
         else:
             issues.append("未说明测试领域能力边界")
+    elif case_id == "T10":
+        evaluate_case_analysis_to_scenario_save(result, passes, issues)
+    elif case_id == "T12":
+        evaluate_case_analysis_to_assertion_save(result, passes, issues)
+    elif case_id == "T13":
+        evaluate_scenario_compose(result, passes, issues)
+    elif case_id == "T15":
+        evaluate_scenario_compose_assets_then_save(result, passes, issues)
 
     score = max(0, round(100 * len(passes) / max(len(passes) + len(issues), 1)))
     return {"score": score, "passed": not issues, "passes": passes, "issues": issues}
@@ -1468,6 +1646,91 @@ def evaluate_tool_diagnostic_chain(result: dict[str, Any], passes: list[str], is
         issues.append("ToolCall 诊断链缺少 execution_context/dispatch_trace 摘要")
     else:
         passes.append("工具调用携带 execution_context 与 dispatch_trace 诊断摘要")
+
+
+def evaluate_testcase_query_tool_use(tool_names: list[str], passes: list[str], issues: list[str]) -> None:
+    if "testcase.query_project_cases" in tool_names:
+        passes.append("按需调用 testcase.query_project_cases 获取真实用例事实")
+    else:
+        issues.append(f"测试用例分析未调用 testcase.query_project_cases，实际={tool_names}")
+
+
+def evaluate_approval_required_boundary(
+    result: dict[str, Any],
+    tool_calls: list[dict[str, Any]],
+    passes: list[str],
+    issues: list[str],
+) -> None:
+    case_id = str(result.get("case_id") or "")
+    expected_tools = expected_approval_tool_names_for_case(case_id)
+    status = result.get("status")
+    message = text_value(result.get("assistant_message"))
+    if status == "needs_human":
+        passes.append("副作用工具提交后停在人工审批边界")
+    else:
+        issues.append(f"副作用工具未进入人工审批等待态，status={status}")
+    if expected_tools and approval_required_tool_seen(tool_calls, expected_tools):
+        passes.append("目标保存/变更 ToolCall 标记 approval_required=true")
+    else:
+        issues.append(f"未发现目标保存/变更审批 ToolCall，期望={sorted(expected_tools)}")
+    if not SAVE_CLAIM_RE.search(message):
+        passes.append("审批前未声称业务对象已保存成功")
+    else:
+        issues.append("审批前错误声称业务对象已保存成功")
+
+
+def evaluate_scenario_save_reuses_draft(result: dict[str, Any], passes: list[str], issues: list[str]) -> None:
+    tool_names = string_list(result.get("tool_names"))
+    tool_calls = dict_list(result.get("tool_calls"))
+    save_tools = {"scenario.create_saved", "scenario.update_saved"}
+    if any(name in save_tools for name in tool_names):
+        passes.append("调用场景保存工具提交审批")
+    else:
+        issues.append(f"未调用场景保存工具，实际={tool_names}")
+    if any_tool_input_has_key(tool_calls, "scenario.create_saved", "scenario_draft_source") or any_tool_input_has_key(
+        tool_calls,
+        "scenario.update_saved",
+        "scenario_draft_source",
+    ):
+        passes.append("场景保存输入包含 scenario_draft_source，复用同会话完整草稿")
+    else:
+        issues.append("场景保存输入未携带 scenario_draft_source，可能从摘要重构")
+
+
+def evaluate_case_analysis_to_scenario_save(result: dict[str, Any], passes: list[str], issues: list[str]) -> None:
+    tool_names = string_list(result.get("tool_names"))
+    if "scenario.compose_draft" in tool_names:
+        passes.append("测试用例分析后继续组合自动化测试流程草稿")
+    else:
+        issues.append(f"测试用例分析后未组合场景草稿，实际={tool_names}")
+    evaluate_scenario_save_reuses_draft(result, passes, issues)
+
+
+def evaluate_case_analysis_to_assertion_save(result: dict[str, Any], passes: list[str], issues: list[str]) -> None:
+    tool_names = string_list(result.get("tool_names"))
+    assertion_save_tools = {
+        "testcase.update_assertions",
+        "testcase.batch_update_assertions",
+        "websocket_testcase.update_assertions",
+        "websocket_testcase.batch_update_assertions",
+    }
+    if any(name in assertion_save_tools for name in tool_names):
+        passes.append("测试用例分析后提交断言保存审批")
+    else:
+        issues.append(f"未发现断言保存工具调用，实际={tool_names}")
+    if "testcase.query_project_cases" in tool_names or "tool_result.read_full" in tool_names:
+        passes.append("断言保存前复用或读取同会话测试用例事实")
+    else:
+        issues.append("断言保存前未观察到测试用例事实查询或 tool_result.read_full")
+
+
+def evaluate_scenario_compose_assets_then_save(result: dict[str, Any], passes: list[str], issues: list[str]) -> None:
+    tool_names = string_list(result.get("tool_names"))
+    if any(name in {"scenario.create_saved", "scenario.update_saved"} for name in tool_names):
+        passes.append("项目资产查询后仍提交保存自动化测试流程")
+    else:
+        issues.append(f"项目资产查询后未调用场景保存工具，实际={tool_names}")
+    evaluate_scenario_save_reuses_draft(result, passes, issues)
 
 
 def evaluate_scenario_compose(result: dict[str, Any], passes: list[str], issues: list[str]) -> None:

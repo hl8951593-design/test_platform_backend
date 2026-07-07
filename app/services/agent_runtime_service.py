@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -10,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 from fastapi import HTTPException, status
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -38,7 +40,11 @@ from app.models.agent import (
     AgentToolCall,
     AgentWorkerQueue,
 )
+from app.models.project import ProjectEnvironment
+from app.models.scenario import TestScenario
+from app.models.test_case import TestCase
 from app.models.user import User
+from app.models.websocket_test_case import WebSocketTestCase
 from app.schemas.ai import AIChatMessage, AIChatRequest
 from app.schemas.agent import (
     AgentContextBuildCreateRequest,
@@ -46,10 +52,31 @@ from app.schemas.agent import (
     AgentRunCreateRequest,
     AgentToolCallCreateRequest,
 )
+from app.schemas.scenario import ScenarioCreateRequest, ScenarioUpdateRequest
+from app.schemas.test_case import AssertionConfig, TestCaseCreateRequest, TestCaseUpdateRequest
+from app.schemas.websocket_test_case import (
+    WebSocketAssertionConfig,
+    WebSocketTestCaseCreateRequest,
+    WebSocketTestCaseUpdateRequest,
+)
 from app.services.agent_approval_service import ApprovalService, PolicyManager
 from app.services.agent_loop_service import ContextBuilder, EvidenceRefResolver, EvidenceWatchService, LoopController
 from app.services.agent_memory_service import MemoryCandidate, MemoryManager
-from app.services.agent_skill_registry import AgentSkill, AgentSkillRegistry
+from app.services.agent_skill_registry import (
+    AgentSkill,
+    AgentSkillRegistry,
+    intent_matches_routing_phrase,
+)
+from app.services.agent_trace import (
+    trace_debug,
+    trace_error,
+    trace_full_payload,
+    trace_info,
+    trace_message_summary,
+    trace_payload_summary,
+    trace_verbose_payload,
+    trace_warning,
+)
 from app.services.agent_tool_result_policy import FINAL_RESPONSE_BUDGET_INSTRUCTION, build_tool_result_message
 from app.services.ai_service import AIService
 from app.services.agent_tool_service import AgentToolBackend, SAFE_SIDE_EFFECT_CLASSES, ToolPolicyResolver, ToolRegistry
@@ -114,6 +141,14 @@ AGENT_CONTENT_PREVIEW_SUMMARY_VERSION = "agent_content_preview_summary_v1"
 AGENT_CONTENT_PREVIEW_MAX_CHARS = 512
 AGENT_CONTENT_PREVIEW_TRUNCATION_MARKER = "[agent_content_preview_truncated]"
 AGENT_TOOL_REQUEST_CONTEXT_SUMMARY_VERSION = "agent_tool_request_context_summary_v1"
+AGENT_FINAL_SUMMARY_TOOL_REQUEST_SUPPRESSED_MESSAGE = (
+    "工具执行结果已经进入上下文，但最终总结阶段模型又输出了工具请求。"
+    "后端已阻止该工具请求展示给用户；请查看上方 ToolCall 失败详情，修正输入后重新提交。"
+)
+AGENT_FINAL_SUMMARY_TOOL_REQUEST_SUPPRESSED_SUCCESS_MESSAGE = (
+    "工具已成功执行完成，但最终总结阶段模型又输出了工具请求。"
+    "后端已阻止重复工具请求展示给用户；本次运行已按已完成工具结果结束。"
+)
 AGENT_INTERNAL_TOOL_CONTEXT_LEAK_MESSAGE = (
     "工具执行已完成，但模型返回了仅供内部循环使用的工具上下文摘要；后端已阻止该摘要展示给用户。"
 )
@@ -148,6 +183,15 @@ AGENT_MARKDOWN_RESPONSE_PROMPT = """
 - 代码必须使用闭合 fenced block，并尽量标注语言。
 - 最终回复前自检 Markdown 能被前端渲染器直接渲染。
 """.strip()
+AGENT_BUSINESS_OBJECT_DISPLAY_PROMPT = """
+面向用户总结平台对象时，优先使用业务名称而不是只输出内部 ID：
+- 测试用例、WebSocket 用例、场景、计划、报告、缺陷、环境、执行记录等对象，如果工具结果同时提供 id 和 name/title/resource_name，必须展示为“名称（ID: 7）”或表格列“名称 / ID”，不要只写“用例 ID：7, 8, 10”。
+- 用例相关表格应优先包含“用例名称”“方法”“路径”“状态/问题”“ID”列；ID 只作为定位和后续工具输入，不作为用户理解结果的主要描述。
+- 当工具结果提供 `case_display_rows`、`case_attention_rows` 或 `object_reference_manifest.object_references` 时，用例名称必须逐字复制这些结构里的 `name`/`display_name`；禁止按路径、历史上下文、语义理解或旧对话内容改写、翻译、补全名称。
+- 如果需要按状态分组测试用例，优先使用工具结果里的 `case_status_summary` 与 `case_attention_rows`，不要自行重新匹配 ID 和名称。
+- 如果工具结果只有 ID 没有名称，必须说明“工具结果未返回名称”，再展示 ID，不能臆造名称。
+- 发起工具调用时仍必须使用工具 schema 要求的 id 字段；这条规则只改变面向用户的文字总结，不改变工具入参。
+""".strip()
 AGENT_TOOL_PROTOCOL_PROMPT = """
 可用工具如下：
 {tools}
@@ -158,6 +202,11 @@ AGENT_TOOL_PROTOCOL_PROMPT = """
 ```
 不要在工具请求前后输出面向用户的自然语言。工具执行结果返回后，再根据结果给用户最终答复。
 如果不需要工具，请直接用自然语言回答。
+
+测试用例工具约束：
+- 分析/展示用例时先用 `testcase.query_project_cases` 的 `detail_level="summary"`；查看少量用例断言或请求细节时，使用显式 `test_case_ids`/`websocket_test_case_ids` 并设置 `detail_level="selected"`、`"assertions"` 或 `"full"`。
+- 调用 `testcase.batch_execute`、`websocket_testcase.batch_execute`、`testcase.batch_update_assertions`、`websocket_testcase.batch_update_assertions` 前，必须重新调用 `testcase.query_project_cases`，对目标集合设置 `detail_level="execution_ready"`，然后复制返回的 `*_batch_execute_input`、`case_snapshot_id`、`object_references` 或显式 id 列表。不要从历史回复、用户口述、连续数字范围、summary 查询或 selected/assertions 查询拼批量输入。
+- 如果工具结果提示 `output_compacted_for_model`、`full_output_reference` 或 `full_output_read_tool`，需要更多事实时优先调用 `tool_result.read_full`，不要猜测被压缩的字段。
 """.strip()
 TOOL_REQUEST_BLOCK_RE = re.compile(r"```agent_tool_request\s*(?P<body>\{.*?\})\s*```", re.S)
 MARKDOWN_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
@@ -171,6 +220,8 @@ AGENT_HISTORY_CONTEXT_SUMMARY_CHARS = 360
 AGENT_HISTORY_CONTEXT_RECENT_USER_CHARS = 800
 AGENT_HISTORY_CONTEXT_RECENT_ASSISTANT_CHARS = 1200
 AGENT_HISTORY_CONTEXT_SOURCE_STATUS = "completed"
+AGENT_CONVERSATION_TOOL_ARTIFACT_MANIFEST_MAX_CALLS = 50
+AGENT_CONVERSATION_TOOL_ARTIFACT_CONTEXT_MAX_ITEMS = 12
 AGENT_HISTORY_CONTEXT_EXCLUDED_STATUSES = tuple(
     status for status in RUN_STATUSES if status != AGENT_HISTORY_CONTEXT_SOURCE_STATUS
 )
@@ -235,13 +286,17 @@ AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_MAX_CHARS = 3000
 AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_TRUNCATION_MARKER = (
     "\n\n[agent_classifier_prompt_truncated: full private classifier prompt is not injected into model context]"
 )
-AGENT_TOOL_RESULT_CONTEXT_TOTAL_MAX_CHARS = 12000
+AGENT_TOOL_RESULT_CONTEXT_TOTAL_MAX_CHARS = 64 * 1024
 AGENT_TOOL_RESULT_CONTEXT_TRUNCATION_MARKER = (
     "\n\n[agent_tool_result_context_truncated: additional tool results remain available in ToolCall detail]"
 )
 AGENT_REPAIR_CONTEXT_MAX_CHARS = 3000
 AGENT_REPAIR_CONTEXT_TRUNCATION_MARKER = (
     "\n\n[agent_repair_context_truncated: full previous model content is not injected into repair context]"
+)
+AGENT_FINAL_RESPONSE_REFERENCE_REPAIR_FALLBACK = (
+    "模型最终回复引用了不在最新工具查询结果中的测试用例 ID，后端已阻止该回复直接展示。"
+    "请基于上方最新 testcase.query_project_cases 工具结果重新生成总结。"
 )
 
 
@@ -1945,8 +2000,27 @@ class AgentConversationRunner:
                 .order_by(AgentToolCall.step_index.asc(), AgentToolCall.attempt_index.asc())
             ).all()
         )
+        auto_followup_calls = self._execute_post_save_dry_run_followups(
+            run=run,
+            current_user=user,
+            completed_calls=calls,
+        )
+        if auto_followup_calls:
+            calls.extend(auto_followup_calls)
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES or run.status == "needs_human":
+                return run
         messages = self._build_chat_messages(run, current_user=user, runtime=runtime)
         messages.extend(_tool_result_context_messages(calls))
+        trace_info(
+            "agent_trace_complete_after_tool_results_start",
+            run_id=run.run_id,
+            project_id=run.project_id,
+            user_id=user.id,
+            tool_call_count=len(calls),
+            requested_tool_call_count=len(tool_call_ids),
+            message_count=len(messages),
+        )
         messages.append(AIChatMessage(
             role="user",
             content="以上工具已完成审批和执行。请基于这些工具结果给用户最终回复，不要再请求工具。",
@@ -1967,6 +2041,16 @@ class AgentConversationRunner:
             if run.status in RUN_TERMINAL_STATUSES:
                 return run
             clean_model_payload = {key: value for key, value in model_payload.items() if value is not None}
+            if _looks_like_tool_request_content(content):
+                return self._complete_suppressed_final_summary_tool_request(
+                    run=run,
+                    runtime=runtime,
+                    content=content,
+                    iteration=run.current_iteration,
+                    tool_summaries=[_tool_call_summary(call) for call in calls],
+                    model_payload=clean_model_payload,
+                    resumed_after_approval=True,
+                )
             content, chunks = self._normalize_user_visible_markdown(
                 run=run,
                 runtime=runtime,
@@ -1979,6 +2063,52 @@ class AgentConversationRunner:
             self.db.refresh(run)
             if run.status in RUN_TERMINAL_STATUSES:
                 return run
+            content, chunks, clean_model_payload, final_repair_tool_request = self._repair_final_response_reference_issues(
+                run=run,
+                runtime=runtime,
+                messages=messages,
+                content=content,
+                chunks=chunks,
+                model_payload=clean_model_payload,
+                iteration=run.max_iterations,
+                final_summary=True,
+            )
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run
+            if final_repair_tool_request is not None:
+                return self._complete_suppressed_final_summary_tool_request(
+                    run=run,
+                    runtime=runtime,
+                    content=content,
+                    iteration=run.max_iterations,
+                    tool_summaries=[_tool_call_summary(call) for call in calls],
+                    model_payload=clean_model_payload,
+                    resumed_after_approval=True,
+                )
+            content, chunks, clean_model_payload, final_repair_tool_request = self._repair_final_response_reference_issues(
+                run=run,
+                runtime=runtime,
+                messages=messages,
+                content=content,
+                chunks=chunks,
+                model_payload=clean_model_payload,
+                iteration=run.current_iteration,
+                final_summary=True,
+            )
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run
+            if final_repair_tool_request is not None:
+                return self._complete_suppressed_final_summary_tool_request(
+                    run=run,
+                    runtime=runtime,
+                    content=content,
+                    iteration=run.current_iteration,
+                    tool_summaries=[_tool_call_summary(call) for call in calls],
+                    model_payload=clean_model_payload,
+                    resumed_after_approval=True,
+                )
             self._emit_model_deltas(
                 run=run,
                 runtime=runtime,
@@ -2003,6 +2133,15 @@ class AgentConversationRunner:
             self.db.refresh(run)
             if run.status in RUN_TERMINAL_STATUSES:
                 return run
+            trace_info(
+                "agent_trace_run_completed",
+                run_id=run.run_id,
+                project_id=run.project_id,
+                completion_mode="after_approval_tools",
+                iteration=run.current_iteration,
+                tool_call_count=len(calls),
+                content_length=len(content),
+            )
             return runtime.complete_run(
                 run,
                 {
@@ -2030,6 +2169,146 @@ class AgentConversationRunner:
                 original_exception=exc,
             )
 
+    def _execute_post_save_dry_run_followups(
+        self,
+        *,
+        run: AgentRun,
+        current_user: User,
+        completed_calls: list[AgentToolCall],
+    ) -> list[AgentToolCall]:
+        if not _intent_requests_save_then_execute(run.intent):
+            return []
+        saved = self._saved_scenario_from_tool_calls(completed_calls)
+        if saved is None:
+            return []
+        scenario_id = saved["scenario_id"]
+        if self._has_existing_scenario_dry_run_call(run=run, scenario_id=scenario_id):
+            return []
+
+        runtime = AgentRuntimeService(self.db)
+        followups: list[AgentToolCall] = []
+        query_input: dict[str, Any] = {
+            "project_id": run.project_id,
+            "detail_level": "summary",
+            "page_size": 50,
+        }
+        if saved.get("name"):
+            query_input["keyword"] = saved["name"]
+        runtime.append_event(
+            run,
+            "tool.auto_followup_requested",
+            {
+                "source_tool_call_id": saved["tool_call_id"],
+                "source_tool_name": saved["tool_name"],
+                "tool_name": "scenario.query_project_scenarios",
+                "reason": "save_then_execute_requires_fresh_scenario_snapshot",
+                "scenario_id": scenario_id,
+            },
+            commit=False,
+        )
+        query_call = self._create_and_execute_tool_request(
+            run=run,
+            current_user=current_user,
+            tool_request=AgentToolRequest(
+                tool_name="scenario.query_project_scenarios",
+                tool_input=query_input,
+                reason="保存成功后按用户要求执行场景前，先刷新场景快照。",
+            ),
+            iteration=run.current_iteration,
+        )
+        followups.append(query_call)
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES or run.status == "needs_human":
+            return followups
+        if query_call.status != "succeeded":
+            return followups
+
+        dry_run_input: dict[str, Any] = {
+            "project_id": run.project_id,
+            "scenario_id": scenario_id,
+            "idempotency_key": f"{run.run_id}:{saved['tool_call_id']}:post-save-dry-run",
+        }
+        if saved.get("environment_id") is not None:
+            dry_run_input["environment_id"] = saved["environment_id"]
+        if saved.get("current_version") is not None:
+            dry_run_input["scenario_version"] = saved["current_version"]
+        runtime.append_event(
+            run,
+            "tool.auto_followup_requested",
+            {
+                "source_tool_call_id": saved["tool_call_id"],
+                "source_tool_name": saved["tool_name"],
+                "tool_name": "scenario.execute_dry_run",
+                "reason": "user_requested_save_then_execute",
+                "scenario_id": scenario_id,
+                "environment_id": saved.get("environment_id"),
+            },
+            commit=False,
+        )
+        dry_run_call = self._create_and_execute_tool_request(
+            run=run,
+            current_user=current_user,
+            tool_request=AgentToolRequest(
+                tool_name="scenario.execute_dry_run",
+                tool_input=dry_run_input,
+                reason="保存成功后按用户要求立即执行场景 dry-run。",
+            ),
+            iteration=run.current_iteration,
+        )
+        followups.append(dry_run_call)
+        return followups
+
+    @staticmethod
+    def _saved_scenario_from_tool_calls(calls: list[AgentToolCall]) -> dict[str, Any] | None:
+        for call in calls:
+            if call.tool_name not in {"scenario.create_saved", "scenario.update_saved"}:
+                continue
+            if call.status != "succeeded":
+                continue
+            output = call.output_json_redacted if isinstance(call.output_json_redacted, dict) else {}
+            scenario = output.get("scenario") if isinstance(output.get("scenario"), dict) else {}
+            scenario_id = _optional_positive_int(output.get("scenario_id"))
+            if scenario_id is None:
+                scenario_id = _optional_positive_int(scenario.get("id"))
+            if scenario_id is None:
+                continue
+            environment_id = _optional_positive_int(scenario.get("environment_id"))
+            if environment_id is None:
+                environment_id = _optional_positive_int(scenario.get("environmentId"))
+            if environment_id is None:
+                environment_id = _optional_positive_int(output.get("environment_id"))
+            current_version = _optional_positive_int(scenario.get("current_version"))
+            if current_version is None:
+                current_version = _optional_positive_int(scenario.get("currentVersion"))
+            if current_version is None:
+                current_version = _optional_positive_int(output.get("current_version"))
+            return {
+                "tool_call_id": call.tool_call_id,
+                "tool_name": call.tool_name,
+                "scenario_id": scenario_id,
+                "environment_id": environment_id,
+                "current_version": current_version,
+                "name": str(scenario.get("name") or output.get("name") or "").strip(),
+            }
+        return None
+
+    def _has_existing_scenario_dry_run_call(self, *, run: AgentRun, scenario_id: int) -> bool:
+        calls = list(
+            self.db.scalars(
+                select(AgentToolCall)
+                .where(
+                    AgentToolCall.run_id == run.run_id,
+                    AgentToolCall.tool_name == "scenario.execute_dry_run",
+                )
+                .order_by(AgentToolCall.id.desc())
+            ).all()
+        )
+        for call in calls:
+            payload = call.input_json_redacted if isinstance(call.input_json_redacted, dict) else {}
+            if _optional_positive_int(payload.get("scenario_id")) == scenario_id:
+                return True
+        return False
+
     def run(self, *, run_id: str, user_id: int) -> AgentRun | None:
         runtime = AgentRuntimeService(self.db)
         run = self.db.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
@@ -2042,6 +2321,16 @@ class AgentConversationRunner:
             return run
 
         try:
+            trace_info(
+                "agent_trace_run_start",
+                run_id=run.run_id,
+                project_id=run.project_id,
+                user_id=user.id,
+                conversation_id=run.conversation_id,
+                status=run.status,
+                max_iterations=run.max_iterations,
+                intent_chars=len(run.intent or ""),
+            )
             logger.info(
                 "agent_conversation_start run_id=%s project_id=%s user_id=%s conversation_id=%s max_iterations=%s",
                 run.run_id,
@@ -2058,11 +2347,27 @@ class AgentConversationRunner:
                 return self._complete_unsupported_capability(run=run, runtime=runtime, guard=unsupported_guard)
 
             messages = self._build_chat_messages(run, current_user=user, runtime=runtime)
+            trace_debug(
+                "agent_trace_context_built",
+                run_id=run.run_id,
+                project_id=run.project_id,
+                **trace_message_summary(messages),
+            )
             tool_summaries: list[dict[str, Any]] = []
             for iteration in range(max(1, run.max_iterations)):
                 self.db.refresh(run)
                 if run.status in RUN_TERMINAL_STATUSES:
                     return run
+                trace_info(
+                    "agent_trace_iteration_start",
+                    run_id=run.run_id,
+                    project_id=run.project_id,
+                    iteration=iteration,
+                    status=run.status,
+                    current_step_index=run.current_step_index,
+                    message_count=len(messages),
+                    tool_call_count=len(tool_summaries),
+                )
                 content, chunks, model_payload = self._stream_model_response(
                     run=run,
                     messages=messages,
@@ -2075,7 +2380,11 @@ class AgentConversationRunner:
                     return run
                 clean_model_payload = {key: value for key, value in model_payload.items() if value is not None}
                 try:
-                    tool_request = self._parse_tool_request(content)
+                    tool_request = self._parse_tool_request(
+                        content,
+                        normalize_evidence_refs=True,
+                        normalize_single_evidence_ref_object=False,
+                    )
                 except HTTPException as exc:
                     content, chunks, clean_model_payload, tool_request = self._repair_invalid_tool_request(
                         run=run,
@@ -2148,39 +2457,62 @@ class AgentConversationRunner:
                         self.db.refresh(run)
                         if run.status in RUN_TERMINAL_STATUSES:
                             return run
-                        self._emit_model_deltas(
+                        content, chunks, clean_model_payload, tool_request = self._repair_final_response_reference_issues(
                             run=run,
                             runtime=runtime,
+                            messages=messages,
+                            content=content,
                             chunks=chunks,
-                            trace_payload=_model_trace_from_payload(clean_model_payload),
+                            model_payload=clean_model_payload,
+                            iteration=iteration,
+                            final_summary=False,
                         )
                         self.db.refresh(run)
                         if run.status in RUN_TERMINAL_STATUSES:
                             return run
-                        runtime.append_event(
-                            run,
-                            "model.completed",
-                            {
-                                "content": content,
-                                "iteration": iteration,
-                                "requested_tool": False,
-                                **clean_model_payload,
-                            },
-                            commit=False,
-                        )
-                        self.db.refresh(run)
-                        if run.status in RUN_TERMINAL_STATUSES:
-                            return run
-                        result = {"message": content, **clean_model_payload}
-                        if tool_summaries:
-                            result["tool_calls"] = tool_summaries
-                        logger.info(
-                            "agent_conversation_complete_without_tool run_id=%s iteration=%s content_length=%s",
-                            run.run_id,
-                            iteration,
-                            len(content),
-                        )
-                        return runtime.complete_run(run, result, commit=True)
+                        if tool_request is None:
+                            self._emit_model_deltas(
+                                run=run,
+                                runtime=runtime,
+                                chunks=chunks,
+                                trace_payload=_model_trace_from_payload(clean_model_payload),
+                            )
+                            self.db.refresh(run)
+                            if run.status in RUN_TERMINAL_STATUSES:
+                                return run
+                            runtime.append_event(
+                                run,
+                                "model.completed",
+                                {
+                                    "content": content,
+                                    "iteration": iteration,
+                                    "requested_tool": False,
+                                    **clean_model_payload,
+                                },
+                                commit=False,
+                            )
+                            self.db.refresh(run)
+                            if run.status in RUN_TERMINAL_STATUSES:
+                                return run
+                            result = {"message": content, **clean_model_payload}
+                            if tool_summaries:
+                                result["tool_calls"] = tool_summaries
+                            trace_info(
+                                "agent_trace_run_completed",
+                                run_id=run.run_id,
+                                project_id=run.project_id,
+                                completion_mode="without_tool",
+                                iteration=iteration,
+                                tool_call_count=len(tool_summaries),
+                                content_length=len(content),
+                            )
+                            logger.info(
+                                "agent_conversation_complete_without_tool run_id=%s iteration=%s content_length=%s",
+                                run.run_id,
+                                iteration,
+                                len(content),
+                            )
+                            return runtime.complete_run(run, result, commit=True)
 
                 runtime.append_event(
                     run,
@@ -2192,11 +2524,21 @@ class AgentConversationRunner:
                         ),
                         "iteration": iteration,
                         "requested_tool": True,
+                        "assistant_visible": False,
                         **clean_model_payload,
                     },
                     commit=False,
                 )
                 detected_event_payload = tool_request.detected_event_payload(iteration=iteration)
+                trace_info(
+                    "agent_trace_tool_request_detected",
+                    run_id=run.run_id,
+                    project_id=run.project_id,
+                    iteration=iteration,
+                    tool_name=tool_request.tool_name,
+                    evidence_ref_count=len(tool_request.evidence_refs_for_ledger()),
+                    reason_chars=len(tool_request.reason or ""),
+                )
                 runtime.append_event(
                     run,
                     "model.tool_request_detected",
@@ -2260,6 +2602,16 @@ class AgentConversationRunner:
                         commit=True,
                     )
                 _append_tool_result_context_message(messages, call)
+                trace_debug(
+                    "agent_trace_tool_result_context_appended",
+                    run_id=run.run_id,
+                    project_id=run.project_id,
+                    iteration=iteration,
+                    tool_call_id=call.tool_call_id,
+                    tool_name=call.tool_name,
+                    status=call.status,
+                    message_count=len(messages),
+                )
 
             self._record_max_iterations_loop_observation(
                 run=run,
@@ -2289,6 +2641,16 @@ class AgentConversationRunner:
             if run.status in RUN_TERMINAL_STATUSES:
                 return run
             clean_model_payload = {key: value for key, value in model_payload.items() if value is not None}
+            if _looks_like_tool_request_content(content):
+                return self._complete_suppressed_final_summary_tool_request(
+                    run=run,
+                    runtime=runtime,
+                    content=content,
+                    iteration=run.max_iterations,
+                    tool_summaries=tool_summaries,
+                    model_payload=clean_model_payload,
+                    resumed_after_approval=False,
+                )
             content, chunks = self._normalize_user_visible_markdown(
                 run=run,
                 runtime=runtime,
@@ -2325,6 +2687,15 @@ class AgentConversationRunner:
                 len(tool_summaries),
                 len(content),
             )
+            trace_info(
+                "agent_trace_run_completed",
+                run_id=run.run_id,
+                project_id=run.project_id,
+                completion_mode="after_tools",
+                iteration=run.max_iterations,
+                tool_call_count=len(tool_summaries),
+                content_length=len(content),
+            )
             return runtime.complete_run(run, {"message": content, "tool_calls": tool_summaries, **clean_model_payload}, commit=True)
         except HTTPException as exc:
             error_code = "agent_conversation_model_error"
@@ -2335,6 +2706,14 @@ class AgentConversationRunner:
                 run.run_id,
                 run.project_id,
                 bounded_detail,
+            )
+            trace_warning(
+                "agent_trace_run_failed",
+                run_id=run.run_id,
+                project_id=run.project_id,
+                error_code=error_code,
+                error_type=type(exc).__name__,
+                error_message_chars=len(str(bounded_detail)),
             )
             return self._fail_run_after_exception(
                 run=run,
@@ -2353,6 +2732,14 @@ class AgentConversationRunner:
                 type(exc).__name__,
                 bounded_detail,
             )
+            trace_error(
+                "agent_trace_run_failed",
+                run_id=run.run_id,
+                project_id=run.project_id,
+                error_code=error_code,
+                error_type=type(exc).__name__,
+                error_message_chars=len(str(bounded_detail)),
+            )
             return self._fail_run_after_exception(
                 run=run,
                 runtime=runtime,
@@ -2360,6 +2747,75 @@ class AgentConversationRunner:
                 error_message=bounded_detail,
                 original_exception=exc,
             )
+
+    def _complete_suppressed_final_summary_tool_request(
+        self,
+        *,
+        run: AgentRun,
+        runtime: AgentRuntimeService,
+        content: str,
+        iteration: int,
+        tool_summaries: list[dict[str, Any]],
+        model_payload: dict[str, Any],
+        resumed_after_approval: bool,
+    ) -> AgentRun:
+        trace_payload = _model_trace_from_payload(model_payload)
+        trace_warning(
+            "agent_trace_final_summary_tool_request_suppressed",
+            run_id=run.run_id,
+            project_id=run.project_id,
+            iteration=iteration,
+            resumed_after_approval=resumed_after_approval,
+            tool_call_count=len(tool_summaries),
+            content_length=len(content),
+        )
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return run
+        runtime.append_event(
+            run,
+            "model.markdown_normalized",
+            {
+                "iteration": iteration,
+                "final_summary": True,
+                "content": "",
+                "replace_content": True,
+                "normalization_reason": "final_summary_tool_request_suppressed",
+                **trace_payload,
+            },
+            commit=False,
+        )
+        runtime.append_event(
+            run,
+            "model.completed",
+            {
+                "content": _bounded_agent_content_preview(
+                    content,
+                    reference="AgentConversationRunner.model.completed.final_summary_tool_request.content",
+                ),
+                "iteration": iteration,
+                "final_summary": True,
+                "requested_tool": True,
+                "assistant_visible": False,
+                "final_summary_tool_request_suppressed": True,
+                "resumed_after_approval": resumed_after_approval,
+                **model_payload,
+            },
+            commit=False,
+        )
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return run
+        return runtime.complete_run(
+            run,
+            {
+                "message": _final_summary_tool_request_suppressed_message(tool_summaries),
+                "tool_calls": tool_summaries,
+                "final_summary_tool_request_suppressed": True,
+                **model_payload,
+            },
+            commit=True,
+        )
 
     def _unsupported_capability_guard_for_run(self, run: AgentRun) -> UnsupportedCapabilityGuard | None:
         available_tools = {spec.name for spec in ToolRegistry().list_specs()}
@@ -2504,7 +2960,7 @@ class AgentConversationRunner:
         )
 
     def _should_suppress_realtime_deltas(self, run: AgentRun) -> bool:
-        return _intent_likely_requires_agent_tool(run.intent)
+        return True
 
     def _missing_required_tool_after_model_response(self, run: AgentRun) -> RequiredToolFollowupRule | None:
         for rule in _required_tool_followup_rules_for_intent(run.intent):
@@ -2603,8 +3059,9 @@ class AgentConversationRunner:
         if run.status in RUN_TERMINAL_STATUSES:
             return repaired_content, repaired_chunks, repaired_payload, None
         clean_payload = {key: value for key, value in repaired_payload.items() if value is not None}
+        repair_strategy = None
         try:
-            tool_request = self._parse_tool_request(repaired_content)
+            tool_request, repair_strategy = self._parse_repaired_tool_request(repaired_content)
         except HTTPException as exc:
             self.db.refresh(run)
             if run.status in RUN_TERMINAL_STATUSES:
@@ -2641,6 +3098,7 @@ class AgentConversationRunner:
                 "required_tool": required_followup.required_tool,
                 "requested_tool": tool_request is not None,
                 "tool_name": tool_request.tool_name if tool_request else None,
+                **({"repair_strategy": repair_strategy} if repair_strategy else {}),
             },
             commit=True,
         )
@@ -2903,6 +3361,34 @@ class AgentConversationRunner:
             repair_attempt,
             len(messages),
         )
+        trace_info(
+            "agent_trace_model_call_start",
+            run_id=run.run_id,
+            project_id=run.project_id,
+            iteration=iteration,
+            final_summary=final_summary,
+            repair_attempt=repair_attempt,
+            suppress_visible_deltas=suppress_visible_deltas,
+            loop_step=resolved_loop_step,
+            model_call_id=trace_payload.get("model_call_id"),
+            provider=AIService.provider,
+            **trace_message_summary(messages),
+        )
+        trace_full_payload(
+            "agent_trace_model_prompt_full_payload",
+            _chat_messages_trace_payload(messages),
+            prefix="messages",
+            mask=True,
+            run_id=run.run_id,
+            project_id=run.project_id,
+            iteration=iteration,
+            final_summary=final_summary,
+            repair_attempt=repair_attempt,
+            suppress_visible_deltas=suppress_visible_deltas,
+            loop_step=resolved_loop_step,
+            model_call_id=trace_payload.get("model_call_id"),
+            provider=AIService.provider,
+        )
         self._release_db_transaction_before_external_wait()
         request = AIChatRequest(messages=messages, temperature=0.2)
         deltas_emitted = False
@@ -3011,20 +3497,36 @@ class AgentConversationRunner:
                         content = "".join(content_parts)
                         if "```agent_tool_request" in content:
                             tool_request_marker_seen = True
+                            visible_content = _visible_content_before_tool_request(content)
                             pending_visible_deltas.clear()
                             pending_visible_chars = 0
-                            if deltas_emitted and not visible_deltas_retracted:
+                            if visible_content and not suppress_visible_deltas and not visible_deltas_retracted:
+                                if not deltas_emitted:
+                                    runtime.append_event(
+                                        run,
+                                        "model.delta",
+                                        {
+                                            "iteration": iteration,
+                                            "final_summary": final_summary,
+                                            "repair_attempt": repair_attempt,
+                                            "content": visible_content,
+                                            **trace_payload,
+                                        },
+                                        commit=True,
+                                    )
+                                    self._release_db_transaction_before_external_wait()
+                                    deltas_emitted = True
                                 runtime.append_event(
                                     run,
                                     "model.markdown_normalized",
-                                    {
-                                        "iteration": iteration,
-                                        "final_summary": final_summary,
-                                        "repair_attempt": repair_attempt,
-                                        "content": "",
-                                        "replace_content": True,
-                                        "normalization_reason": "tool_request_stream_suppressed",
-                                        **trace_payload,
+                                        {
+                                            "iteration": iteration,
+                                            "final_summary": final_summary,
+                                            "repair_attempt": repair_attempt,
+                                            "content": "",
+                                            "replace_content": True,
+                                            "normalization_reason": "tool_request_stream_suppressed",
+                                            **trace_payload,
                                     },
                                     commit=True,
                                 )
@@ -3126,6 +3628,57 @@ class AgentConversationRunner:
             model_payload.get("model"),
             stream_interrupted,
         )
+        trace_info(
+            "agent_trace_model_call_done",
+            run_id=run.run_id,
+            project_id=run.project_id,
+            iteration=iteration,
+            final_summary=final_summary,
+            repair_attempt=repair_attempt,
+            loop_step=resolved_loop_step,
+            model_call_id=trace_payload.get("model_call_id"),
+            content_length=len(content),
+            chunk_count=len(content_parts),
+            deltas_emitted=deltas_emitted,
+            finish_reason=model_payload.get("finish_reason"),
+            model=model_payload.get("model"),
+            stream_interrupted=stream_interrupted,
+            tool_request_marker_seen=tool_request_marker_seen,
+        )
+        trace_verbose_payload(
+            "agent_trace_model_response_payload",
+            content,
+            prefix="content",
+            mask=False,
+            run_id=run.run_id,
+            project_id=run.project_id,
+            iteration=iteration,
+            final_summary=final_summary,
+            repair_attempt=repair_attempt,
+            loop_step=resolved_loop_step,
+            model_call_id=trace_payload.get("model_call_id"),
+            finish_reason=model_payload.get("finish_reason"),
+            model=model_payload.get("model"),
+            stream_interrupted=stream_interrupted,
+            tool_request_marker_seen=tool_request_marker_seen,
+        )
+        trace_full_payload(
+            "agent_trace_model_response_full_payload",
+            content,
+            prefix="content",
+            mask=False,
+            run_id=run.run_id,
+            project_id=run.project_id,
+            iteration=iteration,
+            final_summary=final_summary,
+            repair_attempt=repair_attempt,
+            loop_step=resolved_loop_step,
+            model_call_id=trace_payload.get("model_call_id"),
+            finish_reason=model_payload.get("finish_reason"),
+            model=model_payload.get("model"),
+            stream_interrupted=stream_interrupted,
+            tool_request_marker_seen=tool_request_marker_seen,
+        )
         if suppress_visible_deltas and not deltas_emitted:
             if content and not _looks_like_tool_request_content(content):
                 return content, [content], model_payload
@@ -3190,7 +3743,8 @@ class AgentConversationRunner:
         content: str,
         *,
         allow_surrounding_text: bool = False,
-        normalize_evidence_refs: bool = False,
+        normalize_evidence_refs: bool = True,
+        normalize_single_evidence_ref_object: bool = True,
     ) -> AgentToolRequest | None:
         raw = None
         match = TOOL_REQUEST_BLOCK_RE.search(content)
@@ -3232,12 +3786,10 @@ class AgentConversationRunner:
         if evidence_refs is None:
             evidence_refs = []
         if normalize_evidence_refs:
-            if isinstance(evidence_refs, dict):
-                evidence_refs = [evidence_refs] if evidence_refs else []
-            elif isinstance(evidence_refs, list):
-                evidence_refs = [item for item in evidence_refs if isinstance(item, dict)]
-            else:
-                evidence_refs = []
+            evidence_refs = _normalize_model_evidence_refs(
+                evidence_refs,
+                allow_single_object=normalize_single_evidence_ref_object,
+            )
         if not isinstance(evidence_refs, list) or not all(isinstance(item, dict) for item in evidence_refs):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型工具 evidence_refs 必须是对象列表")
         return AgentToolRequest(
@@ -3335,8 +3887,9 @@ class AgentConversationRunner:
         if run.status in RUN_TERMINAL_STATUSES:
             return repaired_content, repaired_chunks, repaired_payload, None
         clean_payload = {key: value for key, value in repaired_payload.items() if value is not None}
+        repair_strategy = None
         try:
-            tool_request = self._parse_tool_request(repaired_content)
+            tool_request, repair_strategy = self._parse_repaired_tool_request(repaired_content)
         except HTTPException as exc:
             self.db.refresh(run)
             if run.status in RUN_TERMINAL_STATUSES:
@@ -3370,11 +3923,203 @@ class AgentConversationRunner:
                 "iteration": iteration,
                 "requested_tool": tool_request is not None,
                 "tool_name": tool_request.tool_name if tool_request else None,
+                **({"repair_strategy": repair_strategy} if repair_strategy else {}),
                 **_model_trace_from_payload(clean_payload),
             },
             commit=True,
         )
         return repaired_content, repaired_chunks, clean_payload, tool_request
+
+    def _repair_final_response_reference_issues(
+        self,
+        *,
+        run: AgentRun,
+        runtime: AgentRuntimeService,
+        messages: list[AIChatMessage],
+        content: str,
+        chunks: list[str],
+        model_payload: dict[str, Any],
+        iteration: int,
+        final_summary: bool,
+    ) -> tuple[str, list[str], dict[str, Any], AgentToolRequest | None]:
+        reference_context = self._latest_test_case_reference_context(run.run_id)
+        if reference_context is None:
+            return content, chunks, model_payload, None
+        invalid_ids = _invalid_test_case_ids_in_final_response(
+            content,
+            valid_ids=set(reference_context["valid_test_case_ids"]),
+        )
+        if not invalid_ids:
+            return content, chunks, model_payload, None
+
+        trace_payload = _model_trace_from_payload(model_payload)
+        runtime.append_event(
+            run,
+            "model.final_response_reference_invalid",
+            {
+                "iteration": iteration,
+                "final_summary": final_summary,
+                "invalid_test_case_ids": invalid_ids,
+                "valid_test_case_ids": reference_context["valid_test_case_ids"],
+                "source_tool_call_id": reference_context["tool_call_id"],
+                "content_preview": _bounded_agent_content_preview(
+                    content,
+                    reference="AgentConversationRunner.model.final_response_reference_invalid.content",
+                ),
+                **trace_payload,
+            },
+            commit=True,
+        )
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return content, [], model_payload, None
+
+        repair_messages = [
+            *messages,
+            AIChatMessage(role="assistant", content=_bounded_repair_context(content)),
+            AIChatMessage(
+                role="user",
+                content=(
+                    "上一条最终回复引用了不存在于最新 testcase.query_project_cases 工具结果中的测试用例 ID。"
+                    f"无效 ID：{invalid_ids}。"
+                    "请重写最终用户回复：只能使用下面 authoritative_case_display_rows 中的 id/name/method/path/status；"
+                    "不要按连续数字区间补全，不要复用旧对话中的用例名称或 ID。"
+                    f"\nauthoritative_valid_test_case_ids={reference_context['valid_test_case_ids']}"
+                    f"\nauthoritative_case_display_rows={json.dumps(reference_context['case_display_rows'], ensure_ascii=False, default=str)}"
+                ),
+            ),
+        ]
+        repaired_content, repaired_chunks, repaired_payload = self._stream_model_response(
+            run=run,
+            messages=repair_messages,
+            runtime=runtime,
+            iteration=iteration,
+            final_summary=final_summary,
+            repair_attempt=True,
+            suppress_visible_deltas=True,
+            loop_step="final_response_reference_repair",
+        )
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            return repaired_content, repaired_chunks, repaired_payload, None
+        clean_payload = {key: value for key, value in repaired_payload.items() if value is not None}
+        try:
+            repaired_tool_request, repair_strategy = self._parse_repaired_tool_request(repaired_content)
+        except HTTPException as exc:
+            if not _looks_like_tool_request_content(repaired_content):
+                raise
+            repair_error_message = _bounded_agent_error_message(
+                _http_exception_detail(exc),
+                reference="AgentConversationRunner.model.final_response_reference_tool_request_repair_failed",
+            )
+            runtime.append_event(
+                run,
+                "model.final_response_reference_repair_failed",
+                {
+                    "iteration": iteration,
+                    "final_summary": final_summary,
+                    "invalid_test_case_ids": invalid_ids,
+                    "valid_test_case_ids": reference_context["valid_test_case_ids"],
+                    "source_tool_call_id": reference_context["tool_call_id"],
+                    "error_message": repair_error_message,
+                    "content_preview": _bounded_agent_content_preview(
+                        repaired_content,
+                        reference="AgentConversationRunner.model.final_response_reference_tool_request_repair_failed.content",
+                    ),
+                    **_model_trace_from_payload(clean_payload),
+                },
+                commit=True,
+            )
+            repaired_content = AGENT_FINAL_RESPONSE_REFERENCE_REPAIR_FALLBACK
+            repaired_chunks = [repaired_content] if chunks else []
+            repaired_tool_request = None
+        if repaired_tool_request is not None:
+            runtime.append_event(
+                run,
+                "model.final_response_reference_tool_request_repaired",
+                {
+                    "iteration": iteration,
+                    "final_summary": final_summary,
+                    "requested_tool": True,
+                    "tool_name": repaired_tool_request.tool_name,
+                    "source_tool_call_id": reference_context["tool_call_id"],
+                    **({"repair_strategy": repair_strategy} if repair_strategy else {}),
+                    **_model_trace_from_payload(clean_payload),
+                },
+                commit=True,
+            )
+            return repaired_content, [], clean_payload, repaired_tool_request
+        repaired_content = _normalize_agent_markdown_response(repaired_content)
+        repaired_invalid_ids = _invalid_test_case_ids_in_final_response(
+            repaired_content,
+            valid_ids=set(reference_context["valid_test_case_ids"]),
+        )
+        if repaired_invalid_ids:
+            runtime.append_event(
+                run,
+                "model.final_response_reference_repair_failed",
+                {
+                    "iteration": iteration,
+                    "final_summary": final_summary,
+                    "invalid_test_case_ids": repaired_invalid_ids,
+                    "valid_test_case_ids": reference_context["valid_test_case_ids"],
+                    "source_tool_call_id": reference_context["tool_call_id"],
+                    "content_preview": _bounded_agent_content_preview(
+                        repaired_content,
+                        reference="AgentConversationRunner.model.final_response_reference_repair_failed.content",
+                    ),
+                    **_model_trace_from_payload(clean_payload),
+                },
+                commit=True,
+            )
+            repaired_content = AGENT_FINAL_RESPONSE_REFERENCE_REPAIR_FALLBACK
+            repaired_chunks = [repaired_content] if chunks else []
+        runtime.append_event(
+            run,
+            "model.markdown_normalized",
+            {
+                "iteration": iteration,
+                "final_summary": final_summary,
+                "original_length": len(content),
+                "normalized_length": len(repaired_content),
+                "content": repaired_content,
+                "replace_content": True,
+                "normalization_reason": "final_response_reference_repaired",
+                **_model_trace_from_payload(clean_payload),
+            },
+            commit=False,
+        )
+        return repaired_content, [repaired_content] if chunks else repaired_chunks, clean_payload, None
+
+    def _latest_test_case_reference_context(self, run_id: str) -> dict[str, Any] | None:
+        call = self.db.scalar(
+            select(AgentToolCall)
+            .where(
+                AgentToolCall.run_id == run_id,
+                AgentToolCall.tool_name == "testcase.query_project_cases",
+                AgentToolCall.status == "succeeded",
+            )
+            .order_by(AgentToolCall.created_at.desc(), AgentToolCall.id.desc())
+        )
+        if call is None or not isinstance(call.output_json_redacted, dict):
+            return None
+        output = call.output_json_redacted
+        manifest = output.get("case_id_manifest") if isinstance(output.get("case_id_manifest"), dict) else {}
+        valid_ids = _coerce_int_list(manifest.get("http_test_case_ids")) + _coerce_int_list(
+            manifest.get("websocket_test_case_ids")
+        )
+        if not valid_ids:
+            valid_ids = _coerce_int_list(output.get("http_test_case_ids")) + _coerce_int_list(
+                output.get("websocket_test_case_ids")
+            )
+        case_display_rows = output.get("case_display_rows")
+        if not isinstance(case_display_rows, list):
+            case_display_rows = []
+        return {
+            "tool_call_id": call.tool_call_id,
+            "valid_test_case_ids": sorted(dict.fromkeys(valid_ids)),
+            "case_display_rows": case_display_rows,
+        }
 
     def _record_invalid_tool_request_loop_observation(
         self,
@@ -3434,6 +4179,30 @@ class AgentConversationRunner:
             current_user=current_user,
         )
 
+    def _parse_repaired_tool_request(self, content: str) -> tuple[AgentToolRequest | None, str | None]:
+        try:
+            return self._parse_tool_request(content, normalize_evidence_refs=True), None
+        except HTTPException:
+            salvaged_tool_request = self._try_salvage_mixed_tool_request(content)
+            if salvaged_tool_request is not None:
+                return salvaged_tool_request, "salvaged_repair_fenced_tool_request"
+            salvaged_first_tool_request = self._try_salvage_first_tool_request_block(content)
+            if salvaged_first_tool_request is not None:
+                return salvaged_first_tool_request, "salvaged_repair_first_tool_request_block"
+            raise
+
+    def _try_salvage_first_tool_request_block(self, content: str) -> AgentToolRequest | None:
+        first_match = TOOL_REQUEST_BLOCK_RE.search(content)
+        if first_match is None or TOOL_REQUEST_BLOCK_RE.search(content, first_match.end()) is None:
+            return None
+        try:
+            return self._parse_tool_request(
+                first_match.group(0),
+                normalize_evidence_refs=True,
+            )
+        except HTTPException:
+            return None
+
     def _try_salvage_mixed_tool_request(self, content: str) -> AgentToolRequest | None:
         match = TOOL_REQUEST_BLOCK_RE.search(content)
         if match is None or TOOL_REQUEST_BLOCK_RE.search(content, match.end()):
@@ -3476,6 +4245,57 @@ class AgentConversationRunner:
             current_user=current_user,
             enqueue=False,
         )
+        trace_info(
+            "agent_trace_tool_call_created",
+            run_id=run.run_id,
+            project_id=run.project_id,
+            iteration=iteration,
+            tool_call_id=call.tool_call_id,
+            tool_name=call.tool_name,
+            step_index=call.step_index,
+            attempt_index=call.attempt_index,
+            approval_required=call.approval_required,
+            side_effect_class=call.resolved_side_effect_class,
+            replay_policy=call.resolved_replay_policy,
+            evidence_ref_count=len(tool_request.evidence_refs_for_ledger()),
+            **trace_payload_summary(tool_input, prefix="input"),
+        )
+        trace_full_payload(
+            "agent_trace_tool_input_full_payload",
+            tool_input,
+            prefix="input",
+            mask=True,
+            run_id=run.run_id,
+            project_id=run.project_id,
+            iteration=iteration,
+            tool_call_id=call.tool_call_id,
+            tool_name=call.tool_name,
+            step_index=call.step_index,
+            attempt_index=call.attempt_index,
+            approval_required=call.approval_required,
+            side_effect_class=call.resolved_side_effect_class,
+            replay_policy=call.resolved_replay_policy,
+            evidence_ref_count=len(tool_request.evidence_refs_for_ledger()),
+        )
+        if call.status not in TOOL_CALL_EXECUTABLE_STATUSES:
+            trace_warning(
+                "agent_trace_tool_call_preflight_blocked_before_approval",
+                run_id=run.run_id,
+                project_id=run.project_id,
+                iteration=iteration,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                status=call.status,
+                error_code=call.error_code,
+                execution_phase=call.execution_phase,
+                recovery_decision=call.recovery_decision,
+            )
+            run.current_iteration = iteration + 1
+            run.current_step_index += 1
+            self.db.commit()
+            self.db.refresh(run)
+            self.db.refresh(call)
+            return call
         decision_reason = (
             _bounded_agent_error_message(
                 tool_request.reason,
@@ -3492,7 +4312,43 @@ class AgentConversationRunner:
             decision_reason=decision_reason,
         )
         self.db.refresh(run)
+        blocked_by_case_ids = ToolExecutor(self.db)._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=run,
+            queue_item=None,
+            queue_service=AgentWorkerQueueService(self.db),
+            runtime=runtime,
+        )
+        if blocked_by_case_ids is not None:
+            trace_warning(
+                "agent_trace_tool_call_blocked",
+                run_id=run.run_id,
+                project_id=run.project_id,
+                iteration=iteration,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                status=call.status,
+                error_code=call.error_code,
+                execution_phase=call.execution_phase,
+                recovery_decision=call.recovery_decision,
+            )
+            run.current_iteration = iteration + 1
+            run.current_step_index += 1
+            self.db.commit()
+            self.db.refresh(run)
+            self.db.refresh(call)
+            return call
         if call.approval_required:
+            trace_info(
+                "agent_trace_tool_call_needs_human",
+                run_id=run.run_id,
+                project_id=run.project_id,
+                iteration=iteration,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                side_effect_class=call.resolved_side_effect_class,
+                replay_policy=call.resolved_replay_policy,
+            )
             blocking = list(run.blocking_tool_call_ids_json or [])
             if call.tool_call_id not in blocking:
                 blocking.append(call.tool_call_id)
@@ -3517,6 +4373,15 @@ class AgentConversationRunner:
         missing_prerequisite_tool = self._missing_tool_prerequisite_before_execution(run=run, call=call)
         if missing_prerequisite_tool is not None:
             spec = ToolRegistry().get(call.tool_name)
+            trace_warning(
+                "agent_trace_tool_call_prerequisite_missing",
+                run_id=run.run_id,
+                project_id=run.project_id,
+                iteration=iteration,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                required_tool=missing_prerequisite_tool,
+            )
             output = {
                 "required_tool": missing_prerequisite_tool,
                 "blocked_tool": call.tool_name,
@@ -3575,6 +4440,48 @@ class AgentConversationRunner:
             run=run,
             queue_item=None,
             current_user=current_user,
+        )
+        trace_info(
+            "agent_trace_tool_call_executed",
+            run_id=run.run_id,
+            project_id=run.project_id,
+            iteration=iteration,
+            tool_call_id=executed.tool_call_id,
+            tool_name=executed.tool_name,
+            status=executed.status,
+            execution_phase=executed.execution_phase,
+            error_code=executed.error_code,
+            **trace_payload_summary(executed.output_json_redacted, prefix="output"),
+        )
+        trace_verbose_payload(
+            "agent_trace_tool_output_payload",
+            executed.output_json_redacted,
+            prefix="output",
+            mask=True,
+            run_id=run.run_id,
+            project_id=run.project_id,
+            iteration=iteration,
+            tool_call_id=executed.tool_call_id,
+            tool_name=executed.tool_name,
+            status=executed.status,
+            execution_phase=executed.execution_phase,
+            error_code=executed.error_code,
+            output_hash=executed.output_hash,
+        )
+        trace_full_payload(
+            "agent_trace_tool_output_full_payload",
+            executed.output_json_redacted,
+            prefix="output",
+            mask=True,
+            run_id=run.run_id,
+            project_id=run.project_id,
+            iteration=iteration,
+            tool_call_id=executed.tool_call_id,
+            tool_name=executed.tool_name,
+            status=executed.status,
+            execution_phase=executed.execution_phase,
+            error_code=executed.error_code,
+            output_hash=executed.output_hash,
         )
         self.db.refresh(run)
         run.current_iteration = iteration + 1
@@ -3644,11 +4551,67 @@ class AgentConversationRunner:
         )
 
     def _normalize_tool_input(self, *, run: AgentRun, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+        tool_input = dict(tool_input)
         spec = ToolRegistry().get(tool_name)
         required = set((spec.input_schema or {}).get("required") or [])
         if "project_id" in required and "project_id" not in tool_input:
             tool_input["project_id"] = run.project_id
+        if tool_name in {"scenario.create_saved", "scenario.update_saved"}:
+            draft = self._latest_reusable_scenario_draft(run)
+            if draft is not None and _intent_requests_latest_scenario_draft(run.intent):
+                original_scenario = tool_input.get("scenario") if isinstance(tool_input.get("scenario"), dict) else {}
+                scenario = copy.deepcopy(draft["scenario"])
+                if tool_name == "scenario.update_saved" and isinstance(original_scenario, dict):
+                    version = original_scenario.get("version")
+                    if version is not None:
+                        scenario["version"] = version
+                tool_input["scenario"] = scenario
+                tool_input["scenario_draft_source"] = {
+                    "source": "latest_conversation_scenario_compose_draft",
+                    "run_id": draft["run_id"],
+                    "tool_call_id": draft["tool_call_id"],
+                }
         return tool_input
+
+    def _latest_reusable_scenario_draft(self, run: AgentRun) -> dict[str, Any] | None:
+        if not run.conversation_id:
+            return None
+        calls = list(
+            self.db.scalars(
+                select(AgentToolCall)
+                .join(AgentRun, AgentRun.run_id == AgentToolCall.run_id)
+                .where(
+                    AgentRun.project_id == run.project_id,
+                    AgentRun.user_id == run.user_id,
+                    AgentRun.conversation_id == run.conversation_id,
+                    AgentRun.id <= run.id,
+                    AgentToolCall.tool_name == "scenario.compose_draft",
+                    AgentToolCall.status == "succeeded",
+                )
+                .order_by(AgentToolCall.id.desc())
+                .limit(10)
+            ).all()
+        )
+        reusable: list[dict[str, Any]] = []
+        for call in calls:
+            scenario = _scenario_from_compose_draft_output(call.output_json_redacted)
+            if scenario is None:
+                continue
+            try:
+                validated = ScenarioCreateRequest.model_validate(scenario)
+            except ValidationError:
+                continue
+            candidate = {
+                "scenario": validated.model_dump(mode="json"),
+                "run_id": call.run_id,
+                "tool_call_id": call.tool_call_id,
+            }
+            if _scenario_name_matches_intent(candidate["scenario"], run.intent):
+                return candidate
+            reusable.append(candidate)
+        if reusable:
+            return reusable[0]
+        return None
 
     def _missing_tool_prerequisite_before_execution(self, *, run: AgentRun, call: AgentToolCall) -> str | None:
         prerequisite_tool = ToolRegistry().get(call.tool_name).required_successful_tool_before
@@ -3700,9 +4663,11 @@ class AgentConversationRunner:
                 ).all()
             )
             previous_runs = list(reversed(previous_runs))
+            tool_artifact_manifests = self._conversation_tool_artifact_manifests(run)
             working_context = _conversation_working_context(
                 current_intent=run.intent,
                 previous_runs=previous_runs,
+                tool_artifact_manifests=tool_artifact_manifests,
             )
         skill_intent = run.intent
         if working_context is not None:
@@ -3736,6 +4701,31 @@ class AgentConversationRunner:
                 )
         messages.append(AIChatMessage(role="user", content=run.intent))
         return messages
+
+    def _conversation_tool_artifact_manifests(self, run: AgentRun) -> list[dict[str, Any]]:
+        if not run.conversation_id:
+            return []
+        rows = list(
+            self.db.execute(
+                select(AgentToolCall, AgentRun)
+                .join(AgentRun, AgentRun.run_id == AgentToolCall.run_id)
+                .where(
+                    AgentRun.project_id == run.project_id,
+                    AgentRun.user_id == run.user_id,
+                    AgentRun.conversation_id == run.conversation_id,
+                    AgentRun.id < run.id,
+                    AgentToolCall.status == "succeeded",
+                )
+                .order_by(AgentToolCall.id.desc())
+                .limit(AGENT_CONVERSATION_TOOL_ARTIFACT_MANIFEST_MAX_CALLS)
+            ).all()
+        )
+        manifests: list[dict[str, Any]] = []
+        for call, source_run in reversed(rows):
+            manifest = _tool_call_artifact_manifest(call, source_run)
+            if manifest is not None:
+                manifests.append(manifest)
+        return _prioritize_tool_artifact_manifests_for_context(manifests)
 
     def _conversation_history_messages(
         self,
@@ -3979,6 +4969,37 @@ class ExecutionLedgerService:
         self.db.flush()
         runtime = AgentRuntimeService(self.db)
         runtime.append_event(run, "tool.planned", {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name}, commit=False)
+        if call.approval_required:
+            executor = ToolExecutor(self.db)
+            blocked_by_action_preflight = executor._reject_case_reference_ids_without_current_facts(
+                call=call,
+                run=run,
+                queue_item=None,
+                queue_service=AgentWorkerQueueService(self.db),
+                runtime=runtime,
+            )
+            if blocked_by_action_preflight is not None:
+                self.db.commit()
+                self.db.refresh(call)
+                return call
+            blocked_by_schema_preflight = executor._reject_tool_input_schema_invalid_before_approval(
+                call=call,
+                run=run,
+                runtime=runtime,
+            )
+            if blocked_by_schema_preflight is not None:
+                self.db.refresh(call)
+                return call
+            blocked_by_scenario_quality_preflight = (
+                executor._reject_scenario_orchestration_quality_missing_before_approval(
+                    call=call,
+                    run=run,
+                    runtime=runtime,
+                )
+            )
+            if blocked_by_scenario_quality_preflight is not None:
+                self.db.refresh(call)
+                return call
         EvidenceWatchService(self.db).register_watches(
             run=run,
             evidence_refs=evidence_refs,
@@ -4470,6 +5491,176 @@ class AgentToolRuntime:
         )
 
 
+@dataclass(frozen=True)
+class ObjectReferenceGuardRule:
+    object_type: str
+    query_tool: str
+    db_model: type[Any]
+    request_id_keys: tuple[str, ...]
+    manifest_keys: tuple[str, ...]
+    id_keys: tuple[str, ...]
+    object_list_keys: tuple[str, ...]
+    batch_result_paths: tuple[tuple[str, str], ...]
+    valid_key: str
+    invalid_key: str
+    stale_key: str
+    invalid_error_code: str
+    stale_error_code: str
+    snapshot_error_code: str
+    invalid_error_message: str
+    stale_error_message: str
+    snapshot_error_message: str
+    query_before_retry_decision: str
+    refresh_before_retry_decision: str
+    snapshot_before_retry_decision: str
+    request_id_array_keys: tuple[str, ...] = ()
+    request_snapshot_id_keys: tuple[str, ...] = ()
+    request_item_list_key: str | None = None
+    request_item_id_key: str | None = None
+    request_nested_id_paths: tuple[tuple[str, ...], ...] = ()
+    request_nested_id_array_paths: tuple[tuple[str, ...], ...] = ()
+    request_nested_snapshot_id_paths: tuple[tuple[str, ...], ...] = ()
+    request_ref_keys: tuple[str, ...] = ("object_reference",)
+    request_ref_array_keys: tuple[str, ...] = ("object_references",)
+    not_deleted_attr: str | None = None
+
+
+HTTP_TEST_CASE_REFERENCE_RULE = ObjectReferenceGuardRule(
+    object_type="http_test_case",
+    query_tool="testcase.query_project_cases",
+    db_model=TestCase,
+    request_id_keys=("test_case_id",),
+    request_id_array_keys=("test_case_ids",),
+    request_item_list_key="items",
+    request_item_id_key="test_case_id",
+    manifest_keys=("http_test_case_ids", "http_assertion_update_ids"),
+    id_keys=("http_test_case_ids",),
+    object_list_keys=("http_test_cases",),
+    batch_result_paths=(("http_batch_execute_input", "test_case_ids"),),
+    valid_key="valid_test_case_ids",
+    invalid_key="invalid_test_case_ids",
+    stale_key="stale_test_case_ids",
+    invalid_error_code="agent_testcase_ids_not_from_query_result",
+    stale_error_code="agent_testcase_id_stale_or_deleted",
+    snapshot_error_code="agent_testcase_snapshot_not_latest",
+    invalid_error_message="Test case ids must come from the latest testcase.query_project_cases result.",
+    stale_error_message="Test case ids from the latest query are stale or deleted; refresh before execution.",
+    snapshot_error_message="Test case snapshot id must match the latest testcase.query_project_cases result.",
+    query_before_retry_decision="query_project_cases_before_retry",
+    refresh_before_retry_decision="refresh_case_snapshot_before_retry",
+    snapshot_before_retry_decision="refresh_case_snapshot_before_retry",
+    request_snapshot_id_keys=("case_snapshot_id",),
+)
+WEBSOCKET_TEST_CASE_REFERENCE_RULE = ObjectReferenceGuardRule(
+    object_type="websocket_test_case",
+    query_tool="testcase.query_project_cases",
+    db_model=WebSocketTestCase,
+    request_id_keys=("test_case_id",),
+    request_id_array_keys=("websocket_test_case_ids",),
+    request_item_list_key="items",
+    request_item_id_key="test_case_id",
+    manifest_keys=("websocket_test_case_ids", "websocket_assertion_update_ids"),
+    id_keys=("websocket_test_case_ids",),
+    object_list_keys=("websocket_test_cases",),
+    batch_result_paths=(("websocket_batch_execute_input", "websocket_test_case_ids"),),
+    valid_key="valid_websocket_test_case_ids",
+    invalid_key="invalid_websocket_test_case_ids",
+    stale_key="stale_websocket_test_case_ids",
+    invalid_error_code="agent_websocket_testcase_ids_not_from_query_result",
+    stale_error_code="agent_websocket_testcase_id_stale_or_deleted",
+    snapshot_error_code="agent_websocket_testcase_snapshot_not_latest",
+    invalid_error_message="Test case ids must come from the latest testcase.query_project_cases result.",
+    stale_error_message="Test case ids from the latest query are stale or deleted; refresh before execution.",
+    snapshot_error_message="Test case snapshot id must match the latest testcase.query_project_cases result.",
+    query_before_retry_decision="query_project_cases_before_retry",
+    refresh_before_retry_decision="refresh_case_snapshot_before_retry",
+    snapshot_before_retry_decision="refresh_case_snapshot_before_retry",
+    request_snapshot_id_keys=("case_snapshot_id",),
+)
+SCENARIO_REFERENCE_RULE = ObjectReferenceGuardRule(
+    object_type="scenario",
+    query_tool="scenario.query_project_scenarios",
+    db_model=TestScenario,
+    request_id_keys=("scenario_id",),
+    manifest_keys=("scenario_ids", "scenario_execute_ids"),
+    id_keys=("scenario_ids",),
+    object_list_keys=("scenarios",),
+    batch_result_paths=(),
+    not_deleted_attr="is_deleted",
+    valid_key="valid_scenario_ids",
+    invalid_key="invalid_scenario_ids",
+    stale_key="stale_scenario_ids",
+    invalid_error_code="agent_scenario_ids_not_from_query_result",
+    stale_error_code="agent_scenario_id_stale_or_deleted",
+    snapshot_error_code="agent_scenario_snapshot_not_latest",
+    invalid_error_message="Scenario ids must come from the latest scenario.query_project_scenarios result.",
+    stale_error_message="Scenario ids from the latest query are stale or deleted; refresh before execution.",
+    snapshot_error_message="Scenario snapshot id must match the latest scenario.query_project_scenarios result.",
+    query_before_retry_decision="query_project_scenarios_before_retry",
+    refresh_before_retry_decision="refresh_scenario_snapshot_before_retry",
+    snapshot_before_retry_decision="refresh_scenario_snapshot_before_retry",
+    request_snapshot_id_keys=("scenario_snapshot_id",),
+)
+ENVIRONMENT_REFERENCE_RULE = ObjectReferenceGuardRule(
+    object_type="environment",
+    query_tool="project.read_context",
+    db_model=ProjectEnvironment,
+    request_id_keys=("environment_id",),
+    request_nested_id_paths=(("case", "environment_id"), ("scenario", "environment_id")),
+    request_nested_id_array_paths=(("case", "environment_ids"),),
+    manifest_keys=("environment_ids", "environment_execute_ids"),
+    id_keys=(),
+    object_list_keys=("environments",),
+    batch_result_paths=(),
+    not_deleted_attr="is_deleted",
+    valid_key="valid_environment_ids",
+    invalid_key="invalid_environment_ids",
+    stale_key="stale_environment_ids",
+    invalid_error_code="agent_environment_ids_not_from_query_result",
+    stale_error_code="agent_environment_id_stale_or_deleted",
+    snapshot_error_code="agent_environment_snapshot_not_latest",
+    invalid_error_message="Environment ids must come from the latest project.read_context result.",
+    stale_error_message="Environment ids from the latest project context are stale or deleted; refresh before execution.",
+    snapshot_error_message="Environment snapshot id must match the latest project.read_context result.",
+    query_before_retry_decision="project_read_context_before_retry",
+    refresh_before_retry_decision="refresh_project_context_before_retry",
+    snapshot_before_retry_decision="refresh_project_context_before_retry",
+    request_snapshot_id_keys=("environment_snapshot_id",),
+    request_nested_snapshot_id_paths=(("case", "environment_snapshot_id"), ("scenario", "environment_snapshot_id")),
+    request_ref_keys=("environment_reference",),
+    request_ref_array_keys=("environment_references",),
+)
+OBJECT_REFERENCE_GUARD_RULES: dict[str, tuple[ObjectReferenceGuardRule, ...]] = {
+    "testcase.create_saved": (ENVIRONMENT_REFERENCE_RULE,),
+    "testcase.execute_saved": (HTTP_TEST_CASE_REFERENCE_RULE, ENVIRONMENT_REFERENCE_RULE),
+    "testcase.batch_execute": (HTTP_TEST_CASE_REFERENCE_RULE, ENVIRONMENT_REFERENCE_RULE),
+    "testcase.update_saved": (HTTP_TEST_CASE_REFERENCE_RULE, ENVIRONMENT_REFERENCE_RULE),
+    "testcase.update_assertions": (HTTP_TEST_CASE_REFERENCE_RULE,),
+    "testcase.batch_update_assertions": (HTTP_TEST_CASE_REFERENCE_RULE,),
+    "websocket_testcase.create_saved": (ENVIRONMENT_REFERENCE_RULE,),
+    "websocket_testcase.execute_saved": (WEBSOCKET_TEST_CASE_REFERENCE_RULE, ENVIRONMENT_REFERENCE_RULE),
+    "websocket_testcase.batch_execute": (WEBSOCKET_TEST_CASE_REFERENCE_RULE, ENVIRONMENT_REFERENCE_RULE),
+    "websocket_testcase.update_saved": (WEBSOCKET_TEST_CASE_REFERENCE_RULE, ENVIRONMENT_REFERENCE_RULE),
+    "websocket_testcase.update_assertions": (WEBSOCKET_TEST_CASE_REFERENCE_RULE,),
+    "websocket_testcase.batch_update_assertions": (WEBSOCKET_TEST_CASE_REFERENCE_RULE,),
+    "scenario.create_saved": (ENVIRONMENT_REFERENCE_RULE,),
+    "scenario.update_saved": (SCENARIO_REFERENCE_RULE, ENVIRONMENT_REFERENCE_RULE),
+    "scenario.execute_dry_run": (SCENARIO_REFERENCE_RULE, ENVIRONMENT_REFERENCE_RULE),
+}
+TOOL_INPUT_SCHEMA_PREFLIGHTS: dict[str, tuple[tuple[str, ...], type[BaseModel]]] = {
+    "testcase.create_saved": (("case",), TestCaseCreateRequest),
+    "testcase.update_saved": (("case",), TestCaseUpdateRequest),
+    "testcase.update_assertions": (("assertions", "*"), AssertionConfig),
+    "testcase.batch_update_assertions": (("items", "*", "assertions", "*"), AssertionConfig),
+    "websocket_testcase.create_saved": (("case",), WebSocketTestCaseCreateRequest),
+    "websocket_testcase.update_saved": (("case",), WebSocketTestCaseUpdateRequest),
+    "websocket_testcase.update_assertions": (("assertions", "*"), WebSocketAssertionConfig),
+    "websocket_testcase.batch_update_assertions": (("items", "*", "assertions", "*"), WebSocketAssertionConfig),
+    "scenario.create_saved": (("scenario",), ScenarioCreateRequest),
+    "scenario.update_saved": (("scenario",), ScenarioUpdateRequest),
+}
+
+
 class ToolExecutor:
     def __init__(
         self,
@@ -4536,12 +5727,8 @@ class ToolExecutor:
         return call
 
     @staticmethod
-    def _case_update_query_guard_mode(tool_name: str) -> str | None:
-        if tool_name in {"testcase.update_assertions", "testcase.batch_update_assertions"}:
-            return "http"
-        if tool_name in {"websocket_testcase.update_assertions", "websocket_testcase.batch_update_assertions"}:
-            return "websocket"
-        return None
+    def _object_reference_guard_rules(tool_name: str) -> tuple[ObjectReferenceGuardRule, ...]:
+        return OBJECT_REFERENCE_GUARD_RULES.get(tool_name, ())
 
     @staticmethod
     def _as_int_list(value: Any) -> list[int]:
@@ -4557,60 +5744,294 @@ class ToolExecutor:
                 ids.append(int(item.strip()))
         return ids
 
-    @classmethod
-    def _case_update_requested_ids(cls, call: AgentToolCall) -> list[int]:
-        payload = call.input_json_redacted if isinstance(call.input_json_redacted, dict) else {}
-        if call.tool_name in {"testcase.batch_update_assertions", "websocket_testcase.batch_update_assertions"}:
-            ids: list[int] = []
-            for item in payload.get("items") or []:
-                if isinstance(item, dict):
-                    ids.extend(cls._as_int_list([item.get("test_case_id")]))
-            return ids
-        return cls._as_int_list([payload.get("test_case_id")])
+    @staticmethod
+    def _value_at_path(payload: dict[str, Any], path: tuple[str, ...]) -> Any:
+        current: Any = payload
+        for segment in path:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(segment)
+        return current
 
     @classmethod
-    def _case_ids_from_query_output(cls, output: Any, *, mode: str) -> list[int]:
+    def _object_reference_requested_ids(cls, call: AgentToolCall, rule: ObjectReferenceGuardRule) -> list[int]:
+        payload = call.input_json_redacted if isinstance(call.input_json_redacted, dict) else {}
+        ids: list[int] = []
+        for key in rule.request_id_keys:
+            ids.extend(cls._as_int_list([payload.get(key)]))
+        for key in rule.request_id_array_keys:
+            ids.extend(cls._as_int_list(payload.get(key)))
+        for path in rule.request_nested_id_paths:
+            ids.extend(cls._as_int_list([cls._value_at_path(payload, path)]))
+        for path in rule.request_nested_id_array_paths:
+            ids.extend(cls._as_int_list(cls._value_at_path(payload, path)))
+        if rule.request_item_list_key and rule.request_item_id_key:
+            for item in payload.get(rule.request_item_list_key) or []:
+                if isinstance(item, dict):
+                    ids.extend(cls._as_int_list([item.get(rule.request_item_id_key)]))
+        return list(dict.fromkeys(ids))
+
+    @staticmethod
+    def _as_str_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            value = [value]
+        refs: list[str] = []
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                refs.append(item.strip())
+        return refs
+
+    @classmethod
+    def _object_reference_requested_refs(cls, call: AgentToolCall, rule: ObjectReferenceGuardRule) -> list[str]:
+        payload = call.input_json_redacted if isinstance(call.input_json_redacted, dict) else {}
+        refs: list[str] = []
+        for key in rule.request_ref_keys:
+            refs.extend(cls._as_str_list(payload.get(key)))
+        for key in rule.request_ref_array_keys:
+            refs.extend(cls._as_str_list(payload.get(key)))
+        for item in payload.get("items") or []:
+            if isinstance(item, dict):
+                for key in rule.request_ref_keys:
+                    refs.extend(cls._as_str_list(item.get(key)))
+                for key in rule.request_ref_array_keys:
+                    refs.extend(cls._as_str_list(item.get(key)))
+        return list(dict.fromkeys(refs))
+
+    @classmethod
+    def _object_reference_requested_snapshot_ids(
+        cls,
+        call: AgentToolCall,
+        rule: ObjectReferenceGuardRule,
+    ) -> list[str]:
+        payload = call.input_json_redacted if isinstance(call.input_json_redacted, dict) else {}
+        snapshot_ids: list[str] = []
+        for key in rule.request_snapshot_id_keys:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                snapshot_ids.append(value.strip())
+        for path in rule.request_nested_snapshot_id_paths:
+            value = cls._value_at_path(payload, path)
+            if isinstance(value, str) and value.strip():
+                snapshot_ids.append(value.strip())
+        return list(dict.fromkeys(snapshot_ids))
+
+    @staticmethod
+    def _object_reference_snapshot_id_from_mapping(value: Any) -> str | None:
+        if not isinstance(value, dict):
+            return None
+        snapshot_id = value.get("snapshot_id")
+        if isinstance(snapshot_id, str) and snapshot_id.strip():
+            return snapshot_id.strip()
+        return None
+
+    @classmethod
+    def _object_ids_from_query_output(cls, output: Any, *, rule: ObjectReferenceGuardRule) -> list[int]:
         if not isinstance(output, dict):
             return []
-        if mode == "websocket":
-            id_keys = ("websocket_test_case_ids",)
-            case_keys = ("websocket_test_cases",)
-            batch_keys = (("websocket_batch_execute_input", "websocket_test_case_ids"),)
-        else:
-            id_keys = ("http_test_case_ids",)
-            case_keys = ("http_test_cases",)
-            batch_keys = (("http_batch_execute_input", "test_case_ids"),)
         ids: list[int] = []
-        for key in id_keys:
+        manifest = output.get("case_id_manifest")
+        if isinstance(manifest, dict):
+            for key in rule.manifest_keys:
+                ids.extend(cls._as_int_list(manifest.get(key)))
+        object_manifest = output.get("object_reference_manifest")
+        if isinstance(object_manifest, dict):
+            object_family = object_manifest.get("object_type") or object_manifest.get("object_family")
+            family_matches = object_family == rule.object_type or (
+                object_family == "test_case"
+                and rule.object_type in {"http_test_case", "websocket_test_case"}
+            )
+        else:
+            family_matches = False
+        if family_matches and isinstance(object_manifest, dict):
+            for key in rule.manifest_keys:
+                ids.extend(cls._as_int_list(object_manifest.get(key)))
+        for key in rule.id_keys:
             ids.extend(cls._as_int_list(output.get(key)))
-        for key in case_keys:
+        for key in rule.object_list_keys:
             for item in output.get(key) or []:
                 if isinstance(item, dict):
                     ids.extend(cls._as_int_list([item.get("id")]))
-        for parent_key, child_key in batch_keys:
+        for parent_key, child_key in rule.batch_result_paths:
             parent = output.get(parent_key)
             if isinstance(parent, dict):
                 ids.extend(cls._as_int_list(parent.get(child_key)))
         return sorted(set(ids))
 
-    def _latest_query_project_case_ids(self, *, call: AgentToolCall, mode: str) -> list[int]:
-        query = (
-            select(AgentToolCall)
-            .where(
-                AgentToolCall.run_id == call.run_id,
-                AgentToolCall.tool_name == "testcase.query_project_cases",
-                AgentToolCall.status == "succeeded",
-            )
-            .order_by(AgentToolCall.id.desc())
-        )
-        if call.id is not None:
-            query = query.where(AgentToolCall.id < call.id)
-        query_call = self.db.scalar(query.limit(1))
-        if query_call is None:
-            return []
-        return self._case_ids_from_query_output(query_call.output_json_redacted, mode=mode)
+    @classmethod
+    def _object_reference_map_from_query_output(
+        cls,
+        output: Any,
+        *,
+        rule: ObjectReferenceGuardRule,
+    ) -> dict[str, int]:
+        if not isinstance(output, dict):
+            return {}
+        ref_map: dict[str, int] = {}
+        manifests: list[dict[str, Any]] = []
+        object_manifest = output.get("object_reference_manifest")
+        if isinstance(object_manifest, dict):
+            manifests.append(object_manifest)
+        for manifest_key in ("case_id_manifest", "scenario_id_manifest", "environment_id_manifest"):
+            manifest = output.get(manifest_key)
+            if isinstance(manifest, dict):
+                manifests.append(manifest)
+        for manifest in manifests:
+            for item in manifest.get("object_references") or []:
+                if not isinstance(item, dict):
+                    continue
+                object_type = item.get("object_type")
+                object_ref = item.get("object_ref") or item.get("ref")
+                object_id = item.get("id")
+                if not isinstance(object_ref, str) or not isinstance(object_id, int):
+                    continue
+                if object_type and object_type != rule.object_type:
+                    continue
+                ref_map[object_ref] = object_id
+        for key in ("http_test_cases", "websocket_test_cases", "scenarios", "environments"):
+            for item in output.get(key) or []:
+                if not isinstance(item, dict):
+                    continue
+                object_ref = item.get("object_ref") or item.get("ref")
+                object_id = item.get("id")
+                if isinstance(object_ref, str) and isinstance(object_id, int):
+                    ref_map.setdefault(object_ref, object_id)
+        return ref_map
 
-    def _reject_case_update_ids_not_from_prior_query(
+    @classmethod
+    def _object_snapshot_id_from_query_output(cls, output: Any, *, rule: ObjectReferenceGuardRule) -> str | None:
+        if not isinstance(output, dict):
+            return None
+        for key in ("case_id_manifest", "scenario_id_manifest", "environment_id_manifest"):
+            snapshot_id = cls._object_reference_snapshot_id_from_mapping(output.get(key))
+            if snapshot_id:
+                return snapshot_id
+        object_manifest = output.get("object_reference_manifest")
+        if isinstance(object_manifest, dict):
+            object_family = object_manifest.get("object_type") or object_manifest.get("object_family")
+            family_matches = object_family == rule.object_type or (
+                object_family == "test_case"
+                and rule.object_type in {"http_test_case", "websocket_test_case"}
+            )
+            if family_matches:
+                snapshot_id = cls._object_reference_snapshot_id_from_mapping(object_manifest)
+                if snapshot_id:
+                    return snapshot_id
+        for key in ("case_snapshot", "scenario_snapshot", "environment_snapshot"):
+            snapshot_id = cls._object_reference_snapshot_id_from_mapping(output.get(key))
+            if snapshot_id:
+                return snapshot_id
+        return None
+
+    def _latest_object_query_facts(
+        self,
+        *,
+        call: AgentToolCall,
+        rule: ObjectReferenceGuardRule,
+    ) -> tuple[list[int], str | None, dict[str, int]]:
+        current_run = self.db.scalar(select(AgentRun).where(AgentRun.run_id == call.run_id))
+        query = select(AgentToolCall).where(
+            AgentToolCall.tool_name == rule.query_tool,
+            AgentToolCall.status == "succeeded",
+        )
+        if current_run is not None and current_run.conversation_id:
+            query = (
+                query
+                .join(AgentRun, AgentRun.run_id == AgentToolCall.run_id)
+                .where(
+                    AgentRun.project_id == current_run.project_id,
+                    AgentRun.user_id == current_run.user_id,
+                    AgentRun.conversation_id == current_run.conversation_id,
+                    AgentRun.id <= current_run.id,
+                )
+            )
+        else:
+            query = query.where(AgentToolCall.run_id == call.run_id)
+        if call.id is not None:
+            query = query.where(
+                (AgentToolCall.run_id != call.run_id) | (AgentToolCall.id < call.id)
+            )
+        query = query.order_by(AgentToolCall.id.desc()).limit(20)
+        query_calls = list(self.db.scalars(query).all())
+        query_call = next(
+            (
+                item
+                for item in query_calls
+                if self._query_output_matches_required_case_mode(call=call, rule=rule, output=item.output_json_redacted)
+            ),
+            None,
+        )
+        if query_call is None:
+            return [], None, {}
+        return (
+            self._object_ids_from_query_output(query_call.output_json_redacted, rule=rule),
+            self._object_snapshot_id_from_query_output(query_call.output_json_redacted, rule=rule),
+            self._object_reference_map_from_query_output(query_call.output_json_redacted, rule=rule),
+        )
+
+    @staticmethod
+    def _query_output_matches_required_case_mode(
+        *,
+        call: AgentToolCall,
+        rule: ObjectReferenceGuardRule,
+        output: Any,
+    ) -> bool:
+        if call.tool_name not in {
+            "testcase.batch_execute",
+            "websocket_testcase.batch_execute",
+            "testcase.batch_update_assertions",
+            "websocket_testcase.batch_update_assertions",
+        }:
+            return True
+        if rule.query_tool != "testcase.query_project_cases":
+            return True
+        if not isinstance(output, dict):
+            return False
+        policy = output.get("case_result_policy")
+        snapshot = output.get("case_snapshot")
+        return (
+            output.get("detail_level") == "execution_ready"
+            or (isinstance(policy, dict) and policy.get("execution_ready") is True)
+            or (isinstance(snapshot, dict) and snapshot.get("execution_ready") is True)
+        )
+
+    def _latest_object_query_ids(self, *, call: AgentToolCall, rule: ObjectReferenceGuardRule) -> list[int]:
+        return self._latest_object_query_facts(call=call, rule=rule)[0]
+
+    @staticmethod
+    def _object_reference_preflight_payload(
+        *,
+        rule: ObjectReferenceGuardRule,
+        call: AgentToolCall,
+        status: str,
+        reason: str,
+        requested_ids: list[int],
+        valid_ids: list[int],
+        requested_snapshot_ids: list[str],
+        latest_snapshot_id: str | None,
+        invalid_ids: list[int] | None = None,
+        stale_ids: list[int] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "preflight_version": "object_reference_preflight_v1",
+            "status": status,
+            "reason": reason,
+            "object_type": rule.object_type,
+            "query_tool": rule.query_tool,
+            "blocked_tool": call.tool_name,
+            "requested_ids": requested_ids,
+            "valid_ids": valid_ids,
+            "requested_snapshot_ids": requested_snapshot_ids,
+            "latest_snapshot_id": latest_snapshot_id,
+        }
+        if invalid_ids is not None:
+            payload["invalid_ids"] = invalid_ids
+        if stale_ids is not None:
+            payload["stale_ids"] = stale_ids
+        return payload
+
+    def _reject_case_reference_ids_without_current_facts(
         self,
         *,
         call: AgentToolCall,
@@ -4619,40 +6040,225 @@ class ToolExecutor:
         queue_service: AgentWorkerQueueService,
         runtime: AgentRuntimeService,
     ) -> AgentToolCall | None:
-        mode = self._case_update_query_guard_mode(call.tool_name)
-        if mode is None:
-            return None
-        requested_ids = self._case_update_requested_ids(call)
-        if not requested_ids:
-            return None
-        valid_ids = self._latest_query_project_case_ids(call=call, mode=mode)
-        valid_id_set = set(valid_ids)
-        invalid_ids = [item for item in requested_ids if item not in valid_id_set]
-        if not invalid_ids:
-            return None
+        for rule in self._object_reference_guard_rules(call.tool_name):
+            blocked = self._reject_object_reference_rule_without_current_facts(
+                call=call,
+                run=run,
+                queue_item=queue_item,
+                queue_service=queue_service,
+                runtime=runtime,
+                rule=rule,
+            )
+            if blocked is not None:
+                return blocked
+        return None
 
-        invalid_key = "invalid_websocket_test_case_ids" if mode == "websocket" else "invalid_test_case_ids"
-        valid_key = "valid_websocket_test_case_ids" if mode == "websocket" else "valid_test_case_ids"
-        error_code = (
-            "agent_websocket_testcase_ids_not_from_query_result"
-            if mode == "websocket"
-            else "agent_testcase_ids_not_from_query_result"
-        )
-        output = {
-            "required_tool": "testcase.query_project_cases",
-            "blocked_tool": call.tool_name,
-            invalid_key: invalid_ids,
-            valid_key: valid_ids,
-            "next_action": (
-                "Call testcase.query_project_cases in this Agent Run and retry using only the ids "
-                "returned in its explicit id lists; do not infer ids from numeric ranges."
-            ),
-        }
+    def _reject_object_reference_rule_without_current_facts(
+        self,
+        *,
+        call: AgentToolCall,
+        run: AgentRun,
+        queue_item: AgentWorkerQueue | None,
+        queue_service: AgentWorkerQueueService,
+        runtime: AgentRuntimeService,
+        rule: ObjectReferenceGuardRule,
+    ) -> AgentToolCall | None:
+        payload = call.input_json_redacted if isinstance(call.input_json_redacted, dict) else {}
+        top_level_scalar_refs = [
+            item
+            for key in rule.request_ref_keys
+            for item in self._as_str_list(payload.get(key))
+        ]
+        top_level_array_refs = [
+            item
+            for key in rule.request_ref_array_keys
+            for item in self._as_str_list(payload.get(key))
+        ]
+        requested_refs = self._object_reference_requested_refs(call, rule)
+        requested_ids = self._object_reference_requested_ids(call, rule)
+        requested_snapshot_ids = self._object_reference_requested_snapshot_ids(call, rule)
+        if not requested_ids and not requested_refs and not requested_snapshot_ids:
+            return None
+        valid_ids, latest_snapshot_id, object_ref_map = self._latest_object_query_facts(call=call, rule=rule)
+        invalid_refs = [item for item in requested_refs if item not in object_ref_map]
+        resolved_ref_ids = [object_ref_map[item] for item in requested_refs if item in object_ref_map]
+        if resolved_ref_ids:
+            requested_ids = list(dict.fromkeys([*requested_ids, *resolved_ref_ids]))
+            if isinstance(call.input_json_redacted, dict) and rule.request_id_keys and top_level_scalar_refs:
+                call.input_json_redacted.setdefault(rule.request_id_keys[0], object_ref_map[top_level_scalar_refs[0]])
+            if isinstance(call.input_json_redacted, dict) and rule.request_id_array_keys and top_level_array_refs:
+                call.input_json_redacted.setdefault(
+                    rule.request_id_array_keys[0],
+                    [object_ref_map[item] for item in top_level_array_refs if item in object_ref_map],
+                )
+            if (
+                isinstance(call.input_json_redacted, dict)
+                and rule.request_item_list_key
+                and rule.request_item_id_key
+            ):
+                for item in call.input_json_redacted.get(rule.request_item_list_key) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    for ref_key in rule.request_ref_keys:
+                        item_ref = item.get(ref_key)
+                        if isinstance(item_ref, str) and item_ref in object_ref_map:
+                            item.setdefault(rule.request_item_id_key, object_ref_map[item_ref])
+                            break
+        valid_id_set = set(valid_ids)
+        if requested_snapshot_ids and latest_snapshot_id not in set(requested_snapshot_ids):
+            preflight = self._object_reference_preflight_payload(
+                rule=rule,
+                call=call,
+                status="blocked",
+                reason="snapshot_mismatch",
+                requested_ids=requested_ids,
+                valid_ids=valid_ids,
+                requested_snapshot_ids=requested_snapshot_ids,
+                latest_snapshot_id=latest_snapshot_id,
+            )
+            output = {
+                "required_tool": rule.query_tool,
+                "blocked_tool": call.tool_name,
+                "object_type": rule.object_type,
+                "requested_snapshot_id": requested_snapshot_ids[0],
+                "latest_snapshot_id": latest_snapshot_id,
+                "snapshot_mismatch": True,
+                rule.valid_key: valid_ids,
+                "object_reference_preflight": preflight,
+                "next_action": (
+                    f"Call {rule.query_tool} again and retry only with the latest snapshot_id and ids."
+                ),
+            }
+            call.status = "failed"
+            call.execution_phase = "blocked_by_harness"
+            call.error_code = rule.snapshot_error_code
+            call.error_message = rule.snapshot_error_message
+            call.recovery_decision = rule.snapshot_before_retry_decision
+            call.output_json_redacted = output
+            call.output_hash = request_fingerprint(output)
+            call.policy_reason_json = _policy_reason_with_execution_context(
+                call,
+                worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
+            )
+            _clear_tool_call_lease(call)
+            runtime.append_event(
+                run,
+                "tool.failed",
+                {
+                    "tool_call_id": call.tool_call_id,
+                    "tool_name": call.tool_name,
+                    "error_code": rule.snapshot_error_code,
+                    "snapshot_mismatch": True,
+                    "requested_snapshot_id": requested_snapshot_ids[0],
+                    "latest_snapshot_id": latest_snapshot_id,
+                    "object_reference_preflight": preflight,
+                },
+                commit=False,
+            )
+            runtime.append_event(
+                run,
+                "tool.result_observed",
+                {
+                    "tool_call_id": call.tool_call_id,
+                    "tool_name": call.tool_name,
+                    "status": "failed",
+                    "error_code": rule.snapshot_error_code,
+                },
+                commit=False,
+            )
+            ApprovalService(self.db).supersede_pending_for_terminal_tool_call(
+                call=call,
+                run=run,
+                reason="tool_call_failed_before_approval",
+                commit=False,
+            )
+            if queue_item is not None:
+                queue_service.mark_failed(queue_item, error_code=rule.snapshot_error_code, commit=False)
+            self.db.commit()
+            self.db.refresh(call)
+            return call
+
+        if not requested_ids and not invalid_refs:
+            return None
+        invalid_ids = [item for item in requested_ids if item not in valid_id_set]
+
+        error_code = rule.invalid_error_code
+        error_message = rule.invalid_error_message
+        recovery_decision = rule.query_before_retry_decision
+        output: dict[str, Any]
+        diagnostic_key = rule.invalid_key
+        diagnostic_ids = invalid_ids
+        if not invalid_ids and not invalid_refs:
+            existing_statement = select(rule.db_model.id).where(
+                rule.db_model.project_id == run.project_id,
+                rule.db_model.id.in_(list(dict.fromkeys(requested_ids))),
+            )
+            if rule.not_deleted_attr:
+                existing_statement = existing_statement.where(
+                    getattr(rule.db_model, rule.not_deleted_attr).is_(False)
+                )
+            existing_ids = set(self.db.scalars(existing_statement).all())
+            stale_ids = [item for item in list(dict.fromkeys(requested_ids)) if item not in existing_ids]
+            if not stale_ids:
+                return None
+            error_code = rule.stale_error_code
+            diagnostic_key = rule.stale_key
+            diagnostic_ids = stale_ids
+            error_message = rule.stale_error_message
+            recovery_decision = rule.refresh_before_retry_decision
+            preflight = self._object_reference_preflight_payload(
+                rule=rule,
+                call=call,
+                status="blocked",
+                reason="stale_or_deleted",
+                requested_ids=requested_ids,
+                valid_ids=valid_ids,
+                requested_snapshot_ids=requested_snapshot_ids,
+                latest_snapshot_id=latest_snapshot_id,
+                stale_ids=stale_ids,
+            )
+            output = {
+                "required_tool": rule.query_tool,
+                "blocked_tool": call.tool_name,
+                "object_type": rule.object_type,
+                rule.stale_key: stale_ids,
+                rule.valid_key: valid_ids,
+                "object_reference_preflight": preflight,
+                "next_action": (
+                    f"Call {rule.query_tool} again and retry only with ids from the latest current snapshot."
+                ),
+            }
+        else:
+            preflight = self._object_reference_preflight_payload(
+                rule=rule,
+                call=call,
+                status="blocked",
+                reason="ids_not_from_query_result",
+                requested_ids=requested_ids,
+                valid_ids=valid_ids,
+                requested_snapshot_ids=requested_snapshot_ids,
+                latest_snapshot_id=latest_snapshot_id,
+                invalid_ids=invalid_ids,
+            )
+            output = {
+                "required_tool": rule.query_tool,
+                "blocked_tool": call.tool_name,
+                "object_type": rule.object_type,
+                rule.invalid_key: invalid_ids,
+                rule.valid_key: valid_ids,
+                "invalid_object_references": invalid_refs,
+                "valid_object_references": sorted(object_ref_map.keys()),
+                "object_reference_preflight": preflight,
+                "next_action": (
+                    f"Call {rule.query_tool} in this Agent conversation and retry using only the ids "
+                    "returned in its latest explicit id lists; do not infer ids from numeric ranges or older prose."
+                ),
+            }
         call.status = "failed"
         call.execution_phase = "blocked_by_harness"
         call.error_code = error_code
-        call.error_message = "Test case assertion update ids must come from testcase.query_project_cases returned ids."
-        call.recovery_decision = "query_project_cases_before_retry"
+        call.error_message = error_message
+        call.recovery_decision = recovery_decision
         call.output_json_redacted = output
         call.output_hash = request_fingerprint(output)
         call.policy_reason_json = _policy_reason_with_execution_context(
@@ -4660,15 +6266,20 @@ class ToolExecutor:
             worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
         )
         _clear_tool_call_lease(call)
+        event_payload = {
+            "tool_call_id": call.tool_call_id,
+            "tool_name": call.tool_name,
+            "error_code": error_code,
+            diagnostic_key: diagnostic_ids,
+            "object_reference_preflight": output["object_reference_preflight"],
+        }
+        if "invalid_object_references" in output:
+            event_payload["invalid_object_references"] = output["invalid_object_references"]
+            event_payload["valid_object_references"] = output["valid_object_references"]
         runtime.append_event(
             run,
             "tool.failed",
-            {
-                "tool_call_id": call.tool_call_id,
-                "tool_name": call.tool_name,
-                "error_code": error_code,
-                invalid_key: invalid_ids,
-            },
+            event_payload,
             commit=False,
         )
         runtime.append_event(
@@ -4682,8 +6293,185 @@ class ToolExecutor:
             },
             commit=False,
         )
+        ApprovalService(self.db).supersede_pending_for_terminal_tool_call(
+            call=call,
+            run=run,
+            reason="tool_call_failed_before_approval",
+            commit=False,
+        )
         if queue_item is not None:
             queue_service.mark_failed(queue_item, error_code=error_code, commit=False)
+        self.db.commit()
+        self.db.refresh(call)
+        return call
+
+    @staticmethod
+    def _path_values(data: Any, path: tuple[str, ...], *, prefix: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], Any]]:
+        if not path:
+            return [(prefix, data)]
+        current, *remaining = path
+        if current == "*":
+            if not isinstance(data, list):
+                return [(prefix, None)]
+            values: list[tuple[tuple[str, ...], Any]] = []
+            for index, item in enumerate(data):
+                values.extend(ToolExecutor._path_values(item, tuple(remaining), prefix=(*prefix, str(index))))
+            return values
+        if not isinstance(data, dict) or current not in data:
+            return [((*prefix, current), None)]
+        return ToolExecutor._path_values(data[current], tuple(remaining), prefix=(*prefix, current))
+
+    @staticmethod
+    def _safe_validation_errors(exc: ValidationError, *, base_path: tuple[str, ...]) -> list[dict[str, Any]]:
+        errors: list[dict[str, Any]] = []
+        for item in exc.errors():
+            loc = tuple(str(part) for part in item.get("loc", ()))
+            error: dict[str, Any] = {
+                "path": ".".join((*base_path, *loc)),
+                "type": str(item.get("type") or "value_error"),
+                "message": str(item.get("msg") or "Invalid value"),
+            }
+            if "input" in item:
+                input_preview = repr(item.get("input"))
+                if len(input_preview) > 240:
+                    input_preview = f"{input_preview[:240]}..."
+                error["input_preview"] = _bounded_agent_error_message(
+                    input_preview,
+                    reference="ToolExecutor.schema_preflight.validation_input",
+                )
+            errors.append(error)
+        return errors
+
+    def _reject_tool_input_schema_invalid_before_approval(
+        self,
+        *,
+        call: AgentToolCall,
+        run: AgentRun,
+        runtime: AgentRuntimeService,
+    ) -> AgentToolCall | None:
+        preflight = TOOL_INPUT_SCHEMA_PREFLIGHTS.get(call.tool_name)
+        if preflight is None:
+            return None
+        path, model = preflight
+        errors: list[dict[str, Any]] = []
+        for value_path, value in self._path_values(call.input_json_redacted, path):
+            try:
+                model.model_validate(value)
+            except ValidationError as exc:
+                errors.extend(self._safe_validation_errors(exc, base_path=value_path))
+        if not errors:
+            return None
+
+        output = {
+            "blocked_tool": call.tool_name,
+            "schema_preflight": {
+                "tool_name": call.tool_name,
+                "schema_name": model.__name__,
+                "errors": errors,
+            },
+            "next_action": (
+                "Repair the tool input to match the backend save schema before requesting approval. "
+                "For scenario response extraction, use test_case.config.extractors or "
+                "test_case.config._scenario_context.extractions instead of fixed_value after_actions."
+            ),
+        }
+        call.status = "failed"
+        call.execution_phase = "blocked_by_harness"
+        call.error_code = "agent_tool_input_schema_invalid"
+        call.error_message = "Tool input failed backend schema preflight before approval."
+        call.recovery_decision = "repair_tool_input_schema_before_retry"
+        call.output_json_redacted = output
+        call.output_hash = request_fingerprint(output)
+        call.policy_reason_json = _policy_reason_with_execution_context(call, worker_id=call.lease_owner)
+        _clear_tool_call_lease(call)
+        runtime.append_event(
+            run,
+            "tool.failed",
+            {
+                "tool_call_id": call.tool_call_id,
+                "tool_name": call.tool_name,
+                "error_code": call.error_code,
+                "schema_preflight": output["schema_preflight"],
+            },
+            commit=False,
+        )
+        runtime.append_event(
+            run,
+            "tool.result_observed",
+            {
+                "tool_call_id": call.tool_call_id,
+                "tool_name": call.tool_name,
+                "status": "failed",
+                "error_code": call.error_code,
+            },
+            commit=False,
+        )
+        self.db.commit()
+        self.db.refresh(call)
+        return call
+
+    def _reject_scenario_orchestration_quality_missing_before_approval(
+        self,
+        *,
+        call: AgentToolCall,
+        run: AgentRun,
+        runtime: AgentRuntimeService,
+    ) -> AgentToolCall | None:
+        if call.tool_name not in {"scenario.create_saved", "scenario.update_saved"}:
+            return None
+        payload = call.input_json_redacted if isinstance(call.input_json_redacted, dict) else {}
+        scenario = payload.get("scenario")
+        if not isinstance(scenario, dict):
+            return None
+        quality = _scenario_orchestration_quality_missing(intent=run.intent, scenario=scenario)
+        if quality is None:
+            return None
+
+        output = {
+            "blocked_tool": call.tool_name,
+            "quality_preflight": {
+                "tool_name": call.tool_name,
+                "reason": "scenario_orchestration_quality_missing",
+                **quality,
+            },
+            "next_action": (
+                "Reuse the latest scenario.compose_draft draft.scenario from the same conversation, "
+                "or recompose the scenario with scenario-level before_actions, after_actions, "
+                "_scenario_context.extractions, _scenario_context.bindings, and downstream {{variable}} references "
+                "before requesting approval to save."
+            ),
+        }
+        call.status = "failed"
+        call.execution_phase = "blocked_by_harness"
+        call.error_code = "agent_scenario_orchestration_quality_missing"
+        call.error_message = "Scenario save input is a degraded test-case list without scenario orchestration data."
+        call.recovery_decision = "reuse_or_recompose_scenario_draft_before_save"
+        call.output_json_redacted = output
+        call.output_hash = request_fingerprint(output)
+        call.policy_reason_json = _policy_reason_with_execution_context(call, worker_id=call.lease_owner)
+        _clear_tool_call_lease(call)
+        runtime.append_event(
+            run,
+            "tool.failed",
+            {
+                "tool_call_id": call.tool_call_id,
+                "tool_name": call.tool_name,
+                "error_code": call.error_code,
+                "quality_preflight": output["quality_preflight"],
+            },
+            commit=False,
+        )
+        runtime.append_event(
+            run,
+            "tool.result_observed",
+            {
+                "tool_call_id": call.tool_call_id,
+                "tool_name": call.tool_name,
+                "status": "failed",
+                "error_code": call.error_code,
+            },
+            commit=False,
+        )
         self.db.commit()
         self.db.refresh(call)
         return call
@@ -4760,6 +6548,24 @@ class ToolExecutor:
                 queue_item=queue_item,
                 queue_service=queue_service,
             )
+        blocked_by_case_ids = self._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=run,
+            queue_item=queue_item,
+            queue_service=queue_service,
+            runtime=runtime,
+        )
+        if blocked_by_case_ids is not None:
+            return blocked_by_case_ids
+        if call.approval_required and not call.approved_approval_id:
+            return self._defer_unapproved_tool_call(
+                call=call,
+                run=run,
+                queue_item=queue_item,
+                queue_service=queue_service,
+                runtime=runtime,
+                current_user=current_user,
+            )
         try:
             self.policy_manager.ensure_context_allows_execution(call=call)
             self.policy_manager.ensure_approval_allows_execution(call=call)
@@ -4825,16 +6631,6 @@ class ToolExecutor:
                 queue_service.mark_failed(queue_item, error_code=call.error_code, commit=False)
             self.db.commit()
             return call
-
-        blocked_by_case_ids = self._reject_case_update_ids_not_from_prior_query(
-            call=call,
-            run=run,
-            queue_item=queue_item,
-            queue_service=queue_service,
-            runtime=runtime,
-        )
-        if blocked_by_case_ids is not None:
-            return blocked_by_case_ids
 
         try:
             now = _utcnow()
@@ -5042,6 +6838,56 @@ class ToolExecutor:
         self.db.refresh(call)
         return call
 
+    def _defer_unapproved_tool_call(
+        self,
+        *,
+        call: AgentToolCall,
+        run: AgentRun,
+        queue_item: AgentWorkerQueue | None,
+        queue_service: AgentWorkerQueueService,
+        runtime: "AgentRuntimeService",
+        current_user: User,
+    ) -> AgentToolCall:
+        ApprovalService(self.db).create_pending_approval(
+            call=call,
+            run=run,
+            current_user=current_user,
+            commit=False,
+        )
+        blocking = list(run.blocking_tool_call_ids_json or [])
+        if call.tool_call_id not in blocking:
+            blocking.append(call.tool_call_id)
+        run.status = "needs_human"
+        run.blocking_tool_call_ids_json = blocking
+        call.status = "planned"
+        call.execution_phase = "awaiting_approval"
+        call.error_code = None
+        call.error_message = None
+        call.recovery_decision = "awaiting_approval"
+        call.policy_reason_json = _policy_reason_with_execution_context(
+            call,
+            worker_id=queue_item.lease_owner if queue_item is not None else call.lease_owner,
+        )
+        _clear_tool_call_lease(call)
+        if queue_item is not None:
+            queue_item.status = "blocked_approval"
+            queue_item.last_error_code = "approval_required_before_execution"
+            queue_item.lease_owner = None
+            queue_item.lease_expires_at = None
+        runtime.append_event(
+            run,
+            "run.needs_human",
+            {
+                "reason": "tool_approval_required",
+                "tool_call_id": call.tool_call_id,
+                "tool_name": call.tool_name,
+            },
+            commit=False,
+        )
+        self.db.commit()
+        self.db.refresh(call)
+        return call
+
     def _mark_eventstore_write_failed_after_effect(
         self,
         *,
@@ -5173,6 +7019,7 @@ def _conversation_system_prompt() -> str:
     return "\n\n".join([
         AGENT_CONVERSATION_SYSTEM_PROMPT,
         AGENT_MARKDOWN_RESPONSE_PROMPT,
+        AGENT_BUSINESS_OBJECT_DISPLAY_PROMPT,
         AGENT_TOOL_PROTOCOL_PROMPT.replace(
             "{tools}",
             json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
@@ -5209,6 +7056,12 @@ def _tool_call_summary(call: AgentToolCall) -> dict[str, Any]:
     }
 
 
+def _final_summary_tool_request_suppressed_message(tool_summaries: list[dict[str, Any]]) -> str:
+    if tool_summaries and all(summary.get("status") == "succeeded" for summary in tool_summaries):
+        return AGENT_FINAL_SUMMARY_TOOL_REQUEST_SUPPRESSED_SUCCESS_MESSAGE
+    return AGENT_FINAL_SUMMARY_TOOL_REQUEST_SUPPRESSED_MESSAGE
+
+
 def _tool_failure_signature(call: AgentToolCall) -> tuple[str, str, str] | None:
     if call.status != "failed":
         return None
@@ -5221,6 +7074,67 @@ def _tool_failure_signature(call: AgentToolCall) -> tuple[str, str, str] | None:
 
 def _tool_result_message(call: AgentToolCall) -> str:
     return build_tool_result_message(call)
+
+
+def _normalize_model_evidence_refs(
+    value: Any,
+    *,
+    allow_single_object: bool = True,
+) -> list[dict[str, Any]] | Any:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        if not allow_single_object:
+            return value
+        return [dict(value)] if value else []
+    if not isinstance(value, list):
+        ref = _model_evidence_ref_from_string(value)
+        return [ref] if ref is not None else []
+
+    normalized: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            normalized.append(dict(item))
+            continue
+        ref = _model_evidence_ref_from_string(item)
+        if ref is not None:
+            normalized.append(ref)
+    return normalized
+
+
+def _model_evidence_ref_from_string(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str):
+        return None
+    ref = value.strip()
+    if not ref:
+        return None
+    for prefix in ("tool-call:", "tool_call:"):
+        if ref.startswith(prefix):
+            tool_call_id = ref[len(prefix):].strip()
+            return _tool_call_audit_evidence_ref(tool_call_id) if tool_call_id else None
+    if ref.startswith("agent-tool-"):
+        return _tool_call_audit_evidence_ref(ref)
+    if ref.startswith("agent-run-"):
+        return {
+            "evidence_ref_id": f"run:{ref}",
+            "ref_type": "agent_run",
+            "ref_id": ref,
+            "mutability_class": "immutable",
+            "dependency_role": "audit_background",
+            "active_for_policy": False,
+        }
+    return None
+
+
+def _tool_call_audit_evidence_ref(tool_call_id: str) -> dict[str, Any]:
+    return {
+        "evidence_ref_id": f"tool-call:{tool_call_id}",
+        "ref_type": "tool_call",
+        "ref_id": tool_call_id,
+        "mutability_class": "immutable",
+        "dependency_role": "audit_background",
+        "active_for_policy": False,
+    }
 
 
 def _tool_request_context_message(*, tool_request: AgentToolRequest, content: str) -> str:
@@ -5264,6 +7178,14 @@ def _tool_result_context_messages(calls: list[AgentToolCall]) -> list[AIChatMess
 
 def _append_tool_result_context_message(messages: list[AIChatMessage], call: AgentToolCall) -> None:
     if any(AGENT_TOOL_RESULT_CONTEXT_TRUNCATION_MARKER in (message.content or "") for message in messages):
+        trace_debug(
+            "agent_trace_tool_result_context_skip_after_truncation",
+            run_id=call.run_id,
+            tool_call_id=call.tool_call_id,
+            tool_name=call.tool_name,
+            status=call.status,
+            message_count=len(messages),
+        )
         return
     used_chars = sum(
         len(message.content or "")
@@ -5272,8 +7194,31 @@ def _append_tool_result_context_message(messages: list[AIChatMessage], call: Age
     )
     remaining_chars = AGENT_TOOL_RESULT_CONTEXT_TOTAL_MAX_CHARS - used_chars
     if remaining_chars <= 0:
+        trace_debug(
+            "agent_trace_tool_result_context_budget_exhausted",
+            run_id=call.run_id,
+            tool_call_id=call.tool_call_id,
+            tool_name=call.tool_name,
+            status=call.status,
+            used_chars=used_chars,
+            budget_chars=AGENT_TOOL_RESULT_CONTEXT_TOTAL_MAX_CHARS,
+        )
         return
-    content = _cap_tool_result_context_message(_tool_result_message(call), remaining_chars)
+    raw_content = _tool_result_message(call)
+    content = _cap_tool_result_context_message(raw_content, remaining_chars)
+    trace_debug(
+        "agent_trace_tool_result_context_append",
+        run_id=call.run_id,
+        tool_call_id=call.tool_call_id,
+        tool_name=call.tool_name,
+        status=call.status,
+        used_chars=used_chars,
+        remaining_chars=remaining_chars,
+        raw_chars=len(raw_content),
+        appended_chars=len(content),
+        truncated=AGENT_TOOL_RESULT_CONTEXT_TRUNCATION_MARKER in content,
+        budget_chars=AGENT_TOOL_RESULT_CONTEXT_TOTAL_MAX_CHARS,
+    )
     messages.append(AIChatMessage(role="user", content=content))
 
 
@@ -5379,20 +7324,20 @@ def _intent_matches_unsupported_capability_guard(
     *,
     registry: AgentSkillRegistry | None = None,
 ) -> bool:
-    text = (intent or "").casefold()
-    if not text:
+    if not (intent or "").strip():
         return False
     registry = registry or AgentSkillRegistry()
     intent_keywords = registry.private_list(guard.skill_name, guard.intent_key)
     subject_keywords = registry.private_list(guard.skill_name, guard.subject_key)
-    if not any(keyword.casefold() in text for keyword in intent_keywords):
+    if not any(intent_matches_routing_phrase(intent, keyword) for keyword in intent_keywords):
         return False
+    ambiguous_subjects = {item.casefold() for item in AMBIGUOUS_DEICTIC_GUARD_SUBJECTS}
     explicit_subject_keywords = tuple(
         keyword
         for keyword in subject_keywords
-        if keyword.casefold() not in {item.casefold() for item in AMBIGUOUS_DEICTIC_GUARD_SUBJECTS}
+        if keyword.casefold() not in ambiguous_subjects
     )
-    return any(keyword.casefold() in text for keyword in explicit_subject_keywords)
+    return any(intent_matches_routing_phrase(intent, keyword) for keyword in explicit_subject_keywords)
 
 
 def _unsupported_capability_classifier_prompt(guard: UnsupportedCapabilityGuard) -> str | None:
@@ -5408,12 +7353,11 @@ def _unsupported_capability_message(guard: UnsupportedCapabilityGuard) -> str | 
 
 def _required_tool_followup_rules_for_intent(intent: str) -> tuple[RequiredToolFollowupRule, ...]:
     registry = AgentSkillRegistry()
-    text = (intent or "").casefold()
     rules: list[RequiredToolFollowupRule] = []
     for skill in registry.select_for_intent(intent):
         for raw_rule in registry.private_list(skill.name, REQUIRED_TOOL_AFTER_SUCCESS_ROUTING_KEY):
             rule = _parse_required_tool_followup_rule(raw_rule)
-            if rule is not None and _required_tool_followup_rule_matches_intent(rule, text):
+            if rule is not None and _required_tool_followup_rule_matches_intent(rule, intent):
                 rules.append(rule)
     return tuple(rules)
 
@@ -5444,7 +7388,7 @@ def _parse_required_tool_followup_rule(raw_rule: str) -> RequiredToolFollowupRul
 def _required_tool_followup_rule_matches_intent(rule: RequiredToolFollowupRule, text: str) -> bool:
     if not rule.intent_markers:
         return True
-    return any(marker.casefold() in text for marker in rule.intent_markers)
+    return any(intent_matches_routing_phrase(text, marker) for marker in rule.intent_markers)
 
 
 def _parse_semicolon_fields(raw_rule: str) -> dict[str, str]:
@@ -5470,13 +7414,12 @@ def _tool_output_min_total_satisfied(output: Any, field_names: tuple[str, ...]) 
 
 
 def _intent_matches_selected_skill_private_list(intent: str, key: str) -> bool:
-    text = (intent or "").casefold()
-    if not text:
+    if not (intent or "").strip():
         return False
     registry = AgentSkillRegistry()
     for skill in registry.list_skills():
         values = registry.private_list(skill.name, key)
-        if any(value.casefold() in text for value in values):
+        if any(intent_matches_routing_phrase(intent, value) for value in values):
             return True
     return False
 
@@ -5596,8 +7539,92 @@ def _looks_like_tool_request_content(content: str) -> bool:
     )
 
 
+def _visible_content_before_tool_request(content: str) -> str:
+    marker_index = content.find("```agent_tool_request")
+    if marker_index < 0:
+        return content.strip()
+    return content[:marker_index].rstrip()
+
+
+def _invalid_test_case_ids_in_final_response(content: str, *, valid_ids: set[int]) -> list[int]:
+    if not valid_ids:
+        return []
+    referenced_ids = _referenced_test_case_ids_in_text(content)
+    return sorted(item for item in referenced_ids if item not in valid_ids)
+
+
+def _referenced_test_case_ids_in_text(content: str) -> set[int]:
+    ids: set[int] = set()
+    case_ref_prefix = r"(?:测试用例|用例|HTTP\s*用例|WebSocket\s*用例|case)"
+    for match in re.finditer(
+        rf"{case_ref_prefix}\s*(?:ID\s*)?[:：]?\s*(\d+)\s*[-~～—]\s*(\d+)\b",
+        content,
+        flags=re.I,
+    ):
+        start = int(match.group(1))
+        end = int(match.group(2))
+        if 0 < start <= end and end - start <= 500:
+            ids.update(range(start, end + 1))
+    strict_patterns = (
+        rf"{case_ref_prefix}\s*(?:ID\s*)?[:：]?\s*(\d+)\b",
+        rf"{case_ref_prefix}[^。\n，,；;（）()]*[（(]\s*ID\s*[:：]?\s*(\d+)\s*[）)]",
+    )
+    for pattern in strict_patterns:
+        for match in re.finditer(pattern, content, flags=re.I):
+            ids.add(int(match.group(1)))
+    broad_pattern = rf"{case_ref_prefix}[^。\n]*?\bID\s*[:：]?\s*(\d+)\b"
+    for match in re.finditer(broad_pattern, content, flags=re.I):
+        matched_text = match.group(0)
+        if _looks_like_non_test_case_id_reference(matched_text):
+            continue
+        ids.add(int(match.group(1)))
+    return ids
+
+
+def _looks_like_non_test_case_id_reference(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?:项目|环境|project|environment)\s*(?:ID|id)\s*[:：]?\s*\d+\b\s*$",
+            text,
+            flags=re.I,
+        )
+    )
+
+
+def _coerce_int_list(value: Any) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    result: list[int] = []
+    for item in value:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
 def _looks_like_internal_tool_context_leak(content: str) -> bool:
-    return AGENT_TOOL_REQUEST_CONTEXT_SUMMARY_VERSION in (content or "")
+    text = content or ""
+    if AGENT_TOOL_REQUEST_CONTEXT_SUMMARY_VERSION in text:
+        return True
+    markers = (
+        "上一轮模型已发起工具请求",
+        "给后续模型使用的有界摘要",
+        "完整结构化事实以 ExecutionLedger/ToolCall 为准",
+        "evidence_refs_json",
+        "source_content_preview",
+        "full_content_reference=AgentConversationRunner.model.completed.tool_request.content",
+        "AgentConversationRunner.model_context.tool_request",
+        "AgentConversationRunner.model.completed.tool_request.content",
+    )
+    hits = sum(1 for marker in markers if marker in text)
+    if hits >= 2:
+        return True
+    return (
+        "input_json" in text
+        and "tool_name" in text
+        and ("tool_request" in text or "ToolCall" in text)
+    )
 
 
 def _normalize_agent_markdown_response(content: str) -> str:
@@ -5738,8 +7765,10 @@ def _conversation_working_context(
     *,
     current_intent: str,
     previous_runs: list[AgentRun],
+    tool_artifact_manifests: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    if not previous_runs:
+    tool_artifact_manifests = list(tool_artifact_manifests or [])
+    if not previous_runs and not tool_artifact_manifests:
         return None
     recent_runs = previous_runs[-AGENT_HISTORY_CONTEXT_FULL_TURNS:]
     turns = []
@@ -5756,19 +7785,38 @@ def _conversation_working_context(
             turn["inferred_artifact"] = inferred
             artifacts.append({"source_run_id": run.run_id, **inferred})
         turns.append(turn)
+    ledger_artifact_candidates = [
+        item
+        for item in tool_artifact_manifests
+        if item.get("artifact_type") and item.get("artifact_type") != "tool_result"
+    ]
     payload: dict[str, Any] = {
         "schema_version": "conversation_working_context_v1",
         "current_intent": current_intent,
         "current_intent_is_deictic_followup": _intent_is_deictic_followup(current_intent),
         "recent_turns": turns,
-        "current_artifact_candidates": artifacts[-3:],
+        "current_artifact_candidates": [
+            *ledger_artifact_candidates[-AGENT_CONVERSATION_TOOL_ARTIFACT_CONTEXT_MAX_ITEMS:],
+            *artifacts[-3:],
+        ],
         "resolution_rules": [
             "If current_intent_is_deictic_followup is true, resolve it against current_artifact_candidates before choosing tools.",
+            "Prefer matching conversation_tool_artifact_manifest items over inferred artifacts from assistant text.",
             "Prefer the latest artifact whose domain matches the user's last concrete request.",
             "If the referenced artifact cannot be identified, ask a short clarification instead of guessing.",
             "High-risk writes still require the matching approved tool and human approval.",
         ],
     }
+    if tool_artifact_manifests:
+        payload["conversation_tool_artifact_manifest"] = {
+            "schema_version": "conversation_tool_artifact_manifest_v1",
+            "items": tool_artifact_manifests,
+            "read_rules": [
+                "Each item is a lightweight pointer to ToolCall.output_json_redacted, not the full JSON.",
+                "Use tool_result.read_full with the listed tool_call_id and output_path when full facts are needed.",
+                "Do not treat unrelated conversation turns as artifact invalidation.",
+            ],
+        }
     return payload
 
 
@@ -5776,22 +7824,430 @@ def _format_conversation_working_context(payload: dict[str, Any]) -> str:
     return (
         "同一会话工作上下文：\n"
         "当前用户请求可能是对上一轮产物的省略回指；请先依据此结构化上下文解析“直接、刚才、上面、这个”等指代，"
-        "再决定是否调用工具、调用哪个工具、是否需要审批。\n"
+        "再决定是否调用工具、调用哪个工具、是否需要审批。若存在 conversation_tool_artifact_manifest，"
+        "它是同会话 ToolCall ledger 的轻量索引，优先于从 assistant 摘要推断的产物。\n"
         f"{json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)}"
     )
+
+
+def _scenario_from_compose_draft_output(output: Any) -> dict[str, Any] | None:
+    _, scenario = _scenario_artifact_from_compose_draft_output(output)
+    return scenario
+
+
+def _scenario_artifact_from_compose_draft_output(output: Any) -> tuple[str | None, dict[str, Any] | None]:
+    if not isinstance(output, dict):
+        return None, None
+    draft = output.get("draft")
+    if isinstance(draft, dict) and isinstance(draft.get("scenario"), dict):
+        return "draft.scenario", copy.deepcopy(draft["scenario"])
+    if isinstance(output.get("scenario"), dict):
+        return "scenario", copy.deepcopy(output["scenario"])
+    return None, None
+
+
+def _tool_call_artifact_manifest(call: AgentToolCall, source_run: AgentRun) -> dict[str, Any] | None:
+    output = call.output_json_redacted
+    if output is None:
+        return None
+    artifact_type = "tool_result"
+    domain = call.tool_name.split(".", 1)[0] if call.tool_name else "tool"
+    output_path: str | None = None
+    artifact_summary = _tool_output_artifact_summary(output)
+    available_followup_actions = ["read_full"]
+
+    if call.tool_name == "scenario.compose_draft":
+        scenario_path, scenario = _scenario_artifact_from_compose_draft_output(output)
+        if scenario is not None:
+            artifact_type = "scenario_draft"
+            domain = "scenario"
+            output_path = scenario_path
+            artifact_summary = _scenario_draft_artifact_summary(scenario)
+            available_followup_actions = ["read_full", "save", "update_saved"]
+    elif call.tool_name == "testcase.query_project_cases" and isinstance(output, dict):
+        artifact_type = "test_case_query_snapshot"
+        domain = "test_case"
+        artifact_summary = _test_case_query_snapshot_artifact_summary(output)
+        available_followup_actions = [
+            "read_full",
+            "analyze_cases",
+            "compose_scenario",
+            "update_assertions",
+            "batch_update_assertions",
+            "execute",
+        ]
+
+    read_full_input: dict[str, Any] = {"tool_call_id": call.tool_call_id}
+    if output_path:
+        read_full_input["path"] = output_path
+    manifest = {
+        "artifact_id": f"agent-tool-artifact://{call.tool_call_id}/{artifact_type}",
+        "artifact_type": artifact_type,
+        "domain": domain,
+        "status": "available",
+        "source": "tool_call_ledger",
+        "tool_call_id": call.tool_call_id,
+        "tool_name": call.tool_name,
+        "run_id": call.run_id,
+        "conversation_id": source_run.conversation_id,
+        "output_hash": call.output_hash,
+        "output_path": output_path,
+        "redaction": "output_json_redacted",
+        "artifact_summary": artifact_summary,
+        "available_followup_actions": available_followup_actions,
+        "full_output_read_tool": {
+            "tool_name": "tool_result.read_full",
+            "input": read_full_input,
+        },
+    }
+    return {key: value for key, value in manifest.items() if value is not None}
+
+
+def _prioritize_tool_artifact_manifests_for_context(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    limit = AGENT_CONVERSATION_TOOL_ARTIFACT_CONTEXT_MAX_ITEMS
+    if len(manifests) <= limit:
+        return manifests
+    selected: list[dict[str, Any]] = []
+    seen_artifact_ids: set[str] = set()
+
+    def add(item: dict[str, Any]) -> None:
+        artifact_id = str(item.get("artifact_id") or "")
+        if not artifact_id or artifact_id in seen_artifact_ids or len(selected) >= limit:
+            return
+        selected.append(item)
+        seen_artifact_ids.add(artifact_id)
+
+    for item in reversed(manifests):
+        if item.get("artifact_type") != "tool_result":
+            add(item)
+    for item in reversed(manifests):
+        add(item)
+    return list(reversed(selected))
+
+
+def _scenario_draft_artifact_summary(scenario: dict[str, Any]) -> dict[str, Any]:
+    nodes = scenario.get("nodes") if isinstance(scenario.get("nodes"), list) else []
+    datasets = scenario.get("datasets") if isinstance(scenario.get("datasets"), list) else []
+    summary: dict[str, Any] = {
+        "node_count": len(nodes),
+        "dataset_count": len(datasets),
+    }
+    name = scenario.get("name")
+    if isinstance(name, str) and name.strip():
+        summary["name"] = _truncate_history_text(name, AGENT_HISTORY_CONTEXT_SUMMARY_CHARS)
+    description = scenario.get("description")
+    if isinstance(description, str) and description.strip():
+        summary["description"] = _truncate_history_text(description, AGENT_HISTORY_CONTEXT_SUMMARY_CHARS)
+    environment_id = scenario.get("environment_id")
+    if environment_id is not None:
+        summary["environment_id"] = environment_id
+    return summary
+
+
+def _test_case_query_snapshot_artifact_summary(output: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key in ("project_id", "environment_id", "detail_level", "http_total", "websocket_total"):
+        value = output.get(key)
+        if value is not None:
+            summary[key] = value
+
+    case_manifest = output.get("case_id_manifest") if isinstance(output.get("case_id_manifest"), dict) else {}
+    object_manifest = (
+        output.get("object_reference_manifest")
+        if isinstance(output.get("object_reference_manifest"), dict)
+        else {}
+    )
+    snapshot = output.get("case_snapshot") if isinstance(output.get("case_snapshot"), dict) else {}
+    snapshot_id = object_manifest.get("snapshot_id") or case_manifest.get("snapshot_id") or snapshot.get("snapshot_id")
+    if snapshot_id is not None:
+        summary["snapshot_id"] = snapshot_id
+    for key in (
+        "http_test_case_ids",
+        "websocket_test_case_ids",
+        "http_assertion_update_ids",
+        "websocket_assertion_update_ids",
+        "http_test_case_refs",
+        "websocket_test_case_refs",
+    ):
+        values = object_manifest.get(key)
+        if not isinstance(values, list):
+            values = case_manifest.get(key)
+        if not isinstance(values, list):
+            values = output.get(key)
+        if isinstance(values, list):
+            summary[f"{key}_count"] = len(values)
+    object_references = object_manifest.get("object_references")
+    if isinstance(object_references, list):
+        summary["object_reference_count"] = len(object_references)
+    case_display_rows = output.get("case_display_rows")
+    if isinstance(case_display_rows, list):
+        summary["case_display_rows_count"] = len(case_display_rows)
+    if isinstance(output.get("case_result_policy"), dict):
+        execution_ready = output["case_result_policy"].get("execution_ready")
+        if execution_ready is not None:
+            summary["execution_ready"] = bool(execution_ready)
+    return summary
+
+
+def _tool_output_artifact_summary(output: Any) -> dict[str, Any]:
+    if isinstance(output, dict):
+        summary: dict[str, Any] = {
+            "top_level_keys": [str(key) for key in list(output.keys())[:8]],
+        }
+        for key, value in output.items():
+            if isinstance(value, list):
+                summary[f"{key}_count"] = len(value)
+            elif isinstance(value, dict):
+                summary[f"{key}_keys"] = [str(item) for item in list(value.keys())[:5]]
+        return summary
+    if isinstance(output, list):
+        return {"item_count": len(output)}
+    return {"value_type": type(output).__name__}
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _compact_reference_text(value: str) -> str:
+    return re.sub(r"[\s\W_]+", "", (value or "").casefold(), flags=re.UNICODE)
+
+
+def _scenario_name_matches_intent(scenario: Any, intent: str) -> bool:
+    if not isinstance(scenario, dict):
+        return False
+    name = str(scenario.get("name") or "").strip()
+    if not name:
+        return False
+    compact_name = _compact_reference_text(name)
+    compact_intent = _compact_reference_text(intent or "")
+    return bool(compact_name and compact_name in compact_intent)
+
+
+def _has_any_marker(text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker.casefold() in text for marker in markers)
+
+
+SCENARIO_SAVE_MARKERS = ("保存", "持久化", "落库", "發布", "发布", "save", "persist")
+SCENARIO_OBJECT_MARKERS = ("场景", "場景", "scenario", "草稿", "draft", "流程", "编排", "編排", "flow")
+SCENARIO_DEICTIC_MARKERS = (
+    "该",
+    "該",
+    "此",
+    "这个",
+    "這個",
+    "刚才",
+    "剛才",
+    "上面",
+    "前面",
+    "直接",
+    "它",
+    "this",
+    "that",
+    "above",
+    "previous",
+)
+SCENARIO_EXECUTE_MARKERS = (
+    "执行",
+    "執行",
+    "运行",
+    "運行",
+    "调试",
+    "調試",
+    "验证",
+    "驗證",
+    "dry-run",
+    "dryrun",
+    "execute",
+    "run",
+)
+
+
+def _intent_is_action_only_followup(intent: str) -> bool:
+    compact = _compact_reference_text(intent or "")
+    if not compact:
+        return False
+    removable_markers = (
+        *SCENARIO_SAVE_MARKERS,
+        *SCENARIO_EXECUTE_MARKERS,
+        "后",
+        "後",
+        "然后",
+        "然後",
+        "并",
+        "並",
+        "并且",
+        "並且",
+        "再",
+        "直接",
+        "马上",
+        "立即",
+        "帮我",
+        "幫我",
+        "一下",
+        "把",
+        "吧",
+        "please",
+    )
+    remainder = compact
+    for marker in sorted(removable_markers, key=len, reverse=True):
+        compact_marker = _compact_reference_text(marker)
+        if compact_marker:
+            remainder = remainder.replace(compact_marker, "")
+    return not remainder
+
+
+def _intent_requests_latest_scenario_draft(intent: str) -> bool:
+    text = (intent or "").casefold()
+    if not text:
+        return False
+    return (
+        _has_any_marker(text, SCENARIO_SAVE_MARKERS)
+        and (
+            _has_any_marker(text, SCENARIO_OBJECT_MARKERS)
+            or _intent_is_deictic_followup(intent)
+            or _has_any_marker(text, SCENARIO_DEICTIC_MARKERS)
+            or _intent_is_action_only_followup(intent)
+        )
+    )
+
+
+def _intent_requests_save_then_execute(intent: str) -> bool:
+    text = (intent or "").casefold()
+    if not text:
+        return False
+    return (
+        _has_any_marker(text, SCENARIO_SAVE_MARKERS)
+        and _has_any_marker(text, SCENARIO_EXECUTE_MARKERS)
+        and (
+            _has_any_marker(text, SCENARIO_OBJECT_MARKERS)
+            or _intent_is_deictic_followup(intent)
+            or _intent_is_action_only_followup(intent)
+        )
+    )
+
+
+def _scenario_orchestration_quality(scenario: Any) -> dict[str, Any]:
+    nodes = scenario.get("nodes") if isinstance(scenario, dict) else []
+    if not isinstance(nodes, list):
+        nodes = []
+    quality = {
+        "node_count": len(nodes),
+        "action_count": 0,
+        "extraction_count": 0,
+        "binding_count": 0,
+        "template_reference_count": 0,
+        "empty_test_case_configs": 0,
+    }
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        before_actions = node.get("before_actions", node.get("beforeActions"))
+        after_actions = node.get("after_actions", node.get("afterActions"))
+        quality["action_count"] += len(before_actions) if isinstance(before_actions, list) else 0
+        quality["action_count"] += len(after_actions) if isinstance(after_actions, list) else 0
+        test_case = node.get("test_case", node.get("testCase"))
+        if not isinstance(test_case, dict):
+            continue
+        config = test_case.get("config")
+        if not isinstance(config, dict) or not config:
+            quality["empty_test_case_configs"] += 1
+            config = {}
+        context = config.get("_scenario_context")
+        if not isinstance(context, dict):
+            context = {}
+        quality["extraction_count"] += _count_context_items(config, "extractors")
+        quality["extraction_count"] += _count_context_items(context, "extractions", "extractors")
+        quality["binding_count"] += _count_context_items(context, "bindings", "inputBindings", "input_bindings")
+        quality["template_reference_count"] += _count_template_references(config)
+    return quality
+
+
+def _count_context_items(data: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            return len([item for item in value if isinstance(item, dict)])
+    return 0
+
+
+def _count_template_references(value: Any) -> int:
+    if isinstance(value, str):
+        return len(re.findall(r"\{\{\s*[^{}]+?\s*\}\}", value))
+    if isinstance(value, dict):
+        return sum(_count_template_references(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(_count_template_references(item) for item in value)
+    return 0
+
+
+def _scenario_save_intent_requires_orchestration(intent: str, scenario: Any) -> bool:
+    scenario_text = ""
+    if isinstance(scenario, dict):
+        scenario_text = "\n".join(str(scenario.get(key) or "") for key in ("name", "description"))
+    text = f"{intent or ''}\n{scenario_text}".casefold()
+    markers = (
+        "依赖",
+        "依賴",
+        "取值",
+        "前置",
+        "后置",
+        "後置",
+        "上下文",
+        "链路",
+        "鏈路",
+        "流程",
+        "编排",
+        "編排",
+        "binding",
+        "dependency",
+        "extract",
+        "precondition",
+        "postcondition",
+        "workflow",
+        "context",
+    )
+    return any(marker.casefold() in text for marker in markers)
+
+
+def _scenario_orchestration_quality_missing(*, intent: str, scenario: Any) -> dict[str, Any] | None:
+    quality = _scenario_orchestration_quality(scenario)
+    if quality["node_count"] <= 1:
+        return None
+    if not _scenario_save_intent_requires_orchestration(intent, scenario):
+        return None
+    if quality["action_count"] or quality["extraction_count"] or quality["binding_count"]:
+        return None
+    empty_config_threshold = max(1, (quality["node_count"] + 1) // 2)
+    if quality["empty_test_case_configs"] < empty_config_threshold:
+        return None
+    return quality
 
 
 def _intent_is_deictic_followup(intent: str) -> bool:
     text = (intent or "").casefold()
     if not text:
         return False
+    if _intent_is_action_only_followup(intent):
+        return True
     markers = (
         "直接",
         "刚才",
         "上面",
         "前面",
+        "该",
+        "該",
+        "此",
         "这个",
+        "這個",
         "这些",
+        "這些",
         "继续",
         "按这个",
         "就这样",
@@ -5807,6 +8263,8 @@ def _intent_is_deictic_followup(intent: str) -> bool:
 def _infer_working_artifact(user_intent: str, assistant_message: str) -> dict[str, Any] | None:
     text = f"{user_intent}\n{assistant_message}".casefold()
     if not text.strip():
+        return None
+    if not _looks_like_working_artifact_signal(text):
         return None
     artifact_type: str | None = None
     domain: str | None = None
@@ -5843,6 +8301,35 @@ def _infer_working_artifact(user_intent: str, assistant_message: str) -> dict[st
     }
 
 
+def _looks_like_working_artifact_signal(text: str) -> bool:
+    markers = (
+        "草稿",
+        "尚未保存",
+        "未保存",
+        "已生成",
+        "生成",
+        "创建",
+        "组合",
+        "编排",
+        "分析",
+        "修复",
+        "更新",
+        "更改",
+        "变更",
+        "保存",
+        "审批",
+        "draft",
+        "generated",
+        "created",
+        "composed",
+        "updated",
+        "fixed",
+        "saved",
+        "approval",
+    )
+    return any(marker in text for marker in markers)
+
+
 def _compact_history_summary(pairs: list[dict[str, Any]]) -> str:
     lines = [
         "Conversation history compacted for prompt budget.",
@@ -5861,6 +8348,17 @@ def _compact_history_summary(pairs: list[dict[str, Any]]) -> str:
 def _estimate_chat_messages_tokens(messages: list[AIChatMessage]) -> int:
     total_chars = sum(len(message.content or "") for message in messages)
     return max(1, total_chars // 4)
+
+
+def _chat_messages_trace_payload(messages: list[AIChatMessage]) -> list[dict[str, Any]]:
+    return [
+        {
+            "index": index,
+            "role": str(getattr(message, "role", "") or ""),
+            "content": str(getattr(message, "content", "") or ""),
+        }
+        for index, message in enumerate(messages)
+    ]
 
 
 def _truncate_history_text(value: str, max_chars: int) -> str:

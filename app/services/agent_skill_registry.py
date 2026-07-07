@@ -13,6 +13,141 @@ AGENT_SKILL_PROMPT_TRUNCATION_MARKER = (
     "\n\n[agent_skill_prompt_truncated: full SKILL.md body is not injected into model context]"
 )
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(?P<body>.*?)\n---\s*\n?", re.S)
+PHRASE_KEY_SEPARATOR_RE = re.compile(r"[\s,，.。:：;；、/\\\-_\[\]【】()（）\"'`]+")
+CJK_OPERATION_TERMS = (
+    "批量执行",
+    "生成",
+    "创建",
+    "组合",
+    "保存",
+    "执行",
+    "运行",
+    "查询",
+    "读取",
+    "获取",
+    "拉取",
+    "查看",
+    "修复",
+    "校验",
+    "验证",
+    "扩写",
+    "导出",
+    "归档",
+    "导入",
+    "更新",
+    "删除",
+    "复制",
+    "重命名",
+    "分析",
+    "诊断",
+    "总结",
+)
+EXPLANATORY_INTENT_CUES = (
+    "是什么",
+    "什么是",
+    "有啥区别",
+    "有什么区别",
+    "区别是什么",
+    "设计原则",
+    "基本原则",
+    "概念",
+    "原理",
+    "理论",
+    "如何理解",
+    "解释",
+    "说明一下",
+    "介绍一下",
+    "讲解",
+)
+OPERATIONAL_CONTEXT_CUES = (
+    "完成",
+    "基于",
+    "按照",
+    "根据",
+    "把",
+    "给我",
+    "为我",
+    "直接",
+    "先",
+    "继续",
+    "重新",
+    "当前",
+    "最近",
+    "已有",
+    "真实",
+    "实际",
+    "项目",
+    "read",
+    "show",
+    "list",
+    "get",
+    "fetch",
+    "create",
+    "run",
+    "execute",
+    "query",
+    "summarize",
+    "analyze",
+    "fix",
+    "repair",
+    "validate",
+    "export",
+)
+WEAK_OPERATION_PHRASE_TERMS = (
+    "\u6279\u91cf\u6267\u884c",
+    "\u751f\u6210",
+    "\u521b\u5efa",
+    "\u7ec4\u5408",
+    "\u4fdd\u5b58",
+    "\u6267\u884c",
+    "\u8fd0\u884c",
+    "\u67e5\u8be2",
+    "\u8bfb\u53d6",
+    "\u83b7\u53d6",
+    "\u62c9\u53d6",
+    "\u67e5\u770b",
+    "\u4fee\u590d",
+    "\u6821\u9a8c",
+    "\u9a8c\u8bc1",
+    "\u6269\u5199",
+    "\u5bfc\u51fa",
+    "\u5f52\u6863",
+    "\u5bfc\u5165",
+    "\u66f4\u65b0",
+    "\u5220\u9664",
+    "\u590d\u5236",
+    "\u91cd\u547d\u540d",
+    "\u5206\u6790",
+    "\u8bca\u65ad",
+    "\u603b\u7ed3",
+    "save",
+    "generate",
+    "create",
+    "compose",
+    "run",
+    "execute",
+    "query",
+    "read",
+    "get",
+    "fetch",
+    "list",
+    "view",
+    "show",
+    "fix",
+    "repair",
+    "validate",
+    "verify",
+    "export",
+    "archive",
+    "import",
+    "update",
+    "delete",
+    "copy",
+    "rename",
+    "analyze",
+    "diagnose",
+    "summarize",
+)
 
 
 @dataclass(frozen=True)
@@ -192,8 +327,14 @@ def _skill_score(skill: AgentSkill, normalized_intent: str) -> int:
         if token in haystack:
             score += 1
     for phrase in skill.triggers:
-        if _normalize_text(phrase) in normalized_intent:
-            score += 3
+        if intent_matches_phrase(normalized_intent, phrase):
+            score += 1 if _is_weak_operation_phrase(phrase) else 3
+    for key, values in skill.routing_hints.items():
+        if key.startswith("guard_"):
+            continue
+        for phrase in values:
+            if intent_matches_routing_phrase(normalized_intent, phrase):
+                score += 0 if _is_weak_operation_phrase(phrase) else 2
     return score
 
 
@@ -217,6 +358,59 @@ def _intent_tokens(text: str) -> list[str]:
 
 def _normalize_text(text: str) -> str:
     return (text or "").casefold()
+
+
+def intent_matches_phrase(intent: str, phrase: str) -> bool:
+    intent_key = _phrase_key(intent)
+    phrase_key = _phrase_key(phrase)
+    if not intent_key or not phrase_key or phrase_key == "--":
+        return False
+    if phrase_key in intent_key:
+        return True
+    return any(variant in intent_key for variant in _phrase_order_variants(phrase_key))
+
+
+def intent_matches_routing_phrase(intent: str, phrase: str) -> bool:
+    if not intent_matches_phrase(intent, phrase):
+        return False
+    intent_key = _phrase_key(intent)
+    if _looks_like_explanatory_only_intent(intent_key):
+        return False
+    return True
+
+
+def _phrase_key(text: str) -> str:
+    return PHRASE_KEY_SEPARATOR_RE.sub("", _normalize_text(text))
+
+
+def _is_weak_operation_phrase(phrase: str) -> bool:
+    return _phrase_key(phrase) in _weak_operation_phrase_keys()
+
+
+@lru_cache(maxsize=1)
+def _weak_operation_phrase_keys() -> frozenset[str]:
+    return frozenset(_phrase_key(term) for term in WEAK_OPERATION_PHRASE_TERMS)
+
+
+def _phrase_order_variants(phrase_key: str) -> tuple[str, ...]:
+    variants: set[str] = set()
+    for term in CJK_OPERATION_TERMS:
+        term_key = _phrase_key(term)
+        if phrase_key.startswith(term_key):
+            rest = phrase_key[len(term_key):]
+            if len(rest) >= 2:
+                variants.add(f"{rest}{term_key}")
+        if phrase_key.endswith(term_key):
+            rest = phrase_key[:-len(term_key)]
+            if len(rest) >= 2:
+                variants.add(f"{term_key}{rest}")
+    return tuple(sorted(variants))
+
+
+def _looks_like_explanatory_only_intent(intent_key: str) -> bool:
+    if not any(_phrase_key(cue) in intent_key for cue in EXPLANATORY_INTENT_CUES):
+        return False
+    return not any(_phrase_key(cue) in intent_key for cue in OPERATIONAL_CONTEXT_CUES)
 
 
 def _cap_prompt_block(block: str) -> str:

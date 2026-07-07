@@ -32,7 +32,10 @@
 5. test_case.kind 只能是 api_case 或 websocket_case。
 6. reference_id 只能使用候选测试用例中的 ID，禁止编造不存在的用例 ID。
 7. 节点顺序必须符合业务流程，优先按鉴权、创建资源、查询校验、更新/删除、清理的顺序组合。
-8. 你必须分析候选用例的 request/session 和 response_snapshot：
+8. 你必须分析候选用例的 request/session、composition_hints 和 response_snapshot：
+   - 先判断每个候选用例在流程中的角色：前置条件、数据提供者、主流程、查询校验、变更操作、清理/后置。
+   - 优先使用 candidate_cases[].composition_hints.role_candidates、suggested_extractors、baseline_assertions、dependency_inputs、dependency_outputs。
+   - 不要把所有用例简单平铺成主流程；查询列表/登录/创建资源通常是下游步骤的前置或数据来源，取消/删除/等待通常是后置或清理候选。
    - 从登录、创建、查询等上游响应中识别 token、id、code、状态、业务主键等可复用字段。
    - 为上游步骤补充 test_case.config.extractors 和 test_case.config._scenario_context.extractions。
    - 为下游步骤补充 test_case.config._scenario_context.bindings，并在 config 的 headers、query_params、body、path 或 WebSocket messages 中使用 {{变量名}}。
@@ -68,12 +71,22 @@
     - 只有变量来自上游 extractors、before_actions 输出或 datasets 时，才允许使用 {{变量名}}。
     - 如果候选用例请求中已经有真实值，且没有上游变量来源，必须保留真实值，不要改写成 {{companyId}}、{{companyName}} 这类表达式。
 15. 前置动作 before_actions 可用于固定变量、随机数据、等待、条件门禁或脚本计算。后置动作 after_actions 可用于清理、等待或轻量校验。不要滥用动作。
+    - delay 用于异步数据落库、第三方同步、消息推送或弱一致性等待，配置 {"duration_ms": 非负整数}。
+    - fixed_value 用于用户需求、环境事实或业务前置中明确给出的固定变量，配置 {"output": "变量名", "value": JSON值}。
+    - random 用于需要唯一值的名称、编号、手机号后缀等，配置 type=integer/string/uuid 和 output。
+    - condition 用于基于 variables 或 steps 的门禁，不用于替代普通响应断言。
+    - script 只用于需要从已有变量计算派生值时，language 只能是 python 或 javascript，必须声明 inputs、outputs 和 timeout_ms；不要在脚本中发网络请求、读文件或处理密钥。
+    - 如果没有真实业务依据，不要凭空生成清理接口、脚本或等待；把缺失依据写入 warnings。
 16. 不要生成旧版 steps、execution_phase、phase 或全局 action。
 17. before_actions 和 after_actions 只在确有必要时生成，默认保持空数组。
 18. 如生成动作，只允许 condition、delay、random、fixed_value、script，并必须满足平台动作配置要求。
 19. datasets 默认输出空数组；只有用户明确要求数据驱动时才生成。
 20. 不确定的依赖关系写入 warnings，不要编造业务规则、不存在的变量或不存在的接口。
-21. 如果输入包含 previous_scenario 和 validation_feedback，表示上一版草稿已被平台实际执行：
+21. 断言策略：
+    - 优先保留候选用例已有断言。
+    - 如果 composition_hints.baseline_assertions 存在，至少保留其中稳定的 status_code、code、success 或 message_count 断言。
+    - 不要对时间戳、随机 id、token、签名、分页总数等不稳定值生成 json_equals，除非用户明确要求。
+22. 如果输入包含 previous_scenario 和 validation_feedback，表示上一版草稿已被平台实际执行：
     - 必须优先修复 validation_feedback.issues 中的失败原因。
     - 变量提取失败时，根据响应样本和失败路径修正 extractors/path。
     - 变量未解析时，补充上游提取器、前置动作、数据集变量，或回填候选用例真实值。

@@ -37,15 +37,16 @@ ROLLOUT_LEVELS = {
         "required_gates": ["Ledger/Worker available"],
     },
     "L2": {
-        "summary": "execution-record tools with reconcile support",
+        "summary": "execution-record and approval-gated business-update tools",
         "allowed_side_effect_classes": {
             "read_only",
             "deterministic_compute",
             "draft_only",
             "execution_record",
+            "business_update",
         },
-        "blocked_side_effect_classes": {"business_create", "business_update", "external_effect", "destructive"},
-        "required_gates": ["Reconcile minimum support"],
+        "blocked_side_effect_classes": {"business_create", "external_effect", "destructive"},
+        "required_gates": ["Reconcile minimum support", "Approval", "Execute-time permission check"],
     },
     "L3": {
         "summary": "business-create tools",
@@ -55,8 +56,9 @@ ROLLOUT_LEVELS = {
             "draft_only",
             "execution_record",
             "business_create",
+            "business_update",
         },
-        "blocked_side_effect_classes": {"business_update", "external_effect", "destructive"},
+        "blocked_side_effect_classes": {"external_effect", "destructive"},
         "required_gates": ["Approval", "Reconcile", "Execute-time permission check"],
     },
     "L4": {
@@ -395,7 +397,8 @@ class AgentReleaseGateService:
 
     def snapshot(self) -> dict[str, Any]:
         current = ROLLOUT_LEVELS[CURRENT_AGENT_ROLLOUT_LEVEL]
-        tools = [self._tool_row(spec) for spec in self.registry.list_specs()]
+        contract_map = self._contract_map()
+        tools = [self._tool_row(spec, contract_map=contract_map) for spec in self.registry.list_specs()]
         violations = [
             {field: violation[field] for field in RELEASE_GATE_VIOLATION_FIELDS}
             for violation in (
@@ -546,8 +549,13 @@ class AgentReleaseGateService:
         }
         return {field: payload[field] for field in PROMOTION_ASSESSMENT_CHECK_FIELDS}
 
-    def _tool_row(self, spec: ToolSpec) -> dict[str, Any]:
-        contract = self._contract_for(spec)
+    def _tool_row(
+        self,
+        spec: ToolSpec,
+        *,
+        contract_map: dict[tuple[str, str, str], AgentBackendContract] | None = None,
+    ) -> dict[str, Any]:
+        contract = self._contract_for(spec, contract_map=contract_map)
         rollout_allowed = (
             spec.side_effect_class in ROLLOUT_LEVELS[CURRENT_AGENT_ROLLOUT_LEVEL]["allowed_side_effect_classes"]
             and (contract is None or contract.compatibility_status == "active")
@@ -569,9 +577,21 @@ class AgentReleaseGateService:
         }
         return {field: row[field] for field in RELEASE_GATE_TOOL_FIELDS}
 
-    def _contract_for(self, spec: ToolSpec) -> AgentBackendContract | None:
+    def _contract_for(
+        self,
+        spec: ToolSpec,
+        *,
+        contract_map: dict[tuple[str, str, str], AgentBackendContract] | None = None,
+    ) -> AgentBackendContract | None:
         if spec.backend_contract is None:
             return None
+        key = (
+            spec.backend_contract.backend_name,
+            spec.backend_contract.backend_operation,
+            spec.backend_contract.backend_contract_version,
+        )
+        if contract_map is not None:
+            return contract_map.get(key)
         return self.db.scalar(
             select(AgentBackendContract).where(
                 AgentBackendContract.backend_name == spec.backend_contract.backend_name,
@@ -579,6 +599,17 @@ class AgentReleaseGateService:
                 AgentBackendContract.backend_contract_version == spec.backend_contract.backend_contract_version,
             )
         )
+
+    def _contract_map(self) -> dict[tuple[str, str, str], AgentBackendContract]:
+        contracts = self.db.scalars(select(AgentBackendContract)).all()
+        return {
+            (
+                contract.backend_name,
+                contract.backend_operation,
+                contract.backend_contract_version,
+            ): contract
+            for contract in contracts
+        }
 
     def _expansion_gates(self) -> list[dict[str, Any]]:
         gates: list[dict[str, Any]] = []

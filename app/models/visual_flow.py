@@ -49,6 +49,9 @@ class VisualFlowExecution(Base):
     __table_args__ = (
         UniqueConstraint("project_id", "idempotency_key", name="uq_visual_flow_executions_idempotency"),
         Index("ix_visual_flow_executions_project_created", "project_id", "created_at"),
+        Index("ix_visual_flow_executions_project_status_created", "project_id", "status", "created_at"),
+        Index("ix_visual_flow_executions_project_env_created", "project_id", "environment_id", "created_at"),
+        Index("ix_visual_flow_executions_project_user_created", "project_id", "trigger_user_id", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)

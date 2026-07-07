@@ -1,0 +1,68 @@
+[
+  {
+    "created_at": "2026-07-06 12:38:17",
+    "current_version": 1,
+    "definition_summary": {
+      "dataset_count": 0,
+      "node_count": 10,
+      "tag_count": 1,
+      "test_case_count": 10
+    },
+    "description": null,
+    "environment_id": 4,
+    "environment_name": "test",
+    "id": 27,
+    "last_run_at": null,
+    "name": "企业全场景自动化测试流程",
+    "object_ref": "object-ref://scenario/default/68147d41270f/27",
+    "project_id": 1,
+    "tags": [
+      "ai-composed"
+    ],
+    "updated_at": "2026-07-06 12:38:17"
+  },
+  {
+    "created_at": "2026-06-24 09:23:51",
+    "current_version": 9,
+    "definition_summary": {
+      "dataset_count": 0,
+      "node_count": 10,
+      "tag_count": 1,
+      "test_case_count": 10
+    },
+    "description": "新增一个企业自当年规划测试场景，涵盖企业从获取到最后新增的全部流程",
+    "environment_id": 4,
+    "environment_name": "test",
+    "id": 16,
+    "last_run_at": "2026-06-24 09:11:47",
+    "name": "企业测试链路",
+    "object_ref": "object-ref://scenario/default/68147d41270f/16",
+    "project_id": 1,
+    "tags": [
+      "ai-composed"
+    ],
+    "updated_at": "2026-06-24 21:18:49"
+  },
+  {
+    "created_at": "2026-06-23 08:28:31",
+    "current_version": 4,
+    "definition_summary": {
+      "dataset_count": 0,
+      "node_count": 9,
+      "tag_count": 1,
+      "test_case_count": 9
+    },
+    "description": "覆盖企业列表获取、详情查询、关注、知识产权与发展优势查询、取消关注的全流程",
+    "environment_id": 4,
+    "environment_name": "test",
+    "id": 15,
+    "last_run_at": "2026-06-23 00:57:42",
+    "name": "企业操作全生命周期",
+    "object_ref": "object-ref://scenario/default/68147d41270f/15",
+    "project_id": 1,
+    "tags": [
+      "ai-composed"
+    ],
+    "updated_at": "2026-06-23 08:57:42"
+  }
+]

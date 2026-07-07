@@ -91,6 +91,7 @@ class AgentEvent(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "event_seq", name="uq_agent_events_run_seq"),
         Index("ix_agent_events_run_seq", "run_id", "event_seq"),
+        Index("idx_agent_events_type_run", "event_type", "run_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
@@ -376,6 +377,7 @@ class AgentApproval(Base):
         Index("idx_agent_approvals_run_status", "run_id", "approval_status"),
         Index("idx_agent_approvals_lineage_status", "approval_lineage_id", "approval_status"),
         Index("idx_agent_approvals_expires", "approval_status", "expires_at"),
+        Index("idx_agent_approvals_project_expires", "project_id", "approval_status", "expires_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
@@ -413,6 +415,7 @@ class AgentApprovalMutationLog(Base):
     __table_args__ = (
         Index("idx_agent_approval_mutation_logs_lineage", "approval_lineage_id", "created_at"),
         Index("idx_agent_approval_mutation_logs_tool_call", "tool_call_id", "created_at"),
+        Index("idx_agent_approval_mutation_logs_run_type", "run_id", "mutation_type"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
@@ -477,6 +480,8 @@ class AgentLoopObservation(Base):
         UniqueConstraint("observation_id", name="uq_agent_loop_observations_observation_id"),
         Index("idx_agent_loop_observations_run", "run_id", "iteration", "step_index"),
         Index("idx_agent_loop_observations_context", "decision_context_build_id"),
+        Index("idx_agent_loop_observations_run_stop", "run_id", "stop_action_reason"),
+        Index("idx_agent_loop_observations_run_root", "run_id", "root_cause_primary"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
@@ -678,6 +683,7 @@ class AgentMemoryContradictionEvent(Base):
     __table_args__ = (
         Index("idx_memory_contradiction", "memory_id", "occurred_at"),
         Index("idx_memory_contradiction_fp", "memory_id", "failure_fingerprint"),
+        Index("idx_memory_contradiction_run_type", "run_id", "contradiction_type"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)

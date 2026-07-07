@@ -29,10 +29,11 @@ routing_requires_tool:
 ## Workflow
 
 1. For conceptual WebSocket testing advice, answer directly without tools.
-2. For current project WebSocket facts or reusable cases, use available read-only project/case tools first.
+2. For current project WebSocket facts or reusable cases, use `testcase.query_project_cases` first.
 3. For WebSocket test case draft generation or expansion, use `ai_skill.run_draft` with `skill_id=websocket-test-case` and operation `generate` or `expand`.
-4. Do not output HTTP-only fields such as method, body, query, or status-code assertions as WebSocket case fields.
-5. Do not claim that a WebSocket debug session was opened, closed, or persisted unless a dedicated backend tool succeeds.
+4. To persist full WebSocket cases, use `websocket_testcase.create_saved` or `websocket_testcase.update_saved` and wait for approval. To run saved WebSocket cases, use `websocket_testcase.execute_saved` or `websocket_testcase.batch_execute` only with ids from fresh project case facts.
+5. Do not output HTTP-only fields such as method, body, query, or status-code assertions as WebSocket case fields.
+6. Do not claim that a WebSocket debug session was opened, closed, or persisted unless a dedicated backend tool succeeds.
 
 ## Draft Quality
 

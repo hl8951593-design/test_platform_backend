@@ -36,10 +36,11 @@ routing_requires_tool:
 2. Use real response samples, execution details, or report summaries before asserting exact JSON paths or actual values.
 3. Prefer platform dot-path notation when the platform expects it, for example `data.dataList.0.companyId`; explain conversions from bracket notation when useful.
 4. Extract variables only after assertions that prove the response is valid enough to trust. Do not bind downstream steps to fields from failed responses unless explicitly intended.
-5. For saved-case assertion follow-ups, use same-conversation context or `testcase.query_project_cases` to recover real HTTP/WebSocket ids before saving; never infer a continuous id range from a table or prose.
-6. To save assertion-only changes, use `testcase.update_assertions` / `testcase.batch_update_assertions` for HTTP cases or `websocket_testcase.update_assertions` / `websocket_testcase.batch_update_assertions` for WebSocket cases after user approval. These tools preserve request, extractor, retry, and connection/message configuration.
-7. Do not use `ai_skill.run_draft` with `skill_id=http-test-case` and `operation=generate` to save or regenerate assertions for existing saved cases; that generate operation requires `interface_text` and is only for new draft creation from interface material.
-8. For missing sample responses, provide candidate paths and ask for the response or recommend a dry-run/read tool instead of inventing field locations.
+5. For saved-case assertion follow-ups, use same-conversation context or `testcase.query_project_cases` with `detail_level=summary` to recover the real HTTP/WebSocket id/name inventory before saving; never infer a continuous id range from a table or prose.
+6. For many cases, process one explicit id at a time: query `detail_level=assertions` for that single HTTP/WebSocket case, deduplicate or repair only that case's assertions, save it, then move to the next id. Do not re-query all cases with full detail after truncation, and do not ask the user to confirm data that can be fetched per case.
+7. To save assertion-only changes, use `testcase.update_assertions` per HTTP case or `websocket_testcase.update_assertions` per WebSocket case for large batches; use `testcase.batch_update_assertions` or `websocket_testcase.batch_update_assertions` only when every item was prepared from explicit per-case details. These tools preserve request, extractor, retry, and connection/message configuration.
+8. Do not use `ai_skill.run_draft` with `skill_id=http-test-case` and `operation=generate` to save or regenerate assertions for existing saved cases; that generate operation requires `interface_text` and is only for new draft creation from interface material.
+9. For missing sample responses, provide candidate paths and ask for the response or recommend a dry-run/read tool instead of inventing field locations.
 
 ## Final Reply
 

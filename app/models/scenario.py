@@ -71,6 +71,10 @@ class TestScenarioRun(Base):
     __table_args__ = (
         UniqueConstraint("project_id", "idempotency_key", name="uq_test_scenario_runs_project_idempotency"),
         Index("ix_test_scenario_runs_project_scenario_started", "project_id", "scenario_id", "started_at"),
+        Index("ix_test_scenario_runs_project_status_started", "project_id", "status", "started_at"),
+        Index("ix_test_scenario_runs_project_env_started", "project_id", "environment_id", "started_at"),
+        Index("ix_test_scenario_runs_project_user_started", "project_id", "triggered_by_id", "started_at"),
+        Index("ix_test_scenario_runs_project_dataset_record", "project_id", "dataset_id", "record_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)

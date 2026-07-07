@@ -124,6 +124,7 @@ DEFAULT_TOOL_RESULT_REPAIR_GUIDANCE = (
     "优先选择当前可用的 read/query/draft/validate 类安全工具补齐上下文、生成修复版或再次验证；不要编造缺失事实或私密凭据。"
 )
 TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS = 6000
+QUERY_PROJECT_CASES_MODEL_MESSAGE_MAX_CHARS = 64000
 TOOL_RESULT_OUTPUT_PREVIEW_MAX_CHARS = 2400
 TOOL_RESULT_MODEL_MESSAGE_TRUNCATION_MARKER = (
     "\n\n[tool_result_model_context_truncated: full output remains available in ToolCall.output_json_redacted]"
@@ -172,13 +173,19 @@ class ToolResultPolicy:
             f"\n\n{FINAL_RESPONSE_BUDGET_INSTRUCTION}\n"
             f"{json.dumps(payload, ensure_ascii=False, default=str)}"
         )
-        return self.cap_model_message(message)
+        return self.cap_model_message(
+            message,
+            max_chars=QUERY_PROJECT_CASES_MODEL_MESSAGE_MAX_CHARS
+            if getattr(call, "tool_name", None) == "testcase.query_project_cases"
+            else TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS,
+        )
 
     def model_payload(self, call: Any) -> dict[str, Any]:
-        output_view = self.model_output_view(getattr(call, "output_json_redacted", None))
+        tool_name = getattr(call, "tool_name", None)
+        output_view = self.model_output_view(getattr(call, "output_json_redacted", None), tool_name=tool_name)
         payload: dict[str, Any] = {
             "tool_call_id": getattr(call, "tool_call_id", None),
-            "tool_name": getattr(call, "tool_name", None),
+            "tool_name": tool_name,
             "status": getattr(call, "status", None),
             "approval_required": getattr(call, "approval_required", None),
             "output": output_view["output"],
@@ -192,9 +199,33 @@ class ToolResultPolicy:
         if output_view["truncated"]:
             payload["output_preview"] = output_view["preview"]
             payload["full_output_reference"] = "ToolCall.output_json_redacted"
+            if getattr(call, "tool_call_id", None):
+                payload["full_output_read_tool"] = {
+                    "tool_name": "tool_result.read_full",
+                    "input": {"tool_call_id": getattr(call, "tool_call_id", None)},
+                }
+        if output_view.get("compacted"):
+            payload["output_compacted_for_model"] = True
+            payload["full_output_reference"] = "ToolCall.output_json_redacted"
+            if getattr(call, "tool_call_id", None):
+                payload["full_output_read_tool"] = {
+                    "tool_name": "tool_result.read_full",
+                    "input": {"tool_call_id": getattr(call, "tool_call_id", None)},
+                }
         return payload
 
-    def model_output_view(self, output: Any) -> dict[str, Any]:
+    def model_output_view(self, output: Any, *, tool_name: str | None = None) -> dict[str, Any]:
+        if tool_name == "testcase.query_project_cases" and isinstance(output, dict):
+            compact_output = self.query_project_cases_model_output(output)
+            compact_json = json.dumps(compact_output, ensure_ascii=False, default=str)
+            return {
+                "output": compact_output,
+                "preview": None,
+                "truncated": False,
+                "size_chars": len(json.dumps(output, ensure_ascii=False, default=str)),
+                "preview_chars": len(compact_json),
+                "compacted": True,
+            }
         output_json = json.dumps(output, ensure_ascii=False, default=str)
         size_chars = len(output_json)
         if size_chars <= TOOL_RESULT_OUTPUT_PREVIEW_MAX_CHARS:
@@ -213,12 +244,80 @@ class ToolResultPolicy:
             "preview_chars": TOOL_RESULT_OUTPUT_PREVIEW_MAX_CHARS,
         }
 
+    def query_project_cases_model_output(self, output: dict[str, Any]) -> dict[str, Any]:
+        compact = {
+            "project_id": output.get("project_id"),
+            "environment_id": output.get("environment_id"),
+            "detail_level": output.get("detail_level"),
+            "http_total": output.get("http_total"),
+            "websocket_total": output.get("websocket_total"),
+            "case_id_manifest": output.get("case_id_manifest"),
+            "object_reference_manifest": output.get("object_reference_manifest"),
+            "case_display_rows": output.get("case_display_rows") or [],
+            "case_status_summary": output.get("case_status_summary"),
+            "case_attention_rows": output.get("case_attention_rows") or [],
+            "http_batch_execute_input": output.get("http_batch_execute_input"),
+            "websocket_batch_execute_input": output.get("websocket_batch_execute_input"),
+            "case_result_policy": output.get("case_result_policy"),
+        }
+        detail_level = str(output.get("detail_level") or "")
+        if detail_level in {"assertions", "selected", "full"}:
+            compact["http_test_cases"] = [
+                self._case_detail_for_model(item)
+                for item in (output.get("http_test_cases") or [])[:20]
+                if isinstance(item, dict)
+            ]
+            compact["websocket_test_cases"] = [
+                self._case_detail_for_model(item)
+                for item in (output.get("websocket_test_cases") or [])[:20]
+                if isinstance(item, dict)
+            ]
+            compact["case_detail_compaction"] = {
+                "http_detail_rows_returned": len(compact["http_test_cases"]),
+                "websocket_detail_rows_returned": len(compact["websocket_test_cases"]),
+                "detail_row_limit": 20,
+                "full_detail_read_tool": "tool_result.read_full",
+            }
+        return compact
+
     @staticmethod
-    def cap_model_message(message: str) -> str:
-        if len(message) <= TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS:
+    def _case_detail_for_model(item: dict[str, Any]) -> dict[str, Any]:
+        allowed_keys = {
+            "id",
+            "object_ref",
+            "name",
+            "method",
+            "path",
+            "environment_id",
+            "environment_ids",
+            "last_execution_status",
+            "assertions",
+            "assertion_count",
+            "extractors",
+            "extractor_count",
+        }
+        return {key: ToolResultPolicy._compact_case_detail_value(item.get(key)) for key in allowed_keys if key in item}
+
+    @staticmethod
+    def _compact_case_detail_value(value: Any) -> Any:
+        if isinstance(value, str):
+            return value if len(value) <= 500 else f"[string_truncated chars={len(value)}]"
+        if isinstance(value, list):
+            return [ToolResultPolicy._compact_case_detail_value(item) for item in value[:20]]
+        if isinstance(value, dict):
+            return {
+                key: ToolResultPolicy._compact_case_detail_value(item)
+                for key, item in value.items()
+                if key not in {"headers", "body", "query_params"}
+            }
+        return value
+
+    @staticmethod
+    def cap_model_message(message: str, *, max_chars: int = TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS) -> str:
+        if len(message) <= max_chars:
             return message
         marker = TOOL_RESULT_MODEL_MESSAGE_TRUNCATION_MARKER
-        prefix_length = max(0, TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS - len(marker))
+        prefix_length = max(0, max_chars - len(marker))
         return f"{message[:prefix_length]}{marker}"
 
     def followup_instruction(

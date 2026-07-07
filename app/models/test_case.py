@@ -74,6 +74,10 @@ class TestCaseExecution(Base):
     __table_args__ = (
         Index("ix_test_case_executions_project_created_at", "project_id", "created_at"),
         Index("ix_test_case_executions_case_created_at", "test_case_id", "created_at"),
+        Index("ix_test_case_executions_project_status_created", "project_id", "status", "created_at"),
+        Index("ix_test_case_executions_project_env_created", "project_id", "environment_id", "created_at"),
+        Index("ix_test_case_executions_project_user_created", "project_id", "executed_by_id", "created_at"),
+        Index("ix_test_case_executions_agent_tool_call_id", "agent_tool_call_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)

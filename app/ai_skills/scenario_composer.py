@@ -1,4 +1,5 @@
 import json
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,38 @@ from app.ai_skills.base import AISkill, SkillPackage, load_model_json
 from app.ai_skills.registry import register_ai_skill
 from app.schemas.ai import AIChatMessage, AIChatRequest, AIGeneratedScenarioResponse
 from app.schemas.scenario import ScenarioActionRequest, ScenarioCreateRequest
+
+
+SCENARIO_ACTION_CAPABILITIES = [
+    {
+        "kind": "delay",
+        "purpose": "wait for asynchronous data, eventual consistency, callbacks, or external state to settle",
+        "required_config": ["duration_ms"],
+    },
+    {
+        "kind": "condition",
+        "purpose": "gate a node by evaluating variables and previous step results",
+        "required_config": ["expression"],
+        "expression_roots": ["variables", "steps"],
+    },
+    {
+        "kind": "fixed_value",
+        "purpose": "declare a typed precondition variable such as tenant id, company id, or request seed data",
+        "required_config": ["output", "value"],
+    },
+    {
+        "kind": "random",
+        "purpose": "generate repeat-safe variable values for unique names, ids, or numbers",
+        "required_config": ["output", "type"],
+        "types": ["integer", "string", "uuid"],
+    },
+    {
+        "kind": "script",
+        "purpose": "compute derived variables from previous variables with a restricted script",
+        "required_config": ["language", "code", "inputs", "outputs", "timeout_ms"],
+        "languages": ["python", "javascript"],
+    },
+]
 
 
 class ScenarioComposerSkill(AISkill):
@@ -35,6 +68,7 @@ class ScenarioComposerSkill(AISkill):
             "execute_candidates": payload.execute_candidates,
             "max_nodes": payload.max_nodes,
             "extra_requirements": payload.extra_requirements,
+            "scenario_action_capabilities": SCENARIO_ACTION_CAPABILITIES,
             "candidate_cases": context["candidate_cases"],
         }
         if context.get("previous_scenario") is not None:
@@ -115,6 +149,7 @@ class ScenarioComposerSkill(AISkill):
             warnings.append("AI 未返回 nodes 数组")
 
         available_variables = self._dataset_variable_names(scenario_data)
+        variable_sources: dict[str, dict[str, str]] = {}
         for index, raw_node in enumerate(raw_nodes[: payload.max_nodes], start=1):
             if not isinstance(raw_node, dict):
                 warnings.append(f"第 {index} 个节点不是对象，已忽略")
@@ -144,13 +179,23 @@ class ScenarioComposerSkill(AISkill):
                 if payload.include_hooks
                 else []
             )
-            available_before_step = {*available_variables, *self._action_outputs(before_actions)}
+            before_action_sources = self._action_variable_sources(before_actions)
+            available_before_step = {
+                *available_variables,
+                *before_action_sources.keys(),
+            }
+            sources_before_step = {
+                **variable_sources,
+                **before_action_sources,
+            }
             config = self._step_config(
                 raw_test_case,
                 payload,
                 candidate,
                 warnings,
                 available_variables=available_before_step,
+                variable_sources=sources_before_step,
+                step_id=step_id,
                 step_label=step_label,
             )
             after_actions = (
@@ -178,9 +223,12 @@ class ScenarioComposerSkill(AISkill):
                 },
                 "after_actions": after_actions,
             })
-            available_variables.update(self._action_outputs(before_actions))
-            available_variables.update(self._config_extraction_names(config))
-            available_variables.update(self._action_outputs(after_actions))
+            variable_sources.update(before_action_sources)
+            extraction_sources = self._config_extraction_sources(config, step_id)
+            variable_sources.update(extraction_sources)
+            after_action_sources = self._action_variable_sources(after_actions)
+            variable_sources.update(after_action_sources)
+            available_variables.update(variable_sources.keys())
 
         if not nodes:
             raise HTTPException(
@@ -301,6 +349,8 @@ class ScenarioComposerSkill(AISkill):
         warnings: list[str],
         *,
         available_variables: set[str],
+        variable_sources: dict[str, dict[str, str]],
+        step_id: str,
         step_label: str,
     ) -> dict[str, Any]:
         config = raw_test_case.get("config") if isinstance(raw_test_case.get("config"), dict) else {}
@@ -308,11 +358,17 @@ class ScenarioComposerSkill(AISkill):
         self._replace_unbound_templates(config, candidate, available_variables, warnings, step_label=step_label)
         if payload.include_assertions:
             raw_assertions = raw_test_case.get("assertions")
+            model_declared_assertions = isinstance(raw_assertions, list)
             if not isinstance(raw_assertions, list) and isinstance(config.get("assertions"), list):
                 raw_assertions = config.get("assertions")
+                model_declared_assertions = True
             if not isinstance(raw_assertions, list) and isinstance(candidate.get("assertions"), list):
                 raw_assertions = candidate.get("assertions")
             assertions = self._normalize_assertions(raw_assertions, candidate, warnings, step_label=step_label)
+            if not assertions and not model_declared_assertions:
+                assertions = self._baseline_assertions(candidate)
+                if assertions:
+                    warnings.append(f"{step_label} 未提供可用断言，已根据最近响应样本补充基础断言")
             if assertions:
                 config["assertions"] = assertions
             else:
@@ -330,6 +386,7 @@ class ScenarioComposerSkill(AISkill):
             raw_extractors = candidate.get("extractors")
         extractors = self._normalize_extractors(raw_extractors, candidate, warnings, step_label=step_label)
         if extractors:
+            self._ensure_extractor_ids(extractors, step_id)
             config["extractors"] = extractors
             scenario_context = config.get("_scenario_context")
             if not isinstance(scenario_context, dict):
@@ -347,7 +404,217 @@ class ScenarioComposerSkill(AISkill):
                 scenario_context = {}
                 config["_scenario_context"] = scenario_context
             scenario_context["bindings"] = raw_test_case["bindings"]
+        if payload.include_bindings:
+            self._auto_bind_available_templates(
+                config,
+                variable_sources,
+                warnings,
+                step_id=step_id,
+                step_label=step_label,
+            )
         return config
+
+    def _action_variable_sources(self, actions: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+        sources: dict[str, dict[str, str]] = {}
+        for action in actions:
+            config = action.get("config")
+            if not isinstance(config, dict):
+                continue
+            action_id = str(action.get("id") or "")
+            output = config.get("output")
+            if output:
+                sources[str(output)] = {
+                    "source_step_id": action_id,
+                    "source_extraction_id": f"action:{action_id}",
+                }
+            raw_outputs = config.get("outputs")
+            if isinstance(raw_outputs, list):
+                for name in raw_outputs:
+                    if str(name).strip():
+                        sources[str(name)] = {
+                            "source_step_id": action_id,
+                            "source_extraction_id": f"action:{action_id}:{name}",
+                        }
+        return sources
+
+    def _config_extraction_sources(self, config: dict[str, Any], step_id: str) -> dict[str, dict[str, str]]:
+        sources: dict[str, dict[str, str]] = {}
+        for extraction in config.get("extractors") or []:
+            if not isinstance(extraction, dict):
+                continue
+            name = extraction.get("name")
+            path = extraction.get("path")
+            if not name or path is None:
+                continue
+            extraction_id = extraction.get("id") or self._trace_id("VAR-AUTO", step_id, name, path)
+            extraction["id"] = extraction_id
+            sources[str(name)] = {
+                "source_step_id": step_id,
+                "source_extraction_id": str(extraction_id),
+            }
+        scenario_context = config.get("_scenario_context")
+        if isinstance(scenario_context, dict):
+            scenario_context["extractions"] = [
+                item for item in config.get("extractors") or [] if isinstance(item, dict)
+            ]
+        return sources
+
+    def _ensure_extractor_ids(self, extractors: list[dict[str, Any]], step_id: str) -> None:
+        for extractor in extractors:
+            if extractor.get("id"):
+                continue
+            name = extractor.get("name")
+            path = extractor.get("path")
+            extractor["id"] = self._trace_id("VAR-AUTO", step_id, name, path)
+
+    def _auto_bind_available_templates(
+        self,
+        config: dict[str, Any],
+        variable_sources: dict[str, dict[str, str]],
+        warnings: list[str],
+        *,
+        step_id: str,
+        step_label: str,
+    ) -> None:
+        if not variable_sources:
+            return
+        scenario_context = config.get("_scenario_context")
+        has_context = isinstance(scenario_context, dict)
+        if not has_context:
+            scenario_context = {}
+        bindings = [
+            dict(item)
+            for item in self._context_items(scenario_context, "bindings", "inputBindings", "input_bindings")
+        ]
+        seen = {
+            (
+                str(item.get("name") or item.get("variable") or item.get("variable_name") or ""),
+                str(item.get("target") or ""),
+                str(item.get("target_path") or item.get("targetPath") or ""),
+            )
+            for item in bindings
+            if isinstance(item, dict)
+        }
+        added = 0
+        for target, target_path, variable_name in self._template_binding_candidates(config):
+            source = self._find_variable_source(variable_sources, variable_name)
+            if source is None:
+                continue
+            key = (variable_name, target, target_path)
+            if key in seen:
+                continue
+            bindings.append({
+                "id": self._trace_id(
+                    "BIND-AUTO",
+                    step_id,
+                    source["source_step_id"],
+                    source["source_extraction_id"],
+                    target,
+                    target_path,
+                ),
+                "name": variable_name,
+                "source_step_id": source["source_step_id"],
+                "source_extraction_id": source["source_extraction_id"],
+                "target": target,
+                "target_path": target_path,
+            })
+            seen.add(key)
+            added += 1
+        if bindings:
+            if not has_context:
+                config["_scenario_context"] = scenario_context
+            scenario_context["bindings"] = bindings
+        elif has_context:
+            scenario_context.pop("bindings", None)
+        if added:
+            warnings.append(f"{step_label} 已根据请求模板自动补充 {added} 条变量绑定")
+
+    def _template_binding_candidates(self, config: dict[str, Any]) -> list[tuple[str, str, str]]:
+        bindings: list[tuple[str, str, str]] = []
+
+        def walk(value: Any, root: str, parts: list[str]) -> None:
+            if isinstance(value, str):
+                target_path = ".".join(parts)
+                if root == "path" and not target_path:
+                    return
+                for match in re.finditer(r"\{\{\s*([^{}]+?)\s*\}\}", value):
+                    bindings.append((root, target_path, match.group(1).strip()))
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    walk(item, root, [*parts, str(key)])
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    walk(item, root, [*parts, str(index)])
+
+        for root in ("path", "headers", "query_params", "body", "messages", "subprotocols"):
+            if root in config:
+                walk(config[root], root, [])
+        return bindings
+
+    def _find_variable_source(
+        self,
+        variable_sources: dict[str, dict[str, str]],
+        variable_name: str,
+    ) -> dict[str, str] | None:
+        if variable_name in variable_sources:
+            return variable_sources[variable_name]
+        normalized = self._normalize_variable_name(variable_name)
+        for name, source in variable_sources.items():
+            if self._normalize_variable_name(name) == normalized:
+                return source
+        return None
+
+    def _baseline_assertions(self, candidate: dict[str, Any]) -> list[dict[str, Any]]:
+        if candidate.get("kind") == "websocket_case":
+            return self._websocket_baseline_assertions(candidate)
+        return self._http_baseline_assertions(candidate)
+
+    def _http_baseline_assertions(self, candidate: dict[str, Any]) -> list[dict[str, Any]]:
+        response = self._candidate_response_snapshot(candidate)
+        if not response:
+            return []
+        assertions: list[dict[str, Any]] = []
+        status_code = response.get("status_code")
+        if status_code is not None:
+            assertions.append({"type": "status_code", "expected": self._as_int_if_possible(status_code)})
+        json_body = response.get("json")
+        if isinstance(json_body, dict):
+            for key in ("code", "success", "status"):
+                value = json_body.get(key)
+                if value is not None and isinstance(value, (str, int, float, bool)):
+                    assertions.append({"type": "json_equals", "path": key, "expected": value})
+        return self._dedupe_assertions(assertions)
+
+    def _websocket_baseline_assertions(self, candidate: dict[str, Any]) -> list[dict[str, Any]]:
+        response = self._candidate_response_snapshot(candidate)
+        messages = response.get("received_messages") if response else None
+        assertions: list[dict[str, Any]] = []
+        if isinstance(messages, list) and messages:
+            assertions.append({"type": "message_count", "expected": len(messages)})
+        elif candidate.get("receive_count") is not None:
+            assertions.append({"type": "message_count", "expected": candidate.get("receive_count")})
+        return assertions
+
+    @staticmethod
+    def _dedupe_assertions(assertions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[tuple[str, str, str]] = set()
+        result: list[dict[str, Any]] = []
+        for assertion in assertions:
+            key = (
+                str(assertion.get("type") or ""),
+                str(assertion.get("path") or assertion.get("message_index") or ""),
+                json.dumps(assertion.get("expected"), ensure_ascii=False, sort_keys=True),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(assertion)
+        return result
+
+    @staticmethod
+    def _trace_id(prefix: str, *parts: Any) -> str:
+        raw = "|".join("" if item is None else str(item) for item in parts)
+        return f"{prefix}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
 
     def _replace_unbound_templates(
         self,

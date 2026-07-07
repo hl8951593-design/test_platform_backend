@@ -34,8 +34,9 @@ routing_requires_tool:
 1. Identify the execution scope: single case batch, scenario, visual flow, test plan, data-driven records, or CI-triggered run.
 2. For real run status, queue state, timing, retry count, or failure distribution, use available execution/report/context tools before stating facts.
 3. Separate planning concerns: ordering, dependency, parallelism, timeout, retry, cancellation, idempotency, environment isolation, and report aggregation.
-4. Avoid recommending retries for non-idempotent requests unless the request is explicitly safe or has a compensation strategy.
-5. If the platform lacks a scheduling or cancellation write tool, describe the contract and do not claim the schedule or cancellation was applied.
+4. For real case batches, use `testcase.batch_execute` or `websocket_testcase.batch_execute` only after fresh execution-ready case facts; do not infer continuous id ranges.
+5. Avoid recommending retries for non-idempotent requests unless the request is explicitly safe or has a compensation strategy.
+6. If the platform lacks a scheduling or cancellation write tool, describe the contract and do not claim the schedule or cancellation was applied.
 
 ## Final Reply
 

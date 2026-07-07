@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import Any
 
@@ -27,6 +27,7 @@ from app.services.permission_service import PermissionService
 
 
 APPROVAL_FINAL_STATUSES = {"approved", "rejected", "expired", "superseded"}
+DEFAULT_APPROVAL_EXPIRATION_MINUTES = 30
 APPROVAL_IMMUTABLE_FIELDS = (
     "input_hash",
     "runtime_snapshot_id",
@@ -196,6 +197,7 @@ class ApprovalService:
             return existing
 
         now = _utcnow()
+        effective_expires_at = expires_at or now + timedelta(minutes=DEFAULT_APPROVAL_EXPIRATION_MINUTES)
         lineage_id = call.approval_lineage_id or f"agent-appr-lineage-{uuid.uuid4().hex}"
         lineage = AgentApprovalLineage(
             approval_lineage_id=lineage_id,
@@ -225,7 +227,7 @@ class ApprovalService:
             resource_scope_hash=call.approval_scope_hash or call.input_hash,
             approval_reason=reason or "tool_call_requires_approval",
             required_permissions_json=list(call.required_permissions_json),
-            expires_at=expires_at,
+            expires_at=effective_expires_at,
             created_at=now,
             updated_at=now,
         )
@@ -332,6 +334,82 @@ class ApprovalService:
                 .order_by(AgentApproval.created_at.desc(), AgentApproval.approval_epoch.desc())
             ).all()
         )
+
+    def supersede_pending_for_terminal_tool_call(
+        self,
+        *,
+        call: AgentToolCall,
+        run: AgentRun,
+        reason: str,
+        commit: bool = True,
+    ) -> list[AgentApproval]:
+        if call.status in APPROVABLE_TOOL_CALL_STATUSES:
+            return []
+
+        approvals = list(
+            self.db.scalars(
+                select(AgentApproval)
+                .where(
+                    AgentApproval.tool_call_id == call.tool_call_id,
+                    AgentApproval.approval_status == "pending",
+                )
+                .with_for_update()
+            ).all()
+        )
+        if not approvals:
+            return []
+
+        now = _utcnow()
+        from app.services.agent_runtime_service import AgentRuntimeService
+
+        runtime = AgentRuntimeService(self.db)
+        for approval in approvals:
+            lineage = self.get_lineage(approval_lineage_id=approval.approval_lineage_id)
+            if lineage is None:
+                continue
+            from_status = approval.approval_status
+            approval.approval_status = "superseded"
+            approval.decided_at = now
+            approval.decision_reason = reason
+            approval.updated_at = now
+            if lineage.tool_call_id == call.tool_call_id and lineage.status == "pending":
+                lineage.status = "superseded"
+                lineage.updated_at = now
+            self._add_mutation(
+                approval=approval,
+                lineage=lineage,
+                mutation_type="supersede",
+                from_status=from_status,
+                to_status="superseded",
+                actor_user_id=None,
+                reason=reason,
+                details_json={
+                    "terminal_tool_call_status": call.status,
+                    "terminal_tool_call_error_code": call.error_code,
+                },
+            )
+            runtime.append_event(
+                run,
+                "approval.superseded",
+                {
+                    "tool_call_id": call.tool_call_id,
+                    "approval_id": approval.approval_id,
+                    "approval_lineage_id": approval.approval_lineage_id,
+                    "approval_epoch": approval.approval_epoch,
+                    "reason": reason,
+                    "terminal_tool_call_status": call.status,
+                    "terminal_tool_call_error_code": call.error_code,
+                },
+                commit=False,
+            )
+
+        if commit:
+            self.db.commit()
+            for approval in approvals:
+                self.db.refresh(approval)
+        else:
+            self.db.flush()
+        return approvals
 
     def _add_mutation(
         self,
@@ -559,6 +637,13 @@ class ApprovalMutationGuard:
             commit=False,
         )
         self._block_queue(call, error_code="approval_rejected")
+        self._settle_run_after_terminal_denial(
+            run=run,
+            call=call,
+            runtime=AgentRuntimeService(self.db),
+            error_code="approval_rejected",
+            error_message=payload.reason or "Approval rejected",
+        )
         self.db.commit()
         self.db.refresh(approval)
         self.db.refresh(lineage)
@@ -1031,6 +1116,13 @@ class ApprovalMutationGuard:
             commit=False,
         )
         self._block_queue(call, error_code="approval_expired")
+        self._settle_run_after_terminal_denial(
+            run=run,
+            call=call,
+            runtime=AgentRuntimeService(self.db),
+            error_code="approval_expired",
+            error_message="Approval expired",
+        )
 
     def _validate_call_approvable(self, call: AgentToolCall) -> None:
         if call.status not in APPROVABLE_TOOL_CALL_STATUSES:
@@ -1073,6 +1165,38 @@ class ApprovalMutationGuard:
             item.lease_owner = None
             item.lease_expires_at = None
 
+    def _settle_run_after_terminal_denial(
+        self,
+        *,
+        run: AgentRun,
+        call: AgentToolCall,
+        runtime: Any,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        blocking_ids = list(run.blocking_tool_call_ids_json or [])
+        if call.tool_call_id not in blocking_ids:
+            return
+
+        remaining = [tool_call_id for tool_call_id in blocking_ids if tool_call_id != call.tool_call_id]
+        run.blocking_tool_call_ids_json = remaining
+        if remaining:
+            run.status = "needs_human"
+            return
+
+        if run.status in {"completed", "failed", "cancelled"}:
+            return
+        run.status = "failed"
+        run.error_code = error_code
+        run.error_message = error_message
+        run.completed_at = _utcnow()
+        runtime.append_event(
+            run,
+            "run.failed",
+            {"error_code": error_code, "error_message": error_message},
+            commit=False,
+        )
+
     def _add_mutation(
         self,
         *,
@@ -1108,7 +1232,7 @@ class ApprovalExpireScanner:
     def audit(self, *, project_id: int | None = None, now: datetime | None = None) -> dict[str, Any]:
         current = now or _utcnow()
         statement = (
-            select(AgentApproval)
+            select(AgentApproval.approval_lineage_id, AgentApproval.expires_at)
             .where(
                 AgentApproval.approval_status == "pending",
                 AgentApproval.expires_at.is_not(None),
@@ -1118,13 +1242,13 @@ class ApprovalExpireScanner:
         )
         if project_id is not None:
             statement = statement.where(AgentApproval.project_id == project_id)
-        approvals = list(self.db.scalars(statement).all())
+        approvals = list(self.db.execute(statement).all())
         lineage_counts: dict[str, int] = {}
-        for approval in approvals:
-            lineage_counts[approval.approval_lineage_id] = lineage_counts.get(approval.approval_lineage_id, 0) + 1
+        for approval_lineage_id, _expires_at in approvals:
+            lineage_counts[approval_lineage_id] = lineage_counts.get(approval_lineage_id, 0) + 1
         oldest_due_lag_ms = 0
         if approvals:
-            oldest_expires_at = min(approval.expires_at for approval in approvals if approval.expires_at is not None)
+            oldest_expires_at = min(expires_at for _approval_lineage_id, expires_at in approvals if expires_at is not None)
             oldest_due_lag_ms = max(0, int((current - oldest_expires_at).total_seconds() * 1000))
         hotspot_lineages = sorted(
             lineage_id for lineage_id, count in lineage_counts.items() if count > 1

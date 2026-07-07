@@ -1,3 +1,4 @@
+import re
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -333,7 +334,7 @@ class AIScenarioComposerService:
         return cases
 
     def _http_case_data(self, item: TestCase, *, execution_sample: dict[str, Any] | None) -> dict[str, Any]:
-        return {
+        data = {
             "kind": "api_case",
             "reference_id": item.id,
             "name": item.name,
@@ -350,9 +351,11 @@ class AIScenarioComposerService:
             "environment_ids": item.environment_ids,
             "execution_sample": execution_sample,
         }
+        data["composition_hints"] = self._composition_hints(data)
+        return data
 
     def _websocket_case_data(self, item: WebSocketTestCase, *, execution_sample: dict[str, Any] | None) -> dict[str, Any]:
-        return {
+        data = {
             "kind": "websocket_case",
             "reference_id": item.id,
             "name": item.name,
@@ -369,6 +372,183 @@ class AIScenarioComposerService:
             "environment_ids": item.environment_ids,
             "execution_sample": execution_sample,
         }
+        data["composition_hints"] = self._composition_hints(data)
+        return data
+
+    def _composition_hints(self, case_data: dict[str, Any]) -> dict[str, Any]:
+        response_json = self._response_json(case_data.get("execution_sample"))
+        response_fields = self._json_leaf_paths(response_json)
+        suggested_extractors = self._suggest_extractors(
+            response_fields=response_fields,
+            existing_extractors=case_data.get("extractors") or [],
+        )
+        baseline_assertions = self._baseline_assertions(case_data, response_json)
+        request_fields = self._request_field_paths(case_data)
+        request_template_variables = self._template_variables({
+            "path": case_data.get("path"),
+            "headers": case_data.get("headers"),
+            "query_params": case_data.get("query_params"),
+            "body": case_data.get("body"),
+            "messages": case_data.get("messages"),
+            "subprotocols": case_data.get("subprotocols"),
+        })
+        return {
+            "role_candidates": self._role_candidates(case_data),
+            "request_fields": request_fields[:120],
+            "request_template_variables": request_template_variables,
+            "response_fields": [item["name"] for item in response_fields[:120]],
+            "suggested_extractors": suggested_extractors[:20],
+            "baseline_assertions": baseline_assertions[:10],
+            "dependency_inputs": request_template_variables,
+            "dependency_outputs": [item["name"] for item in suggested_extractors[:20]],
+        }
+
+    def _role_candidates(self, case_data: dict[str, Any]) -> list[str]:
+        text = " ".join(
+            str(case_data.get(key) or "")
+            for key in ("name", "description", "path", "method")
+        ).lower()
+        method = str(case_data.get("method") or "").upper()
+        roles: list[str] = []
+        if any(marker in text for marker in ("login", "auth", "token", "登录", "鉴权", "授权")):
+            roles.extend(["precondition", "authentication", "data_provider"])
+        if method == "GET" or any(marker in text for marker in ("list", "page", "query", "search", "get", "查询", "列表", "获取")):
+            roles.extend(["data_provider", "validation"])
+        if method in {"POST", "PUT", "PATCH", "DELETE"} or any(
+            marker in text
+            for marker in ("save", "create", "update", "delete", "cancel", "follow", "新增", "创建", "更新", "删除", "取消", "关注")
+        ):
+            roles.append("mutation")
+        if any(marker in text for marker in ("delete", "cancel", "cleanup", "清理", "删除", "取消")):
+            roles.append("cleanup_candidate")
+        return list(dict.fromkeys(roles or ["main_flow"]))
+
+    def _request_field_paths(self, case_data: dict[str, Any]) -> list[str]:
+        fields: list[str] = []
+        for root in ("headers", "query_params", "body", "messages", "subprotocols"):
+            for path in self._value_leaf_paths(case_data.get(root)):
+                fields.append(f"{root}.{path}" if path else root)
+        if case_data.get("path"):
+            fields.append("path")
+        return fields
+
+    def _value_leaf_paths(self, value: Any, prefix: str = "") -> list[str]:
+        if isinstance(value, dict):
+            paths: list[str] = []
+            for key, item in value.items():
+                child = f"{prefix}.{key}" if prefix else str(key)
+                paths.extend(self._value_leaf_paths(item, child))
+            return paths
+        if isinstance(value, list):
+            paths: list[str] = []
+            for index, item in enumerate(value):
+                child = f"{prefix}.{index}" if prefix else str(index)
+                paths.extend(self._value_leaf_paths(item, child))
+            return paths
+        return [prefix] if prefix else []
+
+    def _template_variables(self, value: Any) -> list[str]:
+        found: list[str] = []
+
+        def walk(item: Any) -> None:
+            if isinstance(item, str):
+                for match in re.finditer(r"\{\{\s*([^{}]+?)\s*\}\}", item):
+                    found.append(match.group(1).strip())
+            elif isinstance(item, dict):
+                for child in item.values():
+                    walk(child)
+            elif isinstance(item, list):
+                for child in item:
+                    walk(child)
+
+        walk(value)
+        return list(dict.fromkeys(found))
+
+    def _response_json(self, execution_sample: Any) -> Any:
+        if not isinstance(execution_sample, dict):
+            return None
+        response = execution_sample.get("response_snapshot")
+        if not isinstance(response, dict):
+            return None
+        if "json" in response:
+            return response.get("json")
+        messages = response.get("received_messages")
+        if isinstance(messages, list) and messages:
+            first = messages[0]
+            if isinstance(first, dict):
+                return first.get("json")
+        return None
+
+    def _json_leaf_paths(self, value: Any, prefix: str = "") -> list[dict[str, str]]:
+        if isinstance(value, dict):
+            fields: list[dict[str, str]] = []
+            for key, item in value.items():
+                child = f"{prefix}.{key}" if prefix else str(key)
+                fields.extend(self._json_leaf_paths(item, child))
+            return fields
+        if isinstance(value, list):
+            fields: list[dict[str, str]] = []
+            for index, item in enumerate(value[:3]):
+                child = f"{prefix}.{index}" if prefix else str(index)
+                fields.extend(self._json_leaf_paths(item, child))
+            return fields
+        if prefix:
+            return [{"name": prefix.rsplit(".", 1)[-1], "path": prefix}]
+        return []
+
+    def _suggest_extractors(
+        self,
+        *,
+        response_fields: list[dict[str, str]],
+        existing_extractors: list[Any],
+    ) -> list[dict[str, str]]:
+        existing_names = {
+            str(item.get("name"))
+            for item in existing_extractors
+            if isinstance(item, dict) and item.get("name")
+        }
+        important_names = {
+            "id",
+            "token",
+            "accessToken",
+            "access_token",
+            "companyId",
+            "companyName",
+            "entId",
+            "ent_id",
+        }
+        suggestions: list[dict[str, str]] = []
+        for field in response_fields:
+            name = field["name"]
+            normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+            is_important = (
+                name in important_names
+                or normalized.endswith("id")
+                or normalized.endswith("token")
+                or normalized.endswith("name")
+            )
+            if not is_important or name in existing_names:
+                continue
+            suggestions.append({"name": name, "path": field["path"]})
+        return suggestions
+
+    def _baseline_assertions(self, case_data: dict[str, Any], response_json: Any) -> list[dict[str, Any]]:
+        assertions: list[dict[str, Any]] = []
+        execution_sample = case_data.get("execution_sample")
+        response = execution_sample.get("response_snapshot") if isinstance(execution_sample, dict) else None
+        if isinstance(response, dict) and response.get("status_code") is not None:
+            assertions.append({"type": "status_code", "expected": response.get("status_code")})
+        if case_data.get("kind") == "websocket_case":
+            messages = response.get("received_messages") if isinstance(response, dict) else None
+            if isinstance(messages, list):
+                assertions.append({"type": "message_count", "expected": len(messages)})
+            return assertions
+        if isinstance(response_json, dict):
+            for key in ("code", "success", "status"):
+                value = response_json.get(key)
+                if value is not None and isinstance(value, (str, int, float, bool)):
+                    assertions.append({"type": "json_equals", "path": key, "expected": value})
+        return assertions
 
     def _http_execution_sample(
         self,

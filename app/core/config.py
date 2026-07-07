@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     EXECUTION_WORKER_QUEUE_SIZE: int = 256
     EXECUTION_REQUEST_WAIT_TIMEOUT_SECONDS: float = 300.0
     AGENT_RUN_STALE_TIMEOUT_SECONDS: float = 900.0
+    AGENT_TRACE_VERBOSE_PAYLOADS: bool = False
+    AGENT_TRACE_FULL_PAYLOADS: bool = False
+    AGENT_TRACE_PAYLOAD_MAX_CHARS: int = 12000
     LOG_LEVEL: str = "INFO"
     LOG_FILE_PATH: str = "logs/app.log"
     LOG_REQUESTS: bool = True

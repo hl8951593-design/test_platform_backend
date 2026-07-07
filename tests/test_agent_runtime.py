@@ -9,12 +9,13 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
-from sqlalchemy import create_engine, func, inspect, select
+from sqlalchemy import create_engine, event as sqlalchemy_event, func, inspect, select
 from sqlalchemy.exc import PendingRollbackError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import app.models  # noqa: F401
+from app.core.sensitive_data import request_fingerprint
 from app.db.base import Base
 from app.models.agent import (
     AgentApproval,
@@ -354,6 +355,7 @@ from app.services.agent_runtime_service import (
     UnsupportedCapabilityGuard,
     _conversation_system_prompt,
     _format_memory_context,
+    _looks_like_internal_tool_context_leak,
     _intent_likely_requires_agent_tool,
     _required_tool_followup_rules_for_intent,
     _unsupported_capability_classifier_prompt,
@@ -628,14 +630,291 @@ class AgentRuntimeTests(unittest.TestCase):
                 "run.started",
                 "model.started",
                 "model.delta",
-                "model.delta",
                 "model.completed",
                 "run.completed",
             ],
         )
-        self.assertEqual(events[3].payload_json["content"], "我可以")
-        self.assertEqual(events[5].payload_json["content"], "我可以帮你编排测试。")
-        self.assertEqual(events[6].payload_json["result"]["model"], "deepseek-test")
+        self.assertEqual(events[3].payload_json["content"], "我可以帮你编排测试。")
+        self.assertEqual(events[4].payload_json["content"], "我可以帮你编排测试。")
+        self.assertEqual(events[5].payload_json["result"]["model"], "deepseek-test")
+
+    def test_agent_trace_logs_run_model_and_terminal_flow_without_content_leaks(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="trace sensitive model flow"),
+            current_user=self.owner,
+        )
+
+        def fake_stream(_self, _payload):
+            yield {"type": "delta", "content": "SECRET_TRACE_CONTENT"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_trace.settings.AGENT_TRACE_FULL_PAYLOADS", False),
+            self.assertLogs("app.agent.trace", level="INFO") as captured_logs,
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+        ):
+            AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertIn("agent_trace_run_start", log_output)
+        self.assertIn("agent_trace_model_call_start", log_output)
+        self.assertIn("agent_trace_model_call_done", log_output)
+        self.assertIn("agent_trace_run_completed", log_output)
+        self.assertIn(f"run_id={run.run_id}", log_output)
+        self.assertNotIn("SECRET_TRACE_CONTENT", log_output)
+
+    def test_agent_trace_logs_tool_backend_metadata_without_payload_value_leaks(self):
+        from app.models.test_case import TestCase
+        from app.services.agent_tool_service import AgentToolBackend
+
+        self.db.add(
+            TestCase(
+                id=611,
+                project_id=10,
+                name="Trace Case",
+                description="trace case",
+                method="GET",
+                path="/trace-case",
+                headers={"Authorization": "SECRET_TRACE_TOKEN"},
+                query_params={"secret": "SECRET_QUERY_VALUE"},
+                body_type="none",
+                body=None,
+                assertions=[],
+                extractors=[],
+                retry_policy=None,
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.commit()
+
+        with (
+            patch("app.services.agent_trace.settings.AGENT_TRACE_FULL_PAYLOADS", False),
+            self.assertLogs("app.agent.trace", level="INFO") as captured_logs,
+        ):
+            AgentToolBackend(self.db).execute(
+                tool_name="testcase.query_project_cases",
+                payload={"project_id": 10, "detail_level": "full"},
+                current_user=self.owner,
+            )
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertIn("agent_trace_tool_backend_start", log_output)
+        self.assertIn("agent_trace_tool_backend_done", log_output)
+        self.assertIn("tool_name=testcase.query_project_cases", log_output)
+        self.assertIn("payload_keys=", log_output)
+        self.assertIn("result_keys=", log_output)
+        self.assertNotIn("SECRET_TRACE_TOKEN", log_output)
+        self.assertNotIn("SECRET_QUERY_VALUE", log_output)
+
+    def test_agent_trace_verbose_logs_model_response_payload_when_enabled(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="trace model payload"),
+            current_user=self.owner,
+        )
+
+        def fake_stream(_self, _payload):
+            yield {"type": "delta", "content": "DEEPSEEK_VISIBLE_RETURN"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_trace.settings.AGENT_TRACE_VERBOSE_PAYLOADS", True),
+            patch("app.services.agent_trace.settings.AGENT_TRACE_FULL_PAYLOADS", False),
+            patch("app.services.agent_trace.settings.AGENT_TRACE_PAYLOAD_MAX_CHARS", 200),
+            self.assertLogs("app.agent.trace", level="INFO") as captured_logs,
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+        ):
+            AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertIn("agent_trace_model_response_payload", log_output)
+        self.assertIn("content_preview=DEEPSEEK_VISIBLE_RETURN", log_output)
+        self.assertIn("content_hash=", log_output)
+
+    def test_agent_trace_full_payload_logs_complete_value_without_preview_limit(self):
+        from app.services.agent_trace import trace_full_payload
+
+        full_payload = "FULL_PAYLOAD_MARKER_" + ("x" * 200)
+        with (
+            patch("app.services.agent_trace.settings.AGENT_TRACE_FULL_PAYLOADS", True),
+            patch("app.services.agent_trace.settings.AGENT_TRACE_PAYLOAD_MAX_CHARS", 8),
+            self.assertLogs("app.agent.trace", level="INFO") as captured_logs,
+        ):
+            trace_full_payload(
+                "agent_trace_custom_full_payload",
+                full_payload,
+                prefix="payload",
+                mask=False,
+            )
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertIn("agent_trace_custom_full_payload", log_output)
+        self.assertIn(full_payload, log_output)
+        self.assertIn("payload_size_chars=220", log_output)
+        self.assertIn("payload_hash=", log_output)
+
+    def test_agent_trace_full_logs_model_prompt_messages_and_response_when_enabled(self):
+        full_intent = "FULL_PROMPT_MARKER_" + ("p" * 180)
+        full_response = "FULL_MODEL_RESPONSE_MARKER_" + ("r" * 180)
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent=full_intent),
+            current_user=self.owner,
+        )
+
+        def fake_stream(_self, _payload):
+            yield {"type": "delta", "content": full_response}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_trace.settings.AGENT_TRACE_FULL_PAYLOADS", True),
+            patch("app.services.agent_trace.settings.AGENT_TRACE_PAYLOAD_MAX_CHARS", 8),
+            self.assertLogs("app.agent.trace", level="INFO") as captured_logs,
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+        ):
+            AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertIn("agent_trace_model_prompt_full_payload", log_output)
+        self.assertIn(full_intent, log_output)
+        self.assertIn("agent_trace_model_response_full_payload", log_output)
+        self.assertIn(full_response, log_output)
+
+    def test_agent_trace_full_logs_runtime_tool_input_and_output_when_enabled(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="FULL_TOOL_TRACE_MARKER read project context"),
+            current_user=self.owner,
+        )
+        calls = {"count": 0}
+
+        def fake_stream(_self, _payload):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{"project_id":10},"reason":"read context"}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "context received"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_trace.settings.AGENT_TRACE_FULL_PAYLOADS", True),
+            self.assertLogs("app.agent.trace", level="INFO") as captured_logs,
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertEqual(completed.status, "completed")
+        self.assertIn("agent_trace_tool_input_full_payload", log_output)
+        self.assertIn('input_full={"project_id":10}', log_output)
+        self.assertIn("agent_trace_tool_output_full_payload", log_output)
+        self.assertIn("Agent Project", log_output)
+
+    def test_agent_trace_verbose_logs_tool_result_payload_with_sensitive_values_masked(self):
+        from app.models.test_case import TestCase
+        from app.services.agent_tool_service import AgentToolBackend
+
+        self.db.add(
+            TestCase(
+                id=612,
+                project_id=10,
+                name="Verbose Trace Case",
+                description="trace case",
+                method="GET",
+                path="/verbose-trace-case",
+                headers={"Authorization": "SECRET_VERBOSE_TOKEN"},
+                query_params={"public": "visible"},
+                body_type="none",
+                body=None,
+                assertions=[],
+                extractors=[],
+                retry_policy=None,
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.commit()
+
+        with (
+            patch("app.services.agent_trace.settings.AGENT_TRACE_VERBOSE_PAYLOADS", True),
+            patch("app.services.agent_trace.settings.AGENT_TRACE_FULL_PAYLOADS", False),
+            patch("app.services.agent_trace.settings.AGENT_TRACE_PAYLOAD_MAX_CHARS", 10000),
+            self.assertLogs("app.agent.trace", level="INFO") as captured_logs,
+        ):
+            AgentToolBackend(self.db).execute(
+                tool_name="testcase.query_project_cases",
+                payload={"project_id": 10, "detail_level": "full"},
+                current_user=self.owner,
+            )
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertIn("agent_trace_tool_backend_result_payload", log_output)
+        self.assertIn("Verbose Trace Case", log_output)
+        self.assertIn('"Authorization":"***"', log_output)
+        self.assertNotIn("SECRET_VERBOSE_TOKEN", log_output)
+
+    def test_agent_trace_full_logs_tool_backend_result_with_sensitive_values_masked(self):
+        from app.models.test_case import TestCase
+        from app.services.agent_tool_service import AgentToolBackend
+
+        self.db.add(
+            TestCase(
+                id=613,
+                project_id=10,
+                name="Full Trace Case",
+                description="trace case",
+                method="GET",
+                path="/full-trace-case",
+                headers={"Authorization": "SECRET_FULL_TRACE_TOKEN"},
+                query_params={"public": "visible"},
+                body_type="none",
+                body=None,
+                assertions=[],
+                extractors=[],
+                retry_policy=None,
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.commit()
+
+        with (
+            patch("app.services.agent_trace.settings.AGENT_TRACE_FULL_PAYLOADS", True),
+            patch("app.services.agent_trace.settings.AGENT_TRACE_PAYLOAD_MAX_CHARS", 8),
+            self.assertLogs("app.agent.trace", level="INFO") as captured_logs,
+        ):
+            AgentToolBackend(self.db).execute(
+                tool_name="testcase.query_project_cases",
+                payload={"project_id": 10, "detail_level": "full"},
+                current_user=self.owner,
+            )
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertIn("agent_trace_tool_backend_result_full_payload", log_output)
+        self.assertIn("Full Trace Case", log_output)
+        self.assertIn('"Authorization":"***"', log_output)
+        self.assertNotIn("SECRET_FULL_TRACE_TOKEN", log_output)
+
+    def test_agent_trace_verbose_payload_allows_existing_hash_field(self):
+        from app.services.agent_trace import trace_verbose_payload
+
+        with (
+            patch("app.services.agent_trace.settings.AGENT_TRACE_VERBOSE_PAYLOADS", True),
+            self.assertLogs("app.agent.trace", level="INFO") as captured_logs,
+        ):
+            trace_verbose_payload(
+                "agent_trace_tool_output_payload",
+                {"ok": True},
+                prefix="output",
+                output_hash="stored-output-hash",
+            )
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertIn("agent_trace_tool_output_payload", log_output)
+        self.assertIn("output_hash=stored-output-hash", log_output)
 
     def test_conversation_runner_records_model_stream_retrying_event(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -671,7 +950,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(retry_event.payload_json["max_retries"], 2)
         self.assertEqual(retry_event.payload_json["delay_seconds"], 0.25)
         self.assertEqual(retry_event.payload_json["error_message"], "temporary EOF")
-        self.assertEqual(retry_event.payload_json["loop_step"], "assistant_response")
+        self.assertEqual(retry_event.payload_json["loop_step"], "tool_planning")
 
     def test_conversation_runner_bounds_model_stream_retrying_error_message(self):
         from app.services.agent_runtime_service import (
@@ -881,12 +1160,12 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(tool_calls, [])
         self.assertEqual(started_event.payload_json["iteration_id"], f"{run.run_id}:iter-0")
-        self.assertEqual(started_event.payload_json["loop_step"], "assistant_response")
+        self.assertEqual(started_event.payload_json["loop_step"], "tool_planning")
         expected_loop_state = {
             "iteration": 0,
             "iteration_id": f"{run.run_id}:iter-0",
             "phase": "model",
-            "step": "assistant_response",
+            "step": "tool_planning",
             "model_call_id": model_call_id,
         }
         self.assertEqual(started_event.payload_json["loop_state"], expected_loop_state)
@@ -1056,8 +1335,8 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["model"], "deepseek-test")
         self.assertEqual(payload["finish_reason"], "stop")
         self.assertEqual(payload["usage"], {"total_tokens": "***"})
-        self.assertEqual(payload["event_count"], 7)
-        self.assertEqual(payload["latest_event_sequence"], 7)
+        self.assertEqual(payload["event_count"], 6)
+        self.assertEqual(payload["latest_event_sequence"], 6)
         self.assertEqual(payload["latest_event_types"][-2:], ["model.completed", "run.completed"])
         self.assertEqual(payload["tool_call_count"], 0)
         self.assertEqual(payload["pending_tool_call_count"], 0)
@@ -1295,7 +1574,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue(actions["reconcile_run"]["enabled"])
         self.assertEqual(actions["reconcile_run"]["resource_ids"], [call.tool_call_id])
 
-    def test_conversation_runner_writes_model_delta_before_stream_done(self):
+    def test_conversation_runner_buffers_planner_text_until_stream_done(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="实时返回一段普通回复"),
             current_user=self.owner,
@@ -1322,7 +1601,7 @@ class AgentRuntimeTests(unittest.TestCase):
         ).all())
 
         self.assertEqual(completed.status, "completed")
-        self.assertTrue(observed_mid_stream["delta_seen"])
+        self.assertFalse(observed_mid_stream["delta_seen"])
         self.assertEqual(
             [item.event_type for item in events],
             [
@@ -1330,13 +1609,436 @@ class AgentRuntimeTests(unittest.TestCase):
                 "run.started",
                 "model.started",
                 "model.delta",
-                "model.delta",
                 "model.completed",
                 "run.completed",
             ],
         )
-        self.assertEqual(events[3].payload_json["content"], "第一段")
+        self.assertEqual(events[3].payload_json["content"], "第一段第二段")
+        self.assertEqual(events[3].payload_json["loop_step"], "tool_planning")
         self.assertEqual(completed.result_json["message"], "第一段第二段")
+
+    def test_conversation_runner_suppresses_visible_intro_before_tool_request(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="analyze current project test cases"),
+            current_user=self.owner,
+        )
+        calls = {"count": 0}
+
+        def fake_stream(_service_self, _payload):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                yield {"type": "delta", "content": "I will read the project context first.\n"}
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{"project_id":10},"reason":"read context"}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "Context is ready."}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        delta_events = [item for item in events if item.event_type == "model.delta"]
+
+        self.assertEqual(completed.status, "completed")
+        self.assertLess(event_types.index("model.tool_request_detected"), event_types.index("model.delta"))
+        self.assertEqual(len(delta_events), 1)
+        self.assertEqual(delta_events[0].payload_json["content"], "Context is ready.")
+        self.assertNotIn("model.markdown_normalized", event_types)
+        self.assertNotIn("model.tool_request_stream_suppressed", event_types)
+
+    def test_conversation_runner_suppresses_held_intro_before_tool_request(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="analyze current project test cases"),
+            current_user=self.owner,
+        )
+        calls = {"count": 0}
+
+        def fake_stream(_service_self, _payload):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "I will query the project cases first.\n"
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{"project_id":10},"reason":"read context"}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "Context is ready."}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        delta_events = [item for item in events if item.event_type == "model.delta"]
+
+        self.assertEqual(completed.status, "completed")
+        self.assertLess(event_types.index("model.tool_request_detected"), event_types.index("model.delta"))
+        self.assertEqual(len(delta_events), 1)
+        self.assertEqual(delta_events[0].payload_json["content"], "Context is ready.")
+        self.assertNotIn("model.markdown_normalized", event_types)
+        self.assertNotIn("model.tool_request_stream_suppressed", event_types)
+
+    def test_conversation_runner_hides_tool_planning_preambles_in_multi_tool_dialogue(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+
+        self.db.add(
+            ProjectEnvironment(
+                id=4,
+                project_id=10,
+                name="test",
+                base_url="https://api.example.test",
+                description="test env",
+                is_default=True,
+                is_deleted=False,
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.add_all(
+            [
+                TestCase(
+                    id=7,
+                    project_id=10,
+                    environment_id=4,
+                    name="获取企业列表",
+                    description="case",
+                    method="POST",
+                    path="/api/companies",
+                    headers={},
+                    query_params={},
+                    body_type="json",
+                    body={},
+                    assertions=[],
+                    extractors=[],
+                    retry_policy=None,
+                    created_by_id=self.owner.id,
+                ),
+                TestCase(
+                    id=10,
+                    project_id=10,
+                    environment_id=4,
+                    name="取消关注",
+                    description="case",
+                    method="POST",
+                    path="/api/follow/cancel",
+                    headers={},
+                    query_params={},
+                    body_type="json",
+                    body={},
+                    assertions=[],
+                    extractors=[],
+                    retry_policy=None,
+                    created_by_id=self.owner.id,
+                ),
+            ]
+        )
+        self.db.commit()
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="先分析测试用例，再继续保存断言",
+                max_iterations=4,
+            ),
+            current_user=self.owner,
+        )
+        calls = {"count": 0}
+
+        def fake_stream(_service_self, _payload):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "我先读取项目上下文。\n"
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{"project_id":10},"reason":"获取环境和项目边界"}'
+                        "\n```"
+                    ),
+                }
+            elif calls["count"] == 2:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "上下文已确认，现在查询测试用例清单。\n"
+                        "```agent_tool_request\n"
+                        '{"tool_name":"testcase.query_project_cases","input":{"project_id":10,"detail_level":"summary"},"reason":"获取真实用例ID和名称"}'
+                        "\n```"
+                    ),
+                }
+            else:
+                yield {
+                    "type": "delta",
+                    "content": "已完成分析：获取企业列表（ID: 7）和取消关注（ID: 10）来自最新工具结果。",
+                }
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        visible_model_events = [
+            item
+            for item in events
+            if item.event_type in {"model.delta", "model.markdown_normalized", "model.completed"}
+            and item.payload_json.get("assistant_visible") is not False
+        ]
+        tool_calls = list(
+            self.db.scalars(
+                select(AgentToolCall).where(AgentToolCall.run_id == run.run_id).order_by(AgentToolCall.created_at)
+            ).all()
+        )
+        query_call = next(item for item in tool_calls if item.tool_name == "testcase.query_project_cases")
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual([item.tool_name for item in tool_calls], ["project.read_context", "testcase.query_project_cases"])
+        self.assertTrue(all(item.status == "succeeded" for item in tool_calls))
+        self.assertEqual(
+            query_call.output_json_redacted["case_id_manifest"]["http_test_case_ids"],
+            [7, 10],
+        )
+        self.assertEqual(
+            [row["name"] for row in query_call.output_json_redacted["case_display_rows"]],
+            ["获取企业列表", "取消关注"],
+        )
+        self.assertIn("获取企业列表（ID: 7）", completed.result_json["message"])
+        self.assertIn("取消关注（ID: 10）", completed.result_json["message"])
+        self.assertNotIn("agent_tool_request", "".join(item.payload_json.get("content", "") for item in visible_model_events))
+        self.assertNotIn("我先读取项目上下文。", [item.payload_json.get("content") for item in visible_model_events])
+        self.assertNotIn("上下文已确认，现在查询测试用例清单。", [item.payload_json.get("content") for item in visible_model_events])
+
+
+    def test_conversation_runner_repairs_final_response_with_invalid_test_case_ids(self):
+        from app.models.test_case import TestCase
+
+        self.db.add_all(
+            [
+                TestCase(
+                    id=7,
+                    project_id=10,
+                    environment_id=None,
+                    name="Case Seven",
+                    description="case",
+                    method="GET",
+                    path="/case-seven",
+                    headers={},
+                    query_params={},
+                    body_type="none",
+                    body=None,
+                    assertions=[],
+                    extractors=[],
+                    retry_policy=None,
+                    created_by_id=self.owner.id,
+                ),
+                TestCase(
+                    id=8,
+                    project_id=10,
+                    environment_id=None,
+                    name="Case Eight",
+                    description="case",
+                    method="GET",
+                    path="/case-eight",
+                    headers={},
+                    query_params={},
+                    body_type="none",
+                    body=None,
+                    assertions=[],
+                    extractors=[],
+                    retry_policy=None,
+                    created_by_id=self.owner.id,
+                ),
+                TestCase(
+                    id=18,
+                    project_id=10,
+                    environment_id=None,
+                    name="Case Eighteen",
+                    description="case",
+                    method="GET",
+                    path="/case-eighteen",
+                    headers={},
+                    query_params={},
+                    body_type="none",
+                    body=None,
+                    assertions=[],
+                    extractors=[],
+                    retry_policy=None,
+                    created_by_id=self.owner.id,
+                ),
+            ]
+        )
+        self.db.commit()
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="analyze current project test cases"),
+            current_user=self.owner,
+        )
+        calls = {"count": 0}
+
+        def fake_stream(_service_self, _payload):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"testcase.query_project_cases","input":{"project_id":10,"detail_level":"summary"},"reason":"query cases"}'
+                        "\n```"
+                    ),
+                }
+            elif calls["count"] == 2:
+                yield {
+                    "type": "delta",
+                    "content": "Known test cases: 用例 Case Seven (ID: 7), 缺失用例 Missing (ID: 17), 用例 Case Eighteen (ID: 18).",
+                }
+            else:
+                yield {
+                    "type": "delta",
+                    "content": "Known test cases: 用例 Case Seven (ID: 7), 用例 Case Eight (ID: 8), 用例 Case Eighteen (ID: 18).",
+                }
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        invalid_event = next(item for item in events if item.event_type == "model.final_response_reference_invalid")
+
+        self.assertEqual(completed.status, "completed")
+        self.assertIn("ID: 18", completed.result_json["message"])
+        self.assertNotIn("ID: 17", completed.result_json["message"])
+        self.assertEqual(invalid_event.payload_json["invalid_test_case_ids"], [17])
+        self.assertEqual(invalid_event.payload_json["valid_test_case_ids"], [7, 8, 18])
+
+    def test_conversation_runner_executes_tool_request_returned_by_final_reference_repair(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="检查候选用例并补齐缺失事实",
+                max_iterations=4,
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(_service_self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"testcase.query_project_cases",'
+                        '"input":{"project_id":10,"detail_level":"summary","test_case_ids":[7,8]},'
+                        '"reason":"查询初始候选用例","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+            elif len(captured_messages) == 2:
+                yield {
+                    "type": "delta",
+                    "content": "已分析：Case Seven（ID: 7），Missing Case（ID: 17）仍需补查。",
+                }
+            elif len(captured_messages) == 3:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"testcase.query_project_cases",'
+                        '"input":{"project_id":10,"detail_level":"selected","test_case_ids":[17]},'
+                        '"reason":"补查最终回复引用的缺失用例","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+            else:
+                yield {"type": "delta", "content": "已补查 Missing Case（ID: 17），可以继续给出结论。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def fake_execute(_backend_self, *, tool_name, payload, current_user):
+            self.assertEqual(tool_name, "testcase.query_project_cases")
+            ids = list(payload.get("test_case_ids") or [7, 8])
+            names = {7: "Case Seven", 8: "Case Eight", 17: "Missing Case"}
+            return {
+                "project_id": 10,
+                "detail_level": payload.get("detail_level", "summary"),
+                "case_id_manifest": {
+                    "http_test_case_ids": ids,
+                    "websocket_test_case_ids": [],
+                },
+                "http_test_case_ids": ids,
+                "websocket_test_case_ids": [],
+                "case_display_rows": [
+                    {
+                        "id": case_id,
+                        "name": names[case_id],
+                        "method": "GET",
+                        "path": f"/case-{case_id}",
+                        "last_execution_status": None,
+                    }
+                    for case_id in ids
+                ],
+            }
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch("app.services.agent_tool_service.AgentToolBackend.execute", new=fake_execute),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        tool_calls = list(
+            self.db.scalars(
+                select(AgentToolCall).where(AgentToolCall.run_id == run.run_id).order_by(AgentToolCall.id.asc())
+            ).all()
+        )
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        visible_content = "".join(
+            item.payload_json.get("content", "")
+            for item in events
+            if item.event_type in {"model.delta", "model.markdown_normalized", "model.completed"}
+            and item.payload_json.get("assistant_visible") is not False
+        )
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual([call.tool_name for call in tool_calls], ["testcase.query_project_cases", "testcase.query_project_cases"])
+        self.assertEqual(tool_calls[-1].input_json_redacted["test_case_ids"], [17])
+        self.assertIn("model.final_response_reference_invalid", event_types)
+        self.assertIn("model.final_response_reference_tool_request_repaired", event_types)
+        self.assertIn("已补查 Missing Case（ID: 17）", completed.result_json["message"])
+        self.assertNotIn("agent_tool_request", visible_content)
+        self.assertEqual(len(captured_messages), 4)
 
     def test_conversation_runner_does_not_complete_after_cancel_during_post_stream_normalization(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -1429,7 +2131,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn("model.completed", events_after_cancel)
         self.assertNotIn("run.completed", events_after_cancel)
 
-    def test_conversation_runner_batches_small_model_deltas_after_first_visible_delta(self):
+    def test_conversation_runner_compacts_planner_text_to_one_delta(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="实时返回很多小片段"),
             current_user=self.owner,
@@ -1465,13 +2167,13 @@ class AgentRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.status, "completed")
-        self.assertEqual(observed_mid_stream["delta_count_after_first"], 1)
-        self.assertLess(len(delta_events), 1 + len(tiny_chunks))
-        self.assertEqual(delta_events[0].payload_json["content"], "首段")
+        self.assertEqual(observed_mid_stream["delta_count_after_first"], 0)
+        self.assertEqual(len(delta_events), 1)
         self.assertEqual(
             "".join(item.payload_json["content"] for item in delta_events),
             "首段" + "".join(tiny_chunks),
         )
+        self.assertEqual(delta_events[0].payload_json["loop_step"], "tool_planning")
         self.assertEqual(completed.result_json["message"], "首段" + "".join(tiny_chunks))
 
     def test_conversation_runner_compacts_suppressed_plain_text_stream_to_one_delta(self):
@@ -1570,6 +2272,197 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn('"output_hash": "hash-large-output"', message)
         self.assertIn("ToolCall.output_json_redacted", message)
         self.assertNotIn(large_blob, message)
+
+    def test_tool_result_policy_preserves_query_project_cases_compact_view(self):
+        large_assertion_blob = "x" * 5000
+        case_display_rows = [
+            {"id": 7, "name": "Case Seven", "method": "GET", "path": "/case-seven", "last_execution_status": "passed"},
+            {"id": 8, "name": "Case Eight", "method": "GET", "path": "/case-eight", "last_execution_status": "passed"},
+            {"id": 18, "name": "Case Eighteen", "method": "GET", "path": "/case-eighteen", "last_execution_status": "failed"},
+            {"id": 37, "name": "Case Thirty Seven", "method": "GET", "path": "/case-37", "last_execution_status": None},
+        ]
+        full_output = {
+            "project_id": 10,
+            "environment_id": 4,
+            "detail_level": "assertions",
+            "http_total": 4,
+            "websocket_total": 0,
+            "case_id_manifest": {
+                "http_test_case_ids": [7, 8, 18, 37],
+                "websocket_test_case_ids": [],
+                "id_source_rule": "never infer continuous numeric ranges",
+            },
+            "case_display_rows": case_display_rows,
+            "case_status_summary": {"http": {"passed": 2, "failed": 1, "status_missing": 1}},
+            "http_test_cases": [
+                {"id": row["id"], "assertions": [{"expected": large_assertion_blob}], "headers": {"Authorization": "secret"}}
+                for row in case_display_rows
+            ],
+        }
+        call = SimpleNamespace(
+            tool_call_id="tool-query-cases",
+            tool_name="testcase.query_project_cases",
+            status="succeeded",
+            approval_required=False,
+            output_json_redacted=full_output,
+            output_hash="hash-query-cases",
+            error_code=None,
+            error_message=None,
+        )
+
+        payload = ToolResultPolicy().model_payload(call)
+        message = ToolResultPolicy().build_message(call)
+
+        self.assertFalse(payload["output_truncated"])
+        self.assertEqual(payload["output"]["case_id_manifest"]["http_test_case_ids"], [7, 8, 18, 37])
+        self.assertEqual(payload["output"]["case_display_rows"], case_display_rows)
+        self.assertEqual(payload["output"]["case_status_summary"], {"http": {"passed": 2, "failed": 1, "status_missing": 1}})
+        self.assertIn("full_output_read_tool", payload)
+        self.assertEqual(payload["full_output_read_tool"]["tool_name"], "tool_result.read_full")
+        self.assertIn("http_test_cases", payload["output"])
+        self.assertIn("assertions", payload["output"]["http_test_cases"][0])
+        self.assertNotIn("output_preview", payload)
+        self.assertIn('"http_test_case_ids": [7, 8, 18, 37]', message)
+        self.assertIn("Case Thirty Seven", message)
+        self.assertNotIn(large_assertion_blob, message)
+        self.assertNotIn("Authorization", message)
+
+    def test_tool_result_policy_does_not_recrop_query_project_cases_compact_view(self):
+        from app.services.agent_tool_result_policy import TOOL_RESULT_MODEL_MESSAGE_TRUNCATION_MARKER
+
+        case_display_rows = [
+            {
+                "id": item,
+                "name": f"Case {item}",
+                "method": "GET",
+                "path": f"/case-{item}",
+                "last_execution_status": "passed" if item % 2 == 0 else "failed",
+            }
+            for item in range(1, 121)
+        ]
+        full_output = {
+            "project_id": 10,
+            "environment_id": 4,
+            "detail_level": "assertions",
+            "http_total": len(case_display_rows),
+            "websocket_total": 0,
+            "case_id_manifest": {
+                "http_test_case_ids": [row["id"] for row in case_display_rows],
+                "websocket_test_case_ids": [],
+                "id_source_rule": "never infer continuous numeric ranges",
+            },
+            "case_display_rows": case_display_rows,
+            "case_status_summary": {"http": {"passed": 60, "failed": 60}},
+            "http_test_cases": [
+                {
+                    "id": row["id"],
+                    "assertions": [{"expected": "large-assertion-" + ("x" * 1000)}],
+                    "headers": {"Authorization": "secret"},
+                    "body": {"secret": "not-for-model-compact-view"},
+                    "query_params": {"debug": "true"},
+                }
+                for row in case_display_rows
+            ],
+        }
+        call = SimpleNamespace(
+            tool_call_id="tool-query-cases-large",
+            tool_name="testcase.query_project_cases",
+            status="succeeded",
+            approval_required=False,
+            output_json_redacted=full_output,
+            output_hash="hash-query-cases-large",
+            error_code=None,
+            error_message=None,
+        )
+
+        message = ToolResultPolicy().build_message(call)
+
+        self.assertIn('"http_total": 120', message)
+        self.assertIn('"http_test_case_ids": [1, 2, 3', message)
+        self.assertIn("Case 120", message)
+        self.assertNotIn(TOOL_RESULT_MODEL_MESSAGE_TRUNCATION_MARKER, message)
+        self.assertNotIn("large-assertion-", message)
+        self.assertNotIn("Authorization", message)
+        self.assertNotIn("not-for-model-compact-view", message)
+
+    def test_internal_tool_request_context_leak_detection_matches_bounded_summary(self):
+        leaked = (
+            "上一轮模型已发起工具请求。以下是给后续模型使用的有界摘要；"
+            "完整结构化事实以 ExecutionLedger/ToolCall 为准。 "
+            '{"evidence_refs_json":"[]","input_json":"{}","source_content_preview":"..."}'
+        )
+
+        self.assertTrue(_looks_like_internal_tool_context_leak(leaked))
+        self.assertFalse(_looks_like_internal_tool_context_leak("已经完成分析，下面是测试用例总结。"))
+
+    def test_tool_result_read_full_returns_redacted_tool_output(self):
+        from app.services.agent_tool_service import AgentToolBackend
+
+        run = self._create_run("read full tool output")
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        call.status = "succeeded"
+        call.output_json_redacted = {
+            "case_display_rows": [{"id": 7, "name": "Case Seven"}],
+            "secret_header": "***",
+        }
+        call.output_hash = "hash-read-full"
+        self.db.commit()
+
+        result = AgentToolBackend(self.db).execute(
+            tool_name="tool_result.read_full",
+            payload={"tool_call_id": call.tool_call_id, "path": "case_display_rows"},
+            current_user=self.owner,
+        )
+
+        self.assertEqual(result["tool_call_id"], call.tool_call_id)
+        self.assertEqual(result["tool_name"], "testcase.query_project_cases")
+        self.assertEqual(result["output"], [{"id": 7, "name": "Case Seven"}])
+        self.assertFalse(result["output_truncated"])
+        self.assertEqual(result["redaction"], "output_json_redacted")
+
+    def test_final_response_reference_check_ignores_counts_and_ratios(self):
+        from app.services.agent_runtime_service import _invalid_test_case_ids_in_final_response
+
+        valid_ids = {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 33, 34, 35, 36, 37}
+
+        content = (
+            "用例总量：17 个 HTTP 用例，0 个 WebSocket 用例。\n"
+            "工具结果完整展示 11/17 条并继续分析统计。\n"
+            "取消关注（ID: 10）失败，获取企业列表（ID: 7）通过。"
+        )
+
+        self.assertEqual(_invalid_test_case_ids_in_final_response(content, valid_ids=valid_ids), [])
+
+    def test_final_response_reference_check_ignores_project_and_environment_ids(self):
+        from app.services.agent_runtime_service import _invalid_test_case_ids_in_final_response
+
+        valid_ids = {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 33, 34, 35, 36, 37}
+
+        content = (
+            "项目 testauto（ID: 1）当前共有 17 个 HTTP 测试用例，0 个 WebSocket 用例，"
+            "全部关联环境 ID 4。\n"
+            "失败用例包括 发展优势接口-资质认定接口（ID: 16）和 获取我的发布接口（ID: 19）。"
+        )
+
+        self.assertEqual(_invalid_test_case_ids_in_final_response(content, valid_ids=valid_ids), [])
+
+    def test_final_response_reference_check_still_blocks_explicit_invalid_case_id(self):
+        from app.services.agent_runtime_service import _invalid_test_case_ids_in_final_response
+
+        valid_ids = {7, 8, 9}
+
+        content = "失败用例 ID 4 需要重新查询，获取企业列表（ID: 7）通过。"
+
+        self.assertEqual(_invalid_test_case_ids_in_final_response(content, valid_ids=valid_ids), [4])
 
     def test_tool_result_policy_retries_fixable_failed_tool_inputs(self):
         call = SimpleNamespace(
@@ -1989,6 +2882,289 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("断言", system_context)
         self.assertIn("草稿尚未保存", system_context)
         self.assertEqual(captured_messages[-1].content, "直接保存")
+
+    def test_conversation_runner_injects_tool_call_artifact_manifest_after_unrelated_turn(self):
+        runtime = AgentRuntimeService(self.db)
+        conversation_id = "agent-conv-tool-artifact-manifest"
+        first = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="帮我创建企业自动化测试场景，注意接口上下文依赖",
+            ),
+            current_user=self.owner,
+        )
+        full_json_marker = "FULL_SCENARIO_JSON_SHOULD_STAY_OUT_OF_CONTEXT"
+        draft_output = {
+            "draft": {
+                "scenario": {
+                    "name": "企业自动化测试场景",
+                    "description": "获取企业列表后复用企业 ID",
+                    "environment_id": 4,
+                    "nodes": [
+                        {
+                            "id": "NODE-1",
+                            "name": "获取企业列表",
+                            "test_case": {
+                                "id": "CASE-1",
+                                "kind": "api_case",
+                                "name": "获取企业列表",
+                                "reference_id": 7,
+                                "config": {
+                                    "_scenario_context": {
+                                        "extractions": [
+                                            {
+                                                "id": "VAR-companyId",
+                                                "name": "companyId",
+                                                "path": "data.dataList.0.companyId",
+                                                "debug_marker": full_json_marker,
+                                            }
+                                        ]
+                                    }
+                                },
+                            },
+                        }
+                    ],
+                    "datasets": [],
+                },
+                "warnings": [],
+            }
+        }
+        draft_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=first.run_id,
+                tool_name="scenario.compose_draft",
+                input={"project_id": 10, "input": {"requirement": "企业自动化测试场景"}},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        draft_call.status = "succeeded"
+        draft_call.execution_phase = "completed"
+        draft_call.output_json_redacted = draft_output
+        draft_call.output_hash = request_fingerprint(draft_output)
+        runtime.complete_run(first, {"message": "已生成企业自动化测试场景草稿，尚未保存。", "assistant_visible": True})
+
+        unrelated = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="先保存测试用例数据",
+            ),
+            current_user=self.owner,
+        )
+        for index in range(14):
+            generic_call = ExecutionLedgerService(self.db).create_tool_call(
+                payload=AgentToolCallCreateRequest(
+                    run_id=unrelated.run_id,
+                    tool_name="project.read_context",
+                    input={"project_id": 10},
+                    step_index=index,
+                ),
+                current_user=self.owner,
+                enqueue=False,
+            )
+            generic_output = {"project_id": 10, "unrelated_tool_index": index}
+            generic_call.status = "succeeded"
+            generic_call.execution_phase = "completed"
+            generic_call.output_json_redacted = generic_output
+            generic_call.output_hash = request_fingerprint(generic_output)
+        runtime.complete_run(
+            unrelated,
+            {"message": "测试用例数据需要走测试用例保存工具，不能覆盖上一轮场景草稿。", "assistant_visible": True},
+        )
+        current = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="保存刚才的测试场景",
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.extend(payload.messages)
+            yield {"type": "delta", "content": "我会基于同会话的场景草稿发起保存审批。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=current.run_id, user_id=self.owner.id)
+
+        system_context = "\n\n".join(message.content for message in captured_messages if message.role == "system")
+        self.assertIn("conversation_tool_artifact_manifest_v1", system_context)
+        self.assertIn(draft_call.tool_call_id, system_context)
+        self.assertIn('"tool_name": "scenario.compose_draft"', system_context)
+        self.assertIn('"artifact_type": "scenario_draft"', system_context)
+        self.assertIn('"output_path": "draft.scenario"', system_context)
+        self.assertIn("tool_result.read_full", system_context)
+        self.assertNotIn(full_json_marker, system_context)
+
+    def test_conversation_runner_injects_testcase_query_snapshot_manifest_after_analysis_followup(self):
+        runtime = AgentRuntimeService(self.db)
+        conversation_id = "agent-conv-case-query-artifact-manifest"
+        first = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="请分析当前项目测试用例的断言和可复用字段",
+            ),
+            current_user=self.owner,
+        )
+        full_case_body_marker = "FULL_CASE_BODY_SHOULD_STAY_OUT_OF_CONTEXT"
+        query_output = {
+            "project_id": 10,
+            "detail_level": "assertions",
+            "http_total": 2,
+            "websocket_total": 0,
+            "case_snapshot": {
+                "snapshot_id": "case-snapshot://analysis",
+                "validity_scope": "current_agent_conversation_latest_query",
+            },
+            "case_id_manifest": {
+                "http_test_case_ids": [901, 902],
+                "websocket_test_case_ids": [],
+                "http_assertion_update_ids": [901, 902],
+                "websocket_assertion_update_ids": [],
+                "snapshot_id": "case-snapshot://analysis",
+            },
+            "object_reference_manifest": {
+                "object_family": "test_case",
+                "query_tool": "testcase.query_project_cases",
+                "snapshot_id": "case-snapshot://analysis",
+                "http_assertion_update_ids": [901, 902],
+                "object_references": [
+                    {
+                        "id": 901,
+                        "object_ref": "object-ref://test_case/http/analysis/901",
+                        "object_type": "http_test_case",
+                        "name": "企业列表查询",
+                    },
+                    {
+                        "id": 902,
+                        "object_ref": "object-ref://test_case/http/analysis/902",
+                        "object_type": "http_test_case",
+                        "name": "企业详情查询",
+                    },
+                ],
+            },
+            "case_display_rows": [
+                {"id": 901, "name": "企业列表查询", "case_type": "http", "method": "GET", "path": "/companies"},
+                {"id": 902, "name": "企业详情查询", "case_type": "http", "method": "GET", "path": "/companies/{id}"},
+            ],
+            "http_test_cases": [
+                {
+                    "id": 901,
+                    "name": "企业列表查询",
+                    "assertions": [{"type": "status_code", "expected": 200}],
+                    "body": full_case_body_marker,
+                },
+                {
+                    "id": 902,
+                    "name": "企业详情查询",
+                    "assertions": [{"type": "json_path", "path": "code", "expected": 0}],
+                    "body": full_case_body_marker,
+                },
+            ],
+            "websocket_test_cases": [],
+        }
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=first.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10, "detail_level": "assertions"},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = query_output
+        query_call.output_hash = request_fingerprint(query_output)
+        runtime.complete_run(
+            first,
+            {"message": "已分析 2 个企业相关测试用例的断言，后续可以保存断言更改。", "assistant_visible": True},
+        )
+        middle = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="先查看一下项目资产情况",
+            ),
+            current_user=self.owner,
+        )
+        asset_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=middle.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        asset_output = {"project_id": 10, "assets": {"test_case_count": 2, "scenario_count": 0}}
+        asset_call.status = "succeeded"
+        asset_call.execution_phase = "completed"
+        asset_call.output_json_redacted = asset_output
+        asset_call.output_hash = request_fingerprint(asset_output)
+        runtime.complete_run(
+            middle,
+            {"message": "当前项目有 2 个测试用例和 0 个场景。", "assistant_visible": True},
+        )
+        current = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="基于刚才测试用例分析结果，继续保存断言更改",
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.extend(payload.messages)
+            yield {"type": "delta", "content": "我会基于同会话的测试用例查询快照发起断言保存审批。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=current.run_id, user_id=self.owner.id)
+
+        system_context = "\n\n".join(message.content for message in captured_messages if message.role == "system")
+        self.assertIn("conversation_tool_artifact_manifest_v1", system_context)
+        self.assertIn(query_call.tool_call_id, system_context)
+        self.assertIn('"tool_name": "testcase.query_project_cases"', system_context)
+        self.assertIn('"artifact_type": "test_case_query_snapshot"', system_context)
+        self.assertIn('"domain": "test_case"', system_context)
+        self.assertIn('"http_assertion_update_ids_count": 2', system_context)
+        self.assertIn("tool_result.read_full", system_context)
+        self.assertNotIn(full_case_body_marker, system_context)
+
+    def test_working_context_does_not_infer_scenario_draft_from_project_asset_inventory(self):
+        runtime = AgentRuntimeService(self.db)
+        run = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id="agent-conv-asset-inventory-not-artifact",
+                intent="查看项目资产情况",
+            ),
+            current_user=self.owner,
+        )
+        runtime.complete_run(
+            run,
+            {"message": "当前项目有 2 个测试用例、0 个场景和 1 个环境。", "assistant_visible": True},
+        )
+
+        context = agent_runtime_service._conversation_working_context(
+            current_intent="保存刚才的测试用例断言更改",
+            previous_runs=[run],
+        )
+        encoded = json.dumps(context, ensure_ascii=False, sort_keys=True)
+
+        self.assertNotIn("scenario_draft", encoded)
+        self.assertEqual(context["current_artifact_candidates"], [])
 
     def test_conversation_runner_excludes_invisible_assistant_history_from_model_context(self):
         runtime = AgentRuntimeService(self.db)
@@ -2488,6 +3664,70 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertNotIn("unknown_field", request.detected_event_payload(iteration=2))
 
+    def test_parse_tool_request_normalizes_tool_call_evidence_strings(self):
+        request = AgentConversationRunner(self.db)._parse_tool_request(
+            (
+                "```agent_tool_request\n"
+                '{"tool_name":"tool_result.read_full",'
+                '"input":{"tool_call_id":"agent-tool-b8aed0adefdb45e68310cc3ffe1514ee","path":"runs"},'
+                '"reason":"读取场景 dry-run 完整执行结果以分析各步骤通过/失败状态",'
+                '"evidence_refs":["agent-tool-b8aed0adefdb45e68310cc3ffe1514ee"]}'
+                "\n```"
+            )
+        )
+
+        self.assertIsNotNone(request)
+        self.assertEqual(request.tool_name, "tool_result.read_full")
+        self.assertEqual(
+            request.evidence_refs_for_ledger(),
+            [
+                {
+                    "evidence_ref_id": "tool-call:agent-tool-b8aed0adefdb45e68310cc3ffe1514ee",
+                    "ref_type": "tool_call",
+                    "ref_id": "agent-tool-b8aed0adefdb45e68310cc3ffe1514ee",
+                    "mutability_class": "immutable",
+                    "dependency_role": "audit_background",
+                    "active_for_policy": False,
+                }
+            ],
+        )
+
+    def test_parse_repaired_tool_request_normalizes_tool_call_evidence_strings(self):
+        request, repair_strategy = AgentConversationRunner(self.db)._parse_repaired_tool_request(
+            (
+                "```agent_tool_request\n"
+                '{"tool_name":"tool_result.read_full",'
+                '"input":{"tool_call_id":"agent-tool-b8aed0adefdb45e68310cc3ffe1514ee","path":"runs"},'
+                '"reason":"读取场景 dry-run 完整执行结果以分析各步骤通过/失败状态",'
+                '"evidence_refs":["agent-tool-b8aed0adefdb45e68310cc3ffe1514ee"]}'
+                "\n```"
+            )
+        )
+
+        self.assertIsNotNone(request)
+        self.assertIsNone(repair_strategy)
+        self.assertEqual(request.tool_name, "tool_result.read_full")
+        self.assertEqual(
+            request.tool_input,
+            {
+                "tool_call_id": "agent-tool-b8aed0adefdb45e68310cc3ffe1514ee",
+                "path": "runs",
+            },
+        )
+        self.assertEqual(
+            request.evidence_refs_for_ledger(),
+            [
+                {
+                    "evidence_ref_id": "tool-call:agent-tool-b8aed0adefdb45e68310cc3ffe1514ee",
+                    "ref_type": "tool_call",
+                    "ref_id": "agent-tool-b8aed0adefdb45e68310cc3ffe1514ee",
+                    "mutability_class": "immutable",
+                    "dependency_role": "audit_background",
+                    "active_for_policy": False,
+                }
+            ],
+        )
+
     def test_conversation_runner_executes_model_requested_tool_and_feeds_result_back(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="先读取项目上下文再告诉我能做什么"),
@@ -2984,7 +4224,13 @@ class AgentRuntimeTests(unittest.TestCase):
 
         registry = ToolRegistry()
         resolver = ToolPolicyResolver()
+        expected_permissions = {
+            "scenario.create_saved": (ProjectPermission.MANAGE_SCENARIO.value,),
+            "scenario.update_saved": (ProjectPermission.MANAGE_SCENARIO.value,),
+        }
         for tool_name in [
+            "scenario.create_saved",
+            "scenario.update_saved",
             "testcase.create_saved",
             "testcase.update_saved",
             "testcase.update_assertions",
@@ -3001,11 +4247,903 @@ class AgentRuntimeTests(unittest.TestCase):
 
                 self.assertEqual(spec.side_effect_class, "business_update")
                 self.assertEqual(spec.replay_policy, "require_revalidation")
-                self.assertEqual(spec.required_permissions, (ProjectPermission.MANAGE_CASE.value,))
+                self.assertEqual(
+                    spec.required_permissions,
+                    expected_permissions.get(tool_name, (ProjectPermission.MANAGE_CASE.value,)),
+                )
                 self.assertTrue(policy.approval_required)
                 self.assertEqual(policy.policy_reason["approval_required_reason"], "unsafe_side_effect")
                 self.assertEqual(manifest["backend_contract"]["effect_capability"], "idempotency_index_only")
                 self.assertNotIn("backend_handler", manifest)
+
+    def test_agent_scenario_save_tool_handlers_create_and_update_saved_scenarios(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.scenario import TestScenario
+        from app.models.test_case import TestCase
+        from app.services.agent_tool_service import AgentToolBackend
+
+        environment = ProjectEnvironment(
+            id=117,
+            project_id=10,
+            name="agent scenario save env",
+            base_url="https://api.example.test",
+            description="agent scenario save env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        test_case = TestCase(
+            id=217,
+            project_id=10,
+            environment_id=117,
+            name="Scenario Save HTTP Case",
+            description="case for scenario save",
+            method="GET",
+            path="/scenario/save",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, test_case])
+        self.db.commit()
+
+        create_payload = {
+            "name": "AI saved scenario",
+            "description": "created by approved Agent scenario tool",
+            "environment_id": 117,
+            "tags": ["agent", "smoke"],
+            "nodes": [
+                {
+                    "id": "node-1",
+                    "name": "保存场景节点",
+                    "test_case": {
+                        "id": "step-1",
+                        "kind": "api_case",
+                        "name": "Scenario Save HTTP Case",
+                        "reference_id": 217,
+                        "config": {},
+                    },
+                }
+            ],
+            "datasets": [],
+        }
+
+        backend = AgentToolBackend(self.db)
+        created = backend.execute(
+            tool_name="scenario.create_saved",
+            payload={"project_id": 10, "scenario": create_payload},
+            current_user=self.owner,
+        )
+        scenario_id = created["scenario_id"]
+        update_payload = {
+            **create_payload,
+            "name": "AI updated scenario",
+            "version": created["scenario"]["current_version"],
+            "tags": ["agent", "updated"],
+        }
+        updated = backend.execute(
+            tool_name="scenario.update_saved",
+            payload={"project_id": 10, "scenario_id": scenario_id, "scenario": update_payload},
+            current_user=self.owner,
+        )
+        refreshed = self.db.get(TestScenario, scenario_id)
+
+        self.assertEqual(created["operation"], "create_saved")
+        self.assertEqual(updated["operation"], "update_saved")
+        self.assertEqual(created["scenario"]["name"], "AI saved scenario")
+        self.assertEqual(updated["scenario"]["name"], "AI updated scenario")
+        self.assertEqual(updated["scenario"]["current_version"], 2)
+        self.assertEqual(refreshed.name, "AI updated scenario")
+        self.assertEqual(refreshed.current_version, 2)
+
+    def test_scenario_create_saved_invalid_action_schema_is_blocked_before_approval(self):
+        from app.models.project import ProjectEnvironment
+        from app.services.agent_tool_service import AgentToolBackend
+
+        run = self._create_run("save scenario with invalid extractor action")
+        self.db.add(
+            ProjectEnvironment(
+                id=4,
+                project_id=10,
+                name="test",
+                base_url="https://api.example.test",
+                description="test env",
+                is_default=True,
+                is_deleted=False,
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.commit()
+        context_output = AgentToolBackend(self.db).execute(
+            tool_name="project.read_context",
+            payload={"project_id": 10},
+            current_user=self.owner,
+        )
+        context_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        context_call.status = "succeeded"
+        context_call.execution_phase = "completed"
+        context_call.output_json_redacted = context_output
+        context_call.output_hash = request_fingerprint(context_output)
+        self.db.commit()
+
+        payload = AgentToolCallCreateRequest(
+            run_id=run.run_id,
+            tool_name="scenario.create_saved",
+            input={
+                "project_id": 10,
+                "environment_snapshot_id": context_output["environment_snapshot"]["snapshot_id"],
+                "scenario": {
+                    "name": "企业获取到关注流程",
+                    "description": "从企业列表获取数据，查询CT画像，最后关注企业",
+                    "environment_id": 4,
+                    "nodes": [
+                        {
+                            "id": "NODE-1",
+                            "name": "获取企业列表",
+                            "test_case": {
+                                "id": "TC-1",
+                                "kind": "api_case",
+                                "name": "获取企业列表",
+                                "reference_id": 7,
+                            },
+                            "after_actions": [
+                                {
+                                    "id": "EXTRACT-companyId",
+                                    "kind": "fixed_value",
+                                    "name": "提取companyId",
+                                    "config": {
+                                        "name": "companyId",
+                                        "path": "data.dataList.0.companyId",
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+            step_index=1,
+        )
+
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=payload,
+            current_user=self.owner,
+            enqueue=False,
+        )
+        approvals = list(
+            self.db.scalars(select(AgentApproval).where(AgentApproval.tool_call_id == call.tool_call_id)).all()
+        )
+
+        self.assertEqual(call.status, "failed")
+        self.assertEqual(call.execution_phase, "blocked_by_harness")
+        self.assertEqual(call.error_code, "agent_tool_input_schema_invalid")
+        self.assertEqual(call.recovery_decision, "repair_tool_input_schema_before_retry")
+        self.assertEqual(approvals, [])
+        self.assertIn("schema_preflight", call.output_json_redacted)
+        self.assertEqual(call.output_json_redacted["schema_preflight"]["tool_name"], "scenario.create_saved")
+        self.assertIn("nodes.0.after_actions.0", call.output_json_redacted["schema_preflight"]["errors"][0]["path"])
+
+    def test_scenario_create_saved_reuses_latest_conversation_draft_for_deictic_save(self):
+        conversation_id = "agent-conv-scenario-draft-save"
+        runtime = AgentRuntimeService(self.db)
+        previous = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="为我创建企业自动化测试流程，注意接口上下文依赖",
+            ),
+            current_user=self.owner,
+        )
+        full_draft_scenario = {
+            "name": "企业自动化测试流程",
+            "description": "获取企业列表后复用企业ID继续查询和关注",
+            "environment_id": 4,
+            "tags": ["ai-composed"],
+            "nodes": [
+                {
+                    "id": "NODE-1",
+                    "name": "获取企业列表",
+                    "test_case": {
+                        "id": "CASE-1",
+                        "kind": "api_case",
+                        "name": "获取企业列表",
+                        "reference_id": 7,
+                        "config": {
+                            "assertions": [{"type": "status_code", "expected": 200}],
+                            "extractors": [
+                                {"id": "VAR-companyId", "name": "companyId", "path": "data.dataList.0.companyId"}
+                            ],
+                            "_scenario_context": {
+                                "extractions": [
+                                    {"id": "VAR-companyId", "name": "companyId", "path": "data.dataList.0.companyId"}
+                                ]
+                            },
+                        },
+                    },
+                    "after_actions": [{"id": "WAIT-1", "kind": "delay", "name": "等待同步", "config": {"duration_ms": 1}}],
+                },
+                {
+                    "id": "NODE-2",
+                    "name": "获取对应企业CT画像数",
+                    "test_case": {
+                        "id": "CASE-2",
+                        "kind": "api_case",
+                        "name": "获取对应企业CT画像数",
+                        "reference_id": 8,
+                        "config": {
+                            "query_params": {"companyId": "{{companyId}}"},
+                            "_scenario_context": {
+                                "bindings": [
+                                    {
+                                        "id": "BIND-companyId",
+                                        "name": "companyId",
+                                        "source_step_id": "CASE-1",
+                                        "source_extraction_id": "VAR-companyId",
+                                        "target": "query_params",
+                                        "target_path": "companyId",
+                                    }
+                                ]
+                            },
+                        },
+                    },
+                },
+            ],
+            "datasets": [],
+        }
+        draft_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=previous.run_id,
+                tool_name="scenario.compose_draft",
+                input={"project_id": 10, "input": {"requirement": "企业自动化测试流程"}},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        draft_output = {"draft": {"scenario": full_draft_scenario, "warnings": []}}
+        draft_call.status = "succeeded"
+        draft_call.execution_phase = "completed"
+        draft_call.output_json_redacted = draft_output
+        draft_call.output_hash = request_fingerprint(draft_output)
+        runtime.complete_run(previous, {"message": "已生成企业自动化测试流程草稿。", "assistant_visible": True})
+
+        unrelated = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="先查看项目资产情况",
+            ),
+            current_user=self.owner,
+        )
+        asset_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=unrelated.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        asset_output = {
+            "project_id": 10,
+            "assets": {"test_case_count": 2, "scenario_count": 0, "environment_count": 1},
+        }
+        asset_call.status = "succeeded"
+        asset_call.execution_phase = "completed"
+        asset_call.output_json_redacted = asset_output
+        asset_call.output_hash = request_fingerprint(asset_output)
+        runtime.complete_run(
+            unrelated,
+            {"message": "当前项目有 2 个测试用例、0 个场景和 1 个环境。", "assistant_visible": True},
+        )
+
+        current = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="保存刚才的自动化测试流程",
+            ),
+            current_user=self.owner,
+        )
+        degraded_input = {
+            "project_id": 10,
+            "scenario": {
+                "name": "企业自动化测试流程",
+                "description": "模型从摘要重构的退化版本",
+                "environment_id": 4,
+                "nodes": [
+                    {
+                        "id": "NODE-1",
+                        "name": "获取企业列表",
+                        "test_case": {
+                            "id": "NODE-1-TC",
+                            "kind": "api_case",
+                            "name": "获取企业列表",
+                            "reference_id": 7,
+                            "config": {},
+                        },
+                    },
+                    {
+                        "id": "NODE-2",
+                        "name": "获取对应企业CT画像数",
+                        "test_case": {
+                            "id": "NODE-2-TC",
+                            "kind": "api_case",
+                            "name": "获取对应企业CT画像数",
+                            "reference_id": 8,
+                            "config": {},
+                        },
+                    },
+                ],
+                "datasets": [],
+            },
+        }
+
+        normalized = AgentConversationRunner(self.db)._normalize_tool_input(
+            run=current,
+            tool_name="scenario.create_saved",
+            tool_input=json.loads(json.dumps(degraded_input, ensure_ascii=False)),
+        )
+
+        self.assertEqual(normalized["scenario"]["description"], full_draft_scenario["description"])
+        self.assertEqual(normalized["scenario"]["nodes"][0]["after_actions"][0]["kind"], "delay")
+        self.assertEqual(
+            normalized["scenario"]["nodes"][0]["test_case"]["config"]["_scenario_context"]["extractions"][0]["name"],
+            "companyId",
+        )
+        self.assertEqual(
+            normalized["scenario"]["nodes"][1]["test_case"]["config"]["_scenario_context"]["bindings"][0]["target"],
+            "query_params",
+        )
+        self.assertEqual(
+            normalized["scenario"]["nodes"][1]["test_case"]["config"]["query_params"]["companyId"],
+            "{{companyId}}",
+        )
+        self.assertEqual(normalized["scenario_draft_source"]["tool_call_id"], draft_call.tool_call_id)
+
+    def test_scenario_create_saved_reuses_named_conversation_draft_for_save_then_execute(self):
+        conversation_id = "agent-conv-scenario-named-draft-save"
+        runtime = AgentRuntimeService(self.db)
+        enterprise_run = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="创建企业综合信息查询流程",
+            ),
+            current_user=self.owner,
+        )
+        enterprise_scenario = {
+            "name": "企业综合信息查询流程",
+            "description": "获取企业列表后复用企业ID查询商标和备案信息",
+            "environment_id": 4,
+            "tags": ["ai-composed"],
+            "nodes": [
+                {
+                    "id": "NODE-1",
+                    "name": "获取企业列表",
+                    "test_case": {
+                        "id": "CASE-1",
+                        "kind": "api_case",
+                        "name": "获取企业列表",
+                        "reference_id": 7,
+                        "config": {
+                            "extractors": [
+                                {"id": "VAR-entId", "name": "entId", "path": "data.list.0.entId"}
+                            ],
+                            "_scenario_context": {
+                                "extractions": [
+                                    {"id": "VAR-entId", "name": "entId", "path": "data.list.0.entId"}
+                                ]
+                            },
+                        },
+                    },
+                    "after_actions": [
+                        {"id": "WAIT-1", "kind": "delay", "name": "等待企业数据同步", "config": {"duration_ms": 1}}
+                    ],
+                },
+                {
+                    "id": "NODE-2",
+                    "name": "查询商标信息",
+                    "test_case": {
+                        "id": "CASE-2",
+                        "kind": "api_case",
+                        "name": "查询商标信息",
+                        "reference_id": 8,
+                        "config": {
+                            "query_params": {"entId": "{{entId}}"},
+                            "_scenario_context": {
+                                "bindings": [
+                                    {
+                                        "id": "BIND-entId",
+                                        "name": "entId",
+                                        "source_step_id": "CASE-1",
+                                        "source_extraction_id": "VAR-entId",
+                                        "target": "query_params",
+                                        "target_path": "entId",
+                                    }
+                                ]
+                            },
+                        },
+                    },
+                },
+            ],
+            "datasets": [],
+        }
+        enterprise_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=enterprise_run.run_id,
+                tool_name="scenario.compose_draft",
+                input={"project_id": 10, "input": {"requirement": "企业综合信息查询流程"}},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        enterprise_output = {"draft": {"scenario": enterprise_scenario, "warnings": []}}
+        enterprise_call.status = "succeeded"
+        enterprise_call.execution_phase = "completed"
+        enterprise_call.output_json_redacted = enterprise_output
+        enterprise_call.output_hash = request_fingerprint(enterprise_output)
+        runtime.complete_run(enterprise_run, {"message": "已生成企业综合信息查询流程草稿。", "assistant_visible": True})
+
+        latest_run = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="创建登录流程",
+            ),
+            current_user=self.owner,
+        )
+        latest_scenario = {
+            "name": "登录流程",
+            "description": "这是一个更晚生成但不应被命名保存命中的草稿",
+            "environment_id": 4,
+            "tags": ["ai-composed"],
+            "nodes": [
+                {
+                    "id": "LOGIN-1",
+                    "name": "登录",
+                    "test_case": {
+                        "id": "LOGIN-CASE-1",
+                        "kind": "api_case",
+                        "name": "登录",
+                        "reference_id": 9,
+                        "config": {"assertions": [{"type": "status_code", "expected": 200}]},
+                    },
+                }
+            ],
+            "datasets": [],
+        }
+        latest_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=latest_run.run_id,
+                tool_name="scenario.compose_draft",
+                input={"project_id": 10, "input": {"requirement": "登录流程"}},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        latest_output = {"draft": {"scenario": latest_scenario, "warnings": []}}
+        latest_call.status = "succeeded"
+        latest_call.execution_phase = "completed"
+        latest_call.output_json_redacted = latest_output
+        latest_call.output_hash = request_fingerprint(latest_output)
+        runtime.complete_run(latest_run, {"message": "已生成登录流程草稿。", "assistant_visible": True})
+
+        current = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="保存「企业综合信息查询流程」，保存后执行",
+            ),
+            current_user=self.owner,
+        )
+        degraded_input = {
+            "project_id": 10,
+            "scenario": {
+                "name": "企业综合信息查询流程",
+                "description": "模型从摘要重构的退化版本",
+                "environment_id": 4,
+                "nodes": [
+                    {
+                        "id": "NODE-1",
+                        "name": "获取企业列表",
+                        "test_case": {
+                            "id": "NODE-1-TC",
+                            "kind": "api_case",
+                            "name": "获取企业列表",
+                            "reference_id": 7,
+                            "config": {},
+                        },
+                    }
+                ],
+                "datasets": [],
+            },
+        }
+
+        normalized = AgentConversationRunner(self.db)._normalize_tool_input(
+            run=current,
+            tool_name="scenario.create_saved",
+            tool_input=json.loads(json.dumps(degraded_input, ensure_ascii=False)),
+        )
+
+        self.assertEqual(normalized["scenario"]["name"], "企业综合信息查询流程")
+        self.assertEqual(normalized["scenario"]["description"], enterprise_scenario["description"])
+        self.assertEqual(normalized["scenario"]["nodes"][0]["after_actions"][0]["kind"], "delay")
+        self.assertEqual(
+            normalized["scenario"]["nodes"][1]["test_case"]["config"]["_scenario_context"]["bindings"][0]["name"],
+            "entId",
+        )
+        self.assertEqual(normalized["scenario_draft_source"]["tool_call_id"], enterprise_call.tool_call_id)
+        self.assertNotEqual(normalized["scenario_draft_source"]["tool_call_id"], latest_call.tool_call_id)
+
+    def test_scenario_create_saved_blocks_degraded_orchestration_before_approval(self):
+        from app.models.project import ProjectEnvironment
+        from app.services.agent_tool_service import AgentToolBackend
+
+        run = self._create_run("保存企业自动化测试流程，注意前置后置条件，注意接口上下文依赖")
+        self.db.add(
+            ProjectEnvironment(
+                id=4,
+                project_id=10,
+                name="test",
+                base_url="https://api.example.test",
+                description="test env",
+                is_default=True,
+                is_deleted=False,
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.commit()
+        context_output = AgentToolBackend(self.db).execute(
+            tool_name="project.read_context",
+            payload={"project_id": 10},
+            current_user=self.owner,
+        )
+        context_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        context_call.status = "succeeded"
+        context_call.execution_phase = "completed"
+        context_call.output_json_redacted = context_output
+        context_call.output_hash = request_fingerprint(context_output)
+        self.db.commit()
+
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="scenario.create_saved",
+                input={
+                    "project_id": 10,
+                    "environment_snapshot_id": context_output["environment_snapshot"]["snapshot_id"],
+                    "scenario": {
+                        "name": "企业自动化测试流程",
+                        "description": "需要前置后置和上下文依赖，但输入退化为用例列表",
+                        "environment_id": 4,
+                        "nodes": [
+                            {
+                                "id": "NODE-1",
+                                "name": "获取企业列表",
+                                "test_case": {
+                                    "id": "NODE-1-TC",
+                                    "kind": "api_case",
+                                    "name": "获取企业列表",
+                                    "reference_id": 7,
+                                    "config": {},
+                                },
+                            },
+                            {
+                                "id": "NODE-2",
+                                "name": "获取对应企业CT画像数",
+                                "test_case": {
+                                    "id": "NODE-2-TC",
+                                    "kind": "api_case",
+                                    "name": "获取对应企业CT画像数",
+                                    "reference_id": 8,
+                                    "config": {},
+                                },
+                            },
+                        ],
+                        "datasets": [],
+                    },
+                },
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        approvals = list(
+            self.db.scalars(select(AgentApproval).where(AgentApproval.tool_call_id == call.tool_call_id)).all()
+        )
+
+        self.assertEqual(call.status, "failed")
+        self.assertEqual(call.execution_phase, "blocked_by_harness")
+        self.assertEqual(call.error_code, "agent_scenario_orchestration_quality_missing")
+        self.assertEqual(call.recovery_decision, "reuse_or_recompose_scenario_draft_before_save")
+        self.assertEqual(approvals, [])
+        self.assertEqual(call.output_json_redacted["blocked_tool"], "scenario.create_saved")
+        self.assertIn("quality_preflight", call.output_json_redacted)
+        self.assertEqual(call.output_json_redacted["quality_preflight"]["empty_test_case_configs"], 2)
+
+    def test_scenario_orchestration_quality_gate_allows_partial_nonempty_configs(self):
+        scenario = {
+            "name": "three step workflow",
+            "description": "workflow with dependency context",
+            "nodes": [
+                {
+                    "id": "NODE-1",
+                    "test_case": {
+                        "id": "CASE-1",
+                        "kind": "api_case",
+                        "name": "step one",
+                        "reference_id": 1,
+                        "config": {"assertions": [{"type": "status_code", "expected": 200}]},
+                    },
+                },
+                {
+                    "id": "NODE-2",
+                    "test_case": {
+                        "id": "CASE-2",
+                        "kind": "api_case",
+                        "name": "step two",
+                        "reference_id": 2,
+                        "config": {},
+                    },
+                },
+                {
+                    "id": "NODE-3",
+                    "test_case": {
+                        "id": "CASE-3",
+                        "kind": "api_case",
+                        "name": "step three",
+                        "reference_id": 3,
+                        "config": {"headers": {"X-Trace": "static"}},
+                    },
+                },
+            ],
+        }
+
+        self.assertIsNone(
+            agent_runtime_service._scenario_orchestration_quality_missing(
+                intent="save workflow with dependency context",
+                scenario=scenario,
+            )
+        )
+
+    def test_scenario_query_project_scenarios_summary_mode_omits_full_definition(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.scenario import TestScenario, TestScenarioVersion
+        from app.services.agent_tool_service import AgentToolBackend
+
+        self.db.add(
+            ProjectEnvironment(
+                id=118,
+                project_id=10,
+                name="scenario summary env",
+                base_url="https://summary.example.test",
+                description="env",
+                is_default=True,
+                is_deleted=False,
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.add(
+            TestScenario(
+                id=418,
+                project_id=10,
+                environment_id=118,
+                current_version=1,
+                name="Scenario Summary Mode",
+                description="large scenario",
+                tags=["agent"],
+                created_by_id=self.owner.id,
+                updated_by_id=self.owner.id,
+                is_deleted=False,
+            )
+        )
+        self.db.add(
+            TestScenarioVersion(
+                scenario_id=418,
+                version=1,
+                definition={
+                    "nodes": [
+                        {
+                            "id": f"node-{index}",
+                            "name": "x" * 80,
+                            "test_case": {
+                                "id": f"step-{index}",
+                                "kind": "api_case",
+                                "name": f"Case {index}",
+                                "reference_id": 217,
+                                "config": {},
+                            },
+                        }
+                        for index in range(30)
+                    ],
+                    "datasets": [
+                        {"id": f"dataset-{index}", "name": f"Dataset {index}", "records": [{"id": "r1"}]}
+                        for index in range(20)
+                    ],
+                    "large_blob": "z" * 20000,
+                },
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.commit()
+
+        result = AgentToolBackend(self.db).execute(
+            tool_name="scenario.query_project_scenarios",
+            payload={"project_id": 10, "detail_level": "summary"},
+            current_user=self.owner,
+        )
+        scenario = next(item for item in result["scenarios"] if item["id"] == 418)
+
+        self.assertEqual(result["detail_level"], "summary")
+        self.assertIn("scenario_result_policy", result)
+        self.assertIn("object_ref", scenario)
+        self.assertIn("definition_summary", scenario)
+        self.assertNotIn("definition", scenario)
+        self.assertEqual(scenario["definition_summary"]["node_count"], 30)
+        self.assertEqual(scenario["definition_summary"]["dataset_count"], 20)
+        json.dumps(result)
+
+    def test_testcase_query_project_cases_supports_summary_and_selected_assertion_details(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+        from app.services.agent_tool_service import AgentToolBackend
+
+        self.db.add(
+            ProjectEnvironment(
+                id=119,
+                project_id=10,
+                name="case summary env",
+                base_url="https://case-summary.example.test",
+                description="env",
+                is_default=True,
+                is_deleted=False,
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.add_all(
+            [
+                TestCase(
+                    id=219 + index,
+                    project_id=10,
+                    environment_id=119,
+                    name=f"Large Case {index}",
+                    description="case summary mode",
+                    method="POST",
+                    path=f"/large/{index}",
+                    headers={"Authorization": "{{token}}", "X-Large": "x" * 1000},
+                    query_params={"page": index},
+                    body_type="json",
+                    body={"payload": "z" * 5000},
+                    assertions=[{"type": "status_code", "expected": 200}],
+                    extractors=[{"name": "companyId", "source": "body", "path": "$.data.id"}],
+                    retry_policy=None,
+                    last_execution_status=["failed", "passed", None][index],
+                    created_by_id=self.owner.id,
+                )
+                for index in range(3)
+            ]
+        )
+        self.db.commit()
+
+        backend = AgentToolBackend(self.db)
+        summary = backend.execute(
+            tool_name="testcase.query_project_cases",
+            payload={"project_id": 10, "environment_id": 119, "detail_level": "summary"},
+            current_user=self.owner,
+        )
+        selected = backend.execute(
+            tool_name="testcase.query_project_cases",
+            payload={
+                "project_id": 10,
+                "environment_id": 119,
+                "detail_level": "assertions",
+                "test_case_ids": [219],
+                "include_websocket": False,
+            },
+            current_user=self.owner,
+        )
+        execution_ready = backend.execute(
+            tool_name="testcase.query_project_cases",
+            payload={
+                "project_id": 10,
+                "environment_id": 119,
+                "detail_level": "execution_ready",
+                "test_case_ids": [219, 220],
+                "include_websocket": False,
+            },
+            current_user=self.owner,
+        )
+        default_inventory = backend.execute(
+            tool_name="testcase.query_project_cases",
+            payload={"project_id": 10, "environment_id": 119, "include_websocket": False},
+            current_user=self.owner,
+        )
+
+        self.assertEqual(summary["detail_level"], "summary")
+        self.assertIn("case_result_policy", summary)
+        self.assertEqual(summary["case_result_policy"]["default_detail_level"], "summary")
+        self.assertEqual(
+            summary["case_result_policy"]["large_task_strategy"]["strategy_id"],
+            "summary_then_selected_detail_then_execution_ready_action",
+        )
+        self.assertIn(
+            "query_one_case_with_detail_level_assertions",
+            summary["case_result_policy"]["large_task_strategy"]["steps"],
+        )
+        self.assertIn(
+            "before_batch_side_effect_requery_targets_with_detail_level_execution_ready",
+            summary["case_result_policy"]["large_task_strategy"]["steps"],
+        )
+        self.assertIn(
+            "do_not_requery_all_cases_with_full_detail_after_truncation",
+            summary["case_result_policy"]["large_task_strategy"]["avoid"],
+        )
+        self.assertEqual(summary["http_total"], 3)
+        self.assertNotIn("body", summary["http_test_cases"][0])
+        self.assertEqual(summary["http_test_cases"][0]["assertion_count"], 1)
+        self.assertEqual(
+            summary["case_display_rows"][0],
+            {
+                "case_type": "http",
+                "id": 219,
+                "object_ref": summary["http_test_cases"][0]["object_ref"],
+                "name": "Large Case 0",
+                "path": "/large/0",
+                "environment_id": 119,
+                "environment_ids": [119],
+                "last_execution_status": "failed",
+                "display_name": "Large Case 0（ID: 219）",
+                "name_source": "testcase.query_project_cases",
+                "method": "POST",
+            },
+        )
+        self.assertEqual(summary["case_status_summary"]["by_status"]["failed"], 1)
+        self.assertEqual(summary["case_status_summary"]["by_status"]["passed"], 1)
+        self.assertEqual(summary["case_status_summary"]["by_status"]["status_missing"], 1)
+        self.assertEqual([item["id"] for item in summary["case_attention_rows"]], [219, 221])
+        self.assertEqual([item["name"] for item in summary["case_attention_rows"]], ["Large Case 0", "Large Case 2"])
+        self.assertEqual(selected["http_test_case_ids"], [219])
+        self.assertEqual(selected["detail_level"], "assertions")
+        self.assertIn("assertions", selected["http_test_cases"][0])
+        self.assertNotIn("body", selected["http_test_cases"][0])
+        self.assertEqual(execution_ready["detail_level"], "execution_ready")
+        self.assertTrue(execution_ready["case_result_policy"]["execution_ready"])
+        self.assertTrue(execution_ready["case_snapshot"]["execution_ready"])
+        self.assertEqual(execution_ready["http_test_case_ids"], [219, 220])
+        self.assertEqual(execution_ready["http_batch_execute_input"]["test_case_ids"], [219, 220])
+        self.assertEqual(
+            execution_ready["http_batch_execute_input"]["case_snapshot_id"],
+            execution_ready["case_snapshot"]["snapshot_id"],
+        )
+        self.assertEqual(len(execution_ready["http_batch_execute_input"]["object_references"]), 2)
+        self.assertEqual(default_inventory["detail_level"], "summary")
+        self.assertNotIn("body", default_inventory["http_test_cases"][0])
 
     def test_agent_testcase_assertion_patch_tools_preserve_saved_case_payloads(self):
         from app.models.project import ProjectEnvironment
@@ -3234,6 +5372,169 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(self.db.get(TestCase, http_id).name, "AI updated HTTP case")
         self.assertEqual(self.db.get(WebSocketTestCase, ws_id).name, "AI updated WS case")
 
+    def test_agent_testcase_save_tools_accept_null_retry_policy_as_default(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+        from app.models.websocket_test_case import WebSocketTestCase
+        from app.services.agent_tool_service import AgentToolBackend
+
+        environment = ProjectEnvironment(
+            id=125,
+            project_id=10,
+            name="agent save null retry env",
+            base_url="https://api.example.test",
+            description="agent save null retry env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        self.db.add(environment)
+        self.db.commit()
+
+        backend = AgentToolBackend(self.db)
+        http_created = backend.execute(
+            tool_name="testcase.create_saved",
+            payload={
+                "project_id": 10,
+                "case": {
+                    "environment_id": 125,
+                    "environment_ids": [125],
+                    "name": "AI saved HTTP case null retry",
+                    "description": "created by approved Agent tool",
+                    "method": "GET",
+                    "path": "/ai/null-retry",
+                    "headers": {},
+                    "query_params": {},
+                    "body_type": "none",
+                    "body": None,
+                    "assertions": [],
+                    "extractors": [],
+                    "retry_policy": None,
+                },
+            },
+            current_user=self.owner,
+        )
+        http_id = http_created["test_case"]["id"]
+        http_updated = backend.execute(
+            tool_name="testcase.update_saved",
+            payload={
+                "project_id": 10,
+                "test_case_id": http_id,
+                "case": {
+                    "environment_id": 125,
+                    "environment_ids": [125],
+                    "name": "AI updated HTTP case null retry",
+                    "description": "updated by approved Agent tool",
+                    "method": "POST",
+                    "path": "/ai/null-retry-updated",
+                    "headers": {},
+                    "query_params": {},
+                    "body_type": "json",
+                    "body": {"ok": True},
+                    "assertions": [],
+                    "extractors": [],
+                    "retry_policy": None,
+                },
+            },
+            current_user=self.owner,
+        )
+        ws_created = backend.execute(
+            tool_name="websocket_testcase.create_saved",
+            payload={
+                "project_id": 10,
+                "case": {
+                    "environment_id": 125,
+                    "environment_ids": [125],
+                    "name": "AI saved WS case null retry",
+                    "description": "created by approved Agent tool",
+                    "path": "/ws/null-retry",
+                    "headers": {},
+                    "subprotocols": [],
+                    "messages": [],
+                    "receive_count": 0,
+                    "connect_timeout_ms": 1000,
+                    "receive_timeout_ms": 1000,
+                    "assertions": [],
+                    "extractors": [],
+                    "retry_policy": None,
+                },
+            },
+            current_user=self.owner,
+        )
+        ws_id = ws_created["websocket_test_case"]["id"]
+        ws_updated = backend.execute(
+            tool_name="websocket_testcase.update_saved",
+            payload={
+                "project_id": 10,
+                "test_case_id": ws_id,
+                "case": {
+                    "environment_id": 125,
+                    "environment_ids": [125],
+                    "name": "AI updated WS case null retry",
+                    "description": "updated by approved Agent tool",
+                    "path": "/ws/null-retry-updated",
+                    "headers": {},
+                    "subprotocols": [],
+                    "messages": [],
+                    "receive_count": 0,
+                    "connect_timeout_ms": 1000,
+                    "receive_timeout_ms": 1000,
+                    "assertions": [],
+                    "extractors": [],
+                    "retry_policy": None,
+                },
+            },
+            current_user=self.owner,
+        )
+
+        self.assertEqual(http_updated["test_case"]["name"], "AI updated HTTP case null retry")
+        self.assertEqual(ws_updated["websocket_test_case"]["name"], "AI updated WS case null retry")
+        self.assertEqual(self.db.get(TestCase, http_id).retry_policy["enabled"], False)
+        self.assertEqual(self.db.get(WebSocketTestCase, ws_id).retry_policy["enabled"], False)
+
+    def test_agent_testcase_validate_schema_accepts_null_retry_policy_as_default(self):
+        from app.models.project import ProjectEnvironment
+        from app.services.agent_tool_service import AgentToolBackend
+
+        environment = ProjectEnvironment(
+            id=126,
+            project_id=10,
+            name="agent validate null retry env",
+            base_url="https://api.example.test",
+            description="agent validate null retry env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        self.db.add(environment)
+        self.db.commit()
+
+        result = AgentToolBackend(self.db).execute(
+            tool_name="testcase.validate_schema",
+            payload={
+                "project_id": 10,
+                "case": {
+                    "environment_id": 126,
+                    "environment_ids": [126],
+                    "name": "AI validated HTTP case null retry",
+                    "description": "validated by Agent tool",
+                    "method": "GET",
+                    "path": "/ai/null-retry-validate",
+                    "headers": {},
+                    "query_params": {},
+                    "body_type": "none",
+                    "body": None,
+                    "assertions": [],
+                    "extractors": [],
+                    "retry_policy": None,
+                },
+            },
+            current_user=self.owner,
+        )
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["case"]["retry_policy"]["enabled"], False)
+
     def test_conversation_runner_blocks_testcase_save_tool_until_approved(self):
         from app.core.permissions import ProjectPermission
         from app.models.project import ProjectEnvironment
@@ -3260,8 +5561,6 @@ class AgentRuntimeTests(unittest.TestCase):
             "input": {
                 "project_id": 10,
                 "case": {
-                    "environment_id": 106,
-                    "environment_ids": [106],
                     "name": "Approval gated HTTP case",
                     "description": "must not persist before approval",
                     "method": "GET",
@@ -3384,14 +5683,800 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result["http_test_case_ids"], [204, 205])
         self.assertEqual(result["websocket_test_case_ids"], [304])
+        http_refs = [
+            result["http_test_cases"][0]["object_ref"],
+            result["http_test_cases"][1]["object_ref"],
+        ]
+        websocket_refs = [result["websocket_test_cases"][0]["object_ref"]]
+        self.assertEqual(
+            result["case_id_manifest"],
+            {
+                "http_test_case_ids": [204, 205],
+                "websocket_test_case_ids": [304],
+                "http_assertion_update_ids": [204, 205],
+                "websocket_assertion_update_ids": [304],
+                "http_test_case_refs": http_refs,
+                "websocket_test_case_refs": websocket_refs,
+                "id_source_rule": (
+                    "Use only these explicit ids from the latest query snapshot; never infer continuous numeric ranges "
+                    "or reuse ids from older conversation prose."
+                ),
+                "snapshot_id": result["case_snapshot"]["snapshot_id"],
+                "validity_scope": "current_agent_conversation_latest_query",
+            },
+        )
+        self.assertEqual(result["object_reference_manifest"]["object_family"], "test_case")
+        self.assertEqual(result["object_reference_manifest"]["query_tool"], "testcase.query_project_cases")
+        self.assertEqual(result["object_reference_manifest"]["snapshot_id"], result["case_snapshot"]["snapshot_id"])
+        self.assertEqual(result["object_reference_manifest"]["http_test_case_ids"], [204, 205])
+        self.assertEqual(result["object_reference_manifest"]["websocket_test_case_ids"], [304])
+        self.assertEqual(len(result["object_reference_manifest"]["object_references"]), 3)
+        self.assertEqual(
+            result["object_reference_manifest"]["object_references"][0],
+            {
+                "id": 204,
+                "object_ref": result["http_test_cases"][0]["object_ref"],
+                "object_type": "http_test_case",
+                "name": "HTTP Query Case 1",
+                "method": "GET",
+                "path": "/health",
+                "snapshot_id": result["case_snapshot"]["snapshot_id"],
+            },
+        )
+        self.assertEqual(result["case_id_manifest"]["http_test_case_refs"], http_refs)
+        self.assertEqual(result["case_id_manifest"]["websocket_test_case_refs"], websocket_refs)
+        self.assertTrue(result["http_test_cases"][0]["object_ref"].startswith("object-ref://test_case/http/"))
+        self.assertTrue(result["websocket_test_cases"][0]["object_ref"].startswith("object-ref://test_case/websocket/"))
+        self.assertEqual(
+            result["object_reference_manifest"]["validity_scope"],
+            "current_agent_conversation_latest_query",
+        )
+        self.assertEqual(result["case_snapshot"]["project_id"], 10)
+        self.assertEqual(result["case_snapshot"]["environment_id"], 104)
+        self.assertTrue(result["case_snapshot"]["authoritative_for_tool_input"])
+        self.assertEqual(
+            result["case_snapshot"]["identity_semantics"],
+            "test case ids are volatile database row locators; re-query before writes or execution.",
+        )
         self.assertEqual(
             result["http_batch_execute_input"],
-            {"project_id": 10, "environment_id": 104, "test_case_ids": [204, 205]},
+            {
+                "project_id": 10,
+                "environment_id": 104,
+                "test_case_ids": [204, 205],
+                "object_references": http_refs,
+                "case_snapshot_id": result["case_snapshot"]["snapshot_id"],
+            },
         )
         self.assertEqual(
             result["websocket_batch_execute_input"],
-            {"project_id": 10, "environment_id": 104, "websocket_test_case_ids": [304]},
+            {
+                "project_id": 10,
+                "environment_id": 104,
+                "websocket_test_case_ids": [304],
+                "object_references": websocket_refs,
+                "case_snapshot_id": result["case_snapshot"]["snapshot_id"],
+            },
         )
+
+    def test_executor_resolves_http_case_object_reference_from_latest_query_manifest(self):
+        from app.models.test_case import TestCase
+
+        run = self._create_run("update assertions using object reference handle")
+        object_ref = "object-ref://test_case/http/latest-token/1401"
+        http_case = TestCase(
+            id=1401,
+            project_id=10,
+            name="Handle HTTP Case",
+            description="case",
+            method="GET",
+            path="/handle-case",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add(http_case)
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "detail_level": "execution_ready",
+            "case_result_policy": {"execution_ready": True},
+            "object_reference_manifest": {
+                "object_family": "test_case",
+                "snapshot_id": "case-snapshot://latest",
+                "http_test_case_ids": [1401],
+                "http_assertion_update_ids": [1401],
+                "http_test_case_refs": [object_ref],
+                "object_references": [
+                    {
+                        "id": 1401,
+                        "object_ref": object_ref,
+                        "object_type": "http_test_case",
+                        "name": "Handle HTTP Case",
+                    }
+                ],
+            }
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.update_assertions",
+                input={
+                    "project_id": 10,
+                    "object_reference": object_ref,
+                    "case_snapshot_id": "case-snapshot://latest",
+                    "assertions": [{"type": "status_code", "expected": 200}],
+                },
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        blocked = ToolExecutor(self.db)._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=run,
+            queue_item=None,
+            queue_service=AgentWorkerQueueService(self.db),
+            runtime=AgentRuntimeService(self.db),
+        )
+
+        self.assertIsNone(blocked)
+        self.assertEqual(call.input_json_redacted["test_case_id"], 1401)
+        self.assertEqual(call.input_json_redacted["object_reference"], object_ref)
+
+    def test_executor_resolves_single_http_case_object_reference_for_batch_execute(self):
+        from app.models.test_case import TestCase
+
+        run = self._create_run("batch execute one case using object reference handle")
+        object_ref = "object-ref://test_case/http/latest-token/1403"
+        http_case = TestCase(
+            id=1403,
+            project_id=10,
+            name="Single Handle Batch HTTP Case",
+            description="case",
+            method="GET",
+            path="/single-handle-batch",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add(http_case)
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "detail_level": "execution_ready",
+            "case_result_policy": {"execution_ready": True},
+            "object_reference_manifest": {
+                "object_family": "test_case",
+                "snapshot_id": "case-snapshot://latest",
+                "http_test_case_ids": [1403],
+                "http_assertion_update_ids": [1403],
+                "http_test_case_refs": [object_ref],
+                "object_references": [
+                    {
+                        "id": 1403,
+                        "object_ref": object_ref,
+                        "object_type": "http_test_case",
+                        "name": "Single Handle Batch HTTP Case",
+                    }
+                ],
+            }
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.batch_execute",
+                input={
+                    "project_id": 10,
+                    "object_references": [object_ref],
+                    "case_snapshot_id": "case-snapshot://latest",
+                },
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        blocked = ToolExecutor(self.db)._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=run,
+            queue_item=None,
+            queue_service=AgentWorkerQueueService(self.db),
+            runtime=AgentRuntimeService(self.db),
+        )
+
+        self.assertIsNone(blocked)
+        self.assertEqual(call.input_json_redacted["test_case_ids"], [1403])
+        self.assertNotIn("test_case_id", call.input_json_redacted)
+
+    def test_executor_resolves_http_case_object_reference_inside_batch_assertion_items(self):
+        from app.models.test_case import TestCase
+
+        run = self._create_run("batch update assertions using object reference items")
+        object_ref = "object-ref://test_case/http/latest-token/1404"
+        http_case = TestCase(
+            id=1404,
+            project_id=10,
+            name="Item Handle HTTP Case",
+            description="case",
+            method="GET",
+            path="/item-handle-case",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add(http_case)
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "detail_level": "execution_ready",
+            "case_result_policy": {"execution_ready": True},
+            "object_reference_manifest": {
+                "object_family": "test_case",
+                "snapshot_id": "case-snapshot://latest",
+                "http_test_case_ids": [1404],
+                "http_assertion_update_ids": [1404],
+                "http_test_case_refs": [object_ref],
+                "object_references": [
+                    {
+                        "id": 1404,
+                        "object_ref": object_ref,
+                        "object_type": "http_test_case",
+                        "name": "Item Handle HTTP Case",
+                    }
+                ],
+            }
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.batch_update_assertions",
+                input={
+                    "project_id": 10,
+                    "case_snapshot_id": "case-snapshot://latest",
+                    "items": [
+                        {
+                            "object_reference": object_ref,
+                            "assertions": [{"type": "status_code", "expected": 200}],
+                        }
+                    ],
+                },
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        blocked = ToolExecutor(self.db)._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=run,
+            queue_item=None,
+            queue_service=AgentWorkerQueueService(self.db),
+            runtime=AgentRuntimeService(self.db),
+        )
+
+        self.assertIsNone(blocked)
+        self.assertEqual(call.input_json_redacted["items"][0]["test_case_id"], 1404)
+        self.assertEqual(call.input_json_redacted["items"][0]["object_reference"], object_ref)
+
+    def test_executor_blocks_http_case_object_reference_not_from_latest_query_manifest(self):
+        run = self._create_run("block forged object reference handle")
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "object_reference_manifest": {
+                "object_family": "test_case",
+                "snapshot_id": "case-snapshot://latest",
+                "http_test_case_ids": [1402],
+                "http_assertion_update_ids": [1402],
+                "object_references": [
+                    {
+                        "id": 1402,
+                        "object_ref": "object-ref://test_case/http/latest-token/1402",
+                        "object_type": "http_test_case",
+                        "name": "Real HTTP Case",
+                    }
+                ],
+            }
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.update_assertions",
+                input={
+                    "project_id": 10,
+                    "object_reference": "object-ref://test_case/http/forged-token/9999",
+                    "assertions": [{"type": "status_code", "expected": 200}],
+                },
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        blocked = ToolExecutor(self.db)._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=run,
+            queue_item=None,
+            queue_service=AgentWorkerQueueService(self.db),
+            runtime=AgentRuntimeService(self.db),
+        )
+
+        self.assertIsNotNone(blocked)
+        self.assertEqual(blocked.status, "failed")
+        self.assertEqual(blocked.error_code, "agent_testcase_ids_not_from_query_result")
+        self.assertEqual(
+            blocked.output_json_redacted["invalid_object_references"],
+            ["object-ref://test_case/http/forged-token/9999"],
+        )
+        self.assertEqual(
+            blocked.output_json_redacted["valid_object_references"],
+            ["object-ref://test_case/http/latest-token/1402"],
+        )
+
+    def test_executor_resolves_scenario_and_environment_object_references(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.scenario import TestScenario
+
+        run = self._create_run("dry run scenario using object reference handles")
+        scenario_ref = "object-ref://scenario/default/latest-token/430"
+        environment_ref = "object-ref://environment/default/latest-token/530"
+        self.db.add_all([
+            ProjectEnvironment(
+                id=530,
+                project_id=10,
+                name="Env Handle",
+                base_url="https://env-handle.example.test",
+                description="env",
+                is_default=True,
+                is_deleted=False,
+                created_by_id=self.owner.id,
+            ),
+            TestScenario(
+                id=430,
+                project_id=10,
+                environment_id=530,
+                current_version=1,
+                name="Scenario Handle",
+                description="scenario",
+                tags=[],
+                created_by_id=self.owner.id,
+                updated_by_id=self.owner.id,
+                is_deleted=False,
+            ),
+        ])
+        scenario_query = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="scenario.query_project_scenarios",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        scenario_query.status = "succeeded"
+        scenario_query.execution_phase = "completed"
+        scenario_query.output_json_redacted = {
+            "object_reference_manifest": {
+                "object_family": "scenario",
+                "snapshot_id": "scenario-snapshot://latest",
+                "scenario_ids": [430],
+                "scenario_execute_ids": [430],
+                "object_references": [
+                    {
+                        "id": 430,
+                        "object_ref": scenario_ref,
+                        "object_type": "scenario",
+                        "name": "Scenario Handle",
+                    }
+                ],
+            }
+        }
+        environment_query = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        environment_query.status = "succeeded"
+        environment_query.execution_phase = "completed"
+        environment_query.output_json_redacted = {
+            "object_reference_manifest": {
+                "object_family": "environment",
+                "snapshot_id": "environment-snapshot://latest",
+                "environment_ids": [530],
+                "environment_execute_ids": [530],
+                "object_references": [
+                    {
+                        "id": 530,
+                        "object_ref": environment_ref,
+                        "object_type": "environment",
+                        "name": "Env Handle",
+                    }
+                ],
+            }
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="scenario.execute_dry_run",
+                input={
+                    "project_id": 10,
+                    "object_reference": scenario_ref,
+                    "environment_reference": environment_ref,
+                    "scenario_snapshot_id": "scenario-snapshot://latest",
+                    "environment_snapshot_id": "environment-snapshot://latest",
+                },
+                step_index=2,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        blocked = ToolExecutor(self.db)._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=run,
+            queue_item=None,
+            queue_service=AgentWorkerQueueService(self.db),
+            runtime=AgentRuntimeService(self.db),
+        )
+
+        self.assertIsNone(blocked)
+        self.assertEqual(call.input_json_redacted["scenario_id"], 430)
+        self.assertEqual(call.input_json_redacted["environment_id"], 530)
+
+    def test_agent_query_project_scenarios_returns_object_reference_manifest(self):
+        from app.models.scenario import TestScenario, TestScenarioVersion
+        from app.services.agent_tool_service import AgentToolBackend
+
+        scenario = TestScenario(
+            id=410,
+            project_id=10,
+            environment_id=20,
+            current_version=1,
+            name="登录冒烟场景",
+            description="login smoke",
+            tags=["smoke"],
+            created_by_id=self.owner.id,
+            updated_by_id=self.owner.id,
+            is_deleted=False,
+        )
+        deleted = TestScenario(
+            id=411,
+            project_id=10,
+            environment_id=20,
+            current_version=1,
+            name="已删除场景",
+            description="deleted",
+            tags=[],
+            created_by_id=self.owner.id,
+            updated_by_id=self.owner.id,
+            is_deleted=True,
+        )
+        self.db.add_all([
+            scenario,
+            deleted,
+            TestScenarioVersion(
+                scenario_id=410,
+                version=1,
+                definition={"nodes": []},
+                created_by_id=self.owner.id,
+            ),
+        ])
+        self.db.commit()
+
+        result = AgentToolBackend(self.db).execute(
+            tool_name="scenario.query_project_scenarios",
+            payload={"project_id": 10},
+            current_user=self.owner,
+        )
+
+        self.assertEqual(result["scenario_ids"], [410])
+        self.assertEqual(result["scenario_total"], 1)
+        self.assertEqual(result["scenario_snapshot"]["object_family"], "scenario")
+        self.assertEqual(result["scenario_snapshot"]["project_id"], 10)
+        self.assertTrue(result["scenario_snapshot"]["authoritative_for_tool_input"])
+        self.assertEqual(result["object_reference_manifest"]["object_family"], "scenario")
+        self.assertEqual(result["object_reference_manifest"]["query_tool"], "scenario.query_project_scenarios")
+        self.assertEqual(result["object_reference_manifest"]["scenario_ids"], [410])
+        self.assertEqual(result["scenario_id_manifest"]["scenario_refs"], [result["scenarios"][0]["object_ref"]])
+        self.assertEqual(result["object_reference_manifest"]["object_references"][0]["id"], 410)
+        self.assertEqual(
+            result["object_reference_manifest"]["object_references"][0]["object_ref"],
+            result["scenarios"][0]["object_ref"],
+        )
+        self.assertEqual(result["object_reference_manifest"]["object_references"][0]["object_type"], "scenario")
+        self.assertEqual(
+            result["object_reference_manifest"]["object_references"][0]["snapshot_id"],
+            result["scenario_snapshot"]["snapshot_id"],
+        )
+        self.assertTrue(result["scenarios"][0]["object_ref"].startswith("object-ref://scenario/default/"))
+        self.assertEqual(result["scenarios"][0]["name"], "登录冒烟场景")
+        json.dumps(result)
+
+    def test_executor_persists_scenario_query_result_without_eventstore_failure(self):
+        from app.models.scenario import TestScenario, TestScenarioVersion
+
+        run = self._create_run("query scenarios through executor")
+        self.db.add_all([
+            TestScenario(
+                id=412,
+                project_id=10,
+                environment_id=20,
+                current_version=1,
+                name="Executor 场景查询",
+                description="scenario query executor",
+                tags=["agent"],
+                created_by_id=self.owner.id,
+                updated_by_id=self.owner.id,
+                is_deleted=False,
+            ),
+            TestScenarioVersion(
+                scenario_id=412,
+                version=1,
+                definition={"nodes": []},
+                created_by_id=self.owner.id,
+            ),
+        ])
+        self.db.commit()
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="scenario.query_project_scenarios",
+                input={"project_id": 10, "detail_level": "summary"},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+
+        result = ToolExecutor(self.db).execute_tool_call(
+            call=call,
+            run=run,
+            queue_item=None,
+            current_user=self.owner,
+        )
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertIsNone(result.error_code)
+        self.assertEqual(result.output_json_redacted["scenario_ids"], [412])
+        event_types = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+        self.assertIn("tool.completed", event_types)
+        self.assertNotIn("tool.failed", event_types)
+
+    def test_project_read_context_returns_environment_reference_manifest(self):
+        from app.models.project import ProjectEnvironment
+        from app.services.agent_tool_service import AgentToolBackend
+
+        self.db.add_all([
+            ProjectEnvironment(
+                id=510,
+                project_id=10,
+                name="env-main",
+                base_url="https://main.example.test",
+                description="main",
+                is_default=True,
+                is_deleted=False,
+                created_by_id=self.owner.id,
+            ),
+            ProjectEnvironment(
+                id=511,
+                project_id=10,
+                name="env-deleted",
+                base_url="https://deleted.example.test",
+                description="deleted",
+                is_default=False,
+                is_deleted=True,
+                created_by_id=self.owner.id,
+            ),
+        ])
+        self.db.commit()
+
+        result = AgentToolBackend(self.db).execute(
+            tool_name="project.read_context",
+            payload={"project_id": 10},
+            current_user=self.owner,
+        )
+
+        self.assertEqual(result["environment_snapshot"]["object_family"], "environment")
+        self.assertEqual(result["environment_snapshot"]["project_id"], 10)
+        self.assertTrue(result["environment_snapshot"]["authoritative_for_tool_input"])
+        self.assertEqual(result["environment_id_manifest"]["environment_ids"], [510])
+        self.assertEqual(result["environment_id_manifest"]["environment_refs"], [result["environments"][0]["object_ref"]])
+        self.assertEqual(result["object_reference_manifest"]["object_family"], "environment")
+        self.assertEqual(result["object_reference_manifest"]["query_tool"], "project.read_context")
+        self.assertEqual(result["object_reference_manifest"]["environment_ids"], [510])
+        self.assertEqual(result["object_reference_manifest"]["object_references"][0]["id"], 510)
+        self.assertEqual(
+            result["object_reference_manifest"]["object_references"][0]["object_ref"],
+            result["environments"][0]["object_ref"],
+        )
+        self.assertEqual(result["object_reference_manifest"]["object_references"][0]["object_type"], "environment")
+        self.assertEqual(
+            result["object_reference_manifest"]["object_references"][0]["snapshot_id"],
+            result["environment_snapshot"]["snapshot_id"],
+        )
+        self.assertTrue(result["environments"][0]["object_ref"].startswith("object-ref://environment/default/"))
+
+    def test_batch_execute_accepts_latest_project_context_environment_snapshot(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+        from app.services.agent_tool_service import AgentToolBackend
+
+        environment = ProjectEnvironment(
+            id=512,
+            project_id=10,
+            name="batch execute context env",
+            base_url="https://api.example.test",
+            description="batch execute context env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        http_case = TestCase(
+            id=1412,
+            project_id=10,
+            environment_id=512,
+            name="Batch Execute Context Case",
+            description="case",
+            method="GET",
+            path="/context-env",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, http_case])
+        self.db.commit()
+
+        run = self._create_run("batch execute validates environment snapshot from project context")
+        backend = AgentToolBackend(self.db)
+        ledger = ExecutionLedgerService(self.db)
+        context_output = backend.execute(
+            tool_name="project.read_context",
+            payload={"project_id": 10},
+            current_user=self.owner,
+        )
+        context_call = ledger.create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        context_call.status = "succeeded"
+        context_call.execution_phase = "completed"
+        context_call.output_json_redacted = context_output
+
+        query_payload = {
+            "project_id": 10,
+            "detail_level": "execution_ready",
+            "test_case_ids": [1412],
+            "environment_id": 512,
+        }
+        query_output = backend.execute(
+            tool_name="testcase.query_project_cases",
+            payload=query_payload,
+            current_user=self.owner,
+        )
+        query_call = ledger.create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input=query_payload,
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = query_output
+
+        batch_input = dict(query_output["http_batch_execute_input"])
+        batch_input["environment_id"] = 512
+        batch_input["environment_snapshot_id"] = context_output["environment_snapshot"]["snapshot_id"]
+        call = ledger.create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.batch_execute",
+                input=batch_input,
+                step_index=2,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        blocked = ToolExecutor(self.db)._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=run,
+            queue_item=None,
+            queue_service=AgentWorkerQueueService(self.db),
+            runtime=AgentRuntimeService(self.db),
+        )
+
+        self.assertIsNone(blocked)
+        self.assertNotEqual(call.error_code, "agent_environment_snapshot_not_latest")
+        self.assertEqual(call.input_json_redacted["environment_snapshot_id"], context_output["environment_snapshot"]["snapshot_id"])
 
     def test_agent_batch_execute_prevalidates_ids_without_partial_execution_records(self):
         from app.models.project import ProjectEnvironment
@@ -3475,16 +6560,12 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(http_ctx.exception.status_code, 422)
         self.assertEqual(http_ctx.exception.detail["invalid_test_case_ids"], [999206])
-        self.assertEqual(
-            http_ctx.exception.detail["retry_batch_execute_input"],
-            {"project_id": 10, "environment_id": 105, "test_case_ids": [206]},
-        )
+        self.assertNotIn("retry_batch_execute_input", http_ctx.exception.detail)
+        self.assertEqual(http_ctx.exception.detail["next_action"], "refresh_case_snapshot_before_retry")
         self.assertEqual(ws_ctx.exception.status_code, 422)
         self.assertEqual(ws_ctx.exception.detail["invalid_websocket_test_case_ids"], [999305])
-        self.assertEqual(
-            ws_ctx.exception.detail["retry_batch_execute_input"],
-            {"project_id": 10, "environment_id": 105, "websocket_test_case_ids": [305]},
-        )
+        self.assertNotIn("retry_batch_execute_input", ws_ctx.exception.detail)
+        self.assertEqual(ws_ctx.exception.detail["next_action"], "refresh_case_snapshot_before_retry")
         self.assertEqual(
             self.db.scalar(
                 select(func.count())
@@ -3994,6 +7075,21 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("companyName 未动态绑定", captured_skill_inputs[1]["extra_requirements"])
 
     def test_conversation_runner_applies_generic_repair_loop_to_ai_skill_warnings(self):
+        from app.models.project import ProjectEnvironment
+
+        self.db.add(
+            ProjectEnvironment(
+                id=120,
+                project_id=10,
+                name="default-ai-draft-env",
+                base_url="https://api.example.test",
+                description="default env",
+                is_default=True,
+                is_deleted=False,
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.commit()
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(
                 project_id=10,
@@ -4427,6 +7523,70 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(observations[0].observation_json["tool_call_count"], 1)
         self.assertLess(loop_observed_index, final_summary_started_index)
 
+    def test_conversation_runner_suppresses_tool_request_returned_as_final_summary(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="读取项目上下文后总结",
+                max_iterations=1,
+            ),
+            current_user=self.owner,
+        )
+        call_count = {"value": 0}
+
+        def fake_stream(self, payload):
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                yield {
+                    "type": "delta",
+                    "content": "```agent_tool_request\n"
+                    + json.dumps(
+                        {
+                            "tool_name": "project.read_context",
+                            "input": {"project_id": 10},
+                            "reason": "需要读取项目上下文",
+                            "evidence_refs": [],
+                        }
+                    )
+                    + "\n```",
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {
+                "type": "delta",
+                "content": "```agent_tool_request\n"
+                + json.dumps(
+                    {
+                        "tool_name": "testcase.query_project_cases",
+                        "input": {"project_id": 10},
+                        "reason": "final summary 阶段不应继续请求工具",
+                        "evidence_refs": [],
+                    }
+                )
+                + "\n```",
+            }
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = self.db.scalars(
+            select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+        ).all()
+        final_tool_completed = [
+            item
+            for item in events
+            if item.event_type == "model.completed"
+            and item.payload_json.get("final_summary")
+            and item.payload_json.get("requested_tool") is True
+        ]
+
+        self.assertEqual(completed.status, "completed")
+        self.assertNotIn("agent_tool_request", completed.result_json["message"])
+        self.assertIn("工具请求", completed.result_json["message"])
+        self.assertTrue(final_tool_completed)
+        self.assertFalse(final_tool_completed[-1].payload_json["assistant_visible"])
+
     def test_conversation_runner_stops_on_repeated_failed_tool_no_progress(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(
@@ -4595,6 +7755,182 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(len(repair_started), 1)
         self.assertIn("格式无效", captured_messages[1][-1].content)
         self.assertIn("工具执行结果如下", captured_messages[2][-1].content)
+
+    def test_conversation_runner_salvages_mixed_tool_request_returned_by_invalid_repair(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="读取项目上下文后再回答"),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{},'
+                        '"reason":"需要项目上下文","evidence_refs":{}}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 2:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "我将先读取项目上下文。\n"
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{},'
+                        '"reason":"需要项目上下文","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "已读取项目上下文，可以继续规划测试。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_runtime_service.AgentToolBackend.execute",
+                return_value={"project": {"id": 10, "name": "TestAuto"}},
+            ),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        repaired_event = next(item for item in events if item.event_type == "model.tool_request_repaired")
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(completed.result_json["message"], "已读取项目上下文，可以继续规划测试。")
+        self.assertIn("model.tool_request_invalid", event_types)
+        self.assertIn("model.tool_request_repaired", event_types)
+        self.assertIn("model.tool_request_detected", event_types)
+        self.assertNotIn("model.tool_request_repair_failed", event_types)
+        self.assertEqual(repaired_event.payload_json["repair_strategy"], "salvaged_repair_fenced_tool_request")
+        self.assertEqual(len(captured_messages), 3)
+
+    def test_conversation_runner_salvages_first_tool_when_repair_returns_multiple_blocks(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="我需要你帮我完成测试场景组合",
+                max_iterations=4,
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        two_tool_requests = (
+            "好的，我会同时拉取用例清单和已有场景。\n\n"
+            "```agent_tool_request\n"
+            '{"tool_name":"testcase.query_project_cases","input":{"project_id":10,"detail_level":"summary"},'
+            '"reason":"获取用例清单","evidence_refs":[]}'
+            "\n```\n"
+            "```agent_tool_request\n"
+            '{"tool_name":"scenario.query_project_scenarios","input":{"project_id":10,"page_size":50},'
+            '"reason":"获取已有场景","evidence_refs":[]}'
+            "\n```"
+        )
+        repaired_two_tool_requests = two_tool_requests.split("\n\n", 1)[1]
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"project.read_context","input":{"project_id":10},'
+                        '"reason":"获取项目环境与资源清单","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 2:
+                yield {"type": "delta", "content": two_tool_requests}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 3:
+                yield {"type": "delta", "content": repaired_two_tool_requests}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 4:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"scenario.compose_draft","input":{"project_id":10,'
+                        '"environment_id":100,"input":{"requirement":"组合测试场景",'
+                        '"http_test_case_ids":[200],"self_validate":false,"max_nodes":3}},'
+                        '"reason":"生成场景草稿","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "已生成测试场景草稿。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def fake_execute(self, *, tool_name, payload, current_user):
+            if tool_name == "project.read_context":
+                return {"project": {"id": 10}, "default_environment": {"id": 100, "name": "test"}}
+            if tool_name == "testcase.query_project_cases":
+                return {
+                    "project_id": 10,
+                    "environment_id": 100,
+                    "http_total": 1,
+                    "websocket_total": 0,
+                    "http_test_case_ids": [200],
+                    "case_display_rows": [{"id": 200, "name": "HTTP Case"}],
+                }
+            if tool_name == "scenario.compose_draft":
+                return {"scenario": {"name": "组合测试场景"}}
+            raise AssertionError(f"unexpected tool: {tool_name}")
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch("app.services.agent_tool_service.AgentToolBackend.execute", new=fake_execute),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        calls = list(
+            self.db.scalars(
+                select(AgentToolCall).where(AgentToolCall.run_id == run.run_id).order_by(AgentToolCall.id.asc())
+            ).all()
+        )
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        repaired_event = next(
+            item
+            for item in events
+            if item.event_type == "model.tool_request_repaired"
+            and item.payload_json.get("repair_strategy") == "salvaged_repair_first_tool_request_block"
+        )
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(
+            [call.tool_name for call in calls],
+            ["project.read_context", "testcase.query_project_cases", "scenario.compose_draft"],
+        )
+        self.assertIn("model.tool_request_invalid", event_types)
+        self.assertNotIn("model.tool_request_repair_failed", event_types)
+        self.assertEqual(repaired_event.payload_json["tool_name"], "testcase.query_project_cases")
+        self.assertEqual(completed.result_json["message"], "已生成测试场景草稿。")
 
     def test_conversation_runner_does_not_continue_after_cancel_during_invalid_tool_repair_parse(self):
         from app.services.agent_runtime_service import AgentToolRequest
@@ -4961,7 +8297,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(calls[0].policy_evidence_refs_json, [])
         self.assertNotIn("agent_tool_request", visible_content)
 
-    def test_conversation_runner_retracts_visible_preamble_when_tool_block_arrives_late(self):
+    def test_conversation_runner_suppresses_preamble_when_tool_block_arrives_late(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="Read project context before answering"),
             current_user=self.owner,
@@ -5001,36 +8337,24 @@ class AgentRuntimeTests(unittest.TestCase):
             ).all()
         )
         event_types = [item.event_type for item in events]
-        visible_preamble = next(
-            item
+        visible_content = "".join(
+            item.payload_json.get("content", "")
             for item in events
-            if item.event_type == "model.delta"
-            and item.payload_json.get("content") == "I will inspect the project first.\n\n"
-        )
-        retraction = next(
-            item
-            for item in events
-            if item.event_type == "model.markdown_normalized"
-            and item.payload_json.get("normalization_reason") == "tool_request_stream_suppressed"
+            if item.event_type in {"model.delta", "model.markdown_normalized"}
         )
 
         self.assertEqual(completed.status, "completed")
         self.assertEqual(completed.result_json["message"], "Project context has been read.")
-        self.assertIn("model.tool_request_stream_suppressed", event_types)
-        self.assertEqual(retraction.payload_json["content"], "")
-        self.assertTrue(retraction.payload_json["replace_content"])
-        self.assertEqual(retraction.payload_json["model_call_id"], visible_preamble.payload_json["model_call_id"])
-        self.assertEqual(
-            retraction.payload_json["model_response_item_id"],
-            visible_preamble.payload_json["model_response_item_id"],
-        )
-        self.assertLess(visible_preamble.event_seq, retraction.event_seq)
+        self.assertNotIn("I will inspect the project first.", visible_content)
+        self.assertNotIn("agent_tool_request", visible_content)
+        self.assertNotIn("model.tool_request_stream_suppressed", event_types)
+        self.assertNotIn("model.markdown_normalized", event_types)
         self.assertLess(
-            retraction.event_seq,
             next(item.event_seq for item in events if item.event_type == "model.tool_request_detected"),
+            next(item.event_seq for item in events if item.event_type == "model.delta"),
         )
 
-    def test_conversation_runner_does_not_append_tool_request_suppressed_after_cancel(self):
+    def test_conversation_runner_does_not_execute_tool_after_cancelled_tool_request_detection(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="Read project context before answering"),
             current_user=self.owner,
@@ -5052,18 +8376,15 @@ class AgentRuntimeTests(unittest.TestCase):
             }
             yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
 
-        def cancel_after_retraction(runtime_self, event_run, event_type, payload, *, commit=True):
+        def cancel_after_tool_request_detection(runtime_self, event_run, event_type, payload, *, commit=True):
             event = original_append_event(runtime_self, event_run, event_type, payload, commit=commit)
-            if (
-                event_type == "model.markdown_normalized"
-                and payload.get("normalization_reason") == "tool_request_stream_suppressed"
-            ):
+            if event_type == "model.tool_request_detected":
                 AgentRuntimeService(self_db).cancel_run(run_id=run.run_id, current_user=owner)
             return event
 
         with (
             patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
-            patch.object(AgentRuntimeService, "append_event", new=cancel_after_retraction),
+            patch.object(AgentRuntimeService, "append_event", new=cancel_after_tool_request_detection),
         ):
             cancelled = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
 
@@ -5077,12 +8398,12 @@ class AgentRuntimeTests(unittest.TestCase):
         events_after_cancel = event_types[cancelled_index + 1:]
 
         self.assertEqual(cancelled.status, "cancelled")
-        self.assertIn("model.markdown_normalized", event_types)
-        self.assertNotIn("model.tool_request_stream_suppressed", events_after_cancel)
+        self.assertIn("model.tool_request_detected", event_types)
         self.assertNotIn("model.tool_request_detected", events_after_cancel)
+        self.assertNotIn("tool.call.created", events_after_cancel)
         self.assertNotIn("run.completed", events_after_cancel)
 
-    def test_conversation_runner_short_circuits_unsupported_scenario_save(self):
+    def test_conversation_runner_allows_supported_scenario_save_intent(self):
         run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(
                 project_id=10,
@@ -5091,16 +8412,11 @@ class AgentRuntimeTests(unittest.TestCase):
             current_user=self.owner,
         )
 
-        classifier_response = AIChatResponse(
-            provider="deepseek",
-            model="deepseek-test",
-            content='{"requires_scenario_persistence": true, "confidence": 0.98, "reason": "用户要求保存为正式场景"}',
-            finish_reason="stop",
-        )
-        with (
-            patch("app.services.agent_runtime_service.AIService.chat", return_value=classifier_response) as chat,
-            patch("app.services.agent_runtime_service.AIService.chat_stream") as chat_stream,
-        ):
+        def fake_stream(self, payload):
+            yield {"type": "delta", "content": "我会使用场景保存工具提交审批。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
             completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
 
         calls = list(self.db.scalars(select(AgentToolCall).where(AgentToolCall.run_id == run.run_id)).all())
@@ -5111,12 +8427,10 @@ class AgentRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.status, "completed")
-        self.assertIn("没有“保存正式场景”的后端工具", completed.result_json["message"])
-        self.assertEqual(completed.result_json["completion_source"], "unsupported_scenario_save_guard")
+        self.assertEqual(completed.result_json["message"], "我会使用场景保存工具提交审批。")
+        self.assertNotEqual(completed.result_json.get("completion_source"), "unsupported_scenario_save_guard")
         self.assertEqual(calls, [])
         self.assertIn("model.delta", [item.event_type for item in events])
-        chat.assert_called_once()
-        chat_stream.assert_not_called()
 
     def test_conversation_runner_does_not_complete_unsupported_guard_after_cancel_during_classifier(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -5138,7 +8452,18 @@ class AgentRuntimeTests(unittest.TestCase):
                 finish_reason="stop",
             )
 
+        from app.services.agent_tool_service import ToolRegistry
+
+        available_specs_without_save = [
+            spec
+            for spec in ToolRegistry().list_specs()
+            if spec.name not in {"scenario.create_saved", "scenario.update_saved"}
+        ]
         with (
+            patch(
+                "app.services.agent_runtime_service.ToolRegistry.list_specs",
+                return_value=available_specs_without_save,
+            ),
             patch("app.services.agent_runtime_service.AIService.chat", new=cancel_during_classifier),
             patch("app.services.agent_runtime_service.AIService.chat_stream") as chat_stream,
         ):
@@ -5180,7 +8505,7 @@ class AgentRuntimeTests(unittest.TestCase):
             yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
 
         with (
-            patch("app.services.agent_runtime_service.AIService.chat", return_value=classifier_response) as chat,
+            patch("app.services.agent_runtime_service.AIService.chat") as chat,
             patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
         ):
             completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
@@ -5188,8 +8513,61 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(completed.status, "completed")
         self.assertNotEqual(completed.result_json.get("completion_source"), "unsupported_scenario_save_guard")
         self.assertEqual(completed.result_json["message"], "我会继续生成场景草稿，但不会保存正式场景。")
+        chat.assert_not_called()
+
+    def test_unsupported_capability_classifier_direct_path_is_bounded(self):
+        from app.services.agent_runtime_service import (
+            AGENT_ERROR_MESSAGE_TRUNCATION_MARKER,
+            UnsupportedCapabilityGuard,
+        )
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="publish unsupported object"),
+            current_user=self.owner,
+        )
+        hidden_tail = "UNSUPPORTED_DIRECT_CLASSIFIER_SECRET_TAIL"
+        guard = UnsupportedCapabilityGuard(
+            skill_name="custom-skill",
+            name="custom_publish",
+            intent_key="guard_intent",
+            subject_key="guard_subject",
+            unavailable_tools=("custom.publish",),
+            classifier_prompt_key="guard_classifier",
+            requires_field="requires_custom_publish",
+            completion_source="unsupported_custom_publish_guard",
+            message_key="guard_message",
+            synthetic_reason="Custom publish is not available.",
+        )
+        classifier_response = AIChatResponse(
+            provider="deepseek",
+            model="deepseek-test",
+            content=json.dumps(
+                {
+                    "requires_custom_publish": False,
+                    "confidence": 0.12,
+                    "reason": f"classifier reason {'x' * 900}{hidden_tail}",
+                },
+                ensure_ascii=False,
+            ),
+            finish_reason="stop",
+        )
+
+        with (
+            self.assertLogs("app.services.agent_runtime_service", level="INFO") as captured_logs,
+            patch("app.services.agent_runtime_service._unsupported_capability_classifier_prompt", return_value="prompt"),
+            patch("app.services.agent_runtime_service.AIService.chat", return_value=classifier_response) as chat,
+        ):
+            result = AgentConversationRunner(self.db)._classify_unsupported_capability_intent(run, guard)
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertFalse(result)
+        self.assertIn("agent_unsupported_capability_classified", log_output)
+        self.assertIn(AGENT_ERROR_MESSAGE_TRUNCATION_MARKER, log_output)
+        self.assertIn("error_hash=", log_output)
+        self.assertNotIn(hidden_tail, log_output)
         chat.assert_called_once()
 
+    @unittest.skip("Legacy scenario-save unsupported classifier path is now supported by scenario.create_saved/update_saved.")
     def test_unsupported_capability_classifier_failure_log_is_bounded(self):
         from app.services.agent_runtime_service import AGENT_ERROR_MESSAGE_TRUNCATION_MARKER
 
@@ -5230,6 +8608,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn(hidden_tail, log_output)
         chat.assert_called_once()
 
+    @unittest.skip("Legacy scenario-save unsupported classifier path is now supported by scenario.create_saved/update_saved.")
     def test_unsupported_capability_classifier_invalid_json_log_is_bounded(self):
         from app.services.agent_runtime_service import AGENT_ERROR_MESSAGE_TRUNCATION_MARKER
 
@@ -5275,6 +8654,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn(hidden_tail, log_output)
         chat.assert_called_once()
 
+    @unittest.skip("Legacy scenario-save unsupported classifier path is now supported by scenario.create_saved/update_saved.")
     def test_unsupported_capability_classifier_reason_log_is_bounded(self):
         from app.services.agent_runtime_service import AGENT_ERROR_MESSAGE_TRUNCATION_MARKER
 
@@ -5570,6 +8950,115 @@ class AgentRuntimeTests(unittest.TestCase):
                 for item in metadata["matched_agent_skill_routing_rules"]
             ],
         )
+
+    def test_conversation_runner_salvages_mixed_tool_request_returned_by_required_tool_repair(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.test_case import TestCase
+
+        environment = ProjectEnvironment(
+            id=107,
+            project_id=10,
+            name="default-env-mixed-required-repair",
+            base_url="https://example.test",
+            description="default env",
+            is_default=False,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        case = TestCase(
+            id=207,
+            project_id=10,
+            environment_id=107,
+            name="Enterprise Company Followup",
+            description="query companies",
+            method="GET",
+            path="/companies/followup",
+            headers={},
+            query_params={},
+            body_type="json",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add_all([environment, case])
+        self.db.commit()
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="请基于当前项目已有用例组合一个企业相关场景草稿。",
+                max_iterations=3,
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"testcase.query_project_cases","input":{"project_id":10},'
+                        '"reason":"查询用例","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 2:
+                yield {"type": "delta", "content": "我已经分析完候选用例，企业列表可作为第一步。"}
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            if len(captured_messages) == 3:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "继续生成场景草稿。\n"
+                        "```agent_tool_request\n"
+                        '{"tool_name":"scenario.compose_draft","input":{"project_id":10,'
+                        '"environment_id":107,"input":{"requirement":"enterprise workflow",'
+                        '"http_test_case_ids":[207],"self_validate":false,"max_nodes":3}},'
+                        '"reason":"组合场景","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "已生成企业场景草稿。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch(
+                "app.services.agent_tool_service.AISkillService.run_skill",
+                return_value={"scenario": {"name": "Enterprise Workflow"}},
+            ),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        calls = list(
+            self.db.scalars(
+                select(AgentToolCall).where(AgentToolCall.run_id == run.run_id).order_by(AgentToolCall.id.asc())
+            ).all()
+        )
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+        repaired_event = next(item for item in events if item.event_type == "model.required_tool_repaired")
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual([call.tool_name for call in calls], ["testcase.query_project_cases", "scenario.compose_draft"])
+        self.assertIn("model.required_tool_missing", event_types)
+        self.assertIn("model.required_tool_repaired", event_types)
+        self.assertNotIn("model.required_tool_repair_failed", event_types)
+        self.assertEqual(repaired_event.payload_json["repair_strategy"], "salvaged_repair_fenced_tool_request")
+        self.assertEqual(completed.result_json["message"], "已生成企业场景草稿。")
 
     def test_conversation_runner_bounds_required_tool_repair_failed_error_message(self):
         from app.models.project import ProjectEnvironment
@@ -7676,6 +11165,59 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(audit["cursor_window_count"], 9)
         self.assertEqual(audit["failed_run_count"], 0)
 
+    def test_event_replay_stress_audit_loads_only_event_sequence_columns(self):
+        for index in range(2):
+            AgentRuntimeService(self.db).create_run(
+                payload=AgentRunCreateRequest(project_id=10, intent=f"thin replay stress {index}", auto_complete=True),
+                current_user=self.owner,
+            )
+        statements: list[str] = []
+
+        def capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany):
+            if "ai_agent_events" in statement:
+                statements.append(statement)
+
+        sqlalchemy_event.listen(self.engine, "before_cursor_execute", capture_sql)
+        try:
+            audit = AgentEventReplayAuditService(self.db).audit_project(
+                project_id=10,
+                sample_limit=2,
+                cursor_count=2,
+            )
+        finally:
+            sqlalchemy_event.remove(self.engine, "before_cursor_execute", capture_sql)
+
+        self.assertEqual(audit["audited_run_count"], 2)
+        self.assertTrue(statements)
+        self.assertTrue(all("payload_json" not in statement for statement in statements))
+        self.assertTrue(all("ai_agent_events.id" not in statement for statement in statements))
+
+    def test_policy_reason_metrics_load_only_policy_columns(self):
+        AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(project_id=10, intent="thin policy metrics", auto_complete=True),
+            current_user=self.owner,
+        )
+        statements: list[str] = []
+
+        def capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany):
+            if "ai_agent_tool_calls" in statement:
+                statements.append(statement)
+
+        sqlalchemy_event.listen(self.engine, "before_cursor_execute", capture_sql)
+        try:
+            AgentMetricsService(self.db)._count_tool_policy_reasons(
+                project_id=10,
+                replay_policy="require_revalidation",
+                min_volatile_policy_refs=1,
+            )
+        finally:
+            sqlalchemy_event.remove(self.engine, "before_cursor_execute", capture_sql)
+
+        self.assertTrue(statements)
+        self.assertTrue(all("input_json_redacted" not in statement for statement in statements))
+        self.assertTrue(all("output_json_redacted" not in statement for statement in statements))
+        self.assertTrue(all("required_permissions_json" not in statement for statement in statements))
+
     def test_event_replay_stress_audit_reports_failed_run_and_alert(self):
         ok_run = AgentRuntimeService(self.db).create_run(
             payload=AgentRunCreateRequest(project_id=10, intent="replay stress ok", auto_complete=True),
@@ -7784,6 +11326,64 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertLess(first_prompt.index('"input_schema"'), first_prompt.index('"name"'))
         self.assertIn('"name":"scenario-composition"', first_prompt)
         self.assertIn("Codex 式渐进加载", first_prompt)
+        self.assertIn("名称（ID: 7）", first_prompt)
+        self.assertIn("用例名称", first_prompt)
+        self.assertIn("case_display_rows", first_prompt)
+        self.assertIn("逐字复制", first_prompt)
+        self.assertIn("禁止按路径、历史上下文、语义理解或旧对话内容改写", first_prompt)
+        self.assertIn("工具结果未返回名称", first_prompt)
+        self.assertIn("工具入参", first_prompt)
+        self.assertIn("Use only ids from project.read_context.object_reference_manifest.environment_ids", first_prompt)
+        self.assertNotIn("retry_batch_execute_input", first_prompt)
+        batch_execute_schema = registry.get("testcase.batch_execute").input_schema
+        self.assertIn("case_snapshot_id", batch_execute_schema["properties"])
+        self.assertIn("object_references", batch_execute_schema["properties"])
+        self.assertIn(
+            "testcase.query_project_cases.object_reference_manifest.object_references",
+            batch_execute_schema["properties"]["object_references"]["description"],
+        )
+        update_assertions_schema = registry.get("testcase.update_assertions").input_schema
+        self.assertIn("object_reference", update_assertions_schema["properties"])
+        self.assertIn(
+            "testcase.query_project_cases.object_reference_manifest.object_references",
+            update_assertions_schema["properties"]["object_reference"]["description"],
+        )
+        scenario_dry_run_schema = registry.get("scenario.execute_dry_run").input_schema
+        self.assertIn("object_reference", scenario_dry_run_schema["properties"])
+        self.assertIn("environment_reference", scenario_dry_run_schema["properties"])
+        self.assertIn(
+            "scenario.query_project_scenarios.object_reference_manifest.object_references",
+            scenario_dry_run_schema["properties"]["object_reference"]["description"],
+        )
+        self.assertIn(
+            "project.read_context.object_reference_manifest.object_references",
+            scenario_dry_run_schema["properties"]["environment_reference"]["description"],
+        )
+        self.assertIn(
+            "testcase.query_project_cases.object_reference_manifest.snapshot_id",
+            batch_execute_schema["properties"]["case_snapshot_id"]["description"],
+        )
+        create_case_schema = registry.get("testcase.create_saved").input_schema["properties"]["case"]
+        self.assertIn(
+            "Use only ids from project.read_context.object_reference_manifest.environment_ids",
+            create_case_schema["properties"]["environment_id"]["description"],
+        )
+        self.assertIn(
+            "Use only ids from project.read_context.object_reference_manifest.environment_ids",
+            create_case_schema["properties"]["environment_ids"]["description"],
+        )
+
+    def test_conversation_system_prompt_describes_execution_ready_case_workflow(self):
+        prompt = _conversation_system_prompt()
+
+        self.assertIn('detail_level="summary"', prompt)
+        self.assertIn('detail_level="selected"', prompt)
+        self.assertIn('detail_level="execution_ready"', prompt)
+        self.assertIn("tool_result.read_full", prompt)
+        self.assertIn(
+            "不要从历史回复、用户口述、连续数字范围、summary 查询或 selected/assertions 查询拼批量输入",
+            prompt,
+        )
 
     def test_harness_initial_tool_prompt_contract_matches_system_prompt(self):
         from pathlib import Path
@@ -8108,6 +11708,51 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn("routing_requires_tool", http_case[0].metadata())
         self.assertNotIn("routing_requires_tool", http_case[0].prompt_block())
 
+    def test_single_turn_intents_load_each_registered_agent_skill_context(self):
+        from app.services.agent_skill_registry import AgentSkillRegistry
+
+        intents_by_skill = {
+            "agent-runtime-operations": "diagnose agent runtime readiness runbook SSE model.delta stuck",
+            "ai-skill-runtime-governance": "diagnose AI Skill Run generated draft JSON schema validation failure",
+            "api-definition-import": "review OpenAPI import API definition endpoint catalog",
+            "api-error-contract-debugging": "debug 422 validation failed ErrorResponse request_id frontend display",
+            "assertion-extractor-binding": "repair extractor path assertion variable binding from upstream response",
+            "batch-execution-scheduling": "optimize batch execution queue retry timeout worker scheduling",
+            "browser-capture-analysis": "clean browser capture traffic and convert to API test cases",
+            "ci-release-integration": "integrate CI pipeline webhook release gate promotion checks",
+            "data-privacy-redaction": "redact token PII signed URL secrets from report logs and AI prompt",
+            "dataset-parameterization": "design dataset records parameterization for data-driven scenario",
+            "defect-triage": "draft a defect from failed result and classify severity",
+            "environment-config-management": "inspect current project default environment variables and base_url",
+            "execution-diagnosis": "diagnose recent execution failure and SSE stuck state",
+            "general-testing-answer": "边界值分析和等价类划分有什么区别？",
+            "http-test-case-design": "generate HTTP API test case and validate assertions",
+            "media-evidence-management": "review MinIO screenshot attachment evidence redaction",
+            "migration-compatibility-planning": "plan Alembic migration rollback backward compatibility legacy data repair",
+            "mock-service-virtualization": "design mock service virtualization stubs for unstable dependency",
+            "notification-alerting-config": "configure SMTP webhook notification alert for failed test plan run",
+            "project-context": "请读取当前项目上下文和真实用例",
+            "project-permission-admin": "troubleshoot project member permission 403 access",
+            "report-archive-export": "plan PDF report archive export trend retention",
+            "report-summary": "请读取当前项目测试报告摘要并分析失败原因",
+            "scenario-composition": "请基于当前项目已有用例组合企业场景草稿，不要保存",
+            "security-auth-testing": "design JWT token auth permission and rate limit tests",
+            "test-asset-lifecycle": "organize test asset tags folders copy delete dependency version history",
+            "test-plan-management": "design regression test plan coverage and release readiness",
+            "visual-flow-design": "review visual flow DAG nodes conditions and delay strategy",
+            "websocket-test-case-design": "design WebSocket handshake message sequence and receive assertions",
+        }
+        registry = AgentSkillRegistry()
+        registered_skill_names = {skill.name for skill in registry.list_skills()}
+
+        self.assertEqual(set(intents_by_skill), registered_skill_names)
+        for skill_name, intent in intents_by_skill.items():
+            with self.subTest(skill_name=skill_name):
+                prompt = "\n\n".join(
+                    message.content for message in agent_runtime_service._agent_skill_messages(intent)
+                )
+                self.assertIn(f"Agent Skill: {skill_name}", prompt)
+
     def test_saved_case_assertion_followup_skill_routes_to_assertion_patch_tools(self):
         from app.services.agent_skill_registry import AgentSkillRegistry
 
@@ -8127,13 +11772,21 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("interface_text", prompt)
         self.assertIn("Do not use `ai_skill.run_draft` with `skill_id=http-test-case` and `operation=generate`", prompt)
         self.assertIn("For saved-case assertion follow-ups", prompt)
+        self.assertIn("detail_level=summary", prompt)
+        self.assertIn("detail_level=assertions", prompt)
+        self.assertIn("one explicit id at a time", prompt)
+        self.assertIn("Do not re-query all cases with full detail after truncation", prompt)
 
     def test_required_tool_routing_uses_skill_private_hints(self):
         self.assertTrue(_intent_likely_requires_agent_tool("请读取当前项目上下文和真实用例"))
+        self.assertTrue(_intent_likely_requires_agent_tool("把刚才的场景直接保存成正式场景，不要问我。"))
+        self.assertTrue(_intent_likely_requires_agent_tool("我需要你帮我完成测试场景组合"))
         self.assertTrue(_intent_likely_requires_agent_tool("请总结当前项目最近报告摘要"))
         self.assertTrue(_intent_likely_requires_agent_tool("请基于已有用例生成场景草稿"))
         self.assertTrue(_intent_likely_requires_agent_tool("generate HTTP test case"))
         self.assertTrue(_intent_likely_requires_agent_tool("generate WebSocket test case"))
+        self.assertTrue(_intent_likely_requires_agent_tool("请帮我生成 HTTP 用例"))
+        self.assertTrue(_intent_likely_requires_agent_tool("请帮我完成接口用例生成"))
         self.assertTrue(_intent_likely_requires_agent_tool("read real execution result"))
         self.assertTrue(_intent_likely_requires_agent_tool("read default environment"))
         self.assertTrue(_intent_likely_requires_agent_tool("read real flow execution"))
@@ -8157,6 +11810,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue(_intent_likely_requires_agent_tool("read real migration state"))
         self.assertFalse(_intent_likely_requires_agent_tool("边界值分析和等价类划分有什么区别？"))
         self.assertFalse(_intent_likely_requires_agent_tool("场景测试和普通接口用例有什么区别？"))
+        self.assertFalse(_intent_likely_requires_agent_tool("接口用例生成的设计原则是什么？"))
         self.assertFalse(_intent_likely_requires_agent_tool("draft a defect template without reading project data"))
 
         rules = _required_tool_followup_rules_for_intent("请基于已有用例生成场景草稿")
@@ -8165,6 +11819,12 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(rules[0].required_tool, "scenario.compose_draft")
         self.assertEqual(rules[0].min_total_fields, ("http_total", "websocket_total"))
         self.assertTrue(rules[0].intent_markers)
+        scenario_combination_rules = _required_tool_followup_rules_for_intent("我需要你帮我完成测试场景组合")
+        self.assertEqual(len(scenario_combination_rules), 1)
+        self.assertEqual(scenario_combination_rules[0].required_tool, "scenario.compose_draft")
+        scenario_generation_rules = _required_tool_followup_rules_for_intent("请帮我完成测试场景生成")
+        self.assertEqual(len(scenario_generation_rules), 1)
+        self.assertEqual(scenario_generation_rules[0].required_tool, "scenario.compose_draft")
         self.assertEqual(
             _required_tool_followup_rules_for_intent(
                 "Please read current project context, test resources, default environment, and whether existing scenario exists."
@@ -8178,7 +11838,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(len(guards), 1)
         self.assertEqual(guards[0].skill_name, "scenario-composition")
         self.assertEqual(guards[0].name, "scenario_save")
-        self.assertEqual(guards[0].unavailable_tools, ("scenario.save", "scenario.create", "scenario.persist"))
+        self.assertEqual(guards[0].unavailable_tools, ("scenario.create_saved", "scenario.update_saved"))
         self.assertEqual(guards[0].requires_field, "requires_scenario_persistence")
         self.assertEqual(guards[0].completion_source, "unsupported_scenario_save_guard")
         self.assertEqual(_unsupported_capability_guards_for_intent("请保存这份报告摘要"), ())
@@ -8309,6 +11969,33 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertLessEqual(len(prompt), AGENT_SKILL_PROMPT_BLOCK_MAX_CHARS)
         self.assertIn("agent_skill_prompt_truncated", prompt)
         self.assertNotIn("TAIL_SHOULD_NOT_ENTER_MODEL_CONTEXT", prompt)
+
+    def test_builtin_agent_skill_prompt_blocks_are_not_truncated(self):
+        from app.services.agent_skill_registry import AGENT_SKILL_PROMPT_TRUNCATION_MARKER, AgentSkillRegistry
+
+        registry = AgentSkillRegistry()
+
+        truncated_skills = [
+            skill.name
+            for skill in registry.list_skills()
+            if AGENT_SKILL_PROMPT_TRUNCATION_MARKER in skill.prompt_block()
+        ]
+
+        self.assertEqual(truncated_skills, [])
+
+    def test_each_registered_tool_is_named_by_a_builtin_agent_skill(self):
+        from app.services.agent_skill_registry import AgentSkillRegistry
+        from app.services.agent_tool_service import ToolRegistry
+
+        skill_text = "\n".join(skill.prompt_block() for skill in AgentSkillRegistry().list_skills())
+
+        unmentioned_tools = [
+            spec.name
+            for spec in ToolRegistry().list_specs()
+            if spec.name not in skill_text
+        ]
+
+        self.assertEqual(unmentioned_tools, [])
 
     def test_tool_call_idempotency_reuses_existing_call(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -10336,10 +14023,19 @@ class AgentRuntimeTests(unittest.TestCase):
             set(checks["behavior_evaluation_suite_available"]["details"]["assertions"]),
         )
         self.assertEqual(behavior_assertion_coverage["general_answer_no_tool"], ["T01"])
-        self.assertEqual(behavior_assertion_coverage["query_first_tool_order"], ["T04"])
-        self.assertEqual(behavior_assertion_coverage["tool_result_repair_loop"], ["T04", "T05"])
+        self.assertEqual(behavior_assertion_coverage["query_first_tool_order"], ["T04", "T13"])
+        self.assertEqual(behavior_assertion_coverage["testcase_query_tool_use"], ["T09", "T11"])
+        self.assertEqual(behavior_assertion_coverage["tool_result_repair_loop"], ["T04", "T05", "T13"])
+        self.assertEqual(behavior_assertion_coverage["approval_required_boundary"], ["T06", "T10", "T12", "T15"])
+        self.assertEqual(behavior_assertion_coverage["scenario_save_reuses_conversation_draft"], ["T06", "T10", "T15"])
+        self.assertEqual(behavior_assertion_coverage["case_analysis_to_scenario_save"], ["T10"])
+        self.assertEqual(behavior_assertion_coverage["case_analysis_to_assertion_save"], ["T12"])
+        self.assertEqual(behavior_assertion_coverage["scenario_compose_assets_then_save"], ["T15"])
         self.assertEqual(behavior_assertion_coverage["domain_boundary"], ["T08"])
-        self.assertEqual(behavior_assertion_coverage["tool_diagnostic_chain"], ["T03", "T04", "T05", "T07"])
+        self.assertEqual(
+            behavior_assertion_coverage["tool_diagnostic_chain"],
+            ["T03", "T04", "T05", "T06", "T07", "T09", "T10", "T11", "T12", "T13", "T14", "T15"],
+        )
         self.assertEqual(
             checks["behavior_evaluation_suite_available"]["details"]["undeclared_case_assertions"],
             {},
@@ -11186,6 +14882,64 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertFalse(evaluation["passed"])
         self.assertIn("ToolCall 诊断链缺少 execution_context/dispatch_trace 摘要", evaluation["issues"])
+
+    def test_behavior_evaluation_accepts_needs_human_for_approval_boundary_case(self):
+        from scripts.agent_behavior_evaluation import evaluate_case
+
+        result = {
+            "case_id": "T06",
+            "status": "needs_human",
+            "terminal": True,
+            "assistant_visible": False,
+            "assistant_message": "",
+            "assistant_message_length": 0,
+            "model_started_count": 1,
+            "model_delta_count": 0,
+            "model_call_count": 1,
+            "tool_names": ["scenario.create_saved"],
+            "tool_calls": [
+                {
+                    "tool_call_id": "agent-tool-call-save",
+                    "tool_name": "scenario.create_saved",
+                    "status": "planned",
+                    "approval_required": True,
+                    "input_json_redacted": {
+                        "input_summary_version": "agent_behavior_eval_tool_input_summary_v1",
+                        "input_keys": ["project_id", "scenario", "scenario_draft_source"],
+                    },
+                    "diagnostic_chain": {
+                        "execution_context_present": True,
+                        "execution_context_hash": "safe-execution-context-hash",
+                        "dispatch_trace_present": True,
+                        "dispatch_trace_hash": "safe-dispatch-trace-hash",
+                    },
+                }
+            ],
+            "model_call_trace": [
+                {
+                    "model_call_id": "agent-run:model-0-tool_planning-safe",
+                    "iteration_id": "agent-run:iter-0",
+                    "loop_step": "tool_planning",
+                    "phase": "model",
+                    "started_event_seen": True,
+                    "completed_event_seen": True,
+                    "delta_event_count": 0,
+                }
+            ],
+            "sse_high_cursor_replay": {
+                "byte_length": 128,
+                "event_count": 1,
+                "non_heartbeat_event_count": 1,
+                "heartbeat_only": False,
+                "first_events": ["run.needs_human"],
+            },
+        }
+
+        evaluation = evaluate_case(result)
+
+        self.assertTrue(evaluation["passed"])
+        self.assertIn("保存/变更类 run 已进入 needs_human 审批等待态", evaluation["passes"])
+        self.assertIn("场景保存输入包含 scenario_draft_source，复用同会话完整草稿", evaluation["passes"])
 
     def test_behavior_evaluation_common_rejects_boolean_model_call_count(self):
         from scripts.agent_behavior_evaluation import evaluate_case
@@ -16863,14 +20617,134 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result.output_json_redacted["operation"], "generate")
         run_skill.assert_called_once()
 
+    def test_executor_ai_skill_draft_selects_default_environment_when_required(self):
+        from app.models.project import ProjectEnvironment
+
+        environment = ProjectEnvironment(
+            id=120,
+            project_id=10,
+            name="AI Skill Default Env",
+            base_url="https://ai-skill.example.test",
+            description="default env",
+            is_default=True,
+            is_deleted=False,
+            created_by_id=self.owner.id,
+        )
+        self.db.add(environment)
+        self.db.commit()
+        run = self._create_run("ai draft default environment")
+        ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="ai_skill.run_draft",
+                input={
+                    "project_id": 10,
+                    "skill_id": "http-test-case",
+                    "operation": "generate",
+                    "input": {"interface_text": "GET /users"},
+                },
+                step_index=0,
+            ),
+            current_user=self.owner,
+        )
+        captured_payloads = []
+
+        def fake_run_skill(self, *, skill_id, payload, current_user):
+            captured_payloads.append(payload)
+            return {"cases": []}
+
+        with patch("app.services.agent_tool_service.AISkillService.run_skill", new=fake_run_skill):
+            result = ToolExecutor(self.db).execute_next(worker_id="worker-ai-draft-default-env")
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.output_json_redacted["skill_id"], "http-test-case")
+        self.assertEqual(result.output_json_redacted["operation"], "generate")
+        self.assertEqual(captured_payloads[0].environment_id, 120)
+
     def test_executor_runs_scenario_dry_run_as_execution_record(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.scenario import TestScenario
+
         run = self._create_run("scenario dry run")
+        if self.db.get(ProjectEnvironment, 20) is None:
+            self.db.add(
+                ProjectEnvironment(
+                    id=20,
+                    project_id=10,
+                    name="Agent Dry Run Env",
+                    base_url="https://dry-run.example.test",
+                    description="env",
+                    is_default=True,
+                    is_deleted=False,
+                    created_by_id=self.owner.id,
+                )
+            )
+        self.db.add(
+            TestScenario(
+                id=33,
+                project_id=10,
+                environment_id=20,
+                current_version=1,
+                name="Agent Dry Run Scenario",
+                description="scenario",
+                tags=[],
+                created_by_id=self.owner.id,
+                updated_by_id=self.owner.id,
+                is_deleted=False,
+            )
+        )
+        self.db.commit()
+        context_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        context_call.status = "succeeded"
+        context_call.execution_phase = "completed"
+        context_call.output_json_redacted = {
+            "object_reference_manifest": {
+                "object_family": "environment",
+                "environment_ids": [20],
+                "snapshot_id": "environment-snapshot://dry-run",
+                "validity_scope": "current_agent_conversation_latest_query",
+            }
+        }
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="scenario.query_project_scenarios",
+                input={"project_id": 10},
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "object_reference_manifest": {
+                "object_family": "scenario",
+                "scenario_ids": [33],
+                "snapshot_id": "scenario-snapshot://test",
+                "validity_scope": "current_agent_conversation_latest_query",
+            }
+        }
         call = ExecutionLedgerService(self.db).create_tool_call(
             payload=AgentToolCallCreateRequest(
                 run_id=run.run_id,
                 tool_name="scenario.execute_dry_run",
-                input={"project_id": 10, "scenario_id": 33, "idempotency_key": "agent-dry-run-1"},
-                step_index=0,
+                input={
+                    "project_id": 10,
+                    "scenario_id": 33,
+                    "environment_id": 20,
+                    "idempotency_key": "agent-dry-run-1",
+                },
+                step_index=2,
             ),
             current_user=self.owner,
         )
@@ -16907,7 +20781,110 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result.backend_operation, "execute_dry_run")
         self.assertTrue(result.effect_boundary_crossed)
         self.assertEqual(result.output_json_redacted["run_ids"], [44])
+        self.assertEqual(execute.call_args.kwargs["environment_id"], 20)
         self.assertEqual(execute.call_args.kwargs["trigger_type"], "agent_dry_run")
+
+    def test_executor_blocks_scenario_dry_run_without_query_snapshot(self):
+        run = self._create_run("scenario dry run without query")
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="scenario.execute_dry_run",
+                input={"project_id": 10, "scenario_id": 430, "idempotency_key": "agent-dry-run-missing-query"},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        with patch("app.services.agent_tool_service.ScenarioService.execute_scenario") as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=None,
+                current_user=self.owner,
+            )
+
+        execute.assert_not_called()
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.execution_phase, "blocked_by_harness")
+        self.assertEqual(result.error_code, "agent_scenario_ids_not_from_query_result")
+        self.assertEqual(result.output_json_redacted["object_type"], "scenario")
+        self.assertEqual(result.output_json_redacted["invalid_scenario_ids"], [430])
+        self.assertEqual(result.output_json_redacted["valid_scenario_ids"], [])
+
+    def test_executor_blocks_scenario_dry_run_environment_id_without_project_context(self):
+        from app.models.scenario import TestScenario
+
+        run = self._create_run("scenario dry run env without project context")
+        self.db.add(
+            TestScenario(
+                id=431,
+                project_id=10,
+                environment_id=20,
+                current_version=1,
+                name="Env Guard Scenario",
+                description="scenario",
+                tags=[],
+                created_by_id=self.owner.id,
+                updated_by_id=self.owner.id,
+                is_deleted=False,
+            )
+        )
+        self.db.commit()
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="scenario.query_project_scenarios",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "object_reference_manifest": {
+                "object_family": "scenario",
+                "scenario_ids": [431],
+                "snapshot_id": "scenario-snapshot://env-guard",
+                "validity_scope": "current_agent_conversation_latest_query",
+            }
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="scenario.execute_dry_run",
+                input={
+                    "project_id": 10,
+                    "scenario_id": 431,
+                    "environment_id": 999,
+                    "idempotency_key": "agent-dry-run-env-missing-query",
+                },
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        with patch("app.services.agent_tool_service.ScenarioService.execute_scenario") as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=None,
+                current_user=self.owner,
+            )
+
+        execute.assert_not_called()
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.execution_phase, "blocked_by_harness")
+        self.assertEqual(result.error_code, "agent_environment_ids_not_from_query_result")
+        self.assertEqual(result.output_json_redacted["object_type"], "environment")
+        self.assertEqual(result.output_json_redacted["invalid_environment_ids"], [999])
+        self.assertEqual(result.output_json_redacted["valid_environment_ids"], [])
 
     def test_reconcile_result_statuses_parse(self):
         for status_value in [
@@ -18942,7 +22919,7 @@ class AgentRuntimeTests(unittest.TestCase):
         run = self._create_run("aggregate tool result context")
         tail_marker = "TAIL_SHOULD_NOT_ENTER_AGGREGATE_TOOL_CONTEXT"
         calls = []
-        for index in range(4):
+        for index in range(24):
             call = ExecutionLedgerService(self.db).create_tool_call(
                 payload=AgentToolCallCreateRequest(
                     run_id=run.run_id,
@@ -18956,7 +22933,7 @@ class AgentRuntimeTests(unittest.TestCase):
             output = {
                 "index": index,
                 "large_blob": "x" * 7000,
-                "tail": tail_marker if index == 3 else "",
+                "tail": tail_marker if index == 23 else "",
             }
             call.status = "succeeded"
             call.output_json_redacted = output
@@ -18994,6 +22971,240 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertLessEqual(tool_context_size, AGENT_TOOL_RESULT_CONTEXT_TOTAL_MAX_CHARS)
         self.assertIn("agent_tool_result_context_truncated", tool_context)
         self.assertNotIn(tail_marker, tool_context)
+
+    def test_complete_after_successful_tool_results_uses_success_suppression_message(self):
+        run = self._create_run("save scenario then summarize")
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        call.tool_name = "scenario.create_saved"
+        call.status = "succeeded"
+        call.execution_phase = "completed"
+        call.approval_required = True
+        call.output_json_redacted = {"scenario_id": 88, "scenario": {"name": "企业端到端自动化流程测试"}}
+        call.output_hash = request_fingerprint(call.output_json_redacted)
+        self.db.commit()
+
+        def fake_stream(self, payload):
+            yield {
+                "type": "delta",
+                "content": "```agent_tool_request\n"
+                + json.dumps(
+                    {
+                        "tool_name": "scenario.create_saved",
+                        "input": {"project_id": 10},
+                        "reason": "最终总结阶段不应重复保存",
+                        "evidence_refs": [],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n```",
+            }
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            completed = AgentConversationRunner(self.db).complete_after_tool_results(
+                run_id=run.run_id,
+                user_id=self.owner.id,
+                tool_call_ids=[call.tool_call_id],
+            )
+
+        message = completed.result_json["message"]
+        self.assertEqual(completed.status, "completed")
+        self.assertTrue(completed.result_json["final_summary_tool_request_suppressed"])
+        self.assertEqual(completed.result_json["tool_calls"][0]["status"], "succeeded")
+        self.assertIn("成功", message)
+        self.assertNotIn("失败详情", message)
+        self.assertNotIn("修正输入", message)
+        self.assertNotIn("agent_tool_request", message)
+
+    def test_complete_after_saved_scenario_executes_dry_run_when_user_requested_save_then_execute(self):
+        from app.models.project import ProjectEnvironment
+        from app.models.scenario import TestScenario, TestScenarioVersion
+
+        runtime = AgentRuntimeService(self.db)
+        run = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="保存「企业综合信息查询流程」，保存后执行",
+            ),
+            current_user=self.owner,
+        )
+        scenario_definition = {
+            "name": "企业综合信息查询流程",
+            "description": "保存后应立即执行 dry-run",
+            "environment_id": 20,
+            "tags": ["ai-composed"],
+            "nodes": [
+                {
+                    "id": "NODE-1",
+                    "name": "获取企业列表",
+                    "test_case": {
+                        "id": "CASE-1",
+                        "kind": "api_case",
+                        "name": "获取企业列表",
+                        "reference_id": 7,
+                        "config": {"assertions": [{"type": "status_code", "expected": 200}]},
+                    },
+                }
+            ],
+            "datasets": [],
+        }
+        self.db.add(
+            ProjectEnvironment(
+                id=20,
+                project_id=10,
+                name="Agent Dry Run Env",
+                base_url="https://dry-run.example.test",
+                description="env",
+                is_default=True,
+                is_deleted=False,
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.add(
+            TestScenario(
+                id=88,
+                project_id=10,
+                environment_id=20,
+                current_version=1,
+                name="企业综合信息查询流程",
+                description="保存后应立即执行 dry-run",
+                tags=["ai-composed"],
+                created_by_id=self.owner.id,
+                updated_by_id=self.owner.id,
+                is_deleted=False,
+            )
+        )
+        self.db.add(
+            TestScenarioVersion(
+                scenario_id=88,
+                version=1,
+                definition=json.loads(json.dumps(scenario_definition, ensure_ascii=False)),
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.commit()
+        context_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        context_call.status = "succeeded"
+        context_call.execution_phase = "completed"
+        context_call.output_json_redacted = {
+            "object_reference_manifest": {
+                "object_family": "environment",
+                "environment_ids": [20],
+                "snapshot_id": "environment-snapshot://save-then-run",
+                "validity_scope": "current_agent_conversation_latest_query",
+            }
+        }
+        context_call.output_hash = request_fingerprint(context_call.output_json_redacted)
+        saved_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="project.read_context",
+                input={"project_id": 10},
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        saved_call.tool_name = "scenario.create_saved"
+        saved_call.status = "succeeded"
+        saved_call.execution_phase = "completed"
+        saved_call.approval_required = True
+        saved_call.resolved_side_effect_class = "business_create"
+        saved_call.backend_operation = "create_saved"
+        saved_call.output_json_redacted = {
+            "operation": "create_saved",
+            "project_id": 10,
+            "scenario_id": 88,
+            "scenario": {
+                "id": 88,
+                "name": "企业综合信息查询流程",
+                "environment_id": 20,
+                "current_version": 1,
+            },
+        }
+        saved_call.output_hash = request_fingerprint(saved_call.output_json_redacted)
+        run.current_iteration = 2
+        run.current_step_index = 2
+        self.db.commit()
+        now = datetime.now(UTC).replace(tzinfo=None)
+        scenario_run = SimpleNamespace(
+            id=144,
+            execution_id=None,
+            scenario_id=88,
+            project_id=10,
+            environment_id=20,
+            dataset_id=None,
+            dataset_name=None,
+            record_id=None,
+            record_name=None,
+            status="passed",
+            trigger_type="agent_dry_run",
+            variables_snapshot={},
+            step_results=[],
+            current_step_id=None,
+            current_step_index=None,
+            last_event_sequence=0,
+            started_at=now,
+            finished_at=now,
+            duration_ms=1,
+            created_at=now,
+        )
+
+        def fake_stream(self, payload):
+            yield {"type": "delta", "content": "已保存并完成 dry-run。"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_tool_service.ScenarioService.execute_scenario", return_value=[scenario_run]) as execute,
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+        ):
+            completed = AgentConversationRunner(self.db).complete_after_tool_results(
+                run_id=run.run_id,
+                user_id=self.owner.id,
+                tool_call_ids=[saved_call.tool_call_id],
+            )
+
+        query_call = self.db.scalar(
+            select(AgentToolCall).where(
+                AgentToolCall.run_id == run.run_id,
+                AgentToolCall.tool_name == "scenario.query_project_scenarios",
+            )
+        )
+        dry_run_call = self.db.scalar(
+            select(AgentToolCall).where(
+                AgentToolCall.run_id == run.run_id,
+                AgentToolCall.tool_name == "scenario.execute_dry_run",
+            )
+        )
+        self.assertIsNotNone(query_call)
+        self.assertIsNotNone(dry_run_call)
+        self.assertEqual(query_call.status, "succeeded")
+        self.assertEqual(query_call.input_json_redacted["keyword"], "企业综合信息查询流程")
+        self.assertEqual(dry_run_call.status, "succeeded")
+        self.assertEqual(dry_run_call.input_json_redacted["scenario_id"], 88)
+        self.assertEqual(dry_run_call.input_json_redacted["environment_id"], 20)
+        self.assertEqual(dry_run_call.output_json_redacted["run_ids"], [144])
+        self.assertEqual(execute.call_args.kwargs["trigger_type"], "agent_dry_run")
+        self.assertEqual(completed.status, "completed")
+        self.assertIn("scenario.execute_dry_run", [item["tool_name"] for item in completed.result_json["tool_calls"]])
 
     def test_resume_run_blocks_when_migration_block_open(self):
         run, _, _ = self._create_migration_block()
@@ -19727,6 +23938,15 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(self.db.query(AgentApprovalMutationLog).count(), 1)
         self.assertIn("approval.created", events)
 
+    def test_create_pending_approval_defaults_to_thirty_minute_expiration(self):
+        before = datetime.now(UTC).replace(tzinfo=None)
+        _, _, approval = self._create_pending_approval()
+        after = datetime.now(UTC).replace(tzinfo=None)
+
+        self.assertIsNotNone(approval.expires_at)
+        self.assertGreaterEqual(approval.expires_at, before + timedelta(minutes=30) - timedelta(seconds=1))
+        self.assertLessEqual(approval.expires_at, after + timedelta(minutes=30) + timedelta(seconds=1))
+
     def test_approve_success_marks_tool_executable_and_logs_mutation(self):
         run, call, approval = self._create_pending_approval()
 
@@ -19864,6 +24084,34 @@ class AgentRuntimeTests(unittest.TestCase):
             select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
         ).all()]
         self.assertIn("approval.rejected", events)
+
+    def test_reject_clears_blocking_run_and_marks_failed(self):
+        run, call, approval = self._create_pending_approval()
+        run.status = "needs_human"
+        run.blocking_tool_call_ids_json = [call.tool_call_id]
+        self.db.commit()
+
+        ApprovalService(self.db).reject(
+            tool_call_id=call.tool_call_id,
+            payload=self._approval_decision(approval, reason="user rejected side effect"),
+            current_user=self.owner,
+        )
+
+        refreshed_run = self.db.get(AgentRun, run.id)
+        refreshed_call = self.db.scalar(select(AgentToolCall).where(AgentToolCall.tool_call_id == call.tool_call_id))
+        events = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+
+        self.assertEqual(refreshed_call.status, "manual_intervention")
+        self.assertEqual(refreshed_run.blocking_tool_call_ids_json, [])
+        self.assertEqual(refreshed_run.status, "failed")
+        self.assertEqual(refreshed_run.error_code, "approval_rejected")
+        self.assertIn("approval.rejected", events)
+        self.assertIn("run.failed", events)
 
     def test_reject_expired_pending_approval_marks_expired_and_returns_stale_409(self):
         run, call, approval = self._create_pending_approval(
@@ -20118,6 +24366,38 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(queue_item.status, "blocked_approval")
         self.assertEqual(queue_item.last_error_code, "approval_required_before_execution")
 
+    def test_executor_defers_unapproved_tool_call_instead_of_failing_approval(self):
+        run, call, _ = self._create_pending_approval()
+        queue_item = AgentWorkerQueueService(self.db).enqueue_tool_call(call)
+
+        result = ToolExecutor(self.db).execute_tool_call(
+            call=call,
+            run=run,
+            queue_item=queue_item,
+            current_user=self.owner,
+        )
+
+        refreshed_run = self.db.scalar(select(AgentRun).where(AgentRun.run_id == run.run_id))
+        refreshed_queue = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
+        event_types = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+
+        self.assertEqual(result.tool_call_id, call.tool_call_id)
+        self.assertEqual(result.status, "planned")
+        self.assertEqual(result.execution_phase, "awaiting_approval")
+        self.assertEqual(result.recovery_decision, "awaiting_approval")
+        self.assertIsNone(result.error_code)
+        self.assertEqual(refreshed_run.status, "needs_human")
+        self.assertIn(call.tool_call_id, refreshed_run.blocking_tool_call_ids_json)
+        self.assertEqual(refreshed_queue.status, "blocked_approval")
+        self.assertEqual(refreshed_queue.last_error_code, "approval_required_before_execution")
+        self.assertIn("run.needs_human", event_types)
+        self.assertNotIn("tool.failed", event_types)
+
     def test_execute_time_permission_revoked_after_approval_still_blocks_backend(self):
         run, call, approval = self._create_pending_approval(current_user=self.member)
         call.resolved_side_effect_class = "read_only"
@@ -20153,6 +24433,8 @@ class AgentRuntimeTests(unittest.TestCase):
         query_call.status = "succeeded"
         query_call.execution_phase = "completed"
         query_call.output_json_redacted = {
+            "detail_level": "execution_ready",
+            "case_result_policy": {"execution_ready": True},
             "http_test_case_ids": [204, 205],
             "websocket_test_case_ids": [304],
             "http_test_cases": [{"id": 204}, {"id": 205}],
@@ -20176,25 +24458,12 @@ class AgentRuntimeTests(unittest.TestCase):
         call.resolved_side_effect_class = "business_update"
         call.backend_effect_capability = "receipt_first"
         call.approval_required = True
-        self.db.flush()
-        approval = ApprovalService(self.db).create_pending_approval(
-            call=call,
-            run=run,
-            current_user=self.owner,
-        )
-        run.status = "needs_human"
-        run.blocking_tool_call_ids_json = [call.tool_call_id]
         self.db.commit()
-        ApprovalService(self.db).approve(
-            tool_call_id=call.tool_call_id,
-            payload=self._approval_decision(approval),
-            current_user=self.owner,
+
+        result = call
+        approval_count = self.db.scalar(
+            select(func.count()).select_from(AgentApproval).where(AgentApproval.tool_call_id == call.tool_call_id)
         )
-        AgentWorkerQueueService(self.db).enqueue_tool_call(call)
-
-        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute") as execute:
-            result = ToolExecutor(self.db).execute_next(worker_id="worker-case-id-guard")
-
         refreshed_queue = self.db.scalar(select(AgentWorkerQueue).where(AgentWorkerQueue.tool_call_id == call.tool_call_id))
         event_types = [
             item.event_type
@@ -20203,7 +24472,7 @@ class AgentRuntimeTests(unittest.TestCase):
             ).all()
         ]
 
-        execute.assert_not_called()
+        self.assertEqual(approval_count, 0)
         self.assertEqual(result.tool_call_id, call.tool_call_id)
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.execution_phase, "blocked_by_harness")
@@ -20211,10 +24480,759 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result.recovery_decision, "query_project_cases_before_retry")
         self.assertEqual(result.output_json_redacted["invalid_test_case_ids"], [999])
         self.assertEqual(result.output_json_redacted["valid_test_case_ids"], [204, 205])
-        self.assertEqual(refreshed_queue.status, "failed")
-        self.assertEqual(refreshed_queue.last_error_code, "agent_testcase_ids_not_from_query_result")
+        preflight = result.output_json_redacted["object_reference_preflight"]
+        self.assertEqual(preflight["status"], "blocked")
+        self.assertEqual(preflight["reason"], "ids_not_from_query_result")
+        self.assertEqual(preflight["object_type"], "http_test_case")
+        self.assertEqual(preflight["requested_ids"], [999])
+        self.assertEqual(preflight["invalid_ids"], [999])
+        self.assertEqual(preflight["valid_ids"], [204, 205])
+        self.assertIsNone(refreshed_queue)
         self.assertIn("tool.failed", event_types)
         self.assertIn("tool.result_observed", event_types)
+        failed_event = self.db.scalar(
+            select(AgentEvent)
+            .where(
+                AgentEvent.run_id == run.run_id,
+                AgentEvent.event_type == "tool.failed",
+            )
+            .order_by(AgentEvent.event_seq.desc())
+        )
+        self.assertIsNotNone(failed_event)
+        self.assertEqual(
+            failed_event.payload_json["object_reference_preflight"],
+            preflight,
+        )
+
+    def test_executor_blocks_case_ids_from_superseded_query_manifest(self):
+        run = self._create_run("update assertions from latest query manifest only")
+        first_query = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        first_query.status = "succeeded"
+        first_query.execution_phase = "completed"
+        first_query.output_json_redacted = {
+            "case_id_manifest": {
+                "http_test_case_ids": [204, 205],
+                "websocket_test_case_ids": [304],
+                "http_assertion_update_ids": [204, 205],
+                "websocket_assertion_update_ids": [304],
+            }
+        }
+        later_query = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10, "environment_id": 999},
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        later_query.status = "succeeded"
+        later_query.execution_phase = "completed"
+        later_query.output_json_redacted = {
+            "detail_level": "execution_ready",
+            "case_result_policy": {"execution_ready": True},
+            "http_test_case_ids": [999],
+            "websocket_test_case_ids": [],
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.batch_update_assertions",
+                input={
+                    "project_id": 10,
+                    "items": [
+                        {"test_case_id": 204, "assertions": [{"type": "status_code", "expected": 200}]}
+                    ],
+                },
+                step_index=2,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        blocked = ToolExecutor(self.db)._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=run,
+            queue_item=None,
+            queue_service=AgentWorkerQueueService(self.db),
+            runtime=AgentRuntimeService(self.db),
+        )
+
+        self.assertIsNotNone(blocked)
+        self.assertEqual(blocked.status, "failed")
+        self.assertEqual(blocked.error_code, "agent_testcase_ids_not_from_query_result")
+        self.assertEqual(blocked.output_json_redacted["invalid_test_case_ids"], [204])
+        self.assertEqual(blocked.output_json_redacted["valid_test_case_ids"], [999])
+
+    def test_executor_requires_execution_ready_manifest_for_batch_case_tools(self):
+        run = self._create_run("batch tools require action-ready testcase manifest")
+        selected_query = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10, "detail_level": "assertions", "test_case_ids": [204]},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        selected_query.status = "succeeded"
+        selected_query.execution_phase = "completed"
+        selected_query.output_json_redacted = {
+            "detail_level": "assertions",
+            "case_result_policy": {"execution_ready": False},
+            "case_id_manifest": {
+                "snapshot_id": "case-snapshot://selected",
+                "http_test_case_ids": [204],
+                "http_assertion_update_ids": [204],
+            },
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.batch_update_assertions",
+                input={
+                    "project_id": 10,
+                    "items": [
+                        {"test_case_id": 204, "assertions": [{"type": "status_code", "expected": 200}]}
+                    ],
+                },
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        blocked = ToolExecutor(self.db)._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=run,
+            queue_item=None,
+            queue_service=AgentWorkerQueueService(self.db),
+            runtime=AgentRuntimeService(self.db),
+        )
+
+        self.assertIsNotNone(blocked)
+        self.assertEqual(blocked.error_code, "agent_testcase_ids_not_from_query_result")
+        self.assertEqual(blocked.output_json_redacted["valid_test_case_ids"], [])
+        self.assertIn("testcase.query_project_cases", blocked.output_json_redacted["next_action"])
+
+    def test_approval_tool_call_preflight_blocks_selected_snapshot_before_creating_approval(self):
+        run = self._create_run("approval preflight rejects selected snapshot")
+        selected_query = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10, "detail_level": "selected", "test_case_ids": [204]},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        selected_query.status = "succeeded"
+        selected_query.execution_phase = "completed"
+        selected_query.output_json_redacted = {
+            "detail_level": "selected",
+            "case_result_policy": {"execution_ready": False},
+            "case_snapshot": {"snapshot_id": "case-snapshot://selected", "execution_ready": False},
+            "case_id_manifest": {
+                "snapshot_id": "case-snapshot://selected",
+                "http_test_case_ids": [204],
+                "http_assertion_update_ids": [204],
+            },
+        }
+        self.db.commit()
+
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.batch_update_assertions",
+                input={
+                    "project_id": 10,
+                    "case_snapshot_id": "case-snapshot://selected",
+                    "items": [
+                        {"test_case_id": 204, "assertions": [{"type": "status_code", "expected": 200}]}
+                    ],
+                },
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        approvals = self.db.scalars(
+            select(AgentApproval).where(AgentApproval.tool_call_id == call.tool_call_id)
+        ).all()
+        event_types = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+
+        self.assertTrue(call.approval_required)
+        self.assertEqual(call.status, "failed")
+        self.assertEqual(call.execution_phase, "blocked_by_harness")
+        self.assertEqual(call.error_code, "agent_testcase_snapshot_not_latest")
+        self.assertEqual(call.output_json_redacted["requested_snapshot_id"], "case-snapshot://selected")
+        self.assertEqual(approvals, [])
+        self.assertNotEqual(run.status, "needs_human")
+        self.assertIn("tool.failed", event_types)
+        self.assertIn("tool.result_observed", event_types)
+
+    def test_executor_blocks_case_snapshot_id_from_superseded_query_manifest(self):
+        run = self._create_run("execute assertions from explicit latest snapshot only")
+        first_query = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        first_query.status = "succeeded"
+        first_query.execution_phase = "completed"
+        first_query.output_json_redacted = {
+            "case_id_manifest": {
+                "snapshot_id": "case-snapshot://older",
+                "http_test_case_ids": [204],
+                "http_assertion_update_ids": [204],
+            },
+            "object_reference_manifest": {
+                "object_family": "test_case",
+                "snapshot_id": "case-snapshot://older",
+                "http_test_case_ids": [204],
+                "http_assertion_update_ids": [204],
+            }
+        }
+        later_query = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        later_query.status = "succeeded"
+        later_query.execution_phase = "completed"
+        later_query.output_json_redacted = {
+            "case_id_manifest": {
+                "snapshot_id": "case-snapshot://latest",
+                "http_test_case_ids": [204],
+                "http_assertion_update_ids": [204],
+            },
+            "object_reference_manifest": {
+                "object_family": "test_case",
+                "snapshot_id": "case-snapshot://latest",
+                "http_test_case_ids": [204],
+                "http_assertion_update_ids": [204],
+            }
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.update_assertions",
+                input={
+                    "project_id": 10,
+                    "test_case_id": 204,
+                    "case_snapshot_id": "case-snapshot://older",
+                    "assertions": [{"type": "status_code", "expected": 200}],
+                },
+                step_index=2,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        blocked = ToolExecutor(self.db)._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=run,
+            queue_item=None,
+            queue_service=AgentWorkerQueueService(self.db),
+            runtime=AgentRuntimeService(self.db),
+        )
+
+        self.assertIsNotNone(blocked)
+        self.assertEqual(blocked.status, "failed")
+        self.assertEqual(blocked.error_code, "agent_testcase_snapshot_not_latest")
+        self.assertEqual(blocked.output_json_redacted["object_type"], "http_test_case")
+        self.assertEqual(blocked.output_json_redacted["requested_snapshot_id"], "case-snapshot://older")
+        self.assertEqual(blocked.output_json_redacted["latest_snapshot_id"], "case-snapshot://latest")
+        self.assertEqual(blocked.output_json_redacted["snapshot_mismatch"], True)
+        self.assertEqual(blocked.output_json_redacted["valid_test_case_ids"], [204])
+        preflight = blocked.output_json_redacted["object_reference_preflight"]
+        self.assertEqual(preflight["status"], "blocked")
+        self.assertEqual(preflight["object_type"], "http_test_case")
+        self.assertEqual(preflight["query_tool"], "testcase.query_project_cases")
+        self.assertEqual(preflight["reason"], "snapshot_mismatch")
+        self.assertEqual(preflight["requested_ids"], [204])
+        self.assertEqual(preflight["valid_ids"], [204])
+        self.assertEqual(preflight["requested_snapshot_ids"], ["case-snapshot://older"])
+        self.assertEqual(preflight["latest_snapshot_id"], "case-snapshot://latest")
+        failed_event = self.db.scalar(
+            select(AgentEvent)
+            .where(
+                AgentEvent.run_id == run.run_id,
+                AgentEvent.event_type == "tool.failed",
+            )
+            .order_by(AgentEvent.event_seq.desc())
+        )
+        self.assertIsNotNone(failed_event)
+        self.assertEqual(
+            failed_event.payload_json["object_reference_preflight"],
+            preflight,
+        )
+
+    def test_executor_object_reference_rules_cover_case_side_effect_tools(self):
+        expected = {
+            "testcase.execute_saved": ("http_test_case", "testcase.query_project_cases"),
+            "testcase.batch_execute": ("http_test_case", "testcase.query_project_cases"),
+            "testcase.update_saved": ("http_test_case", "testcase.query_project_cases"),
+            "testcase.update_assertions": ("http_test_case", "testcase.query_project_cases"),
+            "testcase.batch_update_assertions": ("http_test_case", "testcase.query_project_cases"),
+            "websocket_testcase.execute_saved": ("websocket_test_case", "testcase.query_project_cases"),
+            "websocket_testcase.batch_execute": ("websocket_test_case", "testcase.query_project_cases"),
+            "websocket_testcase.update_saved": ("websocket_test_case", "testcase.query_project_cases"),
+            "websocket_testcase.update_assertions": ("websocket_test_case", "testcase.query_project_cases"),
+            "websocket_testcase.batch_update_assertions": ("websocket_test_case", "testcase.query_project_cases"),
+            "scenario.execute_dry_run": ("scenario", "scenario.query_project_scenarios"),
+        }
+
+        for tool_name, (object_type, query_tool) in expected.items():
+            with self.subTest(tool_name=tool_name):
+                rules = ToolExecutor._object_reference_guard_rules(tool_name)
+                rule = next((item for item in rules if item.object_type == object_type), None)
+                self.assertIsNotNone(rule)
+                self.assertEqual(rule.object_type, object_type)
+                self.assertEqual(rule.query_tool, query_tool)
+                self.assertIn("not_from_query_result", rule.invalid_error_code)
+                self.assertIn("stale_or_deleted", rule.stale_error_code)
+                self.assertTrue(rule.request_snapshot_id_keys)
+                self.assertIn("snapshot_not_latest", rule.snapshot_error_code)
+        self.assertIn(
+            "environment",
+            {rule.object_type for rule in ToolExecutor._object_reference_guard_rules("scenario.execute_dry_run")},
+        )
+        expected_environment_guard_tools = {
+            "testcase.create_saved",
+            "testcase.execute_saved",
+            "testcase.batch_execute",
+            "testcase.update_saved",
+            "websocket_testcase.create_saved",
+            "websocket_testcase.execute_saved",
+            "websocket_testcase.batch_execute",
+            "websocket_testcase.update_saved",
+            "scenario.execute_dry_run",
+        }
+        for tool_name in expected_environment_guard_tools:
+            with self.subTest(tool_name=tool_name, object_type="environment"):
+                rules = ToolExecutor._object_reference_guard_rules(tool_name)
+                environment_rule = next((item for item in rules if item.object_type == "environment"), None)
+                self.assertIsNotNone(environment_rule)
+                self.assertEqual(environment_rule.query_tool, "project.read_context")
+                self.assertEqual(environment_rule.invalid_error_code, "agent_environment_ids_not_from_query_result")
+                self.assertEqual(environment_rule.stale_error_code, "agent_environment_id_stale_or_deleted")
+
+    def test_executor_blocks_http_case_save_nested_environment_ids_without_project_context(self):
+        run = self._create_run("create case with ungrounded nested environment ids")
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.create_saved",
+                input={
+                    "project_id": 10,
+                    "case": {
+                        "environment_id": 999,
+                        "environment_ids": [999],
+                        "name": "Ungrounded env HTTP case",
+                        "method": "GET",
+                        "path": "/ungrounded-env",
+                    },
+                },
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute") as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=None,
+                current_user=self.owner,
+            )
+
+        execute.assert_not_called()
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.execution_phase, "blocked_by_harness")
+        self.assertEqual(result.error_code, "agent_environment_ids_not_from_query_result")
+        self.assertEqual(result.output_json_redacted["object_type"], "environment")
+        self.assertEqual(result.output_json_redacted["invalid_environment_ids"], [999])
+        self.assertEqual(result.output_json_redacted["valid_environment_ids"], [])
+
+    def test_executor_blocks_websocket_case_update_nested_environment_ids_without_project_context(self):
+        from app.models.websocket_test_case import WebSocketTestCase
+
+        run = self._create_run("update websocket case with ungrounded nested environment ids")
+        self.db.add(
+            WebSocketTestCase(
+                id=307,
+                project_id=10,
+                environment_id=None,
+                name="WS nested env guard case",
+                description="case",
+                path="/ws/nested-env-guard",
+                headers={},
+                subprotocols=[],
+                messages=[],
+                receive_count=0,
+                connect_timeout_ms=1000,
+                receive_timeout_ms=1000,
+                assertions=[],
+                extractors=[],
+                retry_policy=None,
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.commit()
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "case_id_manifest": {
+                "websocket_test_case_ids": [307],
+                "websocket_assertion_update_ids": [307],
+            }
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="websocket_testcase.update_saved",
+                input={
+                    "project_id": 10,
+                    "test_case_id": 307,
+                    "case": {
+                        "environment_id": 999,
+                        "environment_ids": [999],
+                        "name": "Ungrounded env WS case",
+                        "path": "/ws/ungrounded-env",
+                    },
+                },
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute") as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=None,
+                current_user=self.owner,
+            )
+
+        execute.assert_not_called()
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.execution_phase, "blocked_by_harness")
+        self.assertEqual(result.error_code, "agent_environment_ids_not_from_query_result")
+        self.assertEqual(result.output_json_redacted["object_type"], "environment")
+        self.assertEqual(result.output_json_redacted["invalid_environment_ids"], [999])
+        self.assertEqual(result.output_json_redacted["valid_environment_ids"], [])
+
+    def test_executor_accepts_case_update_ids_from_prior_conversation_query_manifest(self):
+        from app.models.test_case import TestCase
+
+        previous_run = self._create_run("analyze cases before saving assertions")
+        previous_run.conversation_id = "agent-conv-case-save"
+        current_run = self._create_run("save assertions from prior conversation context")
+        current_run.conversation_id = "agent-conv-case-save"
+        http_case = TestCase(
+            id=1204,
+            project_id=10,
+            name="Conversation HTTP Case",
+            description="case",
+            method="GET",
+            path="/conversation-case",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add(http_case)
+        self.db.commit()
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=previous_run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "case_id_manifest": {
+                "http_test_case_ids": [1204],
+                "http_assertion_update_ids": [1204],
+            }
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=current_run.run_id,
+                tool_name="testcase.update_assertions",
+                input={
+                    "project_id": 10,
+                    "test_case_id": 1204,
+                    "assertions": [{"type": "status_code", "expected": 200}],
+                },
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        blocked = ToolExecutor(self.db)._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=current_run,
+            queue_item=None,
+            queue_service=AgentWorkerQueueService(self.db),
+            runtime=AgentRuntimeService(self.db),
+        )
+
+        self.assertIsNone(blocked)
+
+    def test_executor_supersedes_pending_approval_when_case_guard_blocks_tool(self):
+        previous_run = self._create_run("analyze cases before invalid save")
+        previous_run.conversation_id = "agent-conv-case-guard"
+        current_run = self._create_run("save invalid assertions")
+        current_run.conversation_id = "agent-conv-case-guard"
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=previous_run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "case_id_manifest": {
+                "http_test_case_ids": [1204],
+                "http_assertion_update_ids": [1204],
+            }
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=current_run.run_id,
+                tool_name="testcase.update_assertions",
+                input={
+                    "project_id": 10,
+                    "test_case_id": 9999,
+                    "assertions": [{"type": "status_code", "expected": 200}],
+                },
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        call.approval_required = True
+        approval = ApprovalService(self.db).create_pending_approval(
+            call=call,
+            run=current_run,
+            current_user=self.owner,
+            commit=False,
+        )
+        self.db.commit()
+
+        blocked = ToolExecutor(self.db)._reject_case_reference_ids_without_current_facts(
+            call=call,
+            run=current_run,
+            queue_item=None,
+            queue_service=AgentWorkerQueueService(self.db),
+            runtime=AgentRuntimeService(self.db),
+        )
+
+        self.assertIsNotNone(blocked)
+        self.db.refresh(approval)
+        lineage = self.db.scalar(
+            select(AgentApprovalLineage).where(
+                AgentApprovalLineage.approval_lineage_id == approval.approval_lineage_id
+            )
+        )
+        mutation = self.db.scalar(
+            select(AgentApprovalMutationLog)
+            .where(
+                AgentApprovalMutationLog.approval_id == approval.approval_id,
+                AgentApprovalMutationLog.mutation_type == "supersede",
+            )
+            .order_by(AgentApprovalMutationLog.created_at.desc())
+        )
+        events = [
+            event.event_type
+            for event in self.db.scalars(select(AgentEvent).where(AgentEvent.run_id == current_run.run_id)).all()
+        ]
+        self.assertEqual(call.status, "failed")
+        self.assertEqual(approval.approval_status, "superseded")
+        self.assertIsNotNone(lineage)
+        self.assertEqual(lineage.status, "superseded")
+        self.assertIsNotNone(mutation)
+        self.assertIn("approval.superseded", events)
+
+    def test_executor_blocks_case_execution_without_query_snapshot(self):
+        run = self._create_run("execute case without query snapshot")
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.execute_saved",
+                input={
+                    "project_id": 10,
+                    "test_case_id": 1301,
+                },
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.commit()
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute") as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=None,
+                current_user=self.owner,
+            )
+
+        execute.assert_not_called()
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.execution_phase, "blocked_by_harness")
+        self.assertEqual(result.error_code, "agent_testcase_ids_not_from_query_result")
+        self.assertEqual(result.output_json_redacted["invalid_test_case_ids"], [1301])
+        self.assertEqual(result.output_json_redacted["valid_test_case_ids"], [])
+
+    def test_executor_blocks_case_execution_when_latest_snapshot_id_was_deleted(self):
+        from app.models.test_case import TestCase
+
+        run = self._create_run("execute deleted case from stale snapshot")
+        http_case = TestCase(
+            id=1302,
+            project_id=10,
+            name="Deleted Snapshot HTTP Case",
+            description="case",
+            method="GET",
+            path="/deleted-snapshot-case",
+            headers={},
+            query_params={},
+            body_type="none",
+            body=None,
+            assertions=[],
+            extractors=[],
+            retry_policy=None,
+            created_by_id=self.owner.id,
+        )
+        self.db.add(http_case)
+        self.db.commit()
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "case_id_manifest": {
+                "http_test_case_ids": [1302],
+                "http_assertion_update_ids": [1302],
+            }
+        }
+        call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.execute_saved",
+                input={
+                    "project_id": 10,
+                    "test_case_id": 1302,
+                },
+                step_index=1,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        self.db.delete(http_case)
+        self.db.commit()
+
+        with patch("app.services.agent_runtime_service.AgentToolRuntime.execute") as execute:
+            result = ToolExecutor(self.db).execute_tool_call(
+                call=call,
+                run=run,
+                queue_item=None,
+                current_user=self.owner,
+            )
+
+        execute.assert_not_called()
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.execution_phase, "blocked_by_harness")
+        self.assertEqual(result.error_code, "agent_testcase_id_stale_or_deleted")
+        self.assertEqual(result.recovery_decision, "refresh_case_snapshot_before_retry")
+        self.assertEqual(result.output_json_redacted["stale_test_case_ids"], [1302])
+        failed_event = self.db.scalar(
+            select(AgentEvent)
+            .where(
+                AgentEvent.run_id == run.run_id,
+                AgentEvent.event_type == "tool.failed",
+            )
+            .order_by(AgentEvent.event_seq.desc())
+        )
+        self.assertIsNotNone(failed_event)
+        self.assertEqual(failed_event.payload_json["stale_test_case_ids"], [1302])
+        self.assertNotIn("invalid_test_case_ids", failed_event.payload_json)
+        self.assertEqual(
+            failed_event.payload_json["object_reference_preflight"],
+            result.output_json_redacted["object_reference_preflight"],
+        )
 
     def test_harness_approval_expire_payload_contract_matches_service(self):
         from pathlib import Path
@@ -22221,7 +27239,51 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result.error_code, "context_decision_build_required")
 
     def test_approval_required_high_risk_tool_call_binds_decision_context_before_approval(self):
+        from app.models.test_case import TestCase
+
         run = self._create_run("approval high risk context")
+        self.db.add(
+            TestCase(
+                id=24701,
+                project_id=10,
+                environment_id=None,
+                name="Approval Context Case",
+                description="case for approval context",
+                method="GET",
+                path="/approval-context",
+                headers={},
+                query_params={},
+                body=None,
+                assertions=[],
+                extractors=[],
+                created_by_id=self.owner.id,
+            )
+        )
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={"project_id": 10, "detail_level": "execution_ready", "test_case_ids": [24701]},
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "detail_level": "execution_ready",
+            "case_result_policy": {"execution_ready": True},
+            "case_snapshot": {"snapshot_id": "case-snapshot://approval-context", "execution_ready": True},
+            "case_id_manifest": {
+                "snapshot_id": "case-snapshot://approval-context",
+                "http_test_case_ids": [24701],
+                "http_assertion_update_ids": [24701],
+                "websocket_test_case_ids": [],
+            },
+            "http_test_case_ids": [24701],
+        }
+        self.db.commit()
 
         call = ExecutionLedgerService(self.db).create_tool_call(
             payload=AgentToolCallCreateRequest(
@@ -22229,14 +27291,15 @@ class AgentRuntimeTests(unittest.TestCase):
                 tool_name="testcase.batch_update_assertions",
                 input={
                     "project_id": 10,
+                    "case_snapshot_id": "case-snapshot://approval-context",
                     "items": [
                         {
-                            "test_case_id": 7,
+                            "test_case_id": 24701,
                             "assertions": [{"type": "status_code", "expected": "200"}],
                         }
                     ],
                 },
-                step_index=0,
+                step_index=1,
             ),
             current_user=self.owner,
             enqueue=False,

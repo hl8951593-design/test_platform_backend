@@ -327,12 +327,14 @@ HTTP 用例扩写示例：
 - `scenario-composer` 不直接保存场景，只返回草稿；前端确认后再调用场景创建接口。
 - `reference_id` 只能引用 `http_test_case_ids` / `websocket_test_case_ids` 中传入的候选用例。
 - 默认读取候选用例最近一次执行的请求/响应样本，帮助 AI 理解接口语义、响应字段和依赖关系。
+- 后端会为候选用例追加 `composition_hints`，包含角色候选、请求字段、模板变量、响应字段、建议提取器和基础断言，帮助模型区分前置、主流程、校验查询、变更操作和清理/后置。
 - `execute_candidates=true` 时，后端会在组合前实际执行候选用例以获取样本；该开关可能产生业务副作用，调用方应谨慎启用。
 - `self_validate=true` 默认开启。后端会在生成草稿后执行一次未保存场景进行自验证；如果执行失败，会把失败步骤、断言失败、变量提取错误和响应样本反馈给模型修复，最多 `max_validation_attempts=3` 轮。
 - 自验证执行不落库保存场景，但会产生场景运行记录和底层用例执行记录，用于审计和查看执行详情。
 - 实际执行候选用例或自验证场景时，除场景管理权限外，还需要 `test:execute` 权限。
 - skill 会根据候选用例配置和请求/响应样本生成或补充 `assertions`、`extractors`、`_scenario_context.extractions`、`_scenario_context.bindings`。
-- skill 可以生成必要的 `before_actions` / `after_actions`，用于固定变量、随机数据、等待、条件门禁、清理或轻量计算。
+- 返回草稿前会做质量门修补：如果下游请求模板引用了已有上游 extractor 或动作输出，后端会补充 `_scenario_context.bindings`；如果模型没有给出可用断言但最近响应样本包含稳定字段，会补充 `status_code`、`code`、`success` 或 WebSocket `message_count` 基础断言。
+- skill 可以生成必要的 `before_actions` / `after_actions`，用于固定变量、随机数据、等待、条件门禁、清理或轻量计算。动作类型与场景执行模型一致：`delay`、`condition`、`random`、`fixed_value`、`script`，其中 `script` 仅支持受限 `python` / `javascript` 和声明式 `inputs` / `outputs`。
 - 如果 AI 返回的 `before_actions` / `after_actions` 漏掉 `kind`，后端会在可确定时根据配置推断为 `fixed_value`、`delay`、`condition`、`random` 或 `script`；无法推断或配置不合法的动作会被丢弃并写入 warnings，避免单个非关键动作导致整个场景草稿校验失败。
 - 后端会二次校验 AI 返回，丢弃非候选引用；如果没有可用节点则返回 `502`。
 - `include_datasets=false` 时会丢弃 AI 返回的数据集草稿。

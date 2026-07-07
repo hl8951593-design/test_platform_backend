@@ -7,11 +7,11 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 最近核对日期 | 2026-07-01 |
-| 开发基线 | `3.0.474-agent-observability-dashboard-performance` |
-| Alembic head | `0028_agent_memory_staleness_events` |
+| 最近核对日期 | 2026-07-07 |
+| 开发基线 | `3.0.500-scenario-save-followup-dry-run` |
+| Alembic head | `0032_execution_history_query_indexes` |
 | 回归命令 | `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v` |
-| 最近完整回归 | 本轮未重跑全量后端 discover；已执行 `.\.venv\Scripts\python.exe -m unittest tests.test_agent_runtime.AgentRuntimeTests`，通过；Windows 本地日志 rollover 仍有既有文件占用告警 |
+| 最近完整回归 | 已执行 `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v`，696 个用例执行完成，OK（skipped=3）；已执行 `.\.venv\Scripts\python.exe -m alembic current`，当前库为 `0032_execution_history_query_indexes (head)`；Agent 工具请求 `evidence_refs` 简写归一化、Windows 本地日志 rollover 文件占用保护、Agent 场景草稿 artifact 保存链路、full payload trace、同会话 ToolCall artifact manifest、测试用例查询快照 manifest、行为评测多轮复用链路、场景组合编排质量门、Agent 工具-Skill 覆盖审计和 final summary 重复工具请求成功态收尾提示已纳入回归 |
 
 数字基线只能在实际执行命令后更新。数据库结构以 Alembic migration 和当前模型共同为准，
 不能只修改模型而遗漏迁移。

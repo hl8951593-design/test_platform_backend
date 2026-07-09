@@ -155,6 +155,12 @@ class AgentSkill:
     name: str
     description: str
     triggers: tuple[str, ...]
+    capabilities: tuple[str, ...]
+    required_context: tuple[str, ...]
+    tool_names: tuple[str, ...]
+    artifact_types: tuple[str, ...]
+    dependencies: tuple[str, ...]
+    examples: tuple[str, ...]
     routing_hints: dict[str, tuple[str, ...]]
     private_values: dict[str, str]
     body: str
@@ -166,6 +172,18 @@ class AgentSkill:
             "description": self.description,
         }
 
+    def planner_metadata(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "capabilities": list(self.capabilities),
+            "required_context": list(self.required_context),
+            "tool_names": list(self.tool_names),
+            "artifact_types": list(self.artifact_types),
+            "dependencies": list(self.dependencies),
+            "examples": list(self.examples),
+        }
+
     def prompt_block(self) -> str:
         block = (
             f"Agent Skill: {self.name}\n"
@@ -173,6 +191,35 @@ class AgentSkill:
             f"{self.body.strip()}"
         )
         return _cap_prompt_block(block)
+
+
+@dataclass(frozen=True)
+class AgentSkillRoute:
+    primary_skill: AgentSkill | None
+    supporting_skills: tuple[AgentSkill, ...]
+    confidence: float
+    score: int
+    runner_mode: str
+
+    @property
+    def selected_skills(self) -> tuple[AgentSkill, ...]:
+        if self.primary_skill is None:
+            return ()
+        return (self.primary_skill, *self.supporting_skills)
+
+    @property
+    def selected_skill_names(self) -> tuple[str, ...]:
+        return tuple(skill.name for skill in self.selected_skills)
+
+    def model_view(self) -> dict[str, Any]:
+        return {
+            "primary_skill": self.primary_skill.name if self.primary_skill else None,
+            "supporting_skills": [skill.name for skill in self.supporting_skills],
+            "selected_skill_names": list(self.selected_skill_names),
+            "confidence": self.confidence,
+            "score": self.score,
+            "runner_mode": self.runner_mode,
+        }
 
 
 class AgentSkillRegistry:
@@ -214,6 +261,44 @@ class AgentSkillRegistry:
         return resource_path.read_text(encoding="utf-8").strip()
 
     def select_for_intent(self, intent: str, *, limit: int = 3) -> list[AgentSkill]:
+        return [skill for _, _, skill in self._scored_skills(intent)[:limit]]
+
+    def get_skill(self, name: str) -> AgentSkill | None:
+        return self._skills.get(name)
+
+    def rank_for_intent(self, intent: str, *, limit: int | None = None) -> list[tuple[int, AgentSkill]]:
+        ranked = [(score, skill) for score, _, skill in self._scored_skills(intent)]
+        if limit is None:
+            return ranked
+        return ranked[:limit]
+
+    def route_for_intent(self, intent: str, *, allow_supporting: bool = False) -> AgentSkillRoute:
+        scored = self._scored_skills(intent)
+        if not scored:
+            return AgentSkillRoute(
+                primary_skill=None,
+                supporting_skills=(),
+                confidence=0.0,
+                score=0,
+                runner_mode="no_skill",
+            )
+        top_score, _, primary = scored[0]
+        supporting: tuple[AgentSkill, ...] = ()
+        if allow_supporting:
+            supporting = tuple(
+                skill
+                for score, _, skill in scored[1:3]
+                if score >= max(2, top_score - 2)
+            )
+        return AgentSkillRoute(
+            primary_skill=primary,
+            supporting_skills=supporting,
+            confidence=_skill_route_confidence(top_score),
+            score=top_score,
+            runner_mode="primary_skill_only" if not supporting else "primary_plus_supporting_skills",
+        )
+
+    def _scored_skills(self, intent: str) -> list[tuple[int, str, AgentSkill]]:
         text = _normalize_text(intent)
         scored: list[tuple[int, str, AgentSkill]] = []
         for skill in self.list_skills():
@@ -221,7 +306,7 @@ class AgentSkillRegistry:
             if score > 0:
                 scored.append((score, skill.name, skill))
         scored.sort(key=lambda item: (-item[0], item[1]))
-        return [skill for _, _, skill in scored[:limit]]
+        return scored
 
 
 @lru_cache(maxsize=8)
@@ -255,6 +340,12 @@ def _parse_skill_file(path: Path) -> AgentSkill:
     if not body:
         raise RuntimeError(f"Agent skill body is empty: {path}")
     triggers = _coerce_frontmatter_list(frontmatter.get("triggers"))
+    capabilities = _coerce_frontmatter_list(frontmatter.get("capabilities"))
+    required_context = _coerce_frontmatter_list(frontmatter.get("required_context"))
+    tool_names = _coerce_frontmatter_list(frontmatter.get("tools"))
+    artifact_types = _coerce_frontmatter_list(frontmatter.get("artifacts"))
+    dependencies = _coerce_frontmatter_list(frontmatter.get("dependencies"))
+    examples = _coerce_frontmatter_list(frontmatter.get("examples"))
     routing_hints: dict[str, tuple[str, ...]] = {}
     private_values: dict[str, str] = {}
     for key, value in frontmatter.items():
@@ -272,6 +363,12 @@ def _parse_skill_file(path: Path) -> AgentSkill:
         name=name,
         description=description,
         triggers=triggers,
+        capabilities=capabilities,
+        required_context=required_context,
+        tool_names=tool_names,
+        artifact_types=artifact_types,
+        dependencies=dependencies,
+        examples=examples,
         routing_hints=routing_hints,
         private_values=private_values,
         body=body,
@@ -336,6 +433,12 @@ def _skill_score(skill: AgentSkill, normalized_intent: str) -> int:
             if intent_matches_routing_phrase(normalized_intent, phrase):
                 score += 0 if _is_weak_operation_phrase(phrase) else 2
     return score
+
+
+def _skill_route_confidence(score: int) -> float:
+    if score <= 0:
+        return 0.0
+    return round(min(0.99, score / (score + 3)), 4)
 
 
 def _intent_tokens(text: str) -> list[str]:

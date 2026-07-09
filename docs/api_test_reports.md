@@ -94,6 +94,48 @@ HTML 文件包含报告标题、状态、通过率、指标卡片和可展开的
 
 趋势统计以一次测试计划运行或一次 Flow 执行为单位，不以计划目标或 Flow 节点为单位。
 
+## 查询 AI 报告大盘
+
+| 项目 | 内容 |
+| --- | --- |
+| 接口 | `/reports/intelligence-overview?project_id={project_id}` |
+| 方法 | `GET` |
+| 权限 | `report:view` |
+| 说明 | 为测试报告页提供 AI 风险、失败聚类、慢用例和稳定性聚合视图 |
+
+查询参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `environment_id` | 空 | 环境 ID；为空时返回项目整体 |
+| `range` | `7d` | 支持 `today`、`7d`、`30d` |
+
+响应 `data`：
+
+```json
+{
+  "generated_at": "2026-07-08 23:30:00",
+  "summary": {
+    "pass_rate": 94.8,
+    "pass_rate_delta": 3.2,
+    "failure_cluster_count": 5,
+    "p0_cluster_count": 2,
+    "stability_score": 91.2,
+    "slow_test_count": 18,
+    "slow_threshold_ms": 3000,
+    "ai_recommendation_count": 2
+  },
+  "pass_rate_trend": [{ "label": "周一", "value": 88 }],
+  "risk_indicators": [{ "name": "失败聚类风险", "level": "high", "score": 88 }],
+  "failure_clusters": [{ "name": "企业回归计划", "count": 2, "priority": "P0", "confidence": 91 }],
+  "slow_tests": [{ "test_case_id": 7, "name": "企业查询接口", "owner": "当前用户", "risk": "medium", "duration_ms": 5200 }],
+  "stability_heatmap": [{ "module": "报告稳定性", "values": [4, 4, 3, 5, 4, 2, 3] }],
+  "ai_recommendations": [{ "id": "rec-failure-cluster", "priority": "P0", "content": "优先复核失败聚类。", "action_label": "查看失败聚类" }]
+}
+```
+
+该接口不新增报告表；报告摘要来自计划/Flow 报告读模型，慢用例来自 HTTP 用例执行记录，缺陷风险来自缺陷中心。
+
 ## 错误和兼容性
 
 - `source_type` 不合法时返回 HTTP `422`。

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.api.v1.deps import get_current_user, get_db
 from app.core.config import settings
 from app.core.execution_worker import execution_worker
+from app.core.read_response_cache import read_response_cache
 from app.core.response import success
 from app.models.user import User
 from app.schemas.websocket_test_case import (
@@ -48,6 +49,8 @@ def _wait_for_websocket_execution(db: Session, execution) -> None:
             detail="WebSocket 测试用例执行超时，请稍后在执行中心查看结果",
         ) from exc
     db.refresh(execution)
+    read_response_cache.clear_prefix(("websocket_test_cases",))
+    read_response_cache.clear_prefix(("projects",))
 
 
 @router.post("/debug-sessions", status_code=status.HTTP_201_CREATED, summary="创建 WebSocket 长连接调试会话")
@@ -134,29 +137,50 @@ def list_cases(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = WebSocketTestCaseService(db).list_cases(
-        project_id=project_id,
-        current_user=current_user,
-        keyword=keyword,
-        environment_id=environment_id,
-        page=page,
-        page_size=page_size,
+    cache_key = (
+        "websocket_test_cases",
+        id(db.get_bind()),
+        current_user.id,
+        bool(current_user.is_admin),
+        project_id,
+        keyword or "",
+        environment_id,
+        page,
+        page_size,
     )
-    result["items"] = [
-        WebSocketTestCaseRead.model_validate(item) for item in result["items"]
-    ]
-    return success(data=result)
+
+    def build_response():
+        result = WebSocketTestCaseService(db).list_cases(
+            project_id=project_id,
+            current_user=current_user,
+            keyword=keyword,
+            environment_id=environment_id,
+            page=page,
+            page_size=page_size,
+        )
+        result["items"] = [
+            WebSocketTestCaseRead.model_validate(item) for item in result["items"]
+        ]
+        return success(data=result)
+
+    return read_response_cache.get_or_set(cache_key, build_response)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_case(project_id: int, payload: WebSocketTestCaseCreateRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     case = WebSocketTestCaseService(db).create_case(project_id=project_id, payload=payload, current_user=current_user)
+    read_response_cache.clear_prefix(("websocket_test_cases",))
+    read_response_cache.clear_prefix(("projects",))
+    read_response_cache.clear_prefix(("environment_configs",))
     return success(data=WebSocketTestCaseRead.model_validate(case))
 
 
 @router.put("/{test_case_id}")
 def update_case(project_id: int, test_case_id: int, payload: WebSocketTestCaseUpdateRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     case = WebSocketTestCaseService(db).update_case(project_id=project_id, test_case_id=test_case_id, payload=payload, current_user=current_user)
+    read_response_cache.clear_prefix(("websocket_test_cases",))
+    read_response_cache.clear_prefix(("projects",))
+    read_response_cache.clear_prefix(("environment_configs",))
     return success(data=WebSocketTestCaseRead.model_validate(case))
 
 
@@ -172,6 +196,9 @@ def delete_case(
         test_case_id=test_case_id,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("websocket_test_cases",))
+    read_response_cache.clear_prefix(("projects",))
+    read_response_cache.clear_prefix(("environment_configs",))
     return success(message="WebSocket 测试用例删除成功")
 
 
@@ -192,6 +219,7 @@ def execute_saved_case(project_id: int, test_case_id: int, environment_id: int |
 @router.post("/execute-unsaved")
 def execute_unsaved_case(project_id: int, payload: UnsavedWebSocketTestCaseExecuteRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     execution = WebSocketTestCaseService(db).execute_unsaved_case(project_id=project_id, payload=payload, current_user=current_user)
+    read_response_cache.clear_prefix(("projects",))
     return success(data=WebSocketTestCaseExecutionRead.model_validate(execution))
 
 
@@ -218,6 +246,8 @@ def batch_execute(project_id: int, payload: WebSocketBatchExecuteRequest, db: Se
         ) from exc
     for execution in executions:
         db.refresh(execution)
+    read_response_cache.clear_prefix(("websocket_test_cases",))
+    read_response_cache.clear_prefix(("projects",))
     return success(
         data=[WebSocketTestCaseExecutionRead.model_validate(item) for item in executions],
         message="批量 WebSocket 测试用例执行完成",

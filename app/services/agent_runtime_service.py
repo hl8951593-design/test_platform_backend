@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -17,7 +18,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.sensitive_data import mask_sensitive, request_fingerprint
+from app.core.sensitive_data import decrypt_sensitive, encrypt_sensitive, mask_sensitive, request_fingerprint
 from app.db.session import SessionLocal, dispose_engine_after_disconnect
 from app.models.agent import (
     AGENT_APPROVAL_ITEM_ID_PREFIX as AGENT_APPROVAL_MODEL_ITEM_ID_PREFIX,
@@ -60,6 +61,11 @@ from app.schemas.websocket_test_case import (
     WebSocketTestCaseUpdateRequest,
 )
 from app.services.agent_approval_service import ApprovalService, PolicyManager
+from app.services.agent_artifact_resolver import (
+    AgentArtifactResolver,
+)
+from app.services.agent_context_manager import AgentContextManager, MODEL_PRIVATE_TOOL_NAMES
+from app.services.agent_execution_plan import agent_execution_plan_id, agent_execution_plan_payload
 from app.services.agent_loop_service import ContextBuilder, EvidenceRefResolver, EvidenceWatchService, LoopController
 from app.services.agent_memory_service import MemoryCandidate, MemoryManager
 from app.services.agent_skill_registry import (
@@ -79,7 +85,7 @@ from app.services.agent_trace import (
 )
 from app.services.agent_tool_result_policy import FINAL_RESPONSE_BUDGET_INSTRUCTION, build_tool_result_message
 from app.services.ai_service import AIService
-from app.services.agent_tool_service import AgentToolBackend, SAFE_SIDE_EFFECT_CLASSES, ToolPolicyResolver, ToolRegistry
+from app.services.agent_tool_service import AgentToolBackend, SAFE_SIDE_EFFECT_CLASSES, ToolContextRequirement, ToolPolicyResolver, ToolRegistry
 from app.services.permission_service import PermissionService
 
 
@@ -204,11 +210,27 @@ AGENT_TOOL_PROTOCOL_PROMPT = """
 如果不需要工具，请直接用自然语言回答。
 
 测试用例工具约束：
+- 所有 `environment_id` 只能使用 `project.read_context.object_reference_manifest.environment_ids` 中的显式值；不要从历史文本或连续数字猜测环境。
 - 分析/展示用例时先用 `testcase.query_project_cases` 的 `detail_level="summary"`；查看少量用例断言或请求细节时，使用显式 `test_case_ids`/`websocket_test_case_ids` 并设置 `detail_level="selected"`、`"assertions"` 或 `"full"`。
 - 调用 `testcase.batch_execute`、`websocket_testcase.batch_execute`、`testcase.batch_update_assertions`、`websocket_testcase.batch_update_assertions` 前，必须重新调用 `testcase.query_project_cases`，对目标集合设置 `detail_level="execution_ready"`，然后复制返回的 `*_batch_execute_input`、`case_snapshot_id`、`object_references` 或显式 id 列表。不要从历史回复、用户口述、连续数字范围、summary 查询或 selected/assertions 查询拼批量输入。
-- 如果工具结果提示 `output_compacted_for_model`、`full_output_reference` 或 `full_output_read_tool`，需要更多事实时优先调用 `tool_result.read_full`，不要猜测被压缩的字段。
+- 同会话保存场景草稿时，优先传 `scenario_source={artifact_id,output_hash}`，让后端从 Artifact/Ledger 读取完整草稿；不要为了保存而搬运完整场景 JSON。
+""".strip()
+AGENT_FINAL_SUMMARY_SYSTEM_PROMPT = """
+当前阶段：final_summary。
+禁止输出 agent_tool_request，禁止调用任何工具，禁止要求读取额外完整工具结果。
+只基于本次已完成的工具结果和用户原始请求给最终回复。
+如果保存成功，说明对象名称、ID、环境和是否已执行；如果执行失败，说明失败工具、错误码和可恢复下一步。
+回复保持简洁，只总结已完成、已验证、剩余阻断项和下一步。
+""".strip()
+AGENT_TOOL_REQUEST_REPAIR_SYSTEM_PROMPT = """
+当前阶段：tool_request_repair。
+你的唯一任务是修复上一条模型输出里的 agent_tool_request 格式。
+只保留并修正已有的 tool_name、input、reason、evidence_refs；不要重新规划业务，不要追加解释，不要引用历史工具结果。
+如果仍需工具，只输出一个合法的 ```agent_tool_request fenced JSON block；如果不需要工具，直接输出自然语言回复。
 """.strip()
 TOOL_REQUEST_BLOCK_RE = re.compile(r"```agent_tool_request\s*(?P<body>\{.*?\})\s*```", re.S)
+TOOL_REQUEST_FENCE_RE = re.compile(r"```agent_tool_request\s*(?P<body>.*?)\s*```", re.S)
+TOOL_REQUEST_JSON_REPAIR_MAX_CLOSERS = 8
 MARKDOWN_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
 AGENT_MODEL_DELTA_FLUSH_INTERVAL_SECONDS = 0.35
 AGENT_MODEL_DELTA_FLUSH_CHARS = 240
@@ -282,6 +304,19 @@ AGENT_MEMORY_CONTEXT_MESSAGE_MAX_CHARS = 3000
 AGENT_MEMORY_CONTEXT_TITLE_MAX_CHARS = 180
 AGENT_MEMORY_CONTEXT_CONTENT_MAX_CHARS = 500
 AGENT_MEMORY_CONTEXT_TRUNCATION_MARKER = "[agent_memory_context_truncated]"
+AGENT_MODEL_CONTEXT_TOTAL_BUDGET_UNITS = 15000
+AGENT_MODEL_CONTEXT_STATIC_BUDGET_UNITS = 5000
+AGENT_MODEL_CONTEXT_TOOL_CATALOG_BUDGET_UNITS = 3000
+AGENT_MODEL_CONTEXT_SKILL_BUDGET_UNITS = 2500
+AGENT_MODEL_CONTEXT_MEMORY_BUDGET_UNITS = 2000
+AGENT_MODEL_CONTEXT_HISTORY_BUDGET_UNITS = 2400
+AGENT_MODEL_CONTEXT_TOOL_RESULT_BUDGET_UNITS = 5000
+AGENT_MODEL_CONTEXT_BUDGET_SCHEMA_VERSION = "agent_model_context_budget_v1"
+AGENT_MODEL_CONTEXT_BUDGET_SCOPE = "agent_model_context"
+AGENT_MODEL_CONTEXT_BUDGET_EVENT = "context.model_budget_compacted"
+AGENT_MODEL_CONTEXT_LAYER_TRUNCATION_MARKER = (
+    "\n\n[agent_model_context_layer_compacted: additional context remains available in ledger/events]"
+)
 AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_MAX_CHARS = 3000
 AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_TRUNCATION_MARKER = (
     "\n\n[agent_classifier_prompt_truncated: full private classifier prompt is not injected into model context]"
@@ -298,6 +333,28 @@ AGENT_FINAL_RESPONSE_REFERENCE_REPAIR_FALLBACK = (
     "模型最终回复引用了不在最新工具查询结果中的测试用例 ID，后端已阻止该回复直接展示。"
     "请基于上方最新 testcase.query_project_cases 工具结果重新生成总结。"
 )
+DETERMINISTIC_TOOL_INPUT_REPAIR_ENGINE_VERSION = "deterministic_tool_input_repair_v1"
+SCENARIO_CREATION_STATE_MACHINE_VERSION = "scenario_creation_state_machine_v1"
+SCENARIO_CREATION_STATE_MACHINE_NAME = "CREATE_SCENARIO"
+SCENARIO_CREATION_STATES = (
+    "START",
+    "CHECK_CONTEXT",
+    "QUERY_CASES",
+    "COMPOSE_DRAFT",
+    "VALIDATE",
+    "SAVE_PENDING_APPROVAL",
+    "EXECUTE",
+    "SUMMARY",
+    "END",
+)
+SCENARIO_CREATION_TOOL_STATES = {
+    "project.read_context": "CHECK_CONTEXT",
+    "testcase.query_project_cases": "QUERY_CASES",
+    "scenario.compose_draft": "COMPOSE_DRAFT",
+    "scenario.create_saved": "SAVE_PENDING_APPROVAL",
+    "scenario.update_saved": "SAVE_PENDING_APPROVAL",
+    "scenario.execute_dry_run": "EXECUTE",
+}
 
 
 REQUIRES_TOOL_ROUTING_KEY = "routing_requires_tool"
@@ -368,6 +425,44 @@ class AgentToolRequest:
             "reason": reason,
             "decision_reason": reason,
         }
+
+
+@dataclass(frozen=True)
+class ToolInputRepairResult:
+    input: dict[str, Any]
+    repairs: list[dict[str, Any]]
+
+
+class DeterministicToolInputRepairEngine:
+    def repair(self, *, tool_name: str, tool_input: dict[str, Any]) -> ToolInputRepairResult:
+        repaired = copy.deepcopy(tool_input)
+        repairs: list[dict[str, Any]] = []
+        if tool_name in {"scenario.create_saved", "scenario.update_saved"}:
+            repairs.extend(self._hoist_nested_scenario_snapshot_fields(repaired))
+        return ToolInputRepairResult(input=repaired, repairs=repairs)
+
+    def _hoist_nested_scenario_snapshot_fields(self, tool_input: dict[str, Any]) -> list[dict[str, Any]]:
+        scenario = tool_input.get("scenario")
+        if not isinstance(scenario, dict):
+            return []
+        moved_fields: list[str] = []
+        for field in ("environment_snapshot_id", "scenario_snapshot_id"):
+            if field not in scenario:
+                continue
+            value = scenario.pop(field)
+            if field not in tool_input or tool_input.get(field) in (None, ""):
+                tool_input[field] = value
+            moved_fields.append(field)
+        if not moved_fields:
+            return []
+        return [
+            {
+                "strategy": "hoist_nested_scenario_snapshot_fields",
+                "fields": moved_fields,
+                "from_path": "scenario",
+                "to_path": "tool_input",
+            }
+        ]
 
 
 AGENT_RUN_FIELDS = (
@@ -1677,6 +1772,9 @@ class AgentRuntimeService:
         self.db.refresh(run)
         if run.status in RUN_TERMINAL_STATUSES:
             return run
+        terminal_transitions = _scenario_terminal_state_transitions(self.db, run=run)
+        for transition in terminal_transitions:
+            self.append_event(run, "scenario.state_transition", transition, commit=False)
         run.status = "completed"
         run.result_json = mask_sensitive(result)
         run.completed_at = _utcnow()
@@ -2010,8 +2108,7 @@ class AgentConversationRunner:
             self.db.refresh(run)
             if run.status in RUN_TERMINAL_STATUSES or run.status == "needs_human":
                 return run
-        messages = self._build_chat_messages(run, current_user=user, runtime=runtime)
-        messages.extend(_tool_result_context_messages(calls))
+        messages = self._build_final_summary_messages(run, calls=calls)
         trace_info(
             "agent_trace_complete_after_tool_results_start",
             run_id=run.run_id,
@@ -2309,6 +2406,15 @@ class AgentConversationRunner:
                 return True
         return False
 
+    def _build_final_summary_messages(self, run: AgentRun, *, calls: list[AgentToolCall]) -> list[AIChatMessage]:
+        messages = [
+            AIChatMessage(role="system", content=AGENT_FINAL_SUMMARY_SYSTEM_PROMPT),
+            AIChatMessage(role="system", content=_format_run_context(run)),
+            AIChatMessage(role="user", content=f"用户原始请求：{run.intent}"),
+        ]
+        messages.extend(_final_summary_tool_result_context_messages(calls))
+        return messages
+
     def run(self, *, run_id: str, user_id: int) -> AgentRun | None:
         runtime = AgentRuntimeService(self.db)
         run = self.db.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
@@ -2529,7 +2635,16 @@ class AgentConversationRunner:
                     },
                     commit=False,
                 )
-                detected_event_payload = tool_request.detected_event_payload(iteration=iteration)
+                execution_plan_id = agent_execution_plan_id(
+                    run_id=run.run_id,
+                    iteration=iteration,
+                    step_index=run.current_step_index,
+                    tool_name=tool_request.tool_name,
+                )
+                detected_event_payload = {
+                    **tool_request.detected_event_payload(iteration=iteration),
+                    "execution_plan_id": execution_plan_id,
+                }
                 trace_info(
                     "agent_trace_tool_request_detected",
                     run_id=run.run_id,
@@ -2569,6 +2684,7 @@ class AgentConversationRunner:
                     current_user=user,
                     tool_request=tool_request,
                     iteration=iteration,
+                    execution_plan_id=execution_plan_id,
                 )
                 logger.info(
                     "agent_tool_request_finished run_id=%s iteration=%s tool_call_id=%s tool_name=%s status=%s",
@@ -3339,6 +3455,19 @@ class AgentConversationRunner:
             loop_step=resolved_loop_step,
             model_call_id=_new_model_call_id(run=run, iteration=iteration, loop_step=resolved_loop_step),
         )
+        messages, context_budget = _apply_model_context_budget(messages)
+        if context_budget["compacted"]:
+            runtime.append_event(
+                run,
+                AGENT_MODEL_CONTEXT_BUDGET_EVENT,
+                {**context_budget, **trace_payload},
+                commit=True,
+            )
+            self.db.refresh(run)
+            if run.status in RUN_TERMINAL_STATUSES:
+                return "", [], {}
+        message_summary = trace_message_summary(messages)
+        context_metrics = _model_context_metrics(messages)
         model_payload: dict[str, Any] = dict(trace_payload)
         runtime.append_event(
             run,
@@ -3348,6 +3477,9 @@ class AgentConversationRunner:
                 "iteration": iteration,
                 "final_summary": final_summary,
                 "repair_attempt": repair_attempt,
+                "message_summary": message_summary,
+                "context_metrics": context_metrics,
+                "context_budget": context_budget,
                 **trace_payload,
             },
             commit=True,
@@ -3372,7 +3504,7 @@ class AgentConversationRunner:
             loop_step=resolved_loop_step,
             model_call_id=trace_payload.get("model_call_id"),
             provider=AIService.provider,
-            **trace_message_summary(messages),
+            **message_summary,
         )
         trace_full_payload(
             "agent_trace_model_prompt_full_payload",
@@ -3768,35 +3900,16 @@ class AgentConversationRunner:
         if raw is None:
             return None
         try:
-            payload = json.loads(raw)
+            payload = _parse_tool_request_json_payload(raw)
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="模型工具请求不是合法 JSON",
             ) from exc
-        tool_name = payload.get("tool_name")
-        if not isinstance(tool_name, str) or not tool_name:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型工具请求缺少 tool_name")
-        tool_input = payload.get("input", {})
-        if tool_input is None:
-            tool_input = {}
-        if not isinstance(tool_input, dict):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型工具 input 必须是对象")
-        evidence_refs = payload.get("evidence_refs", [])
-        if evidence_refs is None:
-            evidence_refs = []
-        if normalize_evidence_refs:
-            evidence_refs = _normalize_model_evidence_refs(
-                evidence_refs,
-                allow_single_object=normalize_single_evidence_ref_object,
-            )
-        if not isinstance(evidence_refs, list) or not all(isinstance(item, dict) for item in evidence_refs):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型工具 evidence_refs 必须是对象列表")
-        return AgentToolRequest(
-            tool_name=tool_name,
-            tool_input=dict(tool_input),
-            reason=payload.get("reason") if isinstance(payload.get("reason"), str) else None,
-            evidence_refs=tuple(dict(item) for item in evidence_refs),
+        return _tool_request_from_payload(
+            payload,
+            normalize_evidence_refs=normalize_evidence_refs,
+            normalize_single_evidence_ref_object=normalize_single_evidence_ref_object,
         )
 
     def _repair_invalid_tool_request(
@@ -3843,7 +3956,20 @@ class AgentConversationRunner:
             error_message=error_message,
             model_payload=model_payload,
         )
-        salvaged_tool_request = self._try_salvage_mixed_tool_request(invalid_content)
+        repair_strategy = "salvaged_internal_tool_context_summary"
+        salvaged_tool_request = self._try_salvage_internal_tool_context_summary(invalid_content)
+        if salvaged_tool_request is None:
+            repair_strategy = "salvaged_fenced_tool_request"
+            salvaged_tool_request = (
+                self._try_salvage_mixed_tool_request(
+                    invalid_content,
+                    normalize_single_evidence_ref_object=False,
+                )
+                or self._try_salvage_tool_request_json(
+                    invalid_content,
+                    normalize_single_evidence_ref_object=False,
+                )
+            )
         self.db.refresh(run)
         if run.status in RUN_TERMINAL_STATUSES:
             return invalid_content, [], model_payload, None
@@ -3855,15 +3981,16 @@ class AgentConversationRunner:
                     "iteration": iteration,
                     "requested_tool": True,
                     "tool_name": salvaged_tool_request.tool_name,
-                    "repair_strategy": "salvaged_fenced_tool_request",
+                    "repair_strategy": repair_strategy,
                     **_model_trace_from_payload(model_payload),
                 },
                 commit=True,
             )
             return invalid_content, [], model_payload, salvaged_tool_request
 
+        _ = messages
         repair_messages = [
-            *messages,
+            AIChatMessage(role="system", content=AGENT_TOOL_REQUEST_REPAIR_SYSTEM_PROMPT),
             AIChatMessage(role="assistant", content=_bounded_repair_context(invalid_content)),
             AIChatMessage(
                 role="user",
@@ -4180,9 +4307,20 @@ class AgentConversationRunner:
         )
 
     def _parse_repaired_tool_request(self, content: str) -> tuple[AgentToolRequest | None, str | None]:
+        if not (content or "").strip():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="tool request repair returned empty content",
+            )
         try:
             return self._parse_tool_request(content, normalize_evidence_refs=True), None
         except HTTPException:
+            salvaged_internal_summary = self._try_salvage_internal_tool_context_summary(content)
+            if salvaged_internal_summary is not None:
+                return salvaged_internal_summary, "salvaged_repair_internal_tool_context_summary"
+            salvaged_json_tool_request = self._try_salvage_tool_request_json(content)
+            if salvaged_json_tool_request is not None:
+                return salvaged_json_tool_request, "salvaged_repair_tool_request_json"
             salvaged_tool_request = self._try_salvage_mixed_tool_request(content)
             if salvaged_tool_request is not None:
                 return salvaged_tool_request, "salvaged_repair_fenced_tool_request"
@@ -4203,9 +4341,20 @@ class AgentConversationRunner:
         except HTTPException:
             return None
 
-    def _try_salvage_mixed_tool_request(self, content: str) -> AgentToolRequest | None:
+    def _try_salvage_mixed_tool_request(
+        self,
+        content: str,
+        *,
+        normalize_single_evidence_ref_object: bool = True,
+    ) -> AgentToolRequest | None:
         match = TOOL_REQUEST_BLOCK_RE.search(content)
-        if match is None or TOOL_REQUEST_BLOCK_RE.search(content, match.end()):
+        if match is None:
+            return self._try_salvage_tool_request_json(
+                content,
+                allow_surrounding_text=True,
+                normalize_single_evidence_ref_object=normalize_single_evidence_ref_object,
+            )
+        if TOOL_REQUEST_BLOCK_RE.search(content, match.end()):
             return None
         surrounding = (content[:match.start()] + content[match.end():]).strip()
         if not surrounding:
@@ -4215,6 +4364,86 @@ class AgentConversationRunner:
                 content,
                 allow_surrounding_text=True,
                 normalize_evidence_refs=True,
+                normalize_single_evidence_ref_object=normalize_single_evidence_ref_object,
+            )
+        except HTTPException:
+            return self._try_salvage_tool_request_json(
+                content,
+                allow_surrounding_text=True,
+                normalize_single_evidence_ref_object=normalize_single_evidence_ref_object,
+            )
+
+    def _try_salvage_internal_tool_context_summary(self, content: str) -> AgentToolRequest | None:
+        payload = _internal_tool_context_summary_payload(content)
+        if payload is None:
+            return None
+        tool_name = payload.get("tool_name")
+        input_json = payload.get("input_json")
+        if not isinstance(tool_name, str) or not isinstance(input_json, str):
+            return None
+        if AGENT_CONTENT_PREVIEW_TRUNCATION_MARKER in input_json:
+            return None
+        try:
+            tool_input = json.loads(input_json)
+        except ValueError:
+            return None
+        if not isinstance(tool_input, dict):
+            return None
+
+        evidence_refs: Any = []
+        evidence_refs_json = payload.get("evidence_refs_json")
+        if isinstance(evidence_refs_json, str) and AGENT_CONTENT_PREVIEW_TRUNCATION_MARKER not in evidence_refs_json:
+            try:
+                parsed_refs = json.loads(evidence_refs_json)
+            except ValueError:
+                parsed_refs = []
+            if isinstance(parsed_refs, list):
+                evidence_refs = parsed_refs
+
+        try:
+            return _tool_request_from_payload(
+                {
+                    "tool_name": tool_name,
+                    "input": tool_input,
+                    "reason": payload.get("reason") if isinstance(payload.get("reason"), str) else None,
+                    "evidence_refs": evidence_refs,
+                },
+                normalize_evidence_refs=True,
+                normalize_single_evidence_ref_object=False,
+            )
+        except HTTPException:
+            return None
+
+    def _try_salvage_tool_request_json(
+        self,
+        content: str,
+        *,
+        allow_surrounding_text: bool = False,
+        normalize_single_evidence_ref_object: bool = True,
+    ) -> AgentToolRequest | None:
+        body: str | None = None
+        match = TOOL_REQUEST_FENCE_RE.search(content)
+        if match:
+            if TOOL_REQUEST_FENCE_RE.search(content, match.end()):
+                return None
+            surrounding = (content[:match.start()] + content[match.end():]).strip()
+            if surrounding and not allow_surrounding_text:
+                return None
+            body = match.group("body").strip()
+        else:
+            stripped = content.strip()
+            if stripped.startswith("{") and '"tool_name"' in stripped:
+                body = stripped
+        if body is None:
+            return None
+        payload = _try_repair_tool_request_json_payload(body)
+        if payload is None:
+            return None
+        try:
+            return _tool_request_from_payload(
+                payload,
+                normalize_evidence_refs=True,
+                normalize_single_evidence_ref_object=normalize_single_evidence_ref_object,
             )
         except HTTPException:
             return None
@@ -4226,6 +4455,7 @@ class AgentConversationRunner:
         current_user: User,
         tool_request: AgentToolRequest,
         iteration: int,
+        execution_plan_id: str | None = None,
     ) -> AgentToolCall:
         runtime = AgentRuntimeService(self.db)
         tool_input = self._normalize_tool_input(
@@ -4233,6 +4463,24 @@ class AgentConversationRunner:
             tool_name=tool_request.tool_name,
             tool_input=tool_request.input_for_ledger(),
         )
+        plan_payload = agent_execution_plan_payload(
+            run=run,
+            iteration=iteration,
+            tool_name=tool_request.tool_name,
+            tool_input=tool_input,
+            reason=tool_request.reason,
+            evidence_refs=tool_request.evidence_refs_for_ledger(),
+            plan_id=execution_plan_id,
+        )
+        runtime.append_event(
+            run,
+            "planner.execution_plan_created",
+            plan_payload,
+            commit=True,
+        )
+        self.db.refresh(run)
+        if run.status in RUN_TERMINAL_STATUSES:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run already terminal")
         call = ExecutionLedgerService(self.db).create_tool_call(
             payload=AgentToolCallCreateRequest(
                 run_id=run.run_id,
@@ -4370,9 +4618,18 @@ class AgentConversationRunner:
             self.db.refresh(call)
             return call
 
-        missing_prerequisite_tool = self._missing_tool_prerequisite_before_execution(run=run, call=call)
-        if missing_prerequisite_tool is not None:
+        missing_context_requirement = self._missing_context_requirement_before_execution(run=run, call=call)
+        if missing_context_requirement is not None:
             spec = ToolRegistry().get(call.tool_name)
+            missing_prerequisite_tool = missing_context_requirement.primary_required_tool or missing_context_requirement.name
+            error_code = (
+                missing_context_requirement.missing_error_code
+                or spec.missing_prerequisite_error_code
+                or "tool_prerequisite_required"
+            )
+            next_action = missing_context_requirement.missing_next_action or spec.missing_prerequisite_next_action or (
+                f"Call {missing_prerequisite_tool} before calling {call.tool_name}."
+            )
             trace_warning(
                 "agent_trace_tool_call_prerequisite_missing",
                 run_id=run.run_id,
@@ -4384,17 +4641,16 @@ class AgentConversationRunner:
             )
             output = {
                 "required_tool": missing_prerequisite_tool,
+                "required_context_requirement": missing_context_requirement.name,
                 "blocked_tool": call.tool_name,
-                "next_action": spec.missing_prerequisite_next_action or (
-                    f"Call {missing_prerequisite_tool} before calling {call.tool_name}."
-                ),
+                "next_action": next_action,
             }
             call.status = "failed"
             call.execution_phase = "blocked_by_harness"
-            call.error_code = spec.missing_prerequisite_error_code or "tool_prerequisite_required"
+            call.error_code = error_code
             call.error_message = (
-                f"{call.tool_name} requires a successful {missing_prerequisite_tool} result "
-                "in the same Agent Run before execution."
+                f"{call.tool_name} requires context requirement {missing_context_requirement.name} "
+                "before execution."
             )
             call.output_json_redacted = output
             call.output_hash = request_fingerprint(output)
@@ -4557,6 +4813,28 @@ class AgentConversationRunner:
         if "project_id" in required and "project_id" not in tool_input:
             tool_input["project_id"] = run.project_id
         if tool_name in {"scenario.create_saved", "scenario.update_saved"}:
+            explicit_source = self._scenario_from_explicit_source(run=run, tool_input=tool_input)
+            if explicit_source is not None:
+                original_scenario = tool_input.get("scenario") if isinstance(tool_input.get("scenario"), dict) else {}
+                scenario = copy.deepcopy(explicit_source["scenario"])
+                if tool_name == "scenario.update_saved" and isinstance(original_scenario, dict):
+                    version = original_scenario.get("version")
+                    if version is not None:
+                        scenario["version"] = version
+                tool_input["scenario"] = scenario
+                draft_source = {
+                    "source": "artifact_reference" if explicit_source.get("artifact_id") else "tool_call_scenario_source",
+                    "run_id": explicit_source["run_id"],
+                    "tool_call_id": explicit_source["tool_call_id"],
+                    "path": explicit_source["path"],
+                    "output_hash": explicit_source["output_hash"],
+                }
+                if explicit_source.get("artifact_id"):
+                    draft_source["artifact_id"] = explicit_source["artifact_id"]
+                if explicit_source.get("artifact_type"):
+                    draft_source["artifact_type"] = explicit_source["artifact_type"]
+                tool_input["scenario_draft_source"] = draft_source
+                return tool_input
             draft = self._latest_reusable_scenario_draft(run)
             if draft is not None and _intent_requests_latest_scenario_draft(run.intent):
                 original_scenario = tool_input.get("scenario") if isinstance(tool_input.get("scenario"), dict) else {}
@@ -4572,6 +4850,93 @@ class AgentConversationRunner:
                     "tool_call_id": draft["tool_call_id"],
                 }
         return tool_input
+
+    def _scenario_from_explicit_source(self, *, run: AgentRun, tool_input: dict[str, Any]) -> dict[str, Any] | None:
+        source = tool_input.get("scenario_source")
+        if not isinstance(source, dict):
+            source = tool_input.get("source_artifact")
+        if not isinstance(source, dict):
+            return None
+        artifact_id = str(source.get("artifact_id") or source.get("id") or "").strip()
+        artifact_type = ""
+        tool_call_id = str(source.get("tool_call_id") or "").strip()
+        if artifact_id and not tool_call_id:
+            parsed_artifact = _parse_tool_artifact_id(artifact_id)
+            if parsed_artifact is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={"code": "scenario_source_artifact_id_invalid", "artifact_id": artifact_id},
+                )
+            artifact_type = parsed_artifact["artifact_type"]
+            if artifact_type != "scenario_draft":
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "code": "scenario_source_artifact_type_invalid",
+                        "artifact_id": artifact_id,
+                        "artifact_type": artifact_type,
+                    },
+                )
+            tool_call_id = parsed_artifact["tool_call_id"]
+        if not tool_call_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "scenario_source_tool_call_id_required"},
+            )
+        path = str(source.get("path") or source.get("output_path") or "draft.scenario").strip()
+        expected_hash = str(source.get("output_hash") or "").strip()
+        row = self.db.execute(
+            select(AgentToolCall, AgentRun)
+            .join(AgentRun, AgentRun.run_id == AgentToolCall.run_id)
+            .where(
+                AgentToolCall.tool_call_id == tool_call_id,
+                AgentToolCall.status == "succeeded",
+                AgentRun.project_id == run.project_id,
+                AgentRun.user_id == run.user_id,
+                AgentRun.id <= run.id,
+            )
+        ).first()
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "scenario_source_tool_call_not_found", "tool_call_id": tool_call_id},
+            )
+        call, source_run = row
+        if expected_hash and expected_hash != str(call.output_hash or ""):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "scenario_source_output_hash_mismatch",
+                    "tool_call_id": tool_call_id,
+                    "expected_hash": expected_hash,
+                    "actual_hash": call.output_hash,
+                },
+            )
+        try:
+            scenario = _json_path_get(call.output_json_redacted, path)
+        except HTTPException:
+            raise
+        if not isinstance(scenario, dict):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "scenario_source_path_not_object", "tool_call_id": tool_call_id, "path": path},
+            )
+        try:
+            validated = ScenarioCreateRequest.model_validate(scenario)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "scenario_source_schema_invalid", "errors": exc.errors()},
+            ) from exc
+        return {
+            "scenario": validated.model_dump(mode="json"),
+            "run_id": source_run.run_id,
+            "tool_call_id": call.tool_call_id,
+            "path": path,
+            "output_hash": call.output_hash,
+            "artifact_id": artifact_id,
+            "artifact_type": artifact_type,
+        }
 
     def _latest_reusable_scenario_draft(self, run: AgentRun) -> dict[str, Any] | None:
         if not run.conversation_id:
@@ -4614,12 +4979,103 @@ class AgentConversationRunner:
         return None
 
     def _missing_tool_prerequisite_before_execution(self, *, run: AgentRun, call: AgentToolCall) -> str | None:
-        prerequisite_tool = ToolRegistry().get(call.tool_name).required_successful_tool_before
-        if prerequisite_tool is None:
+        missing_requirement = self._missing_context_requirement_before_execution(run=run, call=call)
+        if missing_requirement is None:
             return None
-        if self._has_successful_tool_call(run, prerequisite_tool, before_tool_call_id=call.id):
-            return None
-        return prerequisite_tool
+        return missing_requirement.primary_required_tool or missing_requirement.name
+
+    def _missing_context_requirement_before_execution(
+        self,
+        *,
+        run: AgentRun,
+        call: AgentToolCall,
+    ) -> ToolContextRequirement | None:
+        spec = ToolRegistry().get(call.tool_name)
+        for requirement in spec.required_context_requirements:
+            if not self._context_requirement_satisfied(run=run, call=call, requirement=requirement):
+                return requirement
+        return None
+
+    def _context_requirement_satisfied(
+        self,
+        *,
+        run: AgentRun,
+        call: AgentToolCall,
+        requirement: ToolContextRequirement,
+    ) -> bool:
+        return any(
+            self._context_requirement_source_satisfied(run=run, call=call, source=source)
+            for source in requirement.sources
+        )
+
+    def _context_requirement_source_satisfied(
+        self,
+        *,
+        run: AgentRun,
+        call: AgentToolCall,
+        source: Any,
+    ) -> bool:
+        source_type = str(getattr(source, "source_type", "") or "")
+        if source_type == "fresh_tool_execution":
+            tool_name = getattr(source, "tool_name", None)
+            return bool(
+                tool_name
+                and self._has_successful_tool_call(run, str(tool_name), before_tool_call_id=call.id)
+            )
+        if source_type in {"run_artifact", "conversation_artifact"}:
+            return self._has_context_artifact(
+                run=run,
+                call=call,
+                artifact_type=getattr(source, "artifact_type", None),
+                artifact_class=getattr(source, "artifact_class", None),
+                scope="conversation" if source_type == "conversation_artifact" else "run",
+            )
+        return False
+
+    def _has_context_artifact(
+        self,
+        *,
+        run: AgentRun,
+        call: AgentToolCall,
+        artifact_type: str | None,
+        artifact_class: str | None,
+        scope: str,
+    ) -> bool:
+        if not artifact_type:
+            return False
+        rows_query = (
+            select(AgentToolCall, AgentRun)
+            .join(AgentRun, AgentRun.run_id == AgentToolCall.run_id)
+            .where(
+                AgentRun.project_id == run.project_id,
+                AgentRun.user_id == run.user_id,
+                AgentToolCall.status == "succeeded",
+            )
+            .order_by(AgentToolCall.id.desc())
+        )
+        if scope == "conversation":
+            if not run.conversation_id:
+                return False
+            rows_query = rows_query.where(
+                AgentRun.conversation_id == run.conversation_id,
+                AgentRun.id <= run.id,
+            )
+        else:
+            rows_query = rows_query.where(AgentRun.run_id == run.run_id)
+
+        rows = self.db.execute(rows_query.limit(AGENT_CONVERSATION_TOOL_ARTIFACT_MANIFEST_MAX_CALLS)).all()
+        for source_call, source_run in rows:
+            if source_run.id == run.id and source_call.id >= call.id:
+                continue
+            manifest = _tool_call_artifact_manifest(source_call, source_run)
+            if not manifest:
+                continue
+            if manifest.get("artifact_type") != artifact_type:
+                continue
+            if artifact_class and manifest.get("artifact_class") != artifact_class:
+                continue
+            return True
+        return False
 
     def _has_successful_tool_call(
         self,
@@ -4644,7 +5100,8 @@ class AgentConversationRunner:
         current_user: User,
         runtime: AgentRuntimeService,
     ) -> list[AIChatMessage]:
-        messages = [AIChatMessage(role="system", content=_conversation_system_prompt())]
+        context_manager = AgentContextManager()
+        messages = [AIChatMessage(role="system", content=_conversation_static_system_prompt())]
         messages.append(AIChatMessage(role="system", content=_format_run_context(run)))
         working_context: dict[str, Any] | None = None
         previous_runs: list[AgentRun] = []
@@ -4669,10 +5126,18 @@ class AgentConversationRunner:
                 previous_runs=previous_runs,
                 tool_artifact_manifests=tool_artifact_manifests,
             )
-        skill_intent = run.intent
-        if working_context is not None:
-            skill_intent = f"{run.intent}\n{json.dumps(working_context, ensure_ascii=False, default=str)}"
-        messages.extend(_agent_skill_messages(skill_intent))
+        context_plan = context_manager.route(run.intent, working_context=working_context)
+        messages.append(context_manager.skill_plan_message(context_plan))
+        messages.append(context_manager.tool_catalog_message(context_plan))
+        messages.append(context_manager.capability_plan_message(context_plan))
+        messages.append(context_manager.skill_catalog_message(context_plan))
+        tool_contract_message = context_manager.tool_contract_message(
+            context_plan,
+            input_summary_builder=_tool_input_summary,
+        )
+        if tool_contract_message is not None:
+            messages.append(tool_contract_message)
+        messages.extend(context_manager.skill_messages(context_plan))
         memory_context = self._memory_context_message(run=run, current_user=current_user, runtime=runtime)
         if memory_context is not None:
             messages.append(memory_context)
@@ -4685,6 +5150,11 @@ class AgentConversationRunner:
             history_messages, compaction_payload = self._conversation_history_messages(
                 previous_runs=previous_runs,
                 compaction_window_metadata=lambda: runtime.context_compaction_window_metadata(run=run),
+                assistant_transform=lambda previous, assistant: _assistant_history_for_working_context(
+                    previous,
+                    assistant,
+                    working_context=working_context,
+                ),
             )
             messages.extend(history_messages)
             if compaction_payload is not None:
@@ -4713,7 +5183,7 @@ class AgentConversationRunner:
                     AgentRun.project_id == run.project_id,
                     AgentRun.user_id == run.user_id,
                     AgentRun.conversation_id == run.conversation_id,
-                    AgentRun.id < run.id,
+                    AgentRun.id <= run.id,
                     AgentToolCall.status == "succeeded",
                 )
                 .order_by(AgentToolCall.id.desc())
@@ -4732,13 +5202,18 @@ class AgentConversationRunner:
         *,
         previous_runs: list[AgentRun],
         compaction_window_metadata: Callable[[], dict[str, Any]] | dict[str, Any] | None = None,
+        assistant_transform: Callable[[AgentRun, str], str] | None = None,
     ) -> tuple[list[AIChatMessage], dict[str, Any] | None]:
         pairs = [
             {
                 "run_id": previous.run_id,
                 "status": previous.status,
                 "intent": previous.intent,
-                "assistant": _assistant_message_from_run(previous) or "",
+                "assistant": (
+                    assistant_transform(previous, _assistant_message_from_run(previous) or "")
+                    if assistant_transform is not None
+                    else (_assistant_message_from_run(previous) or "")
+                ),
             }
             for previous in previous_runs
         ]
@@ -4868,12 +5343,18 @@ class ExecutionLedgerService:
 
         spec = self.tool_registry.get(payload.tool_name)
         resolved = self.policy_resolver.resolve(spec=spec, evidence_refs=payload.evidence_refs)
+        input_repair = DeterministicToolInputRepairEngine().repair(
+            tool_name=payload.tool_name,
+            tool_input=payload.input,
+        )
+        tool_input = input_repair.input
+        input_hash_before_repair = request_fingerprint(payload.input)
         idempotency_key = payload.idempotency_key or request_fingerprint({
             "run_id": payload.run_id,
             "step_index": payload.step_index,
             "attempt_index": payload.attempt_index,
             "tool_name": payload.tool_name,
-            "input": payload.input,
+            "input": tool_input,
         })
         existing = self.db.scalar(
             select(AgentToolCall).where(
@@ -4894,7 +5375,7 @@ class ExecutionLedgerService:
         }
         contract = spec.backend_contract
         tool_call_id = f"agent-tool-{uuid.uuid4().hex}"
-        input_hash = request_fingerprint(payload.input)
+        input_hash = request_fingerprint(tool_input)
         evidence_refs = copy_evidence_refs(payload.evidence_refs)
         decision_context_build_id = payload.decision_context_build_id
         if resolved.approval_required and resolved.resolved_side_effect_class in HIGH_RISK_SIDE_EFFECT_CLASSES:
@@ -4942,7 +5423,7 @@ class ExecutionLedgerService:
             status="planned",
             effect_submission_state="none",
             input_hash=input_hash,
-            input_json_redacted=mask_sensitive(payload.input),
+            input_json_redacted=_protected_tool_input_for_storage(spec.name, tool_input),
             evidence_refs_json=evidence_refs,
             policy_evidence_refs_json=policy_evidence_refs,
             audit_evidence_refs_json=audit_evidence_refs,
@@ -4954,7 +5435,7 @@ class ExecutionLedgerService:
             approval_scope_hash=request_fingerprint({
                 "run_id": run.run_id,
                 "tool_name": spec.name,
-                "input_hash": request_fingerprint(payload.input),
+                "input_hash": input_hash,
             }),
             backend_name=contract.backend_name if contract else None,
             backend_operation=contract.backend_operation if contract else None,
@@ -4968,7 +5449,29 @@ class ExecutionLedgerService:
         self.db.add(call)
         self.db.flush()
         runtime = AgentRuntimeService(self.db)
+        if input_repair.repairs:
+            runtime.append_event(
+                run,
+                "tool.input_repaired",
+                {
+                    "tool_call_id": call.tool_call_id,
+                    "tool_name": call.tool_name,
+                    "repair_engine": DETERMINISTIC_TOOL_INPUT_REPAIR_ENGINE_VERSION,
+                    "strategy": (
+                        input_repair.repairs[0]["strategy"]
+                        if len(input_repair.repairs) == 1
+                        else "multiple_deterministic_repairs"
+                    ),
+                    "repairs": input_repair.repairs,
+                    "input_hash_before": input_hash_before_repair,
+                    "input_hash_after": input_hash,
+                },
+                commit=False,
+            )
         runtime.append_event(run, "tool.planned", {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name}, commit=False)
+        scenario_state_payload = _scenario_state_transition_for_tool_call(self.db, run=run, call=call)
+        if scenario_state_payload is not None:
+            runtime.append_event(run, "scenario.state_transition", scenario_state_payload, commit=False)
         if call.approval_required:
             executor = ToolExecutor(self.db)
             blocked_by_action_preflight = executor._reject_case_reference_ids_without_current_facts(
@@ -5481,7 +5984,7 @@ class AgentToolRuntime:
         self.backend_factory = backend_factory
 
     def execute(self, *, call: AgentToolCall, current_user: User) -> dict[str, Any]:
-        payload = dict(call.input_json_redacted or {})
+        payload = decrypt_sensitive(dict(call.input_json_redacted or {}))
         payload.setdefault("_agent_run_id", call.run_id)
         payload.setdefault("_agent_tool_call_id", call.tool_call_id)
         return self.backend_factory(self.db).execute(
@@ -5631,6 +6134,10 @@ ENVIRONMENT_REFERENCE_RULE = ObjectReferenceGuardRule(
     request_ref_array_keys=("environment_references",),
 )
 OBJECT_REFERENCE_GUARD_RULES: dict[str, tuple[ObjectReferenceGuardRule, ...]] = {
+    "environment.update_config": (ENVIRONMENT_REFERENCE_RULE,),
+    "environment.delete_config": (ENVIRONMENT_REFERENCE_RULE,),
+    "environment.upsert_variable": (ENVIRONMENT_REFERENCE_RULE,),
+    "environment.delete_variable": (ENVIRONMENT_REFERENCE_RULE,),
     "testcase.create_saved": (ENVIRONMENT_REFERENCE_RULE,),
     "testcase.execute_saved": (HTTP_TEST_CASE_REFERENCE_RULE, ENVIRONMENT_REFERENCE_RULE),
     "testcase.batch_execute": (HTTP_TEST_CASE_REFERENCE_RULE, ENVIRONMENT_REFERENCE_RULE),
@@ -7005,36 +7512,403 @@ def copy_evidence_refs(evidence_refs: list[dict[str, Any]]) -> list[dict[str, An
     return [mask_sensitive(dict(item)) for item in evidence_refs]
 
 
-def _conversation_system_prompt() -> str:
-    tools = [
-        {
-            "name": spec.name,
-            "summary": spec.summary,
-            "input_schema": spec.input_schema,
-            "side_effect_class": spec.side_effect_class,
-            "approval_required": spec.side_effect_class not in SAFE_SIDE_EFFECT_CLASSES,
-        }
-        for spec in ToolRegistry().list_specs()
+def _protected_tool_input_for_storage(tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+    if tool_name != "environment.upsert_variable":
+        return mask_sensitive(tool_input)
+    protected = dict(tool_input)
+    variable_name = str(protected.get("name") or "")
+    raw_value = protected.get("value")
+    should_encrypt = (
+        protected.get("is_secret") is True
+        or _agent_environment_value_looks_secret(variable_name)
+        or _agent_environment_value_looks_secret(raw_value)
+    )
+    if should_encrypt and raw_value is not None:
+        protected["value"] = encrypt_sensitive({"token": raw_value})["token"]
+    return protected
+
+
+def _agent_environment_value_looks_secret(value: object) -> bool:
+    normalized = str(value or "").casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "authorization",
+            "auth",
+            "bearer ",
+            "cookie",
+            "jwt",
+            "password",
+            "secret",
+            "token",
+            "api_key",
+            "apikey",
+            "access_key",
+            "client_secret",
+            "lingxi-auth",
+        )
+    )
+
+
+def _conversation_system_messages() -> list[AIChatMessage]:
+    return [
+        AIChatMessage(role="system", content=_conversation_static_system_prompt()),
+        AIChatMessage(role="system", content=_conversation_tool_catalog_prompt()),
+        AIChatMessage(role="system", content=_conversation_skill_catalog_prompt()),
     ]
+
+
+def _conversation_system_prompt() -> str:
+    return "\n\n".join(message.content for message in _conversation_system_messages())
+
+
+def _conversation_static_system_prompt() -> str:
     return "\n\n".join([
         AGENT_CONVERSATION_SYSTEM_PROMPT,
         AGENT_MARKDOWN_RESPONSE_PROMPT,
         AGENT_BUSINESS_OBJECT_DISPLAY_PROMPT,
-        AGENT_TOOL_PROTOCOL_PROMPT.replace(
-            "{tools}",
-            json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        ),
-        AGENT_SKILL_CATALOG_PROMPT.replace(
-            "{skills}",
-            json.dumps(AgentSkillRegistry().catalog(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        ),
+        AGENT_TOOL_PROTOCOL_PROMPT.replace("可用工具如下：\n{tools}\n\n", ""),
     ])
+
+
+def _conversation_tool_catalog_prompt() -> str:
+    tools = [
+        {
+            "name": spec.name,
+            "summary": spec.summary,
+            "side_effect_class": spec.side_effect_class,
+            "approval_required": spec.side_effect_class not in SAFE_SIDE_EFFECT_CLASSES,
+        }
+        for spec in ToolRegistry().list_specs()
+        if spec.name not in MODEL_PRIVATE_TOOL_NAMES
+    ]
+    return (
+        "可用工具如下。该层是工具 catalog/model view；完整 schema、权限和副作用仍以后端 ToolRuntime 校验为准。\n"
+        f"{json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
+    )
+
+
+def _conversation_skill_catalog_prompt() -> str:
+    return AGENT_SKILL_CATALOG_PROMPT.replace(
+        "{skills}",
+        json.dumps(AgentSkillRegistry().catalog(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
+
+
+def _tool_contract_context_message(intent: str) -> AIChatMessage | None:
+    tool_names = _tool_contract_tool_names_for_intent(intent)
+    if not tool_names:
+        return None
+    registry = ToolRegistry()
+    contracts = []
+    for tool_name in tool_names:
+        spec = registry.get(tool_name)
+        contracts.append({
+            "name": spec.name,
+            "input_summary": _tool_input_summary(spec.input_schema),
+        })
+    return AIChatMessage(
+        role="system",
+        content=(
+            "当前任务相关工具入参契约（Layer 2 model view；完整 schema、权限和副作用由后端 Runtime Validation 裁决）：\n"
+            f"{json.dumps(contracts, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
+        ),
+    )
+
+
+def _tool_contract_tool_names_for_intent(intent: str) -> list[str]:
+    context_plan = AgentContextManager().route(intent)
+    return sorted(name for name in context_plan.allowed_tools if name not in MODEL_PRIVATE_TOOL_NAMES)
+
+
+def _tool_input_summary(schema: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(schema, dict):
+        return {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = schema.get("required") if isinstance(schema.get("required"), list) else []
+    summary: dict[str, Any] = {
+        "required": [str(item) for item in required],
+        "properties": sorted(str(key) for key in properties),
+    }
+    enum_props: dict[str, list[Any]] = {}
+    for key, value in properties.items():
+        if isinstance(value, dict) and isinstance(value.get("enum"), list):
+            enum_props[str(key)] = value["enum"]
+    if enum_props:
+        summary["enums"] = enum_props
+    nested_required: dict[str, list[str]] = {}
+    for key, value in properties.items():
+        required_fields = _schema_property_nested_required(value)
+        if required_fields:
+            nested_required[str(key)] = required_fields
+    if nested_required:
+        summary["nested_required"] = nested_required
+    return summary
+
+
+def _schema_property_nested_required(schema: Any) -> list[str]:
+    if not isinstance(schema, dict):
+        return []
+    required = schema.get("required")
+    if isinstance(required, list) and required:
+        return sorted(str(item) for item in required)
+    for union_key in ("oneOf", "anyOf", "allOf"):
+        variants = schema.get(union_key)
+        if not isinstance(variants, list):
+            continue
+        collected: set[str] = set()
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            variant_required = variant.get("required")
+            if isinstance(variant_required, list):
+                collected.update(str(item) for item in variant_required)
+        if collected:
+            return sorted(collected)
+    return []
+
+
+def _apply_model_context_budget(messages: list[AIChatMessage]) -> tuple[list[AIChatMessage], dict[str, Any]]:
+    before_messages = list(messages)
+    before_units = _model_context_layer_units(before_messages)
+    adjusted_messages = list(before_messages)
+    compacted_layers: list[str] = []
+
+    total_limit_chars = AGENT_MODEL_CONTEXT_TOTAL_BUDGET_UNITS * 4
+    if _model_context_chars(adjusted_messages) > total_limit_chars:
+        for layer in _model_context_compaction_order():
+            current_total_chars = _model_context_chars(adjusted_messages)
+            if current_total_chars <= total_limit_chars:
+                break
+            layer_chars = _model_context_layer_chars(adjusted_messages, layer)
+            if layer_chars <= 0:
+                continue
+            non_layer_chars = current_total_chars - layer_chars
+            max_layer_chars = max(0, total_limit_chars - non_layer_chars)
+            adjusted_messages, changed = _cap_model_context_layer(
+                adjusted_messages,
+                layer=layer,
+                max_chars=max_layer_chars,
+            )
+            if changed and layer not in compacted_layers:
+                compacted_layers.append(layer)
+
+    after_units = _model_context_layer_units(adjusted_messages)
+    compacted = bool(compacted_layers)
+    budget_limit_reached = before_units["total"] > AGENT_MODEL_CONTEXT_TOTAL_BUDGET_UNITS
+    context_budget = {
+        "schema_version": AGENT_MODEL_CONTEXT_BUDGET_SCHEMA_VERSION,
+        "phase": "pre_model_call",
+        "budget_scope": AGENT_MODEL_CONTEXT_BUDGET_SCOPE,
+        "budget_limit_units": AGENT_MODEL_CONTEXT_TOTAL_BUDGET_UNITS,
+        "budget_limit_reached": budget_limit_reached,
+        "compacted": compacted,
+        "compacted_layers": compacted_layers,
+        "estimated_input_units_before": before_units["total"],
+        "estimated_input_units_after": after_units["total"],
+        "layer_budgets": _model_context_layer_budgets(),
+        "layer_actual_units_before": before_units,
+        "layer_actual_units_after": after_units,
+        "source": "AgentConversationRunner._stream_model_response",
+    }
+    return adjusted_messages, context_budget
+
+
+def _model_context_layer_budgets() -> dict[str, int]:
+    return {
+        "static": AGENT_MODEL_CONTEXT_STATIC_BUDGET_UNITS,
+        "tool_catalog": AGENT_MODEL_CONTEXT_TOOL_CATALOG_BUDGET_UNITS,
+        "tool_contract": AGENT_MODEL_CONTEXT_TOOL_CATALOG_BUDGET_UNITS,
+        "skill_catalog": AGENT_MODEL_CONTEXT_SKILL_BUDGET_UNITS,
+        "skill": AGENT_MODEL_CONTEXT_SKILL_BUDGET_UNITS,
+        "memory": AGENT_MODEL_CONTEXT_MEMORY_BUDGET_UNITS,
+        "history": AGENT_MODEL_CONTEXT_HISTORY_BUDGET_UNITS,
+        "tool_result": AGENT_MODEL_CONTEXT_TOOL_RESULT_BUDGET_UNITS,
+        "tool_request_context": AGENT_MODEL_CONTEXT_TOOL_RESULT_BUDGET_UNITS,
+        "task": AGENT_MODEL_CONTEXT_TOTAL_BUDGET_UNITS,
+        "run_context": AGENT_MODEL_CONTEXT_STATIC_BUDGET_UNITS,
+        "working_context": AGENT_MODEL_CONTEXT_HISTORY_BUDGET_UNITS,
+        "total": AGENT_MODEL_CONTEXT_TOTAL_BUDGET_UNITS,
+    }
+
+
+def _model_context_compaction_order() -> tuple[str, ...]:
+    return (
+        "history",
+        "working_context",
+        "memory",
+        "tool_result",
+        "tool_request_context",
+        "skill",
+        "skill_catalog",
+        "tool_contract",
+        "tool_catalog",
+    )
+
+
+def _model_context_chars(messages: list[AIChatMessage]) -> int:
+    return sum(len(message.content or "") for message in messages)
+
+
+def _model_context_layer_units(messages: list[AIChatMessage]) -> dict[str, int]:
+    layer_chars: dict[str, int] = {key: 0 for key in _model_context_layer_budgets() if key != "total"}
+    for index, message in enumerate(messages):
+        layer = _model_context_message_layer(messages, index)
+        layer_chars[layer] = layer_chars.get(layer, 0) + len(message.content or "")
+    units = {layer: math.ceil(chars / 4) for layer, chars in layer_chars.items()}
+    units["total"] = math.ceil(_model_context_chars(messages) / 4)
+    return units
+
+
+def _model_context_layer_chars(messages: list[AIChatMessage], layer: str) -> int:
+    return sum(
+        len(message.content or "")
+        for index, message in enumerate(messages)
+        if _model_context_message_layer(messages, index) == layer
+    )
+
+
+def _model_context_message_layer(messages: list[AIChatMessage], index: int) -> str:
+    message = messages[index]
+    content = message.content or ""
+    if _is_tool_result_context_content(content):
+        return "tool_result"
+    if _looks_like_internal_tool_context_leak(content):
+        return "tool_request_context"
+    if content.startswith("项目记忆上下文"):
+        return "memory"
+    if content.startswith("同一会话工作上下文"):
+        return "working_context"
+    if content.startswith("当前 Agent Run 上下文"):
+        return "run_context"
+    if content.startswith("可用工具如下"):
+        return "tool_catalog"
+    if content.startswith("当前任务相关工具入参契约"):
+        return "tool_contract"
+    if content.startswith("Agent Skill 目录如下"):
+        return "skill_catalog"
+    if content.startswith("已加载 Agent Skill"):
+        return "skill"
+    last_user_index = _last_user_message_index(messages)
+    if index == last_user_index and message.role == "user":
+        return "task"
+    if message.role == "system":
+        if "Conversation history compacted for prompt budget." in content:
+            return "history"
+        return "static"
+    return "history"
+
+
+def _last_user_message_index(messages: list[AIChatMessage]) -> int:
+    last_user_index = -1
+    for index, message in enumerate(messages):
+        if message.role == "user":
+            last_user_index = index
+    return last_user_index
+
+
+def _cap_model_context_layer(
+    messages: list[AIChatMessage],
+    *,
+    layer: str,
+    max_chars: int,
+) -> tuple[list[AIChatMessage], bool]:
+    capped: list[AIChatMessage] = []
+    used_chars = 0
+    changed = False
+    marker_added = False
+    for index, message in enumerate(messages):
+        if _model_context_message_layer(messages, index) != layer:
+            capped.append(message)
+            continue
+        content = message.content or ""
+        remaining = max_chars - used_chars
+        if remaining <= 0:
+            changed = True
+            if not marker_added and max_chars > 0 and used_chars == 0:
+                marker = _model_context_layer_compaction_marker(layer)
+                capped.append(AIChatMessage(role="system", content=marker[:max_chars]))
+                used_chars += min(len(marker), max_chars)
+                marker_added = True
+            continue
+        if len(content) > remaining:
+            capped.append(AIChatMessage(role=message.role, content=_cap_model_context_text(content, remaining, layer)))
+            used_chars += min(len(content), remaining)
+            changed = True
+            continue
+        capped.append(message)
+        used_chars += len(content)
+    return capped, changed
+
+
+def _cap_model_context_text(content: str, max_chars: int, layer: str) -> str:
+    marker = _model_context_layer_compaction_marker(layer)
+    if max_chars <= 0:
+        return marker
+    if len(content) <= max_chars:
+        return content
+    if max_chars <= len(marker):
+        return marker[:max_chars]
+    return f"{content[: max_chars - len(marker)]}{marker}"
+
+
+def _model_context_layer_compaction_marker(layer: str) -> str:
+    return AGENT_MODEL_CONTEXT_LAYER_TRUNCATION_MARKER.replace("]", f"; layer={layer}]")
+
+
+def _model_context_metrics(messages: list[AIChatMessage]) -> dict[str, int | str]:
+    contents = [message.content or "" for message in messages]
+    total_chars = sum(len(content) for content in contents)
+    last_user_index = _last_user_message_index(messages)
+
+    system_chars = 0
+    task_chars = 0
+    history_chars = 0
+    tool_result_chars = 0
+    tool_request_context_chars = 0
+    for index, message in enumerate(messages):
+        content = message.content or ""
+        content_chars = len(content)
+        if message.role == "system":
+            system_chars += content_chars
+            continue
+        if _is_tool_result_context_content(content):
+            tool_result_chars += content_chars
+            continue
+        if _looks_like_internal_tool_context_leak(content):
+            tool_request_context_chars += content_chars
+            continue
+        if index == last_user_index and message.role == "user":
+            task_chars += content_chars
+            continue
+        history_chars += content_chars
+
+    return {
+        "schema_version": "agent_model_context_metrics_v1",
+        "message_count": len(messages),
+        "system_chars": system_chars,
+        "task_chars": task_chars,
+        "history_chars": history_chars,
+        "tool_result_chars": tool_result_chars,
+        "tool_request_context_chars": tool_request_context_chars,
+        "total_chars": total_chars,
+        "estimated_input_units": math.ceil(total_chars / 4),
+    }
+
+
+def _is_tool_result_context_content(content: str) -> bool:
+    return (
+        content.startswith("工具执行结果如下")
+        or content.startswith("工具执行结果摘要如下")
+        or AGENT_TOOL_RESULT_CONTEXT_TRUNCATION_MARKER in content
+        or "tool_result_model_context_truncated" in content
+    )
 
 
 def _agent_skill_messages(intent: str) -> list[AIChatMessage]:
     return [
         AIChatMessage(role="system", content=_format_agent_skill_context(skill))
-        for skill in AgentSkillRegistry().select_for_intent(intent)
+        for skill in AgentSkillRegistry().route_for_intent(intent).selected_skills
     ]
 
 
@@ -7100,6 +7974,104 @@ def _normalize_model_evidence_refs(
         if ref is not None:
             normalized.append(ref)
     return normalized
+
+
+def _tool_request_from_payload(
+    payload: Any,
+    *,
+    normalize_evidence_refs: bool = True,
+    normalize_single_evidence_ref_object: bool = True,
+) -> AgentToolRequest:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型工具请求 JSON 必须是对象")
+    payload = _hoist_misnested_tool_request_metadata(payload)
+    tool_name = payload.get("tool_name")
+    if not isinstance(tool_name, str) or not tool_name:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型工具请求缺少 tool_name")
+    tool_input = payload.get("input", {})
+    if tool_input is None:
+        tool_input = {}
+    if not isinstance(tool_input, dict):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型工具 input 必须是对象")
+    evidence_refs = payload.get("evidence_refs", [])
+    if evidence_refs is None:
+        evidence_refs = []
+    if normalize_evidence_refs:
+        evidence_refs = _normalize_model_evidence_refs(
+            evidence_refs,
+            allow_single_object=normalize_single_evidence_ref_object,
+        )
+    if not isinstance(evidence_refs, list) or not all(isinstance(item, dict) for item in evidence_refs):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型工具 evidence_refs 必须是对象列表")
+    return AgentToolRequest(
+        tool_name=tool_name,
+        tool_input=dict(tool_input),
+        reason=payload.get("reason") if isinstance(payload.get("reason"), str) else None,
+        evidence_refs=tuple(dict(item) for item in evidence_refs),
+    )
+
+
+def _hoist_misnested_tool_request_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    tool_input = payload.get("input")
+    if not isinstance(tool_input, dict):
+        return payload
+    normalized = dict(payload)
+    normalized_input = dict(tool_input)
+    if "reason" not in normalized and isinstance(normalized_input.get("reason"), str):
+        normalized["reason"] = normalized_input.pop("reason")
+    if "evidence_refs" not in normalized and "evidence_refs" in normalized_input:
+        normalized["evidence_refs"] = normalized_input.pop("evidence_refs")
+    if normalized_input is not tool_input:
+        normalized["input"] = normalized_input
+    return normalized
+
+
+def _parse_tool_request_json_payload(raw: str) -> Any:
+    return json.loads(raw)
+
+
+def _try_repair_tool_request_json_payload(raw: str) -> Any | None:
+    candidates = [raw]
+    completed = _complete_missing_json_closers(raw)
+    if completed is not None and completed != raw:
+        candidates.append(completed)
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except ValueError:
+            continue
+    return None
+
+
+def _complete_missing_json_closers(raw: str) -> str | None:
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char == "}":
+            if not stack or stack[-1] != "{":
+                return None
+            stack.pop()
+        elif char == "]":
+            if not stack or stack[-1] != "[":
+                return None
+            stack.pop()
+    if in_string or escaped or len(stack) > TOOL_REQUEST_JSON_REPAIR_MAX_CLOSERS:
+        return None
+    closers = "".join("}" if opener == "{" else "]" for opener in reversed(stack))
+    return f"{raw}{closers}" if closers else raw
 
 
 def _model_evidence_ref_from_string(value: Any) -> dict[str, Any] | None:
@@ -7174,6 +8146,64 @@ def _tool_result_context_messages(calls: list[AgentToolCall]) -> list[AIChatMess
     for call in calls:
         _append_tool_result_context_message(messages, call)
     return messages
+
+
+def _final_summary_tool_result_context_messages(calls: list[AgentToolCall]) -> list[AIChatMessage]:
+    messages: list[AIChatMessage] = []
+    used_chars = 0
+    budget = 6000
+    marker = AGENT_TOOL_RESULT_CONTEXT_TRUNCATION_MARKER
+    for call in calls:
+        content = _final_summary_tool_result_message(call)
+        remaining = budget - used_chars
+        if remaining <= 0:
+            messages.append(AIChatMessage(role="user", content=marker))
+            break
+        if len(content) > remaining:
+            prefix_length = max(0, remaining - len(marker))
+            messages.append(AIChatMessage(role="user", content=f"{content[:prefix_length]}{marker}"))
+            break
+        messages.append(AIChatMessage(role="user", content=content))
+        used_chars += len(content)
+    return messages
+
+
+def _final_summary_tool_result_message(call: AgentToolCall) -> str:
+    output = call.output_json_redacted if isinstance(call.output_json_redacted, dict) else {}
+    summary: dict[str, Any] = {
+        "tool_call_id": call.tool_call_id,
+        "tool_name": call.tool_name,
+        "status": call.status,
+        "error_code": call.error_code,
+        "error_message": call.error_message,
+    }
+    if isinstance(output, dict):
+        for key in (
+            "operation",
+            "project_id",
+            "test_case_id",
+            "websocket_test_case_id",
+            "scenario_id",
+            "run_ids",
+            "total",
+            "http_total",
+            "websocket_total",
+        ):
+            if key in output:
+                summary[key] = output.get(key)
+        for object_key in ("scenario", "test_case", "websocket_test_case", "project"):
+            value = output.get(object_key)
+            if isinstance(value, dict):
+                summary[object_key] = {
+                    key: value.get(key)
+                    for key in ("id", "name", "environment_id", "current_version", "status")
+                    if key in value
+                }
+        if "warnings" in output:
+            summary["warnings"] = output.get("warnings")
+        if "issues" in output:
+            summary["issues"] = output.get("issues")
+    return "工具执行结果摘要如下。\n" + json.dumps(summary, ensure_ascii=False, default=str, sort_keys=True)
 
 
 def _append_tool_result_context_message(messages: list[AIChatMessage], call: AgentToolCall) -> None:
@@ -7488,6 +8518,93 @@ def _loop_trace_payload(
     return payload
 
 
+def _scenario_state_transition_for_tool_call(db: Session, *, run: AgentRun, call: AgentToolCall) -> dict[str, Any] | None:
+    to_state = SCENARIO_CREATION_TOOL_STATES.get(call.tool_name)
+    if to_state is None or not _run_uses_scenario_state_machine(run=run, tool_name=call.tool_name):
+        return None
+    return _scenario_state_transition_payload(
+        db,
+        run=run,
+        to_state=to_state,
+        reason="tool_planned",
+        tool_call_id=call.tool_call_id,
+        tool_name=call.tool_name,
+    )
+
+
+def _scenario_terminal_state_transitions(db: Session, *, run: AgentRun) -> list[dict[str, Any]]:
+    last_state = _latest_scenario_state(db, run_id=run.run_id)
+    if last_state is None or last_state == "END":
+        return []
+    transitions = []
+    if last_state != "SUMMARY":
+        summary_payload = _scenario_state_transition_payload(
+            db,
+            run=run,
+            to_state="SUMMARY",
+            reason="final_response",
+        )
+        if summary_payload is not None:
+            transitions.append(summary_payload)
+    end_payload = _scenario_state_transition_payload(
+        db,
+        run=run,
+        to_state="END",
+        reason="run_completed",
+        from_state_override="SUMMARY" if transitions else None,
+    )
+    if end_payload is not None:
+        transitions.append(end_payload)
+    return transitions
+
+
+def _scenario_state_transition_payload(
+    db: Session,
+    *,
+    run: AgentRun,
+    to_state: str,
+    reason: str,
+    tool_call_id: str | None = None,
+    tool_name: str | None = None,
+    from_state_override: str | None = None,
+) -> dict[str, Any] | None:
+    if to_state not in SCENARIO_CREATION_STATES:
+        return None
+    from_state = from_state_override or _latest_scenario_state(db, run_id=run.run_id) or "START"
+    return {
+        "state_machine": SCENARIO_CREATION_STATE_MACHINE_NAME,
+        "state_machine_version": SCENARIO_CREATION_STATE_MACHINE_VERSION,
+        "states": list(SCENARIO_CREATION_STATES),
+        "from_state": from_state,
+        "to_state": to_state,
+        "reason": reason,
+        "iteration": run.current_iteration,
+        "step_index": run.current_step_index,
+        **({"tool_call_id": tool_call_id} if tool_call_id else {}),
+        **({"tool_name": tool_name} if tool_name else {}),
+    }
+
+
+def _latest_scenario_state(db: Session, *, run_id: str) -> str | None:
+    event = db.scalar(
+        select(AgentEvent)
+        .where(AgentEvent.run_id == run_id, AgentEvent.event_type == "scenario.state_transition")
+        .order_by(AgentEvent.event_seq.desc())
+        .limit(1)
+    )
+    if event is None or not isinstance(event.payload_json, dict):
+        return None
+    state = event.payload_json.get("to_state")
+    return str(state) if isinstance(state, str) else None
+
+
+def _run_uses_scenario_state_machine(*, run: AgentRun, tool_name: str) -> bool:
+    if tool_name.startswith("scenario."):
+        return True
+    route = AgentSkillRegistry().route_for_intent(run.intent)
+    return route.primary_skill is not None and route.primary_skill.name == "scenario-composition"
+
+
 def _model_trace_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         key: payload[key]
@@ -7625,6 +8742,23 @@ def _looks_like_internal_tool_context_leak(content: str) -> bool:
         and "tool_name" in text
         and ("tool_request" in text or "ToolCall" in text)
     )
+
+
+def _internal_tool_context_summary_payload(content: str) -> dict[str, Any] | None:
+    if not _looks_like_internal_tool_context_leak(content):
+        return None
+    text = (content or "").strip()
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"{", text):
+        try:
+            payload, _ = decoder.raw_decode(text[match.start():])
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("summary_version") == AGENT_TOOL_REQUEST_CONTEXT_SUMMARY_VERSION:
+            return payload
+    return None
 
 
 def _normalize_agent_markdown_response(content: str) -> str:
@@ -7770,11 +8904,26 @@ def _conversation_working_context(
     tool_artifact_manifests = list(tool_artifact_manifests or [])
     if not previous_runs and not tool_artifact_manifests:
         return None
+    artifact_resolver = AgentArtifactResolver()
+    ledger_artifact_candidates = [
+        artifact_resolver.ensure_artifact_class(item)
+        for item in tool_artifact_manifests
+        if item.get("artifact_type") and item.get("artifact_type") != "tool_result"
+    ]
+    active_artifact_handles = artifact_resolver.model_handles(ledger_artifact_candidates)
+    active_artifact_action = _active_artifact_action_context(
+        current_intent=current_intent,
+        ledger_artifact_candidates=active_artifact_handles,
+    )
     recent_runs = previous_runs[-AGENT_HISTORY_CONTEXT_FULL_TURNS:]
     turns = []
     artifacts = []
     for run in recent_runs:
         assistant = _assistant_message_from_run(run) or ""
+        assistant = _assistant_text_for_active_artifact_action(
+            assistant,
+            active_artifact_action=active_artifact_action,
+        )
         turn = {
             "run_id": run.run_id,
             "user_intent": _truncate_history_text(run.intent, AGENT_HISTORY_CONTEXT_RECENT_USER_CHARS),
@@ -7783,40 +8932,29 @@ def _conversation_working_context(
         inferred = _infer_working_artifact(run.intent, assistant)
         if inferred is not None:
             turn["inferred_artifact"] = inferred
-            artifacts.append({"source_run_id": run.run_id, **inferred})
+            artifacts.append({"source_run_id": run.run_id, "artifact_class": "SUMMARY", **inferred})
         turns.append(turn)
-    ledger_artifact_candidates = [
-        item
-        for item in tool_artifact_manifests
-        if item.get("artifact_type") and item.get("artifact_type") != "tool_result"
-    ]
     payload: dict[str, Any] = {
         "schema_version": "conversation_working_context_v1",
         "current_intent": current_intent,
         "current_intent_is_deictic_followup": _intent_is_deictic_followup(current_intent),
         "recent_turns": turns,
         "current_artifact_candidates": [
-            *ledger_artifact_candidates[-AGENT_CONVERSATION_TOOL_ARTIFACT_CONTEXT_MAX_ITEMS:],
+            *active_artifact_handles[-AGENT_CONVERSATION_TOOL_ARTIFACT_CONTEXT_MAX_ITEMS:],
             *artifacts[-3:],
         ],
         "resolution_rules": [
             "If current_intent_is_deictic_followup is true, resolve it against current_artifact_candidates before choosing tools.",
-            "Prefer matching conversation_tool_artifact_manifest items over inferred artifacts from assistant text.",
+            "Prefer matching active_artifact_handles over inferred artifacts from assistant text.",
             "Prefer the latest artifact whose domain matches the user's last concrete request.",
             "If the referenced artifact cannot be identified, ask a short clarification instead of guessing.",
             "High-risk writes still require the matching approved tool and human approval.",
         ],
     }
-    if tool_artifact_manifests:
-        payload["conversation_tool_artifact_manifest"] = {
-            "schema_version": "conversation_tool_artifact_manifest_v1",
-            "items": tool_artifact_manifests,
-            "read_rules": [
-                "Each item is a lightweight pointer to ToolCall.output_json_redacted, not the full JSON.",
-                "Use tool_result.read_full with the listed tool_call_id and output_path when full facts are needed.",
-                "Do not treat unrelated conversation turns as artifact invalidation.",
-            ],
-        }
+    if active_artifact_action is not None:
+        payload["active_artifact_action"] = active_artifact_action
+    if active_artifact_handles:
+        payload["active_artifact_handles"] = active_artifact_handles
     return payload
 
 
@@ -7824,15 +8962,256 @@ def _format_conversation_working_context(payload: dict[str, Any]) -> str:
     return (
         "同一会话工作上下文：\n"
         "当前用户请求可能是对上一轮产物的省略回指；请先依据此结构化上下文解析“直接、刚才、上面、这个”等指代，"
-        "再决定是否调用工具、调用哪个工具、是否需要审批。若存在 conversation_tool_artifact_manifest，"
-        "它是同会话 ToolCall ledger 的轻量索引，优先于从 assistant 摘要推断的产物。\n"
+        "再决定是否调用工具、调用哪个工具、是否需要审批。若存在 active_artifact_handles，"
+        "它是同会话权威 ToolCall artifact 的模型可见索引，优先于从 assistant 摘要推断的产物；"
+        "完整 ToolCall 输出仅供后端 ledger/UI 检查，不能要求直接读取 full result。\n"
         f"{json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)}"
     )
+
+
+def _conversation_routing_intent(current_intent: str, working_context: dict[str, Any] | None) -> str:
+    routing_hint = _active_artifact_action_routing_hint(working_context)
+    if not routing_hint:
+        return current_intent
+    return f"{current_intent}\n{routing_hint}"
+
+
+def _active_artifact_action_routing_hint(working_context: dict[str, Any] | None) -> str:
+    active_action = _working_context_active_artifact_action(working_context)
+    if not active_action:
+        return ""
+    artifact_type = str(active_action.get("artifact_type") or "")
+    action = str(active_action.get("action") or "")
+    tool_name = str(active_action.get("tool_name") or "")
+    if artifact_type == "scenario_draft" and action == "save" and tool_name:
+        return (
+            "active_artifact_type=scenario_draft; active_artifact_action=save; "
+            "route_skill=scenario-composition; enable_tools=scenario.create_saved,scenario.update_saved; "
+            "use scenario_source artifact reference instead of reconstructing scenario JSON."
+        )
+    if artifact_type == "scenario_run_failure" and action == "repair" and tool_name:
+        return (
+            "active_artifact_type=scenario_run_failure; active_artifact_action=repair; "
+            "route_skill=scenario-composition; "
+            "enable_tools=scenario.query_project_scenarios,testcase.query_project_cases,"
+            "scenario.compose_draft,scenario.update_saved,scenario.execute_dry_run; "
+            "repair the failed saved scenario from the SOURCE dry-run artifact, then validate with dry-run."
+        )
+    return ""
+
+
+def _working_context_active_artifact_action(working_context: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(working_context, dict):
+        return None
+    active_action = working_context.get("active_artifact_action")
+    return active_action if isinstance(active_action, dict) else None
+
+
+def _active_artifact_action_context(
+    *,
+    current_intent: str,
+    ledger_artifact_candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if _intent_requests_repair_action(current_intent):
+        for item in reversed(ledger_artifact_candidates):
+            if item.get("artifact_type") != "scenario_run_failure":
+                continue
+            actions = item.get("available_followup_actions")
+            if isinstance(actions, list) and "repair" not in actions:
+                continue
+            artifact_id = item.get("artifact_id")
+            if not artifact_id:
+                continue
+            summary = item.get("artifact_summary") if isinstance(item.get("artifact_summary"), dict) else {}
+            tool_input_hint: dict[str, Any] = {"source_artifact_id": artifact_id}
+            for key in ("scenario_id", "environment_id", "run_ids", "failed_run_ids", "failures", "statuses"):
+                if summary.get(key) is not None:
+                    tool_input_hint[key] = summary.get(key)
+            action_context = {
+                "schema_version": "active_artifact_action_v1",
+                "artifact_type": "scenario_run_failure",
+                "artifact_class": item.get("artifact_class"),
+                "artifact_trust": item.get("artifact_trust"),
+                "domain": "scenario",
+                "action": "repair",
+                "tool_name": "scenario.compose_draft",
+                "required_tools": [
+                    "scenario.query_project_scenarios",
+                    "testcase.query_project_cases",
+                    "scenario.compose_draft",
+                    "scenario.update_saved",
+                    "scenario.execute_dry_run",
+                ],
+                "artifact_id": artifact_id,
+                "source_tool_call_id": item.get("tool_call_id"),
+                "output_hash": item.get("output_hash"),
+                "artifact_summary": summary,
+                "tool_input_hint": tool_input_hint,
+                "routing_hint": "enable scenario repair tools from failed dry-run artifact",
+            }
+            return {key: value for key, value in action_context.items() if value not in (None, {}, [])}
+
+    if _intent_requests_save_action(current_intent):
+        if _intent_targets_non_scenario_save_subject(current_intent):
+            return None
+        for item in reversed(ledger_artifact_candidates):
+            if item.get("artifact_type") != "scenario_draft":
+                continue
+            actions = item.get("available_followup_actions")
+            if isinstance(actions, list) and "save" not in actions and "update_saved" not in actions:
+                continue
+            artifact_id = item.get("artifact_id")
+            if not artifact_id:
+                continue
+            scenario_source = {
+                "artifact_id": artifact_id,
+            }
+            if item.get("output_hash"):
+                scenario_source["output_hash"] = item.get("output_hash")
+            action_context: dict[str, Any] = {
+                "schema_version": "active_artifact_action_v1",
+                "artifact_type": "scenario_draft",
+                "artifact_class": item.get("artifact_class"),
+                "artifact_trust": item.get("artifact_trust"),
+                "domain": "scenario",
+                "action": "save",
+                "tool_name": "scenario.create_saved",
+                "artifact_id": artifact_id,
+                "source_tool_call_id": item.get("tool_call_id"),
+                "output_hash": item.get("output_hash"),
+                "artifact_summary": item.get("artifact_summary") if isinstance(item.get("artifact_summary"), dict) else {},
+                "tool_input_hint": {
+                    "scenario_source": scenario_source,
+                },
+                "routing_hint": "enable scenario.create_saved and submit approval using scenario_source",
+            }
+            if _intent_requests_execute_action(current_intent):
+                action_context["after_save_actions"] = ["scenario.execute_dry_run"]
+            return {key: value for key, value in action_context.items() if value not in (None, {}, [])}
+    return None
+
+
+def _assistant_history_for_working_context(
+    run: AgentRun,
+    assistant: str,
+    *,
+    working_context: dict[str, Any] | None,
+) -> str:
+    active_action = _working_context_active_artifact_action(working_context)
+    return _assistant_text_for_active_artifact_action(assistant, active_artifact_action=active_action)
+
+
+def _assistant_text_for_active_artifact_action(
+    assistant: str,
+    *,
+    active_artifact_action: dict[str, Any] | None,
+) -> str:
+    if not active_artifact_action:
+        return assistant
+    if (
+        active_artifact_action.get("artifact_type") == "scenario_draft"
+        and active_artifact_action.get("action") == "save"
+        and _looks_like_stale_unsupported_scenario_save_message(assistant)
+    ):
+        return ""
+    return assistant
+
+
+def _looks_like_stale_unsupported_scenario_save_message(text: str) -> bool:
+    lowered = (text or "").casefold()
+    if not lowered:
+        return False
+    save_markers = ("保存", "持久化", "落库", "正式场景", "save")
+    scenario_markers = ("场景", "scenario", "草稿", "draft")
+    unsupported_markers = (
+        "暂不包含场景保存",
+        "没有场景保存",
+        "缺少场景保存",
+        "不包含场景保存",
+        "无法在此直接持久化",
+        "无法直接保存为正式场景",
+        "无法把",
+        "手动创建场景",
+    )
+    return (
+        any(marker in lowered for marker in save_markers)
+        and any(marker in lowered for marker in scenario_markers)
+        and any(marker in lowered for marker in unsupported_markers)
+    )
+
+
+def _intent_requests_save_action(intent: str) -> bool:
+    text = (intent or "").casefold()
+    return any(marker in text for marker in ("保存", "持久化", "落库", "发布", "正式场景", "save"))
+
+
+def _intent_requests_execute_action(intent: str) -> bool:
+    text = (intent or "").casefold()
+    return any(marker in text for marker in ("保存后执行", "保存并执行", "执行", "试运行", "dry-run", "dryrun"))
+
+
+def _intent_requests_repair_action(intent: str) -> bool:
+    text = (intent or "").casefold()
+    return any(
+        marker in text
+        for marker in (
+            "\u4fee\u590d",
+            "\u89e3\u51b3",
+            "\u4fee\u597d",
+            "\u6539\u597d",
+            "\u5904\u7406\u95ee\u9898",
+            "fix",
+            "repair",
+            "resolve",
+        )
+    )
+
+
+def _intent_targets_non_scenario_save_subject(intent: str) -> bool:
+    text = (intent or "").casefold()
+    if any(marker in text for marker in ("场景", "scenario", "草稿", "draft", "流程")):
+        return False
+    return any(marker in text for marker in ("断言", "assertion", "测试用例", "用例", "testcase", "test case"))
 
 
 def _scenario_from_compose_draft_output(output: Any) -> dict[str, Any] | None:
     _, scenario = _scenario_artifact_from_compose_draft_output(output)
     return scenario
+
+
+def _json_path_get(payload: Any, path: str | None) -> Any:
+    if not path:
+        return payload
+    current = payload
+    for raw_segment in path.split("."):
+        segment = raw_segment.strip()
+        if not segment:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="path contains an empty segment",
+            )
+        if isinstance(current, dict):
+            if segment not in current:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"path segment not found: {segment}",
+                )
+            current = current[segment]
+            continue
+        if isinstance(current, list) and segment.isdigit():
+            index = int(segment)
+            if index >= len(current):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"path index out of range: {segment}",
+                )
+            current = current[index]
+            continue
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"path segment cannot be applied: {segment}",
+        )
+    return current
 
 
 def _scenario_artifact_from_compose_draft_output(output: Any) -> tuple[str | None, dict[str, Any] | None]:
@@ -7846,6 +9225,33 @@ def _scenario_artifact_from_compose_draft_output(output: Any) -> tuple[str | Non
     return None, None
 
 
+def _saved_scenario_artifact_from_output(output: Any) -> tuple[str | None, dict[str, Any] | None]:
+    if not isinstance(output, dict):
+        return None, None
+    scenario = output.get("scenario")
+    if isinstance(scenario, dict):
+        return "scenario", copy.deepcopy(scenario)
+    scenario_id = _optional_positive_int(output.get("scenario_id"))
+    if scenario_id is None:
+        return None, None
+    scenario_payload: dict[str, Any] = {"id": scenario_id}
+    for key in ("name", "environment_id", "current_version"):
+        if output.get(key) is not None:
+            scenario_payload[key] = output[key]
+    return None, scenario_payload
+
+
+def _parse_tool_artifact_id(artifact_id: str) -> dict[str, str] | None:
+    prefix = "agent-tool-artifact://"
+    if not artifact_id.startswith(prefix):
+        return None
+    rest = artifact_id[len(prefix) :]
+    parts = rest.split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    return {"tool_call_id": parts[0], "artifact_type": parts[1]}
+
+
 def _tool_call_artifact_manifest(call: AgentToolCall, source_run: AgentRun) -> dict[str, Any] | None:
     output = call.output_json_redacted
     if output is None:
@@ -7854,7 +9260,7 @@ def _tool_call_artifact_manifest(call: AgentToolCall, source_run: AgentRun) -> d
     domain = call.tool_name.split(".", 1)[0] if call.tool_name else "tool"
     output_path: str | None = None
     artifact_summary = _tool_output_artifact_summary(output)
-    available_followup_actions = ["read_full"]
+    available_followup_actions = ["inspect_ledger_detail"]
 
     if call.tool_name == "scenario.compose_draft":
         scenario_path, scenario = _scenario_artifact_from_compose_draft_output(output)
@@ -7863,13 +9269,27 @@ def _tool_call_artifact_manifest(call: AgentToolCall, source_run: AgentRun) -> d
             domain = "scenario"
             output_path = scenario_path
             artifact_summary = _scenario_draft_artifact_summary(scenario)
-            available_followup_actions = ["read_full", "save", "update_saved"]
+            available_followup_actions = ["save", "update_saved"]
+    elif call.tool_name in {"scenario.create_saved", "scenario.update_saved"}:
+        scenario_path, scenario = _saved_scenario_artifact_from_output(output)
+        if scenario is not None:
+            artifact_type = "saved_scenario"
+            domain = "scenario"
+            output_path = scenario_path
+            artifact_summary = _saved_scenario_artifact_summary(output, scenario)
+            available_followup_actions = ["execute", "query_runs", "update_saved"]
+    elif call.tool_name == "scenario.execute_dry_run" and isinstance(output, dict):
+        scenario_run_summary = _scenario_run_failure_artifact_summary(output)
+        if scenario_run_summary is not None:
+            artifact_type = "scenario_run_failure"
+            domain = "scenario"
+            artifact_summary = scenario_run_summary
+            available_followup_actions = ["repair", "query_scenario", "compose_fix", "update_saved", "execute"]
     elif call.tool_name == "testcase.query_project_cases" and isinstance(output, dict):
         artifact_type = "test_case_query_snapshot"
         domain = "test_case"
         artifact_summary = _test_case_query_snapshot_artifact_summary(output)
         available_followup_actions = [
-            "read_full",
             "analyze_cases",
             "compose_scenario",
             "update_assertions",
@@ -7877,12 +9297,11 @@ def _tool_call_artifact_manifest(call: AgentToolCall, source_run: AgentRun) -> d
             "execute",
         ]
 
-    read_full_input: dict[str, Any] = {"tool_call_id": call.tool_call_id}
-    if output_path:
-        read_full_input["path"] = output_path
+    artifact_class = AgentArtifactResolver().artifact_class_for_type(artifact_type)
     manifest = {
         "artifact_id": f"agent-tool-artifact://{call.tool_call_id}/{artifact_type}",
         "artifact_type": artifact_type,
+        "artifact_class": artifact_class,
         "domain": domain,
         "status": "available",
         "source": "tool_call_ledger",
@@ -7895,10 +9314,7 @@ def _tool_call_artifact_manifest(call: AgentToolCall, source_run: AgentRun) -> d
         "redaction": "output_json_redacted",
         "artifact_summary": artifact_summary,
         "available_followup_actions": available_followup_actions,
-        "full_output_read_tool": {
-            "tool_name": "tool_result.read_full",
-            "input": read_full_input,
-        },
+        "full_output_reference": "ToolCall.output_json_redacted",
     }
     return {key: value for key, value in manifest.items() if value is not None}
 
@@ -7941,6 +9357,126 @@ def _scenario_draft_artifact_summary(scenario: dict[str, Any]) -> dict[str, Any]
     environment_id = scenario.get("environment_id")
     if environment_id is not None:
         summary["environment_id"] = environment_id
+    return summary
+
+
+def _saved_scenario_artifact_summary(output: dict[str, Any], scenario: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    scenario_id = _optional_positive_int(output.get("scenario_id"))
+    if scenario_id is None:
+        scenario_id = _optional_positive_int(scenario.get("id"))
+    if scenario_id is not None:
+        summary["scenario_id"] = scenario_id
+
+    name = scenario.get("name") or output.get("name")
+    if isinstance(name, str) and name.strip():
+        summary["name"] = _truncate_history_text(name, AGENT_HISTORY_CONTEXT_SUMMARY_CHARS)
+
+    environment_id = _optional_positive_int(scenario.get("environment_id"))
+    if environment_id is None:
+        environment_id = _optional_positive_int(scenario.get("environmentId"))
+    if environment_id is None:
+        environment_id = _optional_positive_int(output.get("environment_id"))
+    if environment_id is not None:
+        summary["environment_id"] = environment_id
+
+    current_version = _optional_positive_int(scenario.get("current_version"))
+    if current_version is None:
+        current_version = _optional_positive_int(scenario.get("currentVersion"))
+    if current_version is None:
+        current_version = _optional_positive_int(output.get("current_version"))
+    if current_version is not None:
+        summary["current_version"] = current_version
+
+    return summary
+
+
+def _scenario_run_failure_artifact_summary(output: dict[str, Any]) -> dict[str, Any] | None:
+    runs = output.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    failed_run_ids: list[int] = []
+    run_ids: list[int] = []
+    statuses: dict[str, int] = {}
+    failures: list[dict[str, Any]] = []
+    environment_id: int | None = _optional_positive_int(output.get("environment_id"))
+    scenario_id: int | None = _optional_positive_int(output.get("scenario_id"))
+
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        run_id = _optional_positive_int(run.get("id"))
+        if run_id is None:
+            run_id = _optional_positive_int(run.get("run_id"))
+        if run_id is not None:
+            run_ids.append(run_id)
+
+        if scenario_id is None:
+            scenario_id = _optional_positive_int(run.get("scenario_id"))
+        if environment_id is None:
+            environment_id = _optional_positive_int(run.get("environment_id"))
+        if environment_id is None:
+            environment_id = _optional_positive_int(run.get("environmentId"))
+
+        status_value = str(run.get("status") or "unknown").casefold()
+        statuses[status_value] = statuses.get(status_value, 0) + 1
+        run_failed = status_value in {"failed", "failure", "error", "errored", "timeout", "cancelled"}
+        step_results = run.get("step_results")
+        if not isinstance(step_results, list):
+            step_results = run.get("stepResults")
+        if not isinstance(step_results, list):
+            step_results = run.get("steps")
+        if not isinstance(step_results, list):
+            step_results = []
+        for step in step_results:
+            if not isinstance(step, dict):
+                continue
+            step_status = str(step.get("status") or "").casefold()
+            if step_status not in {"failed", "failure", "error", "errored", "timeout", "cancelled"}:
+                continue
+            run_failed = True
+            if len(failures) >= 5:
+                continue
+            failure: dict[str, Any] = {}
+            for source_key, target_key in (
+                ("node_id", "node_id"),
+                ("nodeId", "node_id"),
+                ("node_name", "node_name"),
+                ("nodeName", "node_name"),
+                ("case_id", "case_id"),
+                ("caseId", "case_id"),
+                ("status", "status"),
+                ("error_message", "error_message"),
+                ("errorMessage", "error_message"),
+                ("message", "error_message"),
+            ):
+                value = step.get(source_key)
+                if value is None or target_key in failure:
+                    continue
+                failure[target_key] = (
+                    _truncate_history_text(str(value), AGENT_HISTORY_CONTEXT_SUMMARY_CHARS)
+                    if isinstance(value, str)
+                    else value
+                )
+            if failure:
+                failures.append(failure)
+        if run_failed and run_id is not None:
+            failed_run_ids.append(run_id)
+
+    if not failed_run_ids and "failed" not in statuses and "error" not in statuses:
+        return None
+
+    summary: dict[str, Any] = {
+        "run_ids": run_ids or output.get("run_ids") or [],
+        "failed_run_ids": sorted(dict.fromkeys(failed_run_ids)),
+        "statuses": statuses,
+    }
+    if scenario_id is not None:
+        summary["scenario_id"] = scenario_id
+    if environment_id is not None:
+        summary["environment_id"] = environment_id
+    if failures:
+        summary["failures"] = failures
     return summary
 
 

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.api.v1.deps import get_current_user, get_db
 from app.core.config import settings
 from app.core.execution_worker import execution_worker
+from app.core.read_response_cache import read_response_cache
 from app.core.response import success
 from app.models.user import User
 from app.schemas.test_case import (
@@ -31,18 +32,33 @@ def list_test_cases(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = TestCaseService(db).list_cases(
-        project_id=project_id,
-        current_user=current_user,
-        keyword=keyword,
-        environment_id=environment_id,
-        page=page,
-        page_size=page_size,
+    cache_key = (
+        "test_cases",
+        id(db.get_bind()),
+        current_user.id,
+        bool(current_user.is_admin),
+        project_id,
+        keyword or "",
+        environment_id,
+        page,
+        page_size,
     )
-    result["items"] = [
-        TestCaseRead.model_validate(item) for item in result["items"]
-    ]
-    return success(data=result)
+
+    def build_response():
+        result = TestCaseService(db).list_cases(
+            project_id=project_id,
+            current_user=current_user,
+            keyword=keyword,
+            environment_id=environment_id,
+            page=page,
+            page_size=page_size,
+        )
+        result["items"] = [
+            TestCaseRead.model_validate(item) for item in result["items"]
+        ]
+        return success(data=result)
+
+    return read_response_cache.get_or_set(cache_key, build_response)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, summary="新增测试用例")
@@ -57,6 +73,9 @@ def create_test_case(
         payload=payload,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("test_cases",))
+    read_response_cache.clear_prefix(("projects",))
+    read_response_cache.clear_prefix(("environment_configs",))
     return success(data=TestCaseRead.model_validate(test_case), message="测试用例创建成功")
 
 
@@ -74,6 +93,9 @@ def update_test_case(
         payload=payload,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("test_cases",))
+    read_response_cache.clear_prefix(("projects",))
+    read_response_cache.clear_prefix(("environment_configs",))
     return success(data=TestCaseRead.model_validate(test_case), message="测试用例更新成功")
 
 
@@ -89,6 +111,9 @@ def delete_test_case(
         test_case_id=test_case_id,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("test_cases",))
+    read_response_cache.clear_prefix(("projects",))
+    read_response_cache.clear_prefix(("environment_configs",))
     return success(message="测试用例删除成功")
 
 
@@ -115,6 +140,8 @@ def _wait_for_http_execution(db: Session, execution) -> None:
             detail="测试用例执行超时，请稍后在执行中心查看结果",
         ) from exc
     db.refresh(execution)
+    read_response_cache.clear_prefix(("test_cases",))
+    read_response_cache.clear_prefix(("projects",))
 
 
 @router.post(
@@ -154,6 +181,7 @@ def execute_unsaved_test_case(
         payload=payload,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("projects",))
     return success(data=TestCaseExecutionRead.model_validate(execution), message="临时测试用例执行完成")
 
 
@@ -189,6 +217,8 @@ def batch_execute_test_cases(
         ) from exc
     for execution in executions:
         db.refresh(execution)
+    read_response_cache.clear_prefix(("test_cases",))
+    read_response_cache.clear_prefix(("projects",))
     return success(
         data=[TestCaseExecutionRead.model_validate(item) for item in executions],
         message="批量测试用例执行完成",

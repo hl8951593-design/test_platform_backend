@@ -18,6 +18,14 @@
       "output_schema": "AIGeneratedTestCaseResponse",
       "requires_environment": false,
       "requires_source": true
+    },
+    {
+      "name": "summarize_description",
+      "summary": "Summarize one HTTP API test case request or request-response pair into a concise saved-case description.",
+      "input_schema": "AIHttpTestCaseDescriptionSummaryRequest",
+      "output_schema": "AIHttpTestCaseDescriptionSummaryResponse",
+      "requires_environment": false,
+      "requires_source": true
     }
   ],
   "resources": {

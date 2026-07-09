@@ -47,6 +47,8 @@ class BrowserCaptureEntry(Base):
     draft_data: Mapped[dict] = mapped_column(JSON, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="captured", nullable=False)
     ai_analysis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    ai_analysis_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    ai_analyzed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     import_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     captured_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

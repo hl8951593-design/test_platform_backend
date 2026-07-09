@@ -82,6 +82,7 @@ Authorization: Bearer <access_token>
       "base_url": "https://uat.example.com",
       "description": "用户验收测试环境",
       "is_default": true,
+      "is_active": true,
       "is_deleted": false,
       "created_by_id": 1,
       "created_at": "2026-06-03T10:00:00",
@@ -100,7 +101,7 @@ Authorization: Bearer <access_token>
           "id": 1,
           "environment_id": 1,
           "name": "token",
-          "value": "example-token",
+          "value": "***",
           "is_secret": true,
           "created_at": "2026-06-03T10:00:00",
           "updated_at": "2026-06-03T10:00:00"
@@ -111,6 +112,14 @@ Authorization: Bearer <access_token>
   ]
 }
 ```
+
+`is_active` 是面向前端展示的可用状态字段，当前等价于 `is_deleted=false`。敏感环境变量
+`is_secret=true` 时，列表、详情、创建/更新变量响应中的 `value` 均返回 `***`，真实值只在后端执行时解析。
+
+性能约束：环境配置列表使用 `joinedload(project/created_by/variables)` 和批量
+`count_test_cases_by_environment_ids()` 统计绑定用例数，不允许对每个环境逐条调用
+`count_test_cases_by_environment()`。该 GET 接口接入后端 10 秒短 TTL 读穿透缓存，缓存 key
+包含 DB bind、用户和项目；创建/更新/删除环境、更新变量和用例环境绑定会清理相关缓存。
 
 ## 创建环境配置
 
@@ -131,6 +140,9 @@ Authorization: Bearer <access_token>
 | base_url | string | 是 | 环境基础地址，长度 1-512 |
 | description | string/null | 否 | 环境说明 |
 | is_default | boolean | 否 | 是否默认环境，默认 `false` |
+
+成功响应返回创建后的环境配置详情对象，结构与查询环境配置详情一致，并包含 `is_active`、
+`variables` 和 `test_case_count` 字段。
 
 ### 请求示例
 

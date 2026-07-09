@@ -10,6 +10,8 @@ from app.core.response import success
 from app.models.user import User
 from app.schemas.ai import (
     AIChatRequest,
+    AIBrowserCaptureAnalyzeRequest,
+    AIBrowserCaptureBatchAnalyzeRequest,
     AIBrowserCaptureBatchGenerateRequest,
     AIBrowserCaptureGenerateRequest,
     AIBrowserCaptureRelationsRequest,
@@ -54,6 +56,29 @@ def generate_cases_from_browser_capture(project_id: int, capture_id: int, entry_
     return success(data=result, message="AI 采集草稿用例生成成功")
 
 
+@router.post("/browser-captures/analyze", summary="AI 分析未同步的浏览器采集草稿")
+def analyze_browser_capture_draft(
+    project_id: int, environment_id: int, payload: AIBrowserCaptureAnalyzeRequest,
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    result = AIBrowserCaptureService(db).analyze_draft(
+        project_id=project_id, environment_id=environment_id, payload=payload, current_user=current_user
+    )
+    return success(data=result, message="采集草稿分析完成")
+
+
+@router.post("/browser-captures/{capture_id}/entries/{entry_id}/analyze", summary="AI 分析已同步的浏览器采集草稿")
+def analyze_browser_capture_entry(
+    project_id: int, capture_id: int, entry_id: int, payload: AIBrowserCaptureAnalyzeRequest | None = None,
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    result = AIBrowserCaptureService(db).analyze_entry(
+        project_id=project_id, capture_id=capture_id, entry_id=entry_id,
+        payload=payload or AIBrowserCaptureAnalyzeRequest(), current_user=current_user,
+    )
+    return success(data=result, message="采集草稿分析完成")
+
+
 @router.post("/browser-captures/{capture_id}/generate-cases", summary="AI 批量生成浏览器采集用例")
 def generate_cases_from_browser_capture_batch(
     project_id: int, capture_id: int, payload: AIBrowserCaptureBatchGenerateRequest,
@@ -74,6 +99,17 @@ def analyze_browser_capture_relations(
         project_id=project_id, capture_id=capture_id, payload=payload, current_user=current_user
     )
     return success(data=result, message="接口依赖分析完成")
+
+
+@router.post("/browser-captures/{capture_id}/batch-analyze", summary="批量分析浏览器采集接口上下文依赖")
+def batch_analyze_browser_capture_context(
+    project_id: int, capture_id: int, payload: AIBrowserCaptureBatchAnalyzeRequest,
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    result = AIBrowserCaptureService(db).analyze_batch_context(
+        project_id=project_id, capture_id=capture_id, payload=payload, current_user=current_user
+    )
+    return success(data=result, message="批量上下文依赖分析完成")
 
 
 @router.post("/browser-captures/{capture_id}/generate-scenario", summary="生成浏览器采集场景草稿")

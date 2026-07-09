@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -22,6 +23,12 @@ from app.models.test_case import TestCase
 from app.models.user import User
 from app.models.websocket_test_case import WebSocketTestCase
 from app.schemas.ai import AIScenarioComposeRequest, AISkillRunRequest
+from app.schemas.project import (
+    ProjectEnvironmentCreateRequest,
+    ProjectEnvironmentRead,
+    ProjectEnvironmentUpdateRequest,
+    ProjectEnvironmentVariableUpsertRequest,
+)
 from app.schemas.scenario import ScenarioCreateRequest, ScenarioRunRead, ScenarioUpdateRequest
 from app.schemas.test_case import (
     AssertionConfig,
@@ -48,7 +55,9 @@ from app.services.agent_trace import (
 from app.ai_skills.registry import get_ai_skill
 from app.services.ai_skill_service import AISkillService
 from app.services.permission_service import PermissionService
+from app.services.project_service import ProjectService
 from app.services.scenario_service import ScenarioService
+from app.services.scenario_graph_validator import ScenarioGraphValidator
 from app.services.test_case_service import TestCaseService
 from app.services.test_report_service import TestReportService
 from app.services.websocket_test_case_service import WebSocketTestCaseService
@@ -69,6 +78,37 @@ AI_DRAFT_OPERATIONS = {
 
 logger = logging.getLogger(__name__)
 
+_SCENARIO_COMPOSE_TOP_LEVEL_INPUT_FIELDS = frozenset(AIScenarioComposeRequest.model_fields)
+_SCENARIO_COMPOSE_STRUCTURED_HINT_KEYS = frozenset({
+    "nodes",
+    "_scenario_context",
+    "before_actions",
+    "after_actions",
+    "datasets",
+})
+_SCENARIO_COMPOSE_STRUCTURED_REQUIREMENT = (
+    "根据已有用例创建自动化测试场景草稿，保留用户提供的节点顺序、变量提取、下游绑定、"
+    "前置后置动作和断言意图。"
+)
+_SCENARIO_COMPOSE_STRUCTURED_EXTRA_REQUIREMENTS_MAX_CHARS = 8000
+_SCENARIO_COMPOSE_DEFAULT_CANDIDATE_LIMIT = 8
+_SCENARIO_COMPOSE_FULL_CANDIDATE_LIMIT = 50
+_SCENARIO_COMPOSE_FULL_INTENT_MARKERS = (
+    "全量",
+    "全部",
+    "所有",
+    "覆盖所有",
+    "全场景",
+    "all ",
+    "all-",
+    "all_",
+    "all.",
+    "every",
+    "full",
+    "entire",
+)
+_OBJECT_REF_ID_RE = re.compile(r"/(?P<object_id>\d+)$")
+
 
 def _tool_spec_item_id(name: str, version: str) -> str:
     return f"{AGENT_TOOL_SPEC_ITEM_ID_PREFIX}://{name}/{version}"
@@ -77,6 +117,198 @@ def _tool_spec_item_id(name: str, version: str) -> str:
 def _object_reference(*, object_family: str, object_type: str, object_id: int, snapshot_id: str) -> str:
     snapshot_token = request_fingerprint({"snapshot_id": snapshot_id})[:12]
     return f"object-ref://{object_family}/{object_type}/{snapshot_token}/{object_id}"
+
+
+def _normalize_scenario_compose_input(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_input = payload.get("input") if "input" in payload else payload.get("compose_input")
+    if raw_input is None:
+        compose_input: dict[str, Any] = {}
+    elif isinstance(raw_input, str):
+        requirement = raw_input.strip()
+        if not requirement:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "agent_scenario_compose_input_invalid",
+                    "message": "scenario.compose_draft input string must not be empty",
+                },
+            )
+        compose_input = {"requirement": requirement}
+    elif isinstance(raw_input, dict):
+        compose_input = dict(raw_input)
+    else:
+        try:
+            compose_input = dict(raw_input)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "agent_scenario_compose_input_invalid",
+                    "message": "scenario.compose_draft input must be an object or a non-empty requirement string",
+                    "input_type": type(raw_input).__name__,
+                },
+            ) from exc
+
+    for field_name in _SCENARIO_COMPOSE_TOP_LEVEL_INPUT_FIELDS:
+        if field_name in payload and field_name not in compose_input:
+            compose_input[field_name] = payload[field_name]
+    _repair_structured_scenario_compose_input(compose_input)
+    return compose_input
+
+
+def _repair_structured_scenario_compose_input(compose_input: dict[str, Any]) -> None:
+    if compose_input.get("requirement"):
+        return
+    if not _looks_like_structured_scenario_compose_hint(compose_input):
+        return
+    compose_input["requirement"] = _SCENARIO_COMPOSE_STRUCTURED_REQUIREMENT
+    http_case_ids, websocket_case_ids = _scenario_case_ids_from_structured_hint(compose_input)
+    if http_case_ids and not compose_input.get("http_test_case_ids"):
+        compose_input["http_test_case_ids"] = http_case_ids
+    if websocket_case_ids and not compose_input.get("websocket_test_case_ids"):
+        compose_input["websocket_test_case_ids"] = websocket_case_ids
+    extra = _structured_scenario_compose_extra_requirements(compose_input)
+    existing_extra = compose_input.get("extra_requirements")
+    if isinstance(existing_extra, str) and existing_extra.strip():
+        compose_input["extra_requirements"] = f"{existing_extra.strip()}\n\n{extra}"
+    else:
+        compose_input["extra_requirements"] = extra
+
+
+def _looks_like_structured_scenario_compose_hint(compose_input: dict[str, Any]) -> bool:
+    return any(key in compose_input for key in _SCENARIO_COMPOSE_STRUCTURED_HINT_KEYS)
+
+
+def _scenario_case_ids_from_structured_hint(compose_input: dict[str, Any]) -> tuple[list[int], list[int]]:
+    nodes = compose_input.get("nodes")
+    if not isinstance(nodes, list):
+        return [], []
+    http_ids: list[int] = []
+    websocket_ids: list[int] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        reference = node.get("reference_id")
+        if reference is None and isinstance(node.get("test_case"), dict):
+            reference = node["test_case"].get("reference_id")
+        object_id = _object_id_from_reference(reference)
+        if object_id is None:
+            continue
+        target = websocket_ids if isinstance(reference, str) and "/websocket" in reference else http_ids
+        if object_id not in target:
+            target.append(object_id)
+    return http_ids, websocket_ids
+
+
+def _object_id_from_reference(reference: Any) -> int | None:
+    if isinstance(reference, int):
+        return reference
+    if not isinstance(reference, str):
+        return None
+    match = _OBJECT_REF_ID_RE.search(reference.strip())
+    if match is None:
+        return None
+    return int(match.group("object_id"))
+
+
+def _normalize_ai_skill_run_draft_input(raw_input: Any) -> dict[str, Any]:
+    if raw_input is None:
+        return {}
+    if isinstance(raw_input, dict):
+        return dict(raw_input)
+    if isinstance(raw_input, str):
+        text = raw_input.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "agent_ai_skill_run_input_invalid",
+                    "message": "ai_skill.run_draft input string must be a JSON object",
+                },
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "agent_ai_skill_run_input_invalid",
+                    "message": "ai_skill.run_draft input JSON must decode to an object",
+                },
+            )
+        return parsed
+    try:
+        return dict(raw_input)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "agent_ai_skill_run_input_invalid",
+                "message": "ai_skill.run_draft input must be an object or JSON object string",
+            },
+        ) from exc
+
+
+def _structured_scenario_compose_extra_requirements(compose_input: dict[str, Any]) -> str:
+    structured_hint = {
+        key: compose_input[key]
+        for key in sorted(_SCENARIO_COMPOSE_STRUCTURED_HINT_KEYS)
+        if key in compose_input
+    }
+    encoded = json.dumps(structured_hint, ensure_ascii=False, default=str, sort_keys=True)
+    if len(encoded) > _SCENARIO_COMPOSE_STRUCTURED_EXTRA_REQUIREMENTS_MAX_CHARS:
+        encoded = (
+            encoded[:_SCENARIO_COMPOSE_STRUCTURED_EXTRA_REQUIREMENTS_MAX_CHARS]
+            + "\n[structured_scenario_compose_hint_truncated]"
+        )
+    return (
+        "模型上一轮把结构化场景意图误放入 scenario.compose_draft.input。"
+        "请把以下内容作为场景编排要求参考，生成正式草稿；不要把该 JSON 原样作为保存入参：\n"
+        f"{encoded}"
+    )
+
+def _scenario_compose_requests_full_candidate_pool(compose_input: dict[str, Any]) -> bool:
+    text_parts = [
+        compose_input.get("requirement"),
+        compose_input.get("scenario_name"),
+        compose_input.get("extra_requirements"),
+    ]
+    text = "\n".join(str(part) for part in text_parts if part is not None).lower()
+    padded = f" {text} "
+    return any(marker in padded for marker in _SCENARIO_COMPOSE_FULL_INTENT_MARKERS)
+
+
+def _merge_int_lists(first: Any, second: Any) -> list[int]:
+    result: list[int] = []
+    for raw_items in (first, second):
+        if not isinstance(raw_items, list):
+            continue
+        for item in raw_items:
+            if isinstance(item, bool) or not isinstance(item, int):
+                continue
+            if item not in result:
+                result.append(item)
+    return result
+
+
+def _expand_scenario_compose_max_nodes(compose_input: dict[str, Any], candidate_ids: dict[str, list[int]]) -> None:
+    total = len(candidate_ids.get("http_test_case_ids") or []) + len(candidate_ids.get("websocket_test_case_ids") or [])
+    if total <= 0:
+        return
+    current = compose_input.get("max_nodes")
+    if not isinstance(current, int) or isinstance(current, bool) or current < total:
+        compose_input["max_nodes"] = min(total, _SCENARIO_COMPOSE_FULL_CANDIDATE_LIMIT)
+
+
+def _append_scenario_compose_extra_requirement(compose_input: dict[str, Any], requirement: str) -> None:
+    existing = compose_input.get("extra_requirements")
+    if isinstance(existing, str) and existing.strip():
+        if requirement not in existing:
+            compose_input["extra_requirements"] = f"{existing.strip()}\n{requirement}"
+        return
+    compose_input["extra_requirements"] = requirement
 
 
 @dataclass(frozen=True)
@@ -94,6 +326,30 @@ class BackendContractSpec:
 
 
 @dataclass(frozen=True)
+class ToolContextRequirementSource:
+    source_type: str
+    tool_name: str | None = None
+    artifact_type: str | None = None
+    artifact_class: str | None = None
+    scope: str = "run"
+
+
+@dataclass(frozen=True)
+class ToolContextRequirement:
+    name: str
+    sources: tuple[ToolContextRequirementSource, ...]
+    missing_error_code: str | None = None
+    missing_next_action: str | None = None
+
+    @property
+    def primary_required_tool(self) -> str | None:
+        for source in self.sources:
+            if source.tool_name:
+                return source.tool_name
+        return None
+
+
+@dataclass(frozen=True)
 class ToolSpec:
     name: str
     version: str
@@ -105,7 +361,7 @@ class ToolSpec:
     output_schema: dict[str, Any]
     backend_contract: BackendContractSpec | None = None
     backend_handler: str | None = None
-    required_successful_tool_before: str | None = None
+    required_context_requirements: tuple[ToolContextRequirement, ...] = ()
     missing_prerequisite_error_code: str | None = None
     missing_prerequisite_next_action: str | None = None
     tool_result_repair_guidance: str | None = None
@@ -276,6 +532,7 @@ class AgentToolBackend:
 
     def execute(self, *, tool_name: str, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         started = time.perf_counter()
+        trace_payload = _redact_agent_tool_payload_for_trace(tool_name=tool_name, payload=payload)
         trace_info(
             "agent_trace_tool_backend_start",
             tool_name=tool_name,
@@ -285,7 +542,7 @@ class AgentToolBackend:
         )
         trace_full_payload(
             "agent_trace_tool_backend_input_full_payload",
-            payload,
+            trace_payload,
             prefix="payload",
             mask=True,
             tool_name=tool_name,
@@ -424,6 +681,179 @@ class AgentToolBackend:
             },
         }
 
+    def _environment_query_project_configs(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        environment_id = self._resolve_environment_id(payload, project_id=project_id, allow_default=False)
+        include_variables = _optional_bool(payload, "include_variables")
+        if include_variables is None:
+            include_variables = True
+        service = ProjectService(self.db)
+        if environment_id is not None:
+            environments = [
+                service.get_environment_config(
+                    project_id=project_id,
+                    environment_id=environment_id,
+                    current_user=current_user,
+                )
+            ]
+        else:
+            environments = service.list_environment_configs(project_id=project_id, current_user=current_user)
+
+        serialized = normalize_response_data(environments)
+        if not include_variables:
+            for item in serialized:
+                if isinstance(item, dict):
+                    item.pop("variables", None)
+        environment_ids = [item.get("id") for item in serialized if isinstance(item.get("id"), int)]
+        generated_at = datetime.now(UTC).isoformat()
+        snapshot = {
+            "snapshot_id": f"environment-config-snapshot://{request_fingerprint({'project_id': project_id, 'environment_ids': environment_ids, 'generated_at': generated_at})}",
+            "object_family": "environment",
+            "project_id": project_id,
+            "generated_at": generated_at,
+            "validity_scope": "current_agent_conversation_latest_query",
+            "authoritative_for_tool_input": True,
+        }
+        object_references = [
+            {
+                "id": item["id"],
+                "object_ref": _object_reference(
+                    object_family="environment",
+                    object_type="default",
+                    object_id=item["id"],
+                    snapshot_id=snapshot["snapshot_id"],
+                ),
+                "object_type": "environment",
+                "name": item.get("name"),
+                "snapshot_id": snapshot["snapshot_id"],
+            }
+            for item in serialized
+            if isinstance(item.get("id"), int)
+        ]
+        return {
+            "project_id": project_id,
+            "environment_snapshot": snapshot,
+            "environment_ids": environment_ids,
+            "environments": serialized,
+            "object_reference_manifest": {
+                "object_family": "environment",
+                "query_tool": "environment.query_project_configs",
+                "environment_ids": environment_ids,
+                "environment_refs": [item["object_ref"] for item in object_references],
+                "snapshot_id": snapshot["snapshot_id"],
+                "object_references": object_references,
+            },
+        }
+
+    def _environment_create_config(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        try:
+            request = ProjectEnvironmentCreateRequest.model_validate(_require_dict(payload, "config"))
+        except ValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors()) from exc
+        environment = ProjectService(self.db).create_environment(
+            project_id=project_id,
+            payload=request,
+            current_user=current_user,
+        )
+        return {
+            "project_id": project_id,
+            "environment": normalize_response_data(ProjectEnvironmentRead.model_validate(environment)),
+            "operation": "created",
+        }
+
+    def _environment_update_config(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        environment_id = self._require_environment_selector(payload, project_id=project_id)
+        try:
+            request = ProjectEnvironmentUpdateRequest.model_validate(_require_dict(payload, "config"))
+        except ValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors()) from exc
+        environment = ProjectService(self.db).update_environment(
+            project_id=project_id,
+            environment_id=environment_id,
+            payload=request,
+            current_user=current_user,
+        )
+        return {
+            "project_id": project_id,
+            "environment": normalize_response_data(ProjectEnvironmentRead.model_validate(environment)),
+            "operation": "updated",
+        }
+
+    def _environment_delete_config(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        environment_id = self._require_environment_selector(payload, project_id=project_id)
+        ProjectService(self.db).delete_environment(
+            project_id=project_id,
+            environment_id=environment_id,
+            current_user=current_user,
+        )
+        return {
+            "project_id": project_id,
+            "environment_id": environment_id,
+            "operation": "deleted",
+        }
+
+    def _environment_upsert_variable(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        environment_id = self._require_environment_selector(payload, project_id=project_id, allow_default=True)
+        name = _require_str(payload, "name")
+        value = _require_str(payload, "value")
+        is_secret = _optional_bool(payload, "is_secret")
+        if is_secret is None:
+            is_secret = _looks_like_secret(name) or _looks_like_secret(value)
+        request = ProjectEnvironmentVariableUpsertRequest(
+            name=name,
+            value=value,
+            is_secret=is_secret,
+        )
+        variable = ProjectService(self.db).upsert_environment_variable(
+            project_id=project_id,
+            environment_id=environment_id,
+            payload=request,
+            current_user=current_user,
+        )
+        return {
+            "project_id": project_id,
+            "environment_id": environment_id,
+            "variable": normalize_response_data(variable),
+            "operation": "upserted",
+        }
+
+    def _environment_delete_variable(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        environment_id = self._require_environment_selector(payload, project_id=project_id)
+        variable_id = _optional_int(payload, "variable_id")
+        variable_name = _optional_str(payload, "name")
+        if variable_id is None:
+            if variable_name is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="variable_id or name is required",
+                )
+            variables = ProjectService(self.db).list_environment_variables(
+                project_id=project_id,
+                environment_id=environment_id,
+                current_user=current_user,
+            )
+            match = next((item for item in variables if item.get("name") == variable_name), None)
+            if match is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="环境变量不存在")
+            variable_id = int(match["id"])
+        ProjectService(self.db).delete_environment_variable(
+            project_id=project_id,
+            environment_id=environment_id,
+            variable_id=variable_id,
+            current_user=current_user,
+        )
+        return {
+            "project_id": project_id,
+            "environment_id": environment_id,
+            "variable_id": variable_id,
+            "operation": "deleted",
+        }
+
     def _tool_result_read_full(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         tool_call_id = _require_str(payload, "tool_call_id")
         output_path = _optional_str(payload, "path")
@@ -474,17 +904,50 @@ class AgentToolBackend:
                 project_id,
                 environment_id,
             )
-        compose_input = payload.get("input") or payload.get("compose_input") or {}
-        compose_input = dict(compose_input)
+        compose_input = _normalize_scenario_compose_input(payload)
+        full_candidate_pool = _scenario_compose_requests_full_candidate_pool(compose_input)
         if not compose_input.get("http_test_case_ids") and not compose_input.get("websocket_test_case_ids"):
-            candidate_ids = self._default_candidate_case_ids(project_id=project_id, environment_id=environment_id)
+            candidate_ids = self._default_candidate_case_ids(
+                project_id=project_id,
+                environment_id=environment_id,
+                limit=(
+                    _SCENARIO_COMPOSE_FULL_CANDIDATE_LIMIT
+                    if full_candidate_pool
+                    else _SCENARIO_COMPOSE_DEFAULT_CANDIDATE_LIMIT
+                ),
+            )
             compose_input.update(candidate_ids)
+            if full_candidate_pool:
+                _expand_scenario_compose_max_nodes(compose_input, candidate_ids)
+                _append_scenario_compose_extra_requirement(
+                    compose_input,
+                    "Full-coverage request: cover every candidate case supplied by the backend candidate pool unless the case is invalid or unavailable.",
+                )
             logger.info(
                 "agent_tool_default_scenario_candidates_selected project_id=%s environment_id=%s http_count=%s websocket_count=%s",
                 project_id,
                 environment_id,
                 len(candidate_ids["http_test_case_ids"]),
                 len(candidate_ids["websocket_test_case_ids"]),
+            )
+        elif full_candidate_pool:
+            candidate_ids = self._default_candidate_case_ids(
+                project_id=project_id,
+                environment_id=environment_id,
+                limit=_SCENARIO_COMPOSE_FULL_CANDIDATE_LIMIT,
+            )
+            compose_input["http_test_case_ids"] = _merge_int_lists(
+                compose_input.get("http_test_case_ids"),
+                candidate_ids["http_test_case_ids"],
+            )
+            compose_input["websocket_test_case_ids"] = _merge_int_lists(
+                compose_input.get("websocket_test_case_ids"),
+                candidate_ids["websocket_test_case_ids"],
+            )
+            _expand_scenario_compose_max_nodes(compose_input, candidate_ids)
+            _append_scenario_compose_extra_requirement(
+                compose_input,
+                "Full-coverage request: backend expanded the candidate id set from current project inventory; do not omit supplied candidates because of model context truncation.",
             )
         request = AISkillRunRequest(
             operation="compose",
@@ -497,7 +960,13 @@ class AgentToolBackend:
             payload=request,
             current_user=current_user,
         )
-        return {"draft": normalize_response_data(result)}
+        draft = normalize_response_data(result)
+        if isinstance(draft, dict) and isinstance(draft.get("scenario"), dict):
+            graph_result = ScenarioGraphValidator().validate_and_repair(draft["scenario"])
+            draft["scenario"] = graph_result.scenario
+            draft["graph_validation"] = graph_result.validation
+            draft["graph_repair"] = graph_result.repair
+        return {"draft": draft}
 
     def _project_environments(self, project_id: int) -> list[dict[str, Any]]:
         environments = list(
@@ -525,7 +994,70 @@ class AgentToolBackend:
         environments = self._project_environments(project_id)
         return environments[0] if environments else None
 
-    def _default_candidate_case_ids(self, *, project_id: int, environment_id: int, limit: int = 8) -> dict[str, list[int]]:
+    def _require_environment_selector(
+        self,
+        payload: dict[str, Any],
+        *,
+        project_id: int,
+        allow_default: bool = False,
+    ) -> int:
+        environment_id = self._resolve_environment_id(
+            payload,
+            project_id=project_id,
+            allow_default=allow_default,
+        )
+        if environment_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "environment_id, environment_reference, or environment_name is required. "
+                    "Call project.read_context or environment.query_project_configs first."
+                ),
+            )
+        return environment_id
+
+    def _resolve_environment_id(
+        self,
+        payload: dict[str, Any],
+        *,
+        project_id: int,
+        allow_default: bool,
+    ) -> int | None:
+        environment_id = _optional_int(payload, "environment_id")
+        if environment_id is not None:
+            return environment_id
+
+        environment_reference = _optional_str(payload, "environment_reference")
+        if environment_reference is not None:
+            object_id = _object_id_from_reference(environment_reference)
+            if object_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="environment_reference must be an object-ref returned by project.read_context or environment.query_project_configs",
+                )
+            return object_id
+
+        environment_name = _optional_str(payload, "environment_name")
+        if environment_name is not None:
+            normalized = environment_name.casefold()
+            for environment in self._project_environments(project_id):
+                if str(environment.get("name") or "").casefold() == normalized:
+                    return int(environment["id"])
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="环境不存在")
+
+        if allow_default:
+            default_environment = self._default_environment(project_id)
+            if default_environment is not None:
+                return int(default_environment["id"])
+        return None
+
+    def _default_candidate_case_ids(
+        self,
+        *,
+        project_id: int,
+        environment_id: int,
+        limit: int = _SCENARIO_COMPOSE_DEFAULT_CANDIDATE_LIMIT,
+    ) -> dict[str, list[int]]:
         http_ids = [
             item.id
             for item in self.db.scalars(
@@ -1317,7 +1849,7 @@ class AgentToolBackend:
             project_id=project_id,
             environment_id=environment_id,
             source_id=_optional_int(payload, "source_id"),
-            input=dict(payload.get("input") or {}),
+            input=_normalize_ai_skill_run_draft_input(payload.get("input")),
         )
         result = AISkillService(self.db).run_skill(
             skill_id=skill_id,
@@ -1623,6 +2155,15 @@ def _optional_int(payload: dict[str, Any], key: str) -> int | None:
     return value
 
 
+def _optional_bool(payload: dict[str, Any], key: str) -> bool | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{key} must be a boolean")
+    return value
+
+
 def _optional_int_array(payload: dict[str, Any], key: str) -> list[int] | None:
     value = payload.get(key)
     if value is None:
@@ -1704,6 +2245,43 @@ def _optional_str(payload: dict[str, Any], key: str) -> str | None:
             detail=f"{key} must be a non-empty string",
         )
     return value
+
+
+def _looks_like_secret(value: object) -> bool:
+    normalized = str(value or "").casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "authorization",
+            "auth",
+            "bearer ",
+            "cookie",
+            "jwt",
+            "password",
+            "secret",
+            "token",
+            "api_key",
+            "apikey",
+            "access_key",
+            "client_secret",
+            "lingxi-auth",
+        )
+    )
+
+
+def _redact_agent_tool_payload_for_trace(*, tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    redacted = mask_sensitive(payload)
+    if (
+        tool_name == "environment.upsert_variable"
+        and isinstance(redacted, dict)
+        and (
+            payload.get("is_secret") is True
+            or _looks_like_secret(payload.get("name"))
+            or _looks_like_secret(payload.get("value"))
+        )
+    ):
+        redacted["value"] = "***"
+    return redacted
 
 
 def _json_path_get(payload: Any, path: str | None) -> Any:
@@ -1855,6 +2433,96 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
             "required": ["project_id"],
             "properties": {"project_id": {"type": "integer"}},
         },
+        "environment_query_project_configs_input": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "environment_id": environment_id_schema,
+                "environment_reference": environment_object_reference_schema,
+                "environment_name": {
+                    "type": "string",
+                    "description": "Optional exact environment name such as test. Prefer ids/refs from the latest environment query when available.",
+                },
+                "include_variables": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Whether to include masked environment variables in the result. Secret values are always returned as ***.",
+                },
+            },
+        },
+        "environment_create_config_input": {
+            "type": "object",
+            "required": ["project_id", "config"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "config": ProjectEnvironmentCreateRequest.model_json_schema(),
+            },
+        },
+        "environment_update_config_input": {
+            "type": "object",
+            "required": ["project_id", "config"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "environment_id": environment_id_schema,
+                "environment_reference": environment_object_reference_schema,
+                "environment_name": {
+                    "type": "string",
+                    "description": "Optional exact environment name. Prefer ids/refs from the latest environment query when available.",
+                },
+                "config": ProjectEnvironmentUpdateRequest.model_json_schema(),
+            },
+        },
+        "environment_delete_config_input": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "environment_id": environment_id_schema,
+                "environment_reference": environment_object_reference_schema,
+                "environment_name": {
+                    "type": "string",
+                    "description": "Optional exact environment name. Prefer ids/refs from the latest environment query when available.",
+                },
+            },
+        },
+        "environment_upsert_variable_input": {
+            "type": "object",
+            "required": ["project_id", "name", "value"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "environment_id": environment_id_schema,
+                "environment_reference": environment_object_reference_schema,
+                "environment_name": {
+                    "type": "string",
+                    "description": "Optional exact environment name such as test. Prefer ids/refs from the latest environment query when available.",
+                },
+                "name": {"type": "string", "description": "Environment variable name, for example Lingxi-Auth."},
+                "value": {
+                    "type": "string",
+                    "description": "New variable value. For bearer tokens, include the complete value exactly as supplied by the user.",
+                },
+                "is_secret": {
+                    "type": "boolean",
+                    "description": "Whether the variable is secret. Defaults to true for auth/token/cookie-like names or values.",
+                },
+            },
+        },
+        "environment_delete_variable_input": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "environment_id": environment_id_schema,
+                "environment_reference": environment_object_reference_schema,
+                "environment_name": {
+                    "type": "string",
+                    "description": "Optional exact environment name. Prefer ids/refs from the latest environment query when available.",
+                },
+                "variable_id": {"type": "integer"},
+                "name": {"type": "string", "description": "Variable name to delete when variable_id is unavailable."},
+            },
+        },
         "tool_result_read_full_input": {
             "type": "object",
             "required": ["tool_call_id"],
@@ -1899,7 +2567,19 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                         f"{ENVIRONMENT_ID_SOURCE_RULE}."
                     ),
                 },
-                "input": AIScenarioComposeRequest.model_json_schema(),
+                "input": {
+                    "oneOf": [
+                        AIScenarioComposeRequest.model_json_schema(),
+                        {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": (
+                                "Natural language scenario composition requirement. The backend normalizes this to "
+                                "AIScenarioComposeRequest.requirement."
+                            ),
+                        },
+                    ],
+                },
             },
         },
         "scenario_query_project_scenarios_input": {
@@ -1924,18 +2604,48 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
         },
         "scenario_create_saved_input": {
             "type": "object",
-            "required": ["project_id", "scenario"],
+            "required": ["project_id"],
             "properties": {
                 "project_id": {"type": "integer"},
                 "scenario": _schema_with_environment_reference_guidance(
                     ScenarioCreateRequest.model_json_schema()
                 ),
+                "scenario_source": {
+                    "type": "object",
+                    "description": (
+                        "Reference a same-project successful scenario.compose_draft artifact instead of copying full "
+                        "draft JSON. Prefer artifact_id from active_artifact_handles; the backend "
+                        "resolves the artifact through the ToolCall ledger before approval."
+                    ),
+                    "properties": {
+                        "artifact_id": {"type": "string"},
+                        "tool_call_id": {"type": "string"},
+                        "path": {"type": "string", "default": "draft.scenario"},
+                        "output_hash": {"type": "string"},
+                    },
+                    "anyOf": [
+                        {"required": ["artifact_id", "output_hash"]},
+                        {"required": ["tool_call_id", "path", "output_hash"]},
+                    ],
+                },
+                "source_artifact": {
+                    "type": "object",
+                    "description": (
+                        "Alias of scenario_source for artifact-native saves. Prefer scenario_source unless an "
+                        "orchestrator emits the generic source_artifact envelope."
+                    ),
+                    "properties": {
+                        "artifact_id": {"type": "string"},
+                        "output_hash": {"type": "string"},
+                    },
+                    "required": ["artifact_id", "output_hash"],
+                },
                 "environment_snapshot_id": environment_snapshot_id_schema,
             },
         },
         "scenario_update_saved_input": {
             "type": "object",
-            "required": ["project_id", "scenario_id", "scenario"],
+            "required": ["project_id", "scenario_id"],
             "properties": {
                 "project_id": {"type": "integer"},
                 "scenario_id": {"type": "integer"},
@@ -1944,6 +2654,36 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 "scenario": _schema_with_environment_reference_guidance(
                     ScenarioUpdateRequest.model_json_schema()
                 ),
+                "scenario_source": {
+                    "type": "object",
+                    "description": (
+                        "Reference a same-project successful scenario.compose_draft artifact instead of copying full "
+                        "draft JSON. Prefer artifact_id from active_artifact_handles; the backend "
+                        "resolves the artifact through the ToolCall ledger before approval."
+                    ),
+                    "properties": {
+                        "artifact_id": {"type": "string"},
+                        "tool_call_id": {"type": "string"},
+                        "path": {"type": "string", "default": "draft.scenario"},
+                        "output_hash": {"type": "string"},
+                    },
+                    "anyOf": [
+                        {"required": ["artifact_id", "output_hash"]},
+                        {"required": ["tool_call_id", "path", "output_hash"]},
+                    ],
+                },
+                "source_artifact": {
+                    "type": "object",
+                    "description": (
+                        "Alias of scenario_source for artifact-native updates. Prefer scenario_source unless an "
+                        "orchestrator emits the generic source_artifact envelope."
+                    ),
+                    "properties": {
+                        "artifact_id": {"type": "string"},
+                        "output_hash": {"type": "string"},
+                    },
+                    "required": ["artifact_id", "output_hash"],
+                },
                 "environment_snapshot_id": environment_snapshot_id_schema,
             },
         },
@@ -1956,7 +2696,10 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 "source_id": {"type": "integer"},
                 "skill_id": {"type": "string", "enum": sorted(AI_DRAFT_OPERATIONS)},
                 "operation": {"type": "string"},
-                "input": {"type": "object"},
+                "input": {
+                    "oneOf": [{"type": "object"}, {"type": "string"}],
+                    "description": "AI skill input object. A JSON-encoded object string is accepted for model repair tolerance.",
+                },
             },
         },
         "scenario_execute_dry_run_input": {
@@ -2233,6 +2976,128 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
             ),
             backend_handler="_project_read_context",
         ),
+        "environment.query_project_configs": ToolSpec(
+            name="environment.query_project_configs",
+            version="1.0.0",
+            summary="Read project environment configs and masked variables for environment planning or updates.",
+            side_effect_class="read_only",
+            replay_policy="reuse_allowed",
+            required_permissions=(ProjectPermission.VIEW_ENVIRONMENT.value,),
+            input_schema=schemas["environment_query_project_configs_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="project-service",
+                backend_operation="environment.query_project_configs",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["environment_query_project_configs_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_environment_query_project_configs",
+        ),
+        "environment.create_config": ToolSpec(
+            name="environment.create_config",
+            version="1.0.0",
+            summary="Create a project environment config through ProjectService. Requires human approval.",
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_ENVIRONMENT.value,),
+            input_schema=schemas["environment_create_config_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="project-service",
+                backend_operation="environment.create_config",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["environment_create_config_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_environment_create_config",
+            tool_result_repair_guidance="该工具会新增环境配置，必须等待用户审批；审批前不要声称已创建。",
+        ),
+        "environment.update_config": ToolSpec(
+            name="environment.update_config",
+            version="1.0.0",
+            summary="Update a project environment config through ProjectService. Requires human approval.",
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_ENVIRONMENT.value,),
+            input_schema=schemas["environment_update_config_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="project-service",
+                backend_operation="environment.update_config",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["environment_update_config_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_environment_update_config",
+            tool_result_repair_guidance="该工具会修改环境配置，必须等待用户审批；审批前不要声称已更新。",
+        ),
+        "environment.delete_config": ToolSpec(
+            name="environment.delete_config",
+            version="1.0.0",
+            summary="Delete a project environment config through ProjectService. Requires human approval.",
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_ENVIRONMENT.value,),
+            input_schema=schemas["environment_delete_config_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="project-service",
+                backend_operation="environment.delete_config",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["environment_delete_config_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_environment_delete_config",
+            tool_result_repair_guidance="该工具会删除环境配置，必须等待用户审批；审批前不要声称已删除。",
+        ),
+        "environment.upsert_variable": ToolSpec(
+            name="environment.upsert_variable",
+            version="1.0.0",
+            summary="Create or update a project environment variable such as Lingxi-Auth. Secret values are masked in outputs. Requires human approval.",
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_ENVIRONMENT.value,),
+            input_schema=schemas["environment_upsert_variable_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="project-service",
+                backend_operation="environment.upsert_variable",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["environment_upsert_variable_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_environment_upsert_variable",
+            tool_result_repair_guidance=(
+                "该工具会新增或更新环境变量，必须等待用户审批；审批前不要声称已更新。"
+                "认证、Token、Cookie、密码类变量必须设置 is_secret=true，最终回复不得回显明文。"
+            ),
+        ),
+        "environment.delete_variable": ToolSpec(
+            name="environment.delete_variable",
+            version="1.0.0",
+            summary="Delete a project environment variable by id or exact name. Requires human approval.",
+            side_effect_class="business_update",
+            replay_policy="require_revalidation",
+            required_permissions=(ProjectPermission.MANAGE_ENVIRONMENT.value,),
+            input_schema=schemas["environment_delete_variable_input"],
+            output_schema={"type": "object"},
+            backend_contract=BackendContractSpec(
+                backend_name="project-service",
+                backend_operation="environment.delete_variable",
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(schemas["environment_delete_variable_input"]),
+                output_schema_hash=request_fingerprint({"type": "object"}),
+            ),
+            backend_handler="_environment_delete_variable",
+            tool_result_repair_guidance="该工具会删除环境变量，必须等待用户审批；审批前不要声称已删除。",
+        ),
         "tool_result.read_full": ToolSpec(
             name="tool_result.read_full",
             version="1.0.0",
@@ -2300,7 +3165,35 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 output_schema_hash=request_fingerprint({"type": "object"}),
             ),
             backend_handler="_scenario_compose_draft",
-            required_successful_tool_before="testcase.query_project_cases",
+            required_context_requirements=(
+                ToolContextRequirement(
+                    name="case_inventory_context",
+                    sources=(
+                        ToolContextRequirementSource(
+                            source_type="fresh_tool_execution",
+                            tool_name="testcase.query_project_cases",
+                            scope="run",
+                        ),
+                        ToolContextRequirementSource(
+                            source_type="run_artifact",
+                            artifact_type="test_case_query_snapshot",
+                            artifact_class="AUTHORITATIVE",
+                            scope="run",
+                        ),
+                        ToolContextRequirementSource(
+                            source_type="conversation_artifact",
+                            artifact_type="test_case_query_snapshot",
+                            artifact_class="AUTHORITATIVE",
+                            scope="conversation",
+                        ),
+                    ),
+                    missing_error_code="scenario_compose_requires_case_query",
+                    missing_next_action=(
+                        "Call testcase.query_project_cases for the current project, then use the returned "
+                        "test case ids when calling scenario.compose_draft."
+                    ),
+                ),
+            ),
             missing_prerequisite_error_code="scenario_compose_requires_case_query",
             missing_prerequisite_next_action=(
                 "Call testcase.query_project_cases for the current project, then use the returned "
@@ -2443,8 +3336,9 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
             ),
             backend_handler="_testcase_query_project_cases",
             tool_result_repair_guidance=(
-                "如果 compact view 仍缺少需要的字段，先调用 tool_result.read_full 读取该 ToolCall 的已脱敏完整输出。"
-                "批量执行或批量保存断言前必须重新以 detail_level=execution_ready 查询目标集合。"
+                "如果 compact view 仍缺少需要的字段，重新调用 testcase.query_project_cases，"
+                "并显式传入 test_case_ids/websocket_test_case_ids 与 detail_level=selected/assertions/execution_ready。"
+                "模型路径不要读取完整 ToolCall 输出；完整账本只供后端 Runtime 或前端详情查看。"
             ),
         ),
         "testcase.execute_saved": ToolSpec(

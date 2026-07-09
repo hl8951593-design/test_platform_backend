@@ -1,8 +1,13 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.core.sensitive_data import mask_sensitive
+
+
+AGENT_RUN_DEFAULT_MAX_ITERATIONS = 12
+AGENT_RUN_MAX_ITERATIONS = 20
 
 RunStatus = Literal[
     "queued",
@@ -62,7 +67,7 @@ class AgentRunCreateRequest(BaseModel):
     project_id: int = Field(description="项目 ID")
     intent: str = Field(min_length=1, max_length=4000, description="用户目标")
     conversation_id: str | None = Field(default=None, max_length=64)
-    max_iterations: int = Field(default=3, ge=1, le=10)
+    max_iterations: int = Field(default=AGENT_RUN_DEFAULT_MAX_ITERATIONS, ge=1, le=AGENT_RUN_MAX_ITERATIONS)
     auto_complete: bool = Field(default=False, description="后端 smoke/debug 用；普通 Agent 对话必须保持 false 并走模型流式生成")
 
 
@@ -387,6 +392,11 @@ class AgentToolCallRead(BaseModel):
     recent_reconcile_attempts: list["AgentReconcileAttemptRead"] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("input_json_redacted", "output_json_redacted", mode="before")
+    @classmethod
+    def mask_protected_json(cls, value: Any) -> Any:
+        return mask_sensitive(value)
 
 
 class AgentCapabilitiesRead(BaseModel):

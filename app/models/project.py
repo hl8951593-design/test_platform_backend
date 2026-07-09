@@ -33,6 +33,7 @@ class ProjectMember(Base):
     __table_args__ = (
         UniqueConstraint("project_id", "user_id", name="uq_project_members_project_user"),
         Index("ix_project_members_user_active_project", "user_id", "is_active", "project_id"),
+        Index("ix_project_members_project_active_id", "project_id", "is_active", "id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)

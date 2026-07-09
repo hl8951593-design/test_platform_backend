@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user, get_db
 from app.core.permissions import ProjectPermission
+from app.core.read_response_cache import read_response_cache
 from app.core.response import success
 from app.models.user import User
 from app.schemas.project import (
@@ -13,7 +14,6 @@ from app.schemas.project import (
     ProjectEnvironmentVariableUpsertRequest,
     ProjectEnvironmentUpdateRequest,
     ProjectMemberGrantRequest,
-    ProjectRead,
     ProjectUpdateRequest,
 )
 from app.services.project_service import ProjectService
@@ -33,8 +33,10 @@ def create_project(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    project = ProjectService(db).create(payload, current_user)
-    return success(data=ProjectRead.model_validate(project), message="项目创建成功")
+    service = ProjectService(db)
+    project = service.create(payload, current_user)
+    read_response_cache.clear_prefix(("projects",))
+    return success(data=service.build_project_read(project), message="项目创建成功")
 
 
 @router.get("", summary="查询当前用户可见项目列表")
@@ -42,8 +44,14 @@ def list_projects(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    projects = ProjectService(db).list_visible_projects(current_user)
-    return success(data=[ProjectRead.model_validate(project) for project in projects])
+    cache_key = ("projects", id(db.get_bind()), current_user.id, bool(current_user.is_admin))
+
+    def build_response():
+        service = ProjectService(db)
+        visible_projects = service.list_visible_projects(current_user)
+        return success(data=service.build_project_reads(visible_projects))
+
+    return read_response_cache.get_or_set(cache_key, build_response)
 
 
 @router.get("/{project_id}", summary="查询项目详情")
@@ -52,8 +60,9 @@ def get_project(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    project = ProjectService(db).get_visible_project(project_id, current_user)
-    return success(data=ProjectRead.model_validate(project))
+    service = ProjectService(db)
+    project = service.get_visible_project(project_id, current_user)
+    return success(data=service.build_project_read(project))
 
 
 @router.put("/{project_id}", summary="更新项目")
@@ -63,8 +72,10 @@ def update_project(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    project = ProjectService(db).update(project_id, payload, current_user)
-    return success(data=ProjectRead.model_validate(project), message="项目更新成功")
+    service = ProjectService(db)
+    project = service.update(project_id, payload, current_user)
+    read_response_cache.clear_prefix(("projects",))
+    return success(data=service.build_project_read(project), message="项目更新成功")
 
 
 @router.delete("/{project_id}", summary="删除项目")
@@ -74,6 +85,11 @@ def delete_project(
     current_user: User = Depends(get_current_user),
 ):
     ProjectService(db).delete(project_id, current_user)
+    read_response_cache.clear_prefix(("projects",))
+    read_response_cache.clear_prefix(("environment_configs",))
+    read_response_cache.clear_prefix(("test_cases",))
+    read_response_cache.clear_prefix(("websocket_test_cases",))
+    read_response_cache.clear_prefix(("notifications",))
     return success(message="项目删除成功")
 
 
@@ -90,6 +106,7 @@ def grant_normal_tester_permissions(
         permission_codes=payload.permission_codes,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("projects",))
     return success(data=member, message="项目成员权限已更新")
 
 
@@ -115,6 +132,8 @@ def create_project_environment(
         payload=payload,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("environment_configs",))
+    read_response_cache.clear_prefix(("projects",))
     return success(data=ProjectEnvironmentRead.model_validate(environment), message="项目环境创建成功")
 
 
@@ -132,6 +151,8 @@ def update_project_environment(
         payload=payload,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("environment_configs",))
+    read_response_cache.clear_prefix(("projects",))
     return success(data=ProjectEnvironmentRead.model_validate(environment), message="项目环境更新成功")
 
 
@@ -147,6 +168,10 @@ def delete_project_environment(
         environment_id=environment_id,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("environment_configs",))
+    read_response_cache.clear_prefix(("projects",))
+    read_response_cache.clear_prefix(("test_cases",))
+    read_response_cache.clear_prefix(("websocket_test_cases",))
     return success(message="项目环境删除成功")
 
 
@@ -179,6 +204,7 @@ def upsert_project_environment_variable(
         payload=payload,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("environment_configs",))
     return success(data=ProjectEnvironmentVariableRead.model_validate(variable), message="项目环境变量已保存")
 
 
@@ -196,4 +222,5 @@ def delete_project_environment_variable(
         variable_id=variable_id,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("environment_configs",))
     return success(message="项目环境变量已删除")

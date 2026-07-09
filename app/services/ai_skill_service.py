@@ -11,6 +11,8 @@ from app.schemas.ai import (
     AIGeneratedScenarioResponse,
     AIGeneratedTestCaseResponse,
     AIGeneratedWebSocketTestCaseResponse,
+    AIHttpTestCaseDescriptionSummaryRequest,
+    AIHttpTestCaseDescriptionSummaryResponse,
     AIScenarioComposeRequest,
     AISkillOperationRead,
     AISkillRead,
@@ -30,6 +32,8 @@ _SCHEMA_TYPES = {
     "AITestCaseGenerateRequest": AITestCaseGenerateRequest,
     "AITestCaseExpandRequest": AITestCaseExpandRequest,
     "AIGeneratedTestCaseResponse": AIGeneratedTestCaseResponse,
+    "AIHttpTestCaseDescriptionSummaryRequest": AIHttpTestCaseDescriptionSummaryRequest,
+    "AIHttpTestCaseDescriptionSummaryResponse": AIHttpTestCaseDescriptionSummaryResponse,
     "AIWebSocketTestCaseGenerateRequest": AIWebSocketTestCaseGenerateRequest,
     "AIWebSocketTestCaseExpandRequest": AIWebSocketTestCaseExpandRequest,
     "AIGeneratedWebSocketTestCaseResponse": AIGeneratedWebSocketTestCaseResponse,
@@ -58,7 +62,12 @@ class AISkillService:
         payload: AISkillRunRequest,
         current_user: User,
         trace: AIRunTrace | None = None,
-    ) -> AIGeneratedTestCaseResponse | AIGeneratedWebSocketTestCaseResponse | AIGeneratedScenarioResponse:
+    ) -> (
+        AIGeneratedTestCaseResponse
+        | AIHttpTestCaseDescriptionSummaryResponse
+        | AIGeneratedWebSocketTestCaseResponse
+        | AIGeneratedScenarioResponse
+    ):
         self._ensure_operation(skill_id, payload.operation)
         if skill_id == "http-test-case":
             return self._run_http_test_case(payload, current_user, trace)
@@ -91,6 +100,15 @@ class AISkillService:
                 test_case_id=source_id,
                 environment_id=payload.environment_id,
                 payload=self._validate_input(AITestCaseExpandRequest, payload.input),
+                current_user=current_user,
+                trace=trace,
+            )
+        if payload.operation == "summarize_description":
+            return service.summarize_description(
+                project_id=payload.project_id,
+                environment_id=payload.environment_id,
+                source_id=payload.source_id,
+                payload=self._validate_input(AIHttpTestCaseDescriptionSummaryRequest, payload.input),
                 current_user=current_user,
                 trace=trace,
             )

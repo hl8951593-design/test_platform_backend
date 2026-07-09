@@ -153,7 +153,7 @@ prompts/
 
 | Skill ID | 协议 | 能力 |
 | --- | --- | --- |
-| `http-test-case` | HTTP | 接口测试用例生成、扩写 |
+| `http-test-case` | HTTP | 接口测试用例生成、扩写、描述总结 |
 | `websocket-test-case` | WebSocket | WebSocket 测试用例生成、扩写 |
 | `scenario-composer` | Mixed | 从候选 HTTP/WebSocket 用例智能组合场景草稿 |
 
@@ -219,7 +219,7 @@ prompts/
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| operation | string | 是 | skill operation，例如 `generate`、`expand` |
+| operation | string | 是 | skill operation，例如 `generate`、`expand`、`summarize_description` |
 | project_id | integer | 是 | 当前项目 ID |
 | environment_id | integer/null | 否 | 当前环境 ID。生成类 operation 通常必填；扩写类不传时使用源用例环境 |
 | source_id | integer/null | 否 | 源资源 ID。扩写测试用例时为源测试用例 ID |
@@ -255,6 +255,68 @@ HTTP 用例扩写示例：
   }
 }
 ```
+
+HTTP 用例描述总结示例：
+
+```json
+{
+  "operation": "summarize_description",
+  "project_id": 1,
+  "environment_id": 4,
+  "source_id": 7,
+  "input": {
+    "mode": "request_response",
+    "test_case_id": 7,
+    "name": "获取企业列表",
+    "protocol": "http",
+    "environment_id": 4,
+    "environment_ids": [4],
+    "request": {
+      "environment_id": 4,
+      "environment_ids": [4],
+      "method": "GET",
+      "path": "/api/enterprise/list",
+      "headers": {},
+      "query_params": {},
+      "body_type": "none",
+      "body": null,
+      "assertions": [],
+      "extractors": []
+    },
+    "response": {
+      "status": "passed",
+      "status_code": 200,
+      "duration_ms": 785,
+      "headers": "{\"content-type\":\"application/json\"}",
+      "body": "{\"code\":200,\"data\":{}}",
+      "assertions": "pass",
+      "error_message": null,
+      "created_at": "2026-07-09T08:02:53"
+    }
+  }
+}
+```
+
+`summarize_description` 返回结构：
+
+```json
+{
+  "code": 0,
+  "message": "AI Skill 执行成功",
+  "data": {
+    "description": "该接口通过 POST 分页查询企业列表，请求体包含企业编码、分页参数和客户端信息。调试结果 HTTP 200 且业务 code=200，msg 表示操作成功。响应结构：body字段：msg、code、data.total、data.dataList[]；data.dataList[]项字段：esDt、uscNo、regAddr、isFollow。",
+    "source_summary": "request_response",
+    "warnings": []
+  }
+}
+```
+
+说明：
+
+- `mode=request` 表示只根据请求配置生成描述；`mode=request_response` 表示结合调试响应生成描述。
+- `description` 是写入测试用例 `description` 字段的草稿，后端不会在该接口中自动保存。
+- 后端会在调用 AI 前对鉴权头、Token、Cookie、Secret 等敏感字段脱敏。
+- 为兼容早期前端，后端会容忍模型返回 `summary`、`content`、`text`，但 API 响应固定归一为 `description`、`source_summary`、`warnings`。
 
 智能场景组合示例：
 

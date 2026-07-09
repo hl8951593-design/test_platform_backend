@@ -1,4 +1,4 @@
-# 为测试平台设计自研 Harness+Loop Agent 架构（四次修正版：组合尺度与治理闭环版）
+﻿# 为测试平台设计自研 Harness+Loop Agent 架构（四次修正版：组合尺度与治理闭环版）
 
 ## 1. 执行摘要
 
@@ -24,7 +24,7 @@ Recovery  能从中断、超时、未知提交状态中恢复
 
 真实用例执行是当前允许进入 Agent 的 `execution_record` 副作用边界：`testcase.execute_saved`、`testcase.batch_execute`、`websocket_testcase.execute_saved` 与 `websocket_testcase.batch_execute` 只通过现有 HTTP/WebSocket 用例 Service 创建执行记录，执行时复用 `test:execute` 权限、ToolCall 账本和 `require_revalidation` 策略。AgentRuntime 在调用 backend handler 前注入当前 `run_id` 与 `tool_call_id`，Service 写入业务执行记录的 `trigger_source=agent`、`agent_run_id`、`agent_tool_call_id`、`trigger_tool_name`；人工/API 手动执行默认保留 `trigger_source=manual`，从而让执行中心、审计和报表能区分 AI 代用户执行与用户自行点击执行。
 
-场景组合是该闭环的首个 query-first 业务 recipe：用户要求创建、生成或组合测试场景时，包括中文“场景组合 / 测试场景组合”这类短语，模型必须先调用 `testcase.query_project_cases` 获取当前项目全量 HTTP/WebSocket 用例，再基于返回的真实 case id 调用 `scenario.compose_draft`。该 recipe 的可扩展配置分两层：`scenario-composition/SKILL.md` 的私有 `routing_required_tool_after_success` 负责 query 成功后漏 compose 的静默修复，`scenario.compose_draft` 的 ToolSpec 私有 `required_successful_tool_before` 负责执行前顺序校验。如果模型在没有成功 query 结果的同一 run 内直接请求 `scenario.compose_draft`，Harness 不执行下游 AISkill，而是创建可审计 ToolCall、写入 `tool.failed` / `tool.result_observed` 与 `scenario_compose_requires_case_query`，把失败结果回灌给模型继续规划；如果 query 已成功且存在候选用例但模型只输出分析没有 compose，Harness 写入 `model.required_tool_missing(after_tool, required_tool)` 并静默修复为 `scenario.compose_draft` 请求，直到 query -> compose -> final answer 或达到迭代上限；若达到上限后仍需最终总结，Runner 必须在 `final_summary` 前写入 stop 用 ContextBuild 与 `loop.observed(RC_MAX_ITERATIONS)`，把 `max_iterations` 记录为 Resource / Limit RootCause。保存/持久化是独立副作用 guardrail：疑似保存请求会先经结构化语义分类，分类 prompt 来自 Skill 私有资源但进入模型前必须受 `AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_MAX_CHARS` 硬上限保护；只有确认用户要把草稿持久化为正式实体且 ToolRegistry 尚无保存工具时，Runner 才直接说明不能保存并完成 run；“不要保存/仅生成草稿”的请求继续走 query-first 组合，不被保存 guard 短路。
+场景组合是该闭环的首个 query-first 业务 recipe：用户要求创建、生成或组合测试场景时，包括中文“场景组合 / 测试场景组合”这类短语，模型必须先调用 `testcase.query_project_cases` 获取当前项目全量 HTTP/WebSocket 用例，再基于返回的真实 case id 调用 `scenario.compose_draft`。该 recipe 的可扩展配置分两层：`scenario-composition/SKILL.md` 的私有 `routing_required_tool_after_success` 负责 query 成功后漏 compose 的静默修复，`scenario.compose_draft` 的 ToolSpec 私有 `required_context_requirements` 负责执行前顺序校验。如果模型在没有成功 query 结果的同一 run 内直接请求 `scenario.compose_draft`，Harness 不执行下游 AISkill，而是创建可审计 ToolCall、写入 `tool.failed` / `tool.result_observed` 与 `scenario_compose_requires_case_query`，把失败结果回灌给模型继续规划；如果 query 已成功且存在候选用例但模型只输出分析没有 compose，Harness 写入 `model.required_tool_missing(after_tool, required_tool)` 并静默修复为 `scenario.compose_draft` 请求，直到 query -> compose -> final answer 或达到迭代上限；若达到上限后仍需最终总结，Runner 必须在 `final_summary` 前写入 stop 用 ContextBuild 与 `loop.observed(RC_MAX_ITERATIONS)`，把 `max_iterations` 记录为 Resource / Limit RootCause。保存/持久化是独立副作用 guardrail：疑似保存请求会先经结构化语义分类，分类 prompt 来自 Skill 私有资源但进入模型前必须受 `AGENT_UNSUPPORTED_CAPABILITY_CLASSIFIER_PROMPT_MAX_CHARS` 硬上限保护；只有确认用户要把草稿持久化为正式实体且 ToolRegistry 尚无保存工具时，Runner 才直接说明不能保存并完成 run；“不要保存/仅生成草稿”的请求继续走 query-first 组合，不被保存 guard 短路。
 
 unsupported capability classifier 调用失败、返回非 JSON 或返回长 `reason` 时不得把 provider/HTTP 长错误、长响应或模型长 reason 原样写入日志：`agent_unsupported_capability_classification_failed` / `agent_unsupported_capability_classification_invalid_json` / `agent_unsupported_capability_classified` 只记录短文本或 `agent_error_message_summary_v1` 有界摘要，`full_error_reference=AgentConversationRunner.unsupported_capability_classifier`、`AgentConversationRunner.unsupported_capability_classifier.invalid_json` 或 `AgentConversationRunner.unsupported_capability_classifier.reason`；分类失败或解析失败后 guard 视为未触发，成功分类则按 guard 结果继续路径，不新增前端事件或 response 字段；若 classifier 调用期间 run 被 Stop/cancel，Runner 必须保持 `cancelled`，不得继续写 guard synthetic completion 或 `run.completed`。
 
@@ -33,11 +33,13 @@ unsupported capability classifier 调用失败、返回非 JSON 或返回长 `re
 Required Agent initial tool prompt contract:
 
 ```text
-tool_fields=approval_required,input_schema,name,side_effect_class,summary
-private_tool_fields=backend_handler,required_successful_tool_before,missing_prerequisite_error_code,missing_prerequisite_next_action,tool_result_repair_guidance
+tool_fields=approval_required,name,side_effect_class,summary
+tool_contract_fields=name,input_summary
+private_tool_fields=backend_handler,required_context_requirements,missing_prerequisite_error_code,missing_prerequisite_next_action,tool_result_repair_guidance
 excluded_full_manifest_fields=version,replay_policy,required_permissions,output_schema,backend_contract,schema_hash,manifest_hash
-tool_source=ToolRegistry.list_specs
+tool_source=ToolRegistry.list_specs minus MODEL_PRIVATE_TOOL_NAMES
 prompt_source=_conversation_system_prompt
+tool_contract_source=_tool_contract_context_message
 serialization=json.dumps_sort_keys_compact
 ```
 
@@ -251,7 +253,7 @@ Required Agent capabilities payload contract:
 ```text
 fields=run_statuses,tool_call_statuses,effect_submission_states,backend_effect_capabilities,approval_statuses,migration_block_statuses,tools
 tool_fields=item_id,name,version,summary,side_effect_class,replay_policy,required_permissions,input_schema,output_schema,backend_contract,schema_hash,manifest_hash
-private_tool_fields=backend_handler,required_successful_tool_before,missing_prerequisite_error_code,missing_prerequisite_next_action,tool_result_repair_guidance
+private_tool_fields=backend_handler,required_context_requirements,missing_prerequisite_error_code,missing_prerequisite_next_action,tool_result_repair_guidance
 source=AgentCapabilitiesRead
 tool_source=ToolSpec.to_json
 tool_item_prefix=agent-tool-spec
@@ -283,7 +285,7 @@ source=AgentConversationSmokeRead
 | ContextBuilder | 组装当前轮模型输入，并记录 context_build_id | 不绕过 ContextBudget |
 | ContextBudget | 管理单次 run 内 token 预算、压缩、降级记录 | 不静默丢弃证据 |
 | EvidenceRefResolver | 解析 evidence_refs，判断资源可变性、冻结条件、freshness policy，并筛选 active policy refs | 不让历史追溯证据永久污染 replay_policy |
-| ToolRegistry | 生成 ToolSpec 候选集合，并为内置工具声明后端私有 `backend_handler` 供 `AgentToolBackend` 分发；需要顺序校验的工具可声明 `required_successful_tool_before`；需要工具结果质量闭环差异化建议的工具可声明 `tool_result_repair_guidance` | 不在历史 run 中动态读取最新 tool 定义；不把 `backend_handler`、前置工具或结果修复 guidance 私有字段暴露给模型初始工具清单或前端契约 |
+| ToolRegistry | 生成 ToolSpec 候选集合，并为内置工具声明后端私有 `backend_handler` 供 `AgentToolBackend` 分发；需要顺序校验的工具可声明 `required_context_requirements`；需要工具结果质量闭环差异化建议的工具可声明 `tool_result_repair_guidance` | 不在历史 run 中动态读取最新 tool 定义；不把 `backend_handler`、前置工具或结果修复 guidance 私有字段暴露给模型初始工具清单或前端契约 |
 | ExecutionLedger | 记录每次 tool call 的幂等键、状态、effect submission state、结果 | 不承担 UI 展示 |
 | WorkerQueue | 负责排队、租约、心跳、孤儿扫描 | 不做业务事实源 |
 | ToolExecutor | 执行 tool、回写 ledger、写 event | 不跳过 execute-time 权限校验 |
@@ -2993,7 +2995,7 @@ Required RuntimeSnapshot entity payload contract:
 ```text
 fields=item_id,snapshot_id,project_id,created_by,runtime_hash,tool_registry_hash,manifest_bundle_hash,prompt_bundle_hash,policy_version_hash,tools_json,manifests_json,adapters_json,policies_json,created_at
 tool_fields=item_id,name,version,summary,side_effect_class,replay_policy,required_permissions,input_schema,output_schema,backend_contract,schema_hash,manifest_hash
-private_tool_fields=backend_handler,required_successful_tool_before,missing_prerequisite_error_code,missing_prerequisite_next_action,tool_result_repair_guidance
+private_tool_fields=backend_handler,required_context_requirements,missing_prerequisite_error_code,missing_prerequisite_next_action,tool_result_repair_guidance
 source=AgentRuntimeSnapshotRead
 runtime_snapshot_item_prefix=agent-runtime-snapshot
 tool_item_prefix=agent-tool-spec
@@ -3059,6 +3061,91 @@ degraded_event=context.degraded
 degraded_event_fields=schema_version,run_id,project_id,event_seq,event_type,occurred_at,context_build_id,degradation,context_window
 source=ContextBuilder.build
 codex_alignment=ContextWindowTokenStatus
+```
+
+Required Agent model context budget contract:
+
+```text
+schema_version=agent_model_context_budget_v1
+budget_scope=agent_model_context
+budget_event=context.model_budget_compacted
+started_payload_field=context_budget
+budget_fields=schema_version,phase,budget_scope,budget_limit_units,budget_limit_reached,compacted,compacted_layers,estimated_input_units_before,estimated_input_units_after,layer_budgets,layer_actual_units_before,layer_actual_units_after,source
+layer_budget_keys=static,tool_catalog,skill_catalog,skill,memory,history,tool_result,tool_request_context,task,run_context,working_context,total
+compaction_order=history,working_context,memory,tool_result,tool_request_context,skill,skill_catalog,tool_catalog
+source=AgentConversationRunner._stream_model_response
+codex_alignment=ContextWindowTokenStatus
+```
+
+Required Agent artifact native scenario source contract:
+
+```text
+source_input_fields=scenario_source,source_artifact
+preferred_source_fields=artifact_id,output_hash
+legacy_source_fields=tool_call_id,path,output_hash
+artifact_type=scenario_draft
+artifact_manifest_schema=active_artifact_handles
+artifact_id_prefix=agent-tool-artifact
+resolved_input_metadata=scenario_draft_source
+resolved_metadata_fields=source,run_id,tool_call_id,path,output_hash,artifact_id,artifact_type
+active_action_schema=active_artifact_action_v1
+active_action_fields=artifact_type,domain,action,tool_name,artifact_id,source_tool_call_id,output_hash,artifact_summary,tool_input_hint,routing_hint,after_save_actions
+active_action_tool=scenario.create_saved
+active_action_input_hint=scenario_source
+skill_routing_hint_source=active_artifact_action
+stale_unsupported_save_assistant_filtered=true
+model_must_not_copy_full_scenario_json=true
+source=AgentConversationRunner._scenario_from_explicit_source
+```
+
+Required Agent scenario compose input normalization contract:
+
+```text
+tool_name=scenario.compose_draft
+input_field=input
+accepted_input_shapes=AIScenarioComposeRequest,string
+string_normalization=requirement
+top_level_promoted_fields=AIScenarioComposeRequest.model_fields
+invalid_input_error_code=agent_scenario_compose_input_invalid
+must_not_raise_python_dict_value_error=true
+source=AgentToolBackend._scenario_compose_draft
+```
+
+Required Agent deterministic input repair contract:
+
+```text
+repair_engine=deterministic_tool_input_repair_v1
+repair_event=tool.input_repaired
+repair_event_fields=tool_call_id,tool_name,repair_engine,strategy,input_hash_before,input_hash_after
+strategy=hoist_nested_scenario_snapshot_fields
+metric=agent_runtime_input_repair_total
+source=DeterministicToolInputRepairEngine
+```
+
+Required Agent skill router contract:
+
+```text
+route_entity=AgentSkillRoute
+route_fields=primary_skill,supporting_skills,confidence,score,runner_mode,selected_skill_names,model_view
+default_supporting_skills=false
+model_context_source=AgentSkillRegistry.route_for_intent
+tool_contract_source=_tool_contract_tool_names_for_intent
+enterprise_scenario_primary_skill=scenario-composition
+scenario_execution_followup_primary_skill=scenario-composition
+scenario_execution_followup_tools=scenario.query_project_scenarios,scenario.execute_dry_run
+scenario_historical_report_primary_skill=report-summary
+```
+
+Required Agent scenario creation state machine contract:
+
+```text
+state_machine=CREATE_SCENARIO
+state_machine_version=scenario_creation_state_machine_v1
+event=scenario.state_transition
+states=START,CHECK_CONTEXT,QUERY_CASES,COMPOSE_DRAFT,VALIDATE,SAVE_PENDING_APPROVAL,EXECUTE,SUMMARY,END
+tool_state_mapping=project.read_context:CHECK_CONTEXT,testcase.query_project_cases:QUERY_CASES,scenario.compose_draft:COMPOSE_DRAFT,scenario.create_saved:SAVE_PENDING_APPROVAL,scenario.update_saved:SAVE_PENDING_APPROVAL,scenario.execute_dry_run:EXECUTE
+terminal_states=SUMMARY,END
+source=ExecutionLedgerService.create_tool_call,AgentRuntimeService.complete_run
 ```
 
 `ContextBuilder.build_metadata_json` 必须保留 active `policy_refs`，并补充本轮 Codex-style Agent Skill 决策摘要、RuntimeSnapshot 摘要与 permission context 摘要：`selected_agent_skills` 只包含 Skill `name` 与 `skill_hash`；`matched_agent_skill_routing_rules` 只包含命中的 routing rule 摘要，例如 `skill_name`、`routing_key`、`after_tool`、`required_tool`、`min_total_fields` 与 `rule_hash`；`runtime_snapshot` 只包含 `snapshot_id`、`runtime_hash`、`tool_registry_hash`、`manifest_bundle_hash`、`prompt_bundle_hash`、`policy_version_hash`、`available_tool_names` 与 `tool_count`；`permission_context` 只包含 `actor_user_id`、`project_id`、`access_level`、`project_access`、`implicit_all_project_permissions`、`explicit_permission_codes`、`explicit_permission_count` 与 `permission_hash`。不得把私有 frontmatter 原文、Skill 正文、Skill-local 私有 prompt 资源、完整 tools schema、manifest bundle、用户资料或完整授权表写入可读 payload。`LoopObservation.decision_context_build_id` 指向的 ContextBuild 必须能解释 required-tool follow-up 等静默修复的 Skill 规则来源，以及该决策绑定的工具/策略/权限版本。
@@ -3389,7 +3476,7 @@ failed_retryable run 不能让 Summary 漏掉 safe retry 入口：只要存在 `
 
 上述修复完成/失败事件只有在 run 仍非 terminal 时才能写入；如果取消发生在 repair 模型返回后的解析或本地 salvage 窗口，Runner 必须直接返回 `cancelled`，不得把 `model.tool_request_repaired`、`model.tool_request_detected`、ToolCall 或 `run.completed` 追加到 `run.cancelled` 之后。
 
-业务 recipe 级工具顺序也由 Harness 校验，而不是只依赖提示词。当前规则是：`scenario.compose_draft` 的 ToolSpec 声明 `required_successful_tool_before=testcase.query_project_cases`，Runner 在执行前检查同一 run 内是否存在时间顺序更早的成功 query ToolCall；缺失时该 compose ToolCall 在执行前失败，`error_code=scenario_compose_requires_case_query`，并通过 `tool.result_observed` 作为模型下一轮输入。query 成功后模型若没有继续 compose，则由 Skill 私有 `routing_required_tool_after_success` 触发 `model.required_tool_missing(after_tool, required_tool)` 和静默修复；该事件及 LoopObservation 的 `content_preview` 只承载短内容或 `agent_content_preview_summary_v1` 有界摘要。该失败属于可恢复的流程纠正信号，前端展示为 ToolCall 错误，最终是否失败仍以 run terminal 状态为准。
+业务 recipe 级工具顺序也由 Harness 校验，而不是只依赖提示词。当前规则是：`scenario.compose_draft` 的 ToolSpec 声明 `required_context_requirements=testcase.query_project_cases`，Runner 在执行前检查同一 run 内是否存在时间顺序更早的成功 query ToolCall；缺失时该 compose ToolCall 在执行前失败，`error_code=scenario_compose_requires_case_query`，并通过 `tool.result_observed` 作为模型下一轮输入。query 成功后模型若没有继续 compose，则由 Skill 私有 `routing_required_tool_after_success` 触发 `model.required_tool_missing(after_tool, required_tool)` 和静默修复；该事件及 LoopObservation 的 `content_preview` 只承载短内容或 `agent_content_preview_summary_v1` 有界摘要。该失败属于可恢复的流程纠正信号，前端展示为 ToolCall 错误，最终是否失败仍以 run terminal 状态为准。
 
 required follow-up 静默修复后的解析失败也必须保持有界：如果 repaired 内容混入自然语言但含单个合法工具块，Runner 必须先本地挽救并写入 `model.required_tool_repaired(repair_strategy=salvaged_repair_fenced_tool_request)`；只有无法解析也无法挽救时，`model.required_tool_repair_failed.payload.error_message` 才短错误原样返回，超过 512 字符时使用 `agent_error_message_summary_v1` preview、`agent_error_message_truncated` 标记、原始长度、hash 与 `full_error_reference=AgentConversationRunner.model.required_tool_repair_failed`；`model.required_tool_repair_failed.content_preview` 短内容原样返回，超长修复输出使用 `agent_content_preview_summary_v1`、`agent_content_preview_truncated`、原始长度、hash 与 `full_content_reference=AgentConversationRunner.model.required_tool_repair_failed.content`，不得把完整解析异常或模型输出尾部复制到 EventStore/SSE timeline。
 
@@ -3770,7 +3857,7 @@ Markdown companion 渲染必须容忍部分 result 行，同时不得改写 JSON
 
 `GET /api/v1/agents/launch-audit` 是前端联调和上线前准备状态的聚合审计口。带 `project_id` 时按项目权限读取，不带 `project_id` 时仅 admin 可读全局审计。它聚合 `AgentModelHealthService.check(live=false)`、`AgentReadinessDashboardService.snapshot` 与 `AgentReleaseGateService.promotion_assessment`，不得触发 live provider 调用，不得暴露 `DEEPSEEK_API_KEY`。`ready=true` 只表示后端仓库拥有的 Agent 对话链路、前端事件契约、summary/actions/history/export 契约和 dashboard/release gate 输入已经可供前端集成；它不等价于 L3 生产灰度已放开。
 
-`metrics_catalog_complete` 必须输出 `required_metric_keys`、`required_metric_count` 与 `missing_metric_keys`。`required_metric_keys` 覆盖 P0/P1 监控清单中已经由 `AgentMetricsService.snapshot` 计算的所有 recovery/governance 指标，包括 `tool_call_orphan_recovered_total`、`tool_call_send_intent_orphan_total`、`tool_call_safe_retry_after_send_intent_not_found_total`、`tool_call_transport_sent_uncertain_total`、`tool_call_backend_accepted_uncertain_total`、`backend_effect_capability_receipt_first_total`、`backend_effect_capability_legacy_no_receipt_total`、`tool_call_legacy_no_receipt_manual_total`、`tool_call_backend_contract_unsupported_total`、`approval_superseded_total`、`approval_approve_conflict_total`、`context_degraded_total`、`context_decision_build_missing_total`、`runtime_snapshot_migration_block_total`、`backend_contract_migration_block_total`、`run_migration_blocked_total`、`release_gate_violation_count`、`loop_root_cause_context_degraded_total`、`loop_root_cause_unknown_total`、`invalid_repair_scope_total`、`tool_prerequisite_missing_total`、`tool_request_format_invalid_total`、`required_tool_followup_missing_total`、`max_iterations_total`、`same_failure_no_progress_total`、`memory_contradiction_penalty_applied_total`、`memory_retrieved_total`、`memory_used_active_policy_total`、`memory_retrieval_profile_missing_total`、`memory_low_confidence_filtered_total`、`memory_evidence_watch_stale_total` 与 `backend_capability_degraded_total`，防止 dashboard 只校验部分高优先级指标而漏掉 P1/P2 观测面。
+`metrics_catalog_complete` 必须输出 `required_metric_keys`、`required_metric_count` 与 `missing_metric_keys`。`required_metric_keys` 覆盖 P0/P1 监控清单中已经由 `AgentMetricsService.snapshot` 计算的所有 recovery/governance/Phase 0 baseline/Phase 4 input repair 指标，包括 `tool_call_orphan_recovered_total`、`tool_call_send_intent_orphan_total`、`tool_call_safe_retry_after_send_intent_not_found_total`、`tool_call_transport_sent_uncertain_total`、`tool_call_backend_accepted_uncertain_total`、`backend_effect_capability_receipt_first_total`、`backend_effect_capability_legacy_no_receipt_total`、`tool_call_legacy_no_receipt_manual_total`、`tool_call_backend_contract_unsupported_total`、`approval_superseded_total`、`approval_approve_conflict_total`、`context_degraded_total`、`context_decision_build_missing_total`、`runtime_snapshot_migration_block_total`、`backend_contract_migration_block_total`、`run_migration_blocked_total`、`release_gate_violation_count`、`loop_root_cause_context_degraded_total`、`loop_root_cause_unknown_total`、`invalid_repair_scope_total`、`tool_prerequisite_missing_total`、`tool_request_format_invalid_total`、`required_tool_followup_missing_total`、`max_iterations_total`、`same_failure_no_progress_total`、`agent_task_success_rate`、`agent_avg_iterations`、`agent_avg_tokens`、`agent_avg_tool_calls`、`agent_context_avg_chars`、`agent_context_max_chars`、`agent_context_avg_system_chars`、`agent_context_avg_tool_result_chars`、`agent_context_growth_rate`、`agent_repair_rate`、`agent_tool_retry_total`、`agent_tool_schema_error_total`、`agent_tool_request_repair_success_total`、`agent_runtime_input_repair_total`、`memory_contradiction_penalty_applied_total`、`memory_retrieved_total`、`memory_used_active_policy_total`、`memory_retrieval_profile_missing_total`、`memory_low_confidence_filtered_total`、`memory_evidence_watch_stale_total` 与 `backend_capability_degraded_total`，防止 dashboard 只校验部分高优先级指标而漏掉 P1/P2 观测面。
 
 Required dashboard metrics:
 
@@ -3789,6 +3876,20 @@ backend_contract_migration_block_total
 backend_contract_unsupported_total
 backend_effect_capability_legacy_no_receipt_total
 backend_effect_capability_receipt_first_total
+agent_task_success_rate
+agent_avg_iterations
+agent_avg_tokens
+agent_avg_tool_calls
+agent_context_avg_chars
+agent_context_max_chars
+agent_context_avg_system_chars
+agent_context_avg_tool_result_chars
+agent_context_growth_rate
+agent_repair_rate
+agent_tool_retry_total
+agent_tool_schema_error_total
+agent_tool_request_repair_success_total
+agent_runtime_input_repair_total
 checkpoint_freshness_failed_total
 context_decision_build_missing_total
 context_degraded_total

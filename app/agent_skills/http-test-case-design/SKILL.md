@@ -1,6 +1,34 @@
 ---
 name: http-test-case-design
 description: Use when the user asks to design, generate, expand, validate, repair, or explain TestAuto HTTP API test cases, assertions, extractors, variables, request bodies, headers, query parameters, retry policy, or schema validation.
+capabilities:
+  - http_test_case.design
+  - http_test_case.create
+  - http_test_case.update
+  - http_test_case.execute
+  - http_test_case.assertions
+required_context:
+  - project_context
+  - test_case_inventory
+tools:
+  - project.read_context
+  - testcase.query_project_cases
+  - ai_skill.run_draft
+  - testcase.validate_schema
+  - testcase.create_saved
+  - testcase.update_saved
+  - testcase.update_assertions
+  - testcase.batch_update_assertions
+  - testcase.execute_saved
+  - testcase.batch_execute
+artifacts:
+  - test_case_query_snapshot
+  - testcase_draft
+  - testcase_assertion_draft
+examples:
+  - create equivalence class cases from existing cases
+  - expand boundary value HTTP test cases
+  - repair assertions for saved HTTP cases
 triggers:
   - HTTP
   - http
@@ -9,6 +37,10 @@ triggers:
   - 接口用例
   - HTTP用例
   - 测试用例
+  - 现有用例
+  - 等价类的用例
+  - 等价类用例
+  - 边界值用例
   - 断言
   - 提取器
   - header
@@ -22,6 +54,12 @@ routing_requires_tool:
   - repair HTTP test case
   - 生成HTTP用例
   - 生成接口用例
+  - 创建用例
+  - 生成用例
+  - 根据现有用例创建
+  - 基于现有用例生成
+  - 创建等价类用例
+  - 生成等价类用例
   - 扩写HTTP用例
   - 扩写接口用例
   - 校验用例

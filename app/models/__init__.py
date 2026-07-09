@@ -27,6 +27,7 @@ from app.models.agent import (
 )
 from app.models.defect import Defect
 from app.models.media import MediaObject
+from app.models.notification import NotificationReadState
 from app.models.project import (
     Project,
     ProjectEnvironment,
@@ -83,6 +84,7 @@ __all__ = [
     "BrowserCaptureEntry",
     "Defect",
     "MediaObject",
+    "NotificationReadState",
     "Project",
     "ProjectEnvironment",
     "ProjectEnvironmentVariable",

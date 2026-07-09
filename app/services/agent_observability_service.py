@@ -371,7 +371,45 @@ REQUIRED_DASHBOARD_METRICS = {
     "worker_queue_oldest_queued_age_ms",
     "release_gate_violation_count",
     "backend_capability_degraded_total",
+    "agent_task_success_rate",
+    "agent_avg_iterations",
+    "agent_avg_tokens",
+    "agent_avg_tool_calls",
+    "agent_context_avg_chars",
+    "agent_context_max_chars",
+    "agent_context_avg_system_chars",
+    "agent_context_avg_tool_result_chars",
+    "agent_context_growth_rate",
+    "agent_repair_rate",
+    "agent_tool_retry_total",
+    "agent_tool_schema_error_total",
+    "agent_tool_request_repair_success_total",
+    "agent_runtime_input_repair_total",
 }
+
+
+def _round_metric(value: float) -> float:
+    return round(float(value), 4)
+
+
+def _safe_rate(numerator: int | float, denominator: int | float) -> float:
+    if not denominator:
+        return 0.0
+    return _round_metric(float(numerator) / float(denominator))
+
+
+def _average(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return _round_metric(sum(values) / len(values))
+
+
+def _coerce_metric_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
 
 REQUIRED_FAULT_CASES = {
     "send_intent_not_found",
@@ -912,6 +950,7 @@ class AgentMetricsService:
         tool_policy_counts = self._tool_policy_metric_counts(project_id)
         loop_counts = self._loop_observation_metric_counts(project_id)
         event_counts = self._event_metric_counts(project_id)
+        phase_zero_metrics = self._phase_zero_baseline_metrics(project_id)
         metrics = {
             "tool_call_uncertain_total": tool_call_counts["uncertain"],
             "tool_call_reconcile_success_total": self._count_reconcile_attempts(project_id, "succeeded"),
@@ -1000,6 +1039,7 @@ class AgentMetricsService:
             "worker_queue_oldest_queued_age_ms": worker_queue_audit["oldest_queued_age_ms"],
             "release_gate_violation_count": len(release_gate.get("violations") or []),
             "backend_capability_degraded_total": tool_call_counts["backend_capability_degraded"],
+            **phase_zero_metrics,
         }
         snapshot = {
             "project_id": project_id,
@@ -1145,6 +1185,112 @@ class AgentMetricsService:
             }:
                 counts["checkpoint_freshness_failed"] += 1
         return counts
+
+    def _phase_zero_baseline_metrics(self, project_id: int | None) -> dict[str, int | float]:
+        terminal_statement = select(AgentRun.run_id, AgentRun.status).where(
+            AgentRun.status.in_(("completed", "failed", "cancelled"))
+        )
+        if project_id is not None:
+            terminal_statement = terminal_statement.where(AgentRun.project_id == project_id)
+        terminal_status_by_run = {
+            run_id: status
+            for run_id, status in self.db.execute(terminal_statement).all()
+        }
+        terminal_run_count = len(terminal_status_by_run)
+        completed_run_count = sum(1 for status in terminal_status_by_run.values() if status == "completed")
+
+        started_statement = select(
+            AgentEvent.run_id,
+            AgentEvent.event_seq,
+            AgentEvent.payload_json,
+        ).where(AgentEvent.event_type == "model.started")
+        repair_success_statement = select(func.count()).select_from(AgentEvent).where(
+            AgentEvent.event_type.in_(
+                (
+                    "model.tool_request_repaired",
+                    "model.required_tool_repaired",
+                    "model.final_response_reference_tool_request_repaired",
+                )
+            )
+        )
+        runtime_input_repair_statement = select(func.count()).select_from(AgentEvent).where(
+            AgentEvent.event_type == "tool.input_repaired"
+        )
+        tool_call_statement = select(
+            AgentToolCall.attempt_index,
+            AgentToolCall.error_code,
+        )
+        if project_id is not None:
+            run_ids = self._run_ids(project_id)
+            started_statement = started_statement.where(AgentEvent.run_id.in_(run_ids))
+            repair_success_statement = repair_success_statement.where(AgentEvent.run_id.in_(run_ids))
+            runtime_input_repair_statement = runtime_input_repair_statement.where(AgentEvent.run_id.in_(run_ids))
+            tool_call_statement = tool_call_statement.where(AgentToolCall.run_id.in_(run_ids))
+
+        model_call_count = 0
+        repair_model_call_count = 0
+        context_total_chars = 0
+        context_max_chars = 0
+        context_system_chars = 0
+        context_tool_result_chars = 0
+        estimated_input_tokens = 0
+        started_by_run: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for run_id, event_seq, payload in self.db.execute(started_statement):
+            payload = payload or {}
+            context_metrics = payload.get("context_metrics") if isinstance(payload.get("context_metrics"), dict) else {}
+            total_chars = _coerce_metric_int(context_metrics.get("total_chars"))
+            if total_chars <= 0:
+                continue
+            model_call_count += 1
+            if payload.get("repair_attempt") is True:
+                repair_model_call_count += 1
+            context_total_chars += total_chars
+            context_max_chars = max(context_max_chars, total_chars)
+            context_system_chars += _coerce_metric_int(context_metrics.get("system_chars"))
+            context_tool_result_chars += _coerce_metric_int(context_metrics.get("tool_result_chars"))
+            estimated_input_tokens += (
+                _coerce_metric_int(context_metrics.get("estimated_input_units"))
+                or _coerce_metric_int(context_metrics.get("estimated_input_tokens"))
+                or ((total_chars + 3) // 4)
+            )
+            started_by_run[str(run_id)].append((int(event_seq or 0), total_chars))
+
+        growth_rates: list[float] = []
+        for calls in started_by_run.values():
+            if len(calls) < 2:
+                continue
+            ordered = sorted(calls, key=lambda item: item[0])
+            first_total = ordered[0][1]
+            last_total = ordered[-1][1]
+            if first_total > 0:
+                growth_rates.append((last_total - first_total) / first_total)
+
+        tool_call_total = 0
+        tool_retry_total = 0
+        tool_schema_error_total = 0
+        for attempt_index, error_code in self.db.execute(tool_call_statement):
+            tool_call_total += 1
+            if int(attempt_index or 0) > 0:
+                tool_retry_total += 1
+            if error_code == "agent_tool_input_schema_invalid":
+                tool_schema_error_total += 1
+
+        return {
+            "agent_task_success_rate": _safe_rate(completed_run_count, terminal_run_count),
+            "agent_avg_iterations": _safe_rate(model_call_count, terminal_run_count),
+            "agent_avg_tokens": _safe_rate(estimated_input_tokens, model_call_count),
+            "agent_avg_tool_calls": _safe_rate(tool_call_total, terminal_run_count),
+            "agent_context_avg_chars": _safe_rate(context_total_chars, model_call_count),
+            "agent_context_max_chars": context_max_chars,
+            "agent_context_avg_system_chars": _safe_rate(context_system_chars, model_call_count),
+            "agent_context_avg_tool_result_chars": _safe_rate(context_tool_result_chars, model_call_count),
+            "agent_context_growth_rate": _average(growth_rates),
+            "agent_repair_rate": _safe_rate(repair_model_call_count, model_call_count),
+            "agent_tool_retry_total": tool_retry_total,
+            "agent_tool_schema_error_total": tool_schema_error_total,
+            "agent_tool_request_repair_success_total": int(self.db.scalar(repair_success_statement) or 0),
+            "agent_runtime_input_repair_total": int(self.db.scalar(runtime_input_repair_statement) or 0),
+        }
 
     def _count_tool_calls(self, project_id: int | None, *conditions: Any) -> int:
         statement = select(func.count()).select_from(AgentToolCall).where(*conditions)

@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.schemas.scenario import ScenarioCreateRequest
 from app.schemas.test_case import TestCaseCreateRequest
@@ -177,6 +177,23 @@ class AIGeneratedTestCaseResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class AIHttpTestCaseDescriptionSummaryRequest(BaseModel):
+    mode: Literal["request", "request_response"] = Field(description="request 表示仅请求信息，request_response 表示包含调试响应")
+    test_case_id: int | None = None
+    name: str | None = Field(default=None, max_length=128)
+    protocol: Literal["http"] = "http"
+    environment_id: int | None = None
+    environment_ids: list[int] = Field(default_factory=list)
+    request: dict[str, Any] = Field(default_factory=dict)
+    response: dict[str, Any] | None = None
+
+
+class AIHttpTestCaseDescriptionSummaryResponse(BaseModel):
+    description: str
+    source_summary: Literal["request", "request_response"]
+    warnings: list[str] = Field(default_factory=list)
+
+
 class AIWebSocketTestCaseGenerateRequest(BaseModel):
     websocket_text: str = Field(min_length=1, description="WebSocket 文档、连接地址、消息协议、事件说明或示例消息")
     generate_count: int = Field(default=3, ge=1, le=10)
@@ -218,12 +235,112 @@ class AIBrowserCaptureGenerateRequest(BaseModel):
     extra_requirements: str | None = None
 
 
+class AIBrowserCaptureAnalyzeRequest(BaseModel):
+    protocol: Literal["http", "websocket"] | None = None
+    draft_data: dict[str, Any] = Field(default_factory=dict)
+    analysis_focus: list[
+        Literal["semantics", "data_structure", "test_points", "risks", "automation"]
+    ] = Field(
+        default_factory=lambda: ["semantics", "data_structure", "test_points", "risks", "automation"],
+        max_length=10,
+    )
+    include_examples: bool = True
+
+
+class AIBrowserCaptureAnalysisSummary(BaseModel):
+    name: str = ""
+    purpose: str = ""
+    business_domain: str = ""
+    operation_type: str = ""
+    confidence: float = 0
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def clamp_confidence(cls, value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(1, number))
+
+
+class AIBrowserCaptureAnalysisField(BaseModel):
+    path: str = ""
+    type: str = ""
+    meaning: str = ""
+    required: bool = False
+    constraints: list[str] = Field(default_factory=list)
+    sensitive: bool = False
+    dynamic: bool = False
+    example: Any = None
+
+
+class AIBrowserCaptureAnalysisSection(BaseModel):
+    description: str = ""
+    fields: list[AIBrowserCaptureAnalysisField] = Field(default_factory=list)
+
+
+class AIBrowserCaptureAnalysisTestPoint(BaseModel):
+    category: str = ""
+    title: str = ""
+    description: str = ""
+    priority: Literal["high", "medium", "low"] = "medium"
+    test_data: dict[str, Any] = Field(default_factory=dict)
+    expected_result: str = ""
+
+
+class AIBrowserCaptureAnalysisRisk(BaseModel):
+    level: Literal["high", "medium", "low"] = "medium"
+    title: str = ""
+    description: str = ""
+    recommendation: str = ""
+
+
+class AIBrowserCaptureAnalysisAutomation(BaseModel):
+    assertions: list[str] = Field(default_factory=list)
+    extractors: list[str] = Field(default_factory=list)
+    dependencies: list[str] = Field(default_factory=list)
+    data_setup: list[str] = Field(default_factory=list)
+    cleanup: list[str] = Field(default_factory=list)
+
+
+class AIBrowserCaptureAnalysisResult(BaseModel):
+    summary: AIBrowserCaptureAnalysisSummary = Field(default_factory=AIBrowserCaptureAnalysisSummary)
+    request: AIBrowserCaptureAnalysisSection = Field(default_factory=AIBrowserCaptureAnalysisSection)
+    response: AIBrowserCaptureAnalysisSection = Field(default_factory=AIBrowserCaptureAnalysisSection)
+    test_points: list[AIBrowserCaptureAnalysisTestPoint] = Field(default_factory=list)
+    risks: list[AIBrowserCaptureAnalysisRisk] = Field(default_factory=list)
+    automation: AIBrowserCaptureAnalysisAutomation = Field(default_factory=AIBrowserCaptureAnalysisAutomation)
+    warnings: list[str] = Field(default_factory=list)
+    model: str | None = None
+    analyzed_at: str | None = None
+
+    @model_validator(mode="after")
+    def normalize_order(self):
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        self.test_points = sorted(
+            self.test_points,
+            key=lambda item: priority_order.get(item.priority, 99),
+        )
+        self.risks = sorted(
+            self.risks,
+            key=lambda item: priority_order.get(item.level, 99),
+        )
+        return self
+
+
 class AIBrowserCaptureBatchGenerateRequest(AIBrowserCaptureGenerateRequest):
     entry_ids: list[int] = Field(min_length=1, max_length=50)
 
 
 class AIBrowserCaptureRelationsRequest(BaseModel):
     entry_ids: list[int] | None = Field(default=None, max_length=100)
+
+
+class AIBrowserCaptureBatchAnalyzeRequest(BaseModel):
+    entry_ids: list[int] = Field(min_length=2, max_length=100)
+    include_nodes: bool = True
+    include_suggestions: bool = True
 
 
 class AIBrowserCaptureScenarioRequest(AIBrowserCaptureRelationsRequest):

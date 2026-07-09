@@ -1,14 +1,17 @@
 from fastapi import APIRouter
 
-from app.api.v1.routers import agents, ai, auth, browser_captures, defects, environment_configs, execution_records, media, projects, scenarios, test_cases, test_plans, test_reports, users, visual_flows, websocket_test_cases
+from app.api.v1.routers import agents, ai, auth, browser_captures, dashboard, defects, environment_configs, execution_center, execution_records, media, notifications, projects, scenarios, test_cases, test_plans, test_reports, users, visual_flows, websocket_test_cases
 
 api_router = APIRouter()
 api_router.include_router(agents.router, prefix="/agents", tags=["AI Agents"])
 api_router.include_router(test_reports.router, prefix="/reports", tags=["Test reports"])
 api_router.include_router(execution_records.router, prefix="/execution-records", tags=["Execution records"])
+api_router.include_router(execution_center.router, prefix="/execution-center", tags=["Execution center"])
+api_router.include_router(dashboard.router, prefix="/dashboard", tags=["Dashboard"])
 api_router.include_router(defects.router, prefix="/defects", tags=["Defects"])
 api_router.include_router(media.router, prefix="/media", tags=["Media"])
 api_router.include_router(browser_captures.router, prefix="/browser-captures", tags=["Browser captures"])
+api_router.include_router(notifications.router, prefix="/notifications", tags=["Notifications"])
 api_router.include_router(visual_flows.router, prefix="/flows", tags=["Visual flows"])
 api_router.include_router(websocket_test_cases.router, prefix="/websocket-test-cases", tags=["WebSocket test cases"])
 api_router.include_router(ai.router, prefix="/ai", tags=["AI"])

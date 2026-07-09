@@ -78,6 +78,102 @@ Agent 可通过 `testcase.create_saved` 新增已保存 HTTP 用例，通过 `te
 | `page` | `1` | 页码，从 1 开始 |
 | `page_size` | `20` | 每页数量，最大 200 |
 
+字段说明：
+
+- `description` 用于说明接口用途、业务含义、请求参数和响应数据结构。前端在编辑弹窗的“描述”页签维护该字段，保存时随新增/更新请求提交。
+- 历史或兼容响应可能返回 `case_description`，前端展示时按 `description` 的语义读取。
+
+AI 描述总结使用统一 Skill Runner：
+
+| 项目 | 内容 |
+| --- | --- |
+| 接口 | `/ai/skills/http-test-case/run` |
+| 方法 | `POST` |
+| `operation` | `summarize_description` |
+| 说明 | 生成接口测试用例 `description` 草稿，前端只写入编辑框，不自动保存 |
+
+描述页签点击“AI总结”时，请求 `input.mode=request`，只携带当前用例已有配置：
+
+```json
+{
+  "operation": "summarize_description",
+  "project_id": 1,
+  "environment_id": 4,
+  "source_id": 7,
+  "input": {
+    "mode": "request",
+    "test_case_id": 7,
+    "name": "获取企业列表",
+    "protocol": "http",
+    "environment_id": 4,
+    "environment_ids": [4],
+    "request": {
+      "environment_id": 4,
+      "environment_ids": [4],
+      "method": "GET",
+      "path": "/api/enterprise/list",
+      "headers": {},
+      "query_params": {},
+      "body_type": "none",
+      "body": null,
+      "assertions": [{ "type": "status_code", "expected": 200 }],
+      "extractors": []
+    }
+  }
+}
+```
+
+调试完成后在响应区点击“AI总结”时，请求 `input.mode=request_response`，除上述用例配置外，还携带本次调试响应：
+
+```json
+{
+  "operation": "summarize_description",
+  "project_id": 1,
+  "environment_id": 4,
+  "source_id": 7,
+  "input": {
+    "mode": "request_response",
+    "test_case_id": 7,
+    "name": "获取企业列表",
+    "protocol": "http",
+    "environment_id": 4,
+    "environment_ids": [4],
+    "request": {
+      "environment_id": 4,
+      "environment_ids": [4],
+      "method": "GET",
+      "path": "/api/enterprise/list",
+      "headers": {},
+      "query_params": {},
+      "body_type": "none",
+      "body": null,
+      "assertions": [],
+      "extractors": []
+    },
+    "response": {
+      "status": "passed",
+      "status_code": 200,
+      "duration_ms": 785,
+      "headers": "{\"content-type\":\"application/json\"}",
+      "body": "{\"code\":200,\"data\":{}}",
+      "assertions": "pass",
+      "error_message": null,
+      "created_at": "2026-07-09T08:02:53"
+    }
+  }
+}
+```
+
+成功响应 `data` 固定返回：
+
+```json
+{
+  "description": "该接口通过 POST 分页查询企业列表，请求体包含企业编码、分页参数和客户端信息。调试结果 HTTP 200 且业务 code=200，msg 表示操作成功。响应结构：body字段：msg、code、data.total、data.dataList[]；data.dataList[]项字段：esDt、uscNo、regAddr、isFollow。",
+  "source_summary": "request_response",
+  "warnings": []
+}
+```
+
 响应 `data` 结构为：
 
 ```json
@@ -88,6 +184,11 @@ Agent 可通过 `testcase.create_saved` 新增已保存 HTTP 用例，通过 `te
   "page_size": 20
 }
 ```
+
+性能约束：该 GET 接口继续返回完整列表项契约，但接入后端 10 秒短 TTL 读穿透缓存，缓存 key
+包含 DB bind、用户、项目、关键字、环境筛选和分页参数；创建、更新、删除或执行 HTTP 用例会清理
+HTTP 用例、项目统计和环境配置相关缓存。仓储层继续使用 `selectinload(environment_links)`，避免
+`environment_ids` 序列化触发逐行懒加载。
 
 ## 新增测试用例
 

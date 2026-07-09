@@ -9,6 +9,7 @@ from app.db.base import Base
 class Defect(Base):
     __tablename__ = "defects"
     __table_args__ = (
+        Index("ix_defects_project_updated", "project_id", "updated_at"),
         Index("ix_defects_project_status_updated", "project_id", "status", "updated_at"),
         Index("ix_defects_project_urgency_updated", "project_id", "urgency", "updated_at"),
     )

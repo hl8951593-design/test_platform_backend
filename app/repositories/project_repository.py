@@ -1,5 +1,5 @@
-from sqlalchemy import delete, func, or_, select, update
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import delete, func, or_, select, union_all, update
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.models.project import (
     Project,
@@ -10,6 +10,7 @@ from app.models.project import (
 )
 from app.models.defect import Defect
 from app.models.media import MediaObject
+from app.models.notification import NotificationReadState
 from app.models.scenario import (
     TestScenario,
     TestScenarioExecution,
@@ -48,7 +49,12 @@ class ProjectRepository:
         return self.db.get(Project, project_id)
 
     def list_visible_for_user(self, *, user_id: int, is_admin: bool) -> list[Project]:
-        statement = select(Project).where(Project.is_deleted.is_(False)).order_by(Project.id.desc())
+        statement = (
+            select(Project)
+            .options(joinedload(Project.creator))
+            .where(Project.is_deleted.is_(False))
+            .order_by(Project.id.desc())
+        )
         if not is_admin:
             statement = (
                 statement.outerjoin(ProjectMember)
@@ -154,6 +160,7 @@ class ProjectRepository:
             delete(WebSocketTestCase).where(WebSocketTestCase.project_id == project_id)
         )
         self.db.execute(delete(MediaObject).where(MediaObject.project_id == project_id))
+        self.db.execute(delete(NotificationReadState).where(NotificationReadState.project_id == project_id))
         self.db.execute(delete(Defect).where(Defect.project_id == project_id))
 
         if environment_ids:
@@ -227,9 +234,9 @@ class ProjectRepository:
         statement = (
             select(ProjectEnvironment)
             .options(
-                selectinload(ProjectEnvironment.project),
-                selectinload(ProjectEnvironment.created_by),
-                selectinload(ProjectEnvironment.variables),
+                joinedload(ProjectEnvironment.project),
+                joinedload(ProjectEnvironment.created_by),
+                joinedload(ProjectEnvironment.variables),
             )
             .where(
                 ProjectEnvironment.project_id == project_id,
@@ -237,7 +244,7 @@ class ProjectRepository:
             )
             .order_by(ProjectEnvironment.is_default.desc(), ProjectEnvironment.id.desc())
         )
-        return list(self.db.scalars(statement).all())
+        return list(self.db.execute(statement).unique().scalars().all())
 
     def get_environment(self, *, project_id: int, environment_id: int) -> ProjectEnvironment | None:
         statement = select(ProjectEnvironment).where(
@@ -256,9 +263,9 @@ class ProjectRepository:
         statement = (
             select(ProjectEnvironment)
             .options(
-                selectinload(ProjectEnvironment.project),
-                selectinload(ProjectEnvironment.created_by),
-                selectinload(ProjectEnvironment.variables),
+                joinedload(ProjectEnvironment.project),
+                joinedload(ProjectEnvironment.created_by),
+                joinedload(ProjectEnvironment.variables),
             )
             .where(
                 ProjectEnvironment.id == environment_id,
@@ -266,7 +273,7 @@ class ProjectRepository:
                 ProjectEnvironment.is_deleted.is_(False),
             )
         )
-        return self.db.scalar(statement)
+        return self.db.execute(statement).unique().scalar_one_or_none()
 
     def create_environment(
         self,
@@ -419,6 +426,48 @@ class ProjectRepository:
             TestCaseEnvironment.environment_id == environment_id
         )
         return int(self.db.scalar(statement) or 0)
+
+    def count_test_cases_by_environment_ids(
+        self,
+        *,
+        project_id: int,
+        environment_ids: list[int],
+    ) -> dict[int, int]:
+        if not environment_ids:
+            return {}
+        direct_bindings = (
+            select(
+                TestCase.environment_id.label("environment_id"),
+                TestCase.id.label("test_case_id"),
+            )
+            .where(
+                TestCase.project_id == project_id,
+                TestCase.environment_id.in_(environment_ids),
+            )
+        )
+        linked_bindings = (
+            select(
+                TestCaseEnvironment.environment_id.label("environment_id"),
+                TestCaseEnvironment.test_case_id.label("test_case_id"),
+            )
+            .where(
+                TestCaseEnvironment.project_id == project_id,
+                TestCaseEnvironment.environment_id.in_(environment_ids),
+            )
+        )
+        bindings = union_all(direct_bindings, linked_bindings).subquery()
+        statement = (
+            select(
+                bindings.c.environment_id,
+                func.count(func.distinct(bindings.c.test_case_id)).label("count"),
+            )
+            .group_by(bindings.c.environment_id)
+        )
+        return {
+            int(row.environment_id): int(row.count or 0)
+            for row in self.db.execute(statement).all()
+            if row.environment_id is not None
+        }
 
     def list_test_cases_by_environment(self, *, project_id: int, environment_id: int) -> list[TestCase]:
         statement = (

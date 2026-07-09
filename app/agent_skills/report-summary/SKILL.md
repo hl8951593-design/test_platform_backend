@@ -1,6 +1,22 @@
 ---
 name: report-summary
 description: Use when the user asks to read, summarize, compare, diagnose, or explain TestAuto reports, execution results, pass rate, failure causes, flaky tests, risk coverage, or defect suggestions.
+capabilities:
+  - report.read
+  - report.summarize
+  - report.diagnose
+required_context:
+  - project_context
+  - report_inventory
+tools:
+  - report.read_summary
+artifacts:
+  - report_summary
+  - scenario_run_failure
+examples:
+  - query scenario 33 execution report
+  - summarize recent report failures
+  - explain pass rate and failure causes
 triggers:
   - 报告
   - report

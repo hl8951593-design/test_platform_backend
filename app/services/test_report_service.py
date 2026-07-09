@@ -8,10 +8,20 @@ from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
 from app.core.permissions import ProjectPermission
+from app.models.defect import Defect
+from app.models.test_case import TestCase, TestCaseExecution
 from app.models.user import User
 from app.repositories.test_report_repository import TestReportRepository
 from app.schemas.test_report import (
+    ReportAIRecommendation,
+    ReportFailureCluster,
+    ReportIntelligenceOverview,
+    ReportIntelligenceSummary,
+    ReportRiskIndicator,
     ReportSourceType,
+    ReportSlowTest,
+    ReportStabilityHeatmapRow,
+    ReportTrendValue,
     TestReportDetail,
     TestReportPage,
     TestReportSummary,
@@ -22,7 +32,10 @@ from app.services.permission_service import PermissionService
 
 
 class TestReportService:
+    SLOW_THRESHOLD_MS = 3000
+
     def __init__(self, db: Session):
+        self.db = db
         self.repository = TestReportRepository(db)
         self.permission_service = PermissionService(db)
 
@@ -184,6 +197,253 @@ class TestReportService:
             started_to=end_date,
             points=points,
         )
+
+    def get_intelligence_overview(
+        self,
+        *,
+        project_id: int,
+        current_user: User,
+        environment_id: int | None,
+        range_value: str,
+    ) -> ReportIntelligenceOverview:
+        self._require_view(current_user, project_id)
+        days = self._range_days(range_value)
+        reference_time = self._latest_report_reference_time(project_id=project_id, environment_id=environment_id)
+        started_from = reference_time - timedelta(days=days - 1)
+        reports, _ = self.repository.list_reports(
+            project_id=project_id,
+            source_type=None,
+            status=None,
+            environment_id=environment_id,
+            started_from=started_from,
+            started_to=reference_time + timedelta(days=1),
+            page=1,
+            page_size=1000,
+        )
+        summaries = [self._summary(row) for row in reports]
+        total = sum(item.total_count for item in summaries)
+        passed = sum(item.passed_count for item in summaries)
+        failed = sum(item.failed_count for item in summaries)
+        pass_rate = round(passed * 100 / total, 2) if total else 0.0
+        previous_reports, _ = self.repository.list_reports(
+            project_id=project_id,
+            source_type=None,
+            status=None,
+            environment_id=environment_id,
+            started_from=started_from - timedelta(days=days),
+            started_to=started_from,
+            page=1,
+            page_size=1000,
+        )
+        previous_summaries = [self._summary(row) for row in previous_reports]
+        previous_total = sum(item.total_count for item in previous_summaries)
+        previous_passed = sum(item.passed_count for item in previous_summaries)
+        previous_rate = round(previous_passed * 100 / previous_total, 2) if previous_total else pass_rate
+        slow_tests = self._slow_tests(
+            project_id=project_id,
+            environment_id=environment_id,
+            started_from=started_from,
+            started_to=reference_time + timedelta(days=1),
+        )
+        failure_clusters = self._failure_clusters(summaries, failed)
+        p0_count = sum(1 for item in failure_clusters if item.priority == "P0")
+        recommendations = self._report_recommendations(failure_clusters=failure_clusters, slow_tests=slow_tests)
+        stability_score = max(round(pass_rate - len(failure_clusters) * 2 - len(slow_tests), 2), 0.0)
+        return ReportIntelligenceOverview(
+            generated_at=datetime.now(),
+            summary=ReportIntelligenceSummary(
+                pass_rate=pass_rate,
+                pass_rate_delta=round(pass_rate - previous_rate, 2),
+                failure_cluster_count=len(failure_clusters),
+                p0_cluster_count=p0_count,
+                stability_score=stability_score,
+                slow_test_count=len(slow_tests),
+                slow_threshold_ms=self.SLOW_THRESHOLD_MS,
+                ai_recommendation_count=len(recommendations),
+            ),
+            pass_rate_trend=self._pass_rate_trend(summaries, days=days),
+            risk_indicators=self._risk_indicators(
+                failure_clusters=failure_clusters,
+                slow_tests=slow_tests,
+                open_defects=self._open_defect_count(project_id),
+            ),
+            failure_clusters=failure_clusters,
+            slow_tests=slow_tests,
+            stability_heatmap=self._stability_heatmap(summaries, days=7),
+            ai_recommendations=recommendations,
+        )
+
+    def _range_days(self, range_value: str) -> int:
+        if range_value == "today":
+            return 1
+        if range_value == "30d":
+            return 30
+        return 7
+
+    def _latest_report_reference_time(self, *, project_id: int, environment_id: int | None) -> datetime:
+        reports, _ = self.repository.list_reports(
+            project_id=project_id,
+            source_type=None,
+            status=None,
+            environment_id=environment_id,
+            started_from=None,
+            started_to=None,
+            page=1,
+            page_size=1,
+        )
+        if reports:
+            return reports[0].get("started_at") or reports[0].get("created_at") or datetime.now()
+        latest_case_execution = (
+            self.db.query(TestCaseExecution)
+            .filter(TestCaseExecution.project_id == project_id)
+            .order_by(TestCaseExecution.created_at.desc())
+            .first()
+        )
+        if latest_case_execution is not None:
+            return latest_case_execution.created_at
+        return datetime.now()
+
+    def _slow_tests(
+        self,
+        *,
+        project_id: int,
+        environment_id: int | None,
+        started_from: datetime,
+        started_to: datetime,
+    ) -> list[ReportSlowTest]:
+        query = (
+            self.db.query(TestCaseExecution, TestCase, User)
+            .outerjoin(TestCase, TestCase.id == TestCaseExecution.test_case_id)
+            .outerjoin(User, User.id == TestCaseExecution.executed_by_id)
+            .filter(TestCaseExecution.project_id == project_id)
+            .filter(TestCaseExecution.duration_ms >= self.SLOW_THRESHOLD_MS)
+            .filter(TestCaseExecution.created_at >= started_from)
+            .filter(TestCaseExecution.created_at <= started_to)
+        )
+        if environment_id is not None:
+            query = query.filter(TestCaseExecution.environment_id == environment_id)
+        query = query.order_by(TestCaseExecution.duration_ms.desc()).limit(10)
+        items = []
+        for execution, test_case, owner in query.all():
+            duration = int(execution.duration_ms or 0)
+            items.append(ReportSlowTest(
+                test_case_id=execution.test_case_id,
+                name=(test_case.name if test_case is not None else f"执行记录 {execution.id}"),
+                owner=(owner.username or owner.account if owner is not None else "未分配"),
+                risk="high" if duration >= self.SLOW_THRESHOLD_MS * 2 else "medium",
+                duration_ms=duration,
+            ))
+        return items
+
+    def _failure_clusters(self, summaries: list[TestReportSummary], failed_count: int) -> list[ReportFailureCluster]:
+        failed_items = [item for item in summaries if item.failed_count > 0 or item.status in {"failed", "timeout"}]
+        clusters = [
+            ReportFailureCluster(
+                name=item.name,
+                count=max(item.failed_count, 1),
+                priority="P0" if item.failed_count or failed_count else "P1",
+                confidence=min(95, 82 + max(item.failed_count, 1) * 3),
+            )
+            for item in failed_items[:5]
+        ]
+        return clusters or [
+            ReportFailureCluster(name="暂无失败聚类", count=0, priority="P3", confidence=60)
+        ]
+
+    def _report_recommendations(
+        self,
+        *,
+        failure_clusters: list[ReportFailureCluster],
+        slow_tests: list[ReportSlowTest],
+    ) -> list[ReportAIRecommendation]:
+        recommendations: list[ReportAIRecommendation] = []
+        risky_clusters = [item for item in failure_clusters if item.count > 0]
+        if risky_clusters:
+            recommendations.append(ReportAIRecommendation(
+                id="rec-failure-cluster",
+                priority="P0" if any(item.priority == "P0" for item in risky_clusters) else "P1",
+                content=f"优先复核 {risky_clusters[0].name}，当前聚类失败 {risky_clusters[0].count} 次。",
+                action_label="查看失败聚类",
+            ))
+        if slow_tests:
+            recommendations.append(ReportAIRecommendation(
+                id="rec-slow-tests",
+                priority="P1",
+                content=f"优化 {slow_tests[0].name}，当前耗时 {slow_tests[0].duration_ms}ms，超过慢用例阈值。",
+                action_label="查看慢用例",
+            ))
+        if not recommendations:
+            recommendations.append(ReportAIRecommendation(
+                id="rec-quality-stable",
+                priority="P2",
+                content="当前报告趋势稳定，建议保持核心链路每日回归。",
+                action_label="查看趋势",
+            ))
+        return recommendations
+
+    def _pass_rate_trend(self, summaries: list[TestReportSummary], *, days: int) -> list[ReportTrendValue]:
+        buckets: dict[date, list[TestReportSummary]] = {}
+        for item in summaries:
+            if item.started_at is None:
+                continue
+            buckets.setdefault(item.started_at.date(), []).append(item)
+        ordered_days = sorted(buckets)[-max(days, 1):]
+        return [
+            ReportTrendValue(
+                label=self._weekday_label(day),
+                value=self._bucket_pass_rate(buckets[day]),
+            )
+            for day in ordered_days
+        ] or [ReportTrendValue(label="今日", value=0)]
+
+    def _stability_heatmap(self, summaries: list[TestReportSummary], *, days: int) -> list[ReportStabilityHeatmapRow]:
+        values = [max(1, min(5, int(round(item.pass_rate / 20)))) for item in summaries[:days]]
+        if not values:
+            values = [5]
+        while len(values) < days:
+            values.append(values[-1])
+        return [
+            ReportStabilityHeatmapRow(module="报告稳定性", values=values[:days]),
+            ReportStabilityHeatmapRow(module="执行波动", values=list(reversed(values[:days]))),
+        ]
+
+    def _risk_indicators(
+        self,
+        *,
+        failure_clusters: list[ReportFailureCluster],
+        slow_tests: list[ReportSlowTest],
+        open_defects: int,
+    ) -> list[ReportRiskIndicator]:
+        risk_score = min(100, open_defects * 12 + sum(item.count for item in failure_clusters) * 10)
+        return [
+            ReportRiskIndicator(
+                name="失败聚类风险",
+                level="high" if risk_score >= 70 else "medium" if risk_score >= 35 else "low",
+                score=risk_score,
+            ),
+            ReportRiskIndicator(
+                name="慢用例风险",
+                level="high" if len(slow_tests) >= 5 else "medium" if slow_tests else "low",
+                score=min(100, len(slow_tests) * 18),
+            ),
+        ]
+
+    def _open_defect_count(self, project_id: int) -> int:
+        return int(
+            self.db.query(Defect)
+            .filter(Defect.project_id == project_id)
+            .filter(~Defect.status.in_(("closed", "resolved", "done", "已关闭", "已解决")))
+            .count()
+        )
+
+    def _bucket_pass_rate(self, items: list[TestReportSummary]) -> float:
+        total = sum(item.total_count for item in items)
+        passed = sum(item.passed_count for item in items)
+        return round(passed * 100 / total, 2) if total else 0.0
+
+    def _weekday_label(self, value: date) -> str:
+        labels = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        return labels[value.weekday()]
 
     def _get_plan_report(self, *, project_id: int, source_id: int):
         run = self.repository.get_plan_run(project_id=project_id, source_id=source_id)

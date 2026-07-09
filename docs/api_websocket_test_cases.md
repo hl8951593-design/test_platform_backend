@@ -58,6 +58,11 @@ Agent 可通过 `websocket_testcase.create_saved` 新增已保存 WebSocket 用�
 
 响应 `data` 为 `{items,total,page,page_size}`。
 
+性能约束：该 GET 接口接入后端 10 秒短 TTL 读穿透缓存，缓存 key 包含 DB bind、用户、项目、
+关键字、环境筛选和分页参数；创建、更新、删除或执行 WebSocket 用例会清理 WebSocket 用例、
+项目统计和环境配置相关缓存。仓储层继续使用 `selectinload(environment_links)`，避免
+`environment_ids` 序列化触发逐行懒加载。
+
 ## 配置示例
 
 ```json

@@ -7,11 +7,11 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 最近核对日期 | 2026-07-07 |
-| 开发基线 | `3.0.500-scenario-save-followup-dry-run` |
-| Alembic head | `0032_execution_history_query_indexes` |
+| 最近核对日期 | 2026-07-09 |
+| 开发基线 | `3.0.532-read-path-performance-cache` |
+| Alembic head | `0036_project_list_query_indexes` |
 | 回归命令 | `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v` |
-| 最近完整回归 | 已执行 `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v`，696 个用例执行完成，OK（skipped=3）；已执行 `.\.venv\Scripts\python.exe -m alembic current`，当前库为 `0032_execution_history_query_indexes (head)`；Agent 工具请求 `evidence_refs` 简写归一化、Windows 本地日志 rollover 文件占用保护、Agent 场景草稿 artifact 保存链路、full payload trace、同会话 ToolCall artifact manifest、测试用例查询快照 manifest、行为评测多轮复用链路、场景组合编排质量门、Agent 工具-Skill 覆盖审计和 final summary 重复工具请求成功态收尾提示已纳入回归 |
+| 最近完整回归 | 上次完整回归为 `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v`，711 个用例执行完成，OK（skipped=3）；本次 `3.0.532-read-path-performance-cache` 已执行 `.\.venv\Scripts\python.exe -m unittest tests.test_notifications_contract tests.test_project_page_contract tests.test_resource_list_filters` 专项契约回归，12 个用例 OK；HTTP 并发验证覆盖 `/test-cases`、`/websocket-test-cases`、`/projects`、`/environment-configs`、`/notifications`；Alembic head 仍为 `0036_project_list_query_indexes` |
 
 数字基线只能在实际执行命令后更新。数据库结构以 Alembic migration 和当前模型共同为准，
 不能只修改模型而遗漏迁移。
@@ -55,7 +55,10 @@
 | [后端日志与排查](logging.md) | request_id、请求日志、执行队列和 AI JSON 修复日志定位 |
 | [统一错误响应](api_errors.md) | HTTP 错误 envelope、字段定位、500 request ID 和 OpenAPI 契约 |
 | [统一执行记录](api_execution_records.md) | HTTP、WebSocket、场景和 Flow 执行历史的公共列表与详情契约 |
-| [测试报告](api_test_reports.md) | 测试计划和 Flow 的报告历史、结构化指标、明细与 HTML 导出 |
+| [执行中心](api_execution_center.md) | 执行中心页面总览、队列、Worker、日志、失败诊断和重试池读接口 |
+| [通知中心](api_notifications.md) | 顶栏通知列表、未读筛选和已读状态持久化契约 |
+| [工作台质量总览](api_dashboard.md) | 首页质量大盘、风险矩阵、自动化效率、AI 建议和热路径聚合性能边界 |
+| [测试报告](api_test_reports.md) | 测试计划、Flow 报告历史、结构化指标、HTML 导出和 AI 报告大盘 |
 | [缺陷跟踪](api_defects.md) | 项目缺陷 CRUD、富文本清洗、状态流转和权限契约 |
 | [媒体存储](api_media.md) | MinIO 图片上传、附件绑定、临时访问地址和清理契约 |
 | [Agent 前端接口契约](api_agent_frontend_contract.md) | Harness Loop Agent 前端接入接口、SSE、字段契约和限制 |
@@ -73,6 +76,9 @@
 - [后端日志与排查](logging.md)
 - [统一错误响应](api_errors.md)
 - [统一执行记录](api_execution_records.md)
+- [执行中心](api_execution_center.md)
+- [通知中心](api_notifications.md)
+- [工作台质量总览](api_dashboard.md)
 - [测试报告](api_test_reports.md)
 - [缺陷跟踪](api_defects.md)
 - [媒体存储](api_media.md)

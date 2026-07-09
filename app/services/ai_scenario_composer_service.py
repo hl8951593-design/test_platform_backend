@@ -1,3 +1,4 @@
+import json
 import re
 from typing import Any
 
@@ -23,6 +24,18 @@ from app.services.permission_service import PermissionService
 from app.services.scenario_service import ScenarioService
 from app.services.test_case_service import TestCaseService
 from app.services.websocket_test_case_service import WebSocketTestCaseService
+
+
+EXTERNAL_VALIDATION_BLOCKER_CODES = {401, 403, 90001, 2001}
+EXTERNAL_VALIDATION_BLOCKER_TEXT_MARKERS = (
+    "未授权",
+    "无权限",
+    "权限",
+    "unauthorized",
+    "forbidden",
+    "permission",
+    "auth",
+)
 
 
 class AIScenarioComposerService:
@@ -147,6 +160,17 @@ class AIScenarioComposerService:
                 )
             if validation.status == "passed":
                 return result
+            external_blockers = self._external_validation_blockers(validation)
+            if external_blockers:
+                result.warnings.append(
+                    "external_validation_blocker: 场景自验证失败来自鉴权、权限或外部账号配置，"
+                    "已停止自动重生成；请修复环境 Token/账号授权后重新验证。"
+                )
+                result.warnings.append(
+                    "external_validation_blocker_details: "
+                    + json.dumps(external_blockers[:5], ensure_ascii=False, default=str, sort_keys=True)
+                )
+                return result
             result.warnings.append(
                 f"第 {attempt} 次场景自验证未通过，状态: {validation.status}"
             )
@@ -170,6 +194,34 @@ class AIScenarioComposerService:
             if trace:
                 trace.step_completed(f"根据第 {attempt} 次验证结果修复场景")
         return result
+
+    def _external_validation_blockers(self, validation: AIScenarioValidationAttemptRead) -> list[dict[str, Any]]:
+        blockers: list[dict[str, Any]] = []
+        for issue in validation.issues:
+            if not isinstance(issue, dict) or not self._is_external_validation_blocker(issue):
+                continue
+            response = issue.get("response_snapshot") if isinstance(issue.get("response_snapshot"), dict) else {}
+            response_json = response.get("json") if isinstance(response.get("json"), dict) else {}
+            blockers.append({
+                "type": "auth_or_permission",
+                "step_id": issue.get("step_id"),
+                "name": issue.get("name"),
+                "status_code": response.get("status_code"),
+                "business_code": response_json.get("code"),
+                "message": response_json.get("msg") or issue.get("message"),
+            })
+        return blockers
+
+    def _is_external_validation_blocker(self, issue: dict[str, Any]) -> bool:
+        response = issue.get("response_snapshot") if isinstance(issue.get("response_snapshot"), dict) else {}
+        response_json = response.get("json") if isinstance(response.get("json"), dict) else {}
+        code = response_json.get("code", response.get("status_code"))
+        if isinstance(code, int) and code in EXTERNAL_VALIDATION_BLOCKER_CODES:
+            return True
+        if isinstance(code, str) and code.isdigit() and int(code) in EXTERNAL_VALIDATION_BLOCKER_CODES:
+            return True
+        haystack = json.dumps(issue, ensure_ascii=False, default=str).lower()
+        return any(marker.lower() in haystack for marker in EXTERNAL_VALIDATION_BLOCKER_TEXT_MARKERS)
 
     def _ensure_environment_name(self, result: AIGeneratedScenarioResponse, environment_name: str | None) -> None:
         if result.environment_name is None and environment_name is not None:

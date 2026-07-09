@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import HTMLResponse
@@ -59,6 +60,23 @@ def get_test_report_trends(
         started_to=started_to,
     )
     return success(data=trends)
+
+
+@router.get("/intelligence-overview", summary="Get AI report intelligence overview")
+def get_report_intelligence_overview(
+    project_id: int,
+    environment_id: int | None = None,
+    range_value: Annotated[str, Query(alias="range")] = "7d",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    overview = TestReportService(db).get_intelligence_overview(
+        project_id=project_id,
+        environment_id=environment_id,
+        range_value=range_value,
+        current_user=current_user,
+    )
+    return success(data=overview)
 
 
 @router.get("/{source_type}/{source_id}", summary="Get a structured test report")

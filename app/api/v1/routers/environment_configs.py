@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user, get_db
+from app.core.read_response_cache import read_response_cache
 from app.core.response import success
 from app.models.user import User
 from app.schemas.project import (
@@ -23,11 +24,22 @@ def list_environment_configs(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    configs = ProjectService(db).list_environment_configs(
-        project_id=project_id,
-        current_user=current_user,
+    cache_key = (
+        "environment_configs",
+        id(db.get_bind()),
+        current_user.id,
+        bool(current_user.is_admin),
+        project_id,
     )
-    return success(data=configs)
+
+    def build_response():
+        configs = ProjectService(db).list_environment_configs(
+            project_id=project_id,
+            current_user=current_user,
+        )
+        return success(data=configs)
+
+    return read_response_cache.get_or_set(cache_key, build_response)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, summary="创建项目环境配置")
@@ -48,6 +60,8 @@ def create_environment_config(
         environment_id=environment.id,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("environment_configs",))
+    read_response_cache.clear_prefix(("projects",))
     return success(data=config, message="环境配置创建成功")
 
 
@@ -86,6 +100,8 @@ def update_environment_config(
         environment_id=environment_id,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("environment_configs",))
+    read_response_cache.clear_prefix(("projects",))
     return success(data=config, message="环境配置更新成功")
 
 
@@ -101,6 +117,10 @@ def delete_environment_config(
         environment_id=environment_id,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("environment_configs",))
+    read_response_cache.clear_prefix(("projects",))
+    read_response_cache.clear_prefix(("test_cases",))
+    read_response_cache.clear_prefix(("websocket_test_cases",))
     return success(message="环境配置删除成功")
 
 
@@ -133,6 +153,7 @@ def upsert_environment_config_variable(
         payload=payload,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("environment_configs",))
     return success(
         data=ProjectEnvironmentVariableRead.model_validate(variable),
         message="环境配置变量保存成功",
@@ -153,6 +174,7 @@ def delete_environment_config_variable(
         variable_id=variable_id,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("environment_configs",))
     return success(message="环境配置变量删除成功")
 
 
@@ -185,4 +207,6 @@ def bind_test_case_environment(
         payload=payload,
         current_user=current_user,
     )
+    read_response_cache.clear_prefix(("environment_configs",))
+    read_response_cache.clear_prefix(("test_cases",))
     return success(data=test_case, message="用例环境配置已更新")

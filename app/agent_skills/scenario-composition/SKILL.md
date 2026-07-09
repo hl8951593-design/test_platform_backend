@@ -1,6 +1,33 @@
 ---
 name: scenario-composition
 description: Use when the user asks to create, generate, compose, update, validate, dry-run, save, or explain a TestAuto scenario, scenario draft, visual flow, multi-step API workflow, dataset-driven scenario, precondition/postcondition chain, or current project scenario composition.
+capabilities:
+  - scenario.compose
+  - scenario.save
+  - scenario.update
+  - scenario.execute
+  - scenario.repair
+required_context:
+  - project_context
+  - test_case_inventory
+  - scenario_inventory
+tools:
+  - project.read_context
+  - testcase.query_project_cases
+  - scenario.compose_draft
+  - scenario.query_project_scenarios
+  - scenario.create_saved
+  - scenario.update_saved
+  - scenario.execute_dry_run
+artifacts:
+  - scenario_draft
+  - saved_scenario
+  - scenario_run_failure
+  - test_case_query_snapshot
+examples:
+  - create enterprise automation flow
+  - execute the flow I just created and summarize the result
+  - save the scenario draft from this conversation
 triggers:
   - 场景
   - scenario
@@ -8,9 +35,19 @@ triggers:
   - 组合
   - 草稿
   - 数据集
+  - 测试流程
+  - 自动化测试流程
+  - 企业
+  - 关注
   - companyid
   - 保存
   - 正式场景
+  - 执行测试
+  - 运行测试
+  - 试运行
+  - 这个场景
+  - 该场景
+  - 场景执行
 routing_requires_tool:
   - 当前项目
   - 已有用例
@@ -22,6 +59,13 @@ routing_requires_tool:
   - 测试场景组合
   - 场景草稿
   - 执行场景
+  - 执行测试
+  - 运行测试
+  - 场景下执行
+  - 这个场景执行
+  - 该场景执行
+  - 场景执行
+  - 试运行
   - dry-run
   - 保存
   - 正式场景
@@ -52,7 +96,7 @@ guard_unsupported_capability:
 
 1. A scenario is an orchestration artifact, not a copied case list. It owns `nodes`, `before_actions`, `after_actions`, `_scenario_context.extractions`, `_scenario_context.bindings`, datasets, and downstream `{{variable}}` references.
 2. For create/generate/compose/update, query current project cases first with `testcase.query_project_cases`; for large projects use summary, then selected `assertions` or `full` detail.
-3. Call `scenario.compose_draft` only with real ids from the latest query. Do not invent case/scenario/environment ids, request fields, samples, or results.
+3. Call `scenario.compose_draft` only with real ids from the latest query, and use `input.requirement` as the natural-language goal. Do not send `nodes`, `_scenario_context`, `before_actions`, `after_actions`, or datasets as the tool input root; put desired bindings/extractions/hooks in `input.extra_requirements` and let the compose tool generate the draft.
 4. For same-conversation save/update, reuse the latest complete `scenario.compose_draft.draft.scenario`; never reconstruct JSON from the visible summary.
 5. Save formal scenarios with `scenario.create_saved` or `scenario.update_saved`. Saving requires approval; do not claim saved before the approved tool succeeds.
 6. For existing saved scenarios or dry-run, first use `scenario.query_project_scenarios`; execute only explicit current results with `scenario.execute_dry_run`.

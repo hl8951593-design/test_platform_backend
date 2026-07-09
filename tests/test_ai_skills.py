@@ -9,6 +9,7 @@ from app.ai_skills import get_ai_skill
 from app.ai_skills.base import AISkillRunner
 from app.schemas.ai import (
     AIGeneratedScenarioResponse,
+    AIHttpTestCaseDescriptionSummaryRequest,
     AIScenarioComposeRequest,
     AISkillRunRequest,
     AITestCaseGenerateRequest,
@@ -73,6 +74,10 @@ class AISkillTests(unittest.TestCase):
         self.assertEqual(generate.input_schema, "AITestCaseGenerateRequest")
         self.assertIn("interface_text", generate.input_json_schema["properties"])
         self.assertTrue(generate.requires_environment)
+        summarize = next(item for item in http_skill.operations if item.name == "summarize_description")
+        self.assertEqual(summarize.input_schema, "AIHttpTestCaseDescriptionSummaryRequest")
+        self.assertEqual(summarize.output_schema, "AIHttpTestCaseDescriptionSummaryResponse")
+        self.assertIn("mode", summarize.input_json_schema["properties"])
 
         scenario_skill = next(item for item in skills if item.id == "scenario-composer")
         compose = next(item for item in scenario_skill.operations if item.name == "compose")
@@ -157,6 +162,219 @@ class AISkillTests(unittest.TestCase):
         self.assertEqual(captured["environment_id"], 2)
         self.assertIs(captured["current_user"], user)
         self.assertIsInstance(captured["payload"], AITestCaseGenerateRequest)
+
+    def test_generic_skill_run_delegates_to_http_description_summary(self):
+        db = SimpleNamespace()
+        user = SimpleNamespace(id=1)
+        summary = SimpleNamespace(
+            description="该接口用于查询企业列表，响应 data 返回企业基础信息集合。",
+            source_summary="request_response",
+            warnings=[],
+        )
+        captured = {}
+
+        class FakeTestCaseService:
+            def __init__(self, service_db):
+                captured["db"] = service_db
+
+            def summarize_description(self, **kwargs):
+                captured.update(kwargs)
+                return summary
+
+        module = __import__("app.services.ai_skill_service", fromlist=["AITestCaseService"])
+        original = module.AITestCaseService
+        module.AITestCaseService = FakeTestCaseService
+        try:
+            result = AISkillService(db).run_skill(
+                skill_id="http-test-case",
+                payload=AISkillRunRequest(
+                    operation="summarize_description",
+                    project_id=1,
+                    environment_id=4,
+                    source_id=7,
+                    input={
+                        "mode": "request_response",
+                        "test_case_id": 7,
+                        "name": "获取企业列表",
+                        "protocol": "http",
+                        "environment_id": 4,
+                        "environment_ids": [4],
+                        "request": {
+                            "method": "GET",
+                            "path": "/api/enterprise/list",
+                            "headers": {},
+                            "query_params": {},
+                            "body_type": "none",
+                            "body": None,
+                            "assertions": [],
+                            "extractors": [],
+                        },
+                        "response": {
+                            "status": "passed",
+                            "status_code": 200,
+                            "duration_ms": 785,
+                            "headers": "{\"content-type\":\"application/json\"}",
+                            "body": "{\"code\":200,\"data\":{}}",
+                            "assertions": "pass",
+                            "error_message": None,
+                            "created_at": "2026-07-09T08:02:53",
+                        },
+                    },
+                ),
+                current_user=user,
+            )
+        finally:
+            module.AITestCaseService = original
+
+        self.assertIs(result, summary)
+        self.assertIs(captured["db"], db)
+        self.assertEqual(captured["project_id"], 1)
+        self.assertEqual(captured["environment_id"], 4)
+        self.assertEqual(captured["source_id"], 7)
+        self.assertIs(captured["current_user"], user)
+        self.assertIsInstance(captured["payload"], AIHttpTestCaseDescriptionSummaryRequest)
+        self.assertEqual(captured["payload"].mode, "request_response")
+
+    def test_http_case_description_summary_returns_fixed_contract(self):
+        service = object.__new__(AITestCaseService)
+        service.permission_service = SimpleNamespace(require_project_permission=lambda *args: None)
+        service.test_case_repository = SimpleNamespace(
+            get_by_id=lambda **kwargs: SimpleNamespace(
+                id=7,
+                project_id=1,
+                name="获取企业列表",
+                description=None,
+                environment_id=4,
+                environment_ids=[4],
+                method="GET",
+                path="/api/enterprise/list",
+                headers={},
+                query_params={},
+                body_type="none",
+                body=None,
+                assertions=[{"type": "status_code", "expected": 200}],
+                extractors=[],
+            )
+        )
+        service.ai_service = FakeAIService({
+            "description": "该接口用于查询企业列表，响应 data 返回企业基础信息集合。",
+            "source_summary": "request_response",
+            "warnings": [],
+        })
+
+        result = service.summarize_description(
+            project_id=1,
+            environment_id=4,
+            source_id=7,
+            payload=AIHttpTestCaseDescriptionSummaryRequest(
+                mode="request_response",
+                test_case_id=7,
+                name="获取企业列表",
+                protocol="http",
+                environment_id=4,
+                environment_ids=[4],
+                request={
+                    "method": "GET",
+                    "path": "/api/enterprise/list",
+                    "headers": {},
+                    "query_params": {},
+                    "body_type": "none",
+                    "body": None,
+                    "assertions": [],
+                    "extractors": [],
+                },
+                response={
+                    "status": "passed",
+                    "status_code": 200,
+                    "duration_ms": 785,
+                    "headers": "{\"content-type\":\"application/json\"}",
+                    "body": "{\"code\":200,\"data\":{}}",
+                    "assertions": "pass",
+                    "error_message": None,
+                    "created_at": "2026-07-09T08:02:53",
+                },
+            ),
+            current_user=SimpleNamespace(id=1),
+        )
+
+        self.assertIn("该接口用于查询企业列表，响应 data 返回企业基础信息集合。", result.description)
+        self.assertIn("响应结构", result.description)
+        self.assertIn("code", result.description)
+        self.assertIn("data", result.description)
+        self.assertEqual(result.source_summary, "request_response")
+        self.assertEqual(result.warnings, [])
+        self.assertIn("接口测试用例描述总结助手", service.ai_service.requests[0].messages[0].content)
+        request_payload = json.loads(service.ai_service.requests[0].messages[1].content)
+        self.assertEqual(request_payload["mode"], "request_response")
+        self.assertEqual(request_payload["request"]["path"], "/api/enterprise/list")
+        self.assertEqual(request_payload["response"]["status_code"], 200)
+
+    def test_http_case_description_summary_enriches_response_structure(self):
+        service = object.__new__(AITestCaseService)
+        service.permission_service = SimpleNamespace(require_project_permission=lambda *args: None)
+        service.test_case_repository = SimpleNamespace(get_by_id=lambda **kwargs: None)
+        service.ai_service = FakeAIService({
+            "description": "该接口用于分页查询企业列表。",
+            "source_summary": "request_response",
+            "warnings": [],
+        })
+
+        result = service.summarize_description(
+            project_id=1,
+            environment_id=4,
+            source_id=None,
+            payload=AIHttpTestCaseDescriptionSummaryRequest(
+                mode="request_response",
+                test_case_id=None,
+                name="获取企业列表",
+                protocol="http",
+                environment_id=4,
+                environment_ids=[4],
+                request={
+                    "method": "POST",
+                    "path": "/api/lingxi-chain/cloudentchain/getEntPageList",
+                    "headers": {},
+                    "query_params": {},
+                    "body_type": "json",
+                    "body": {"keyword": "企业", "page": 1, "size": 10},
+                    "assertions": [],
+                    "extractors": [],
+                },
+                response={
+                    "status": "passed",
+                    "status_code": 200,
+                    "duration_ms": 1200,
+                    "headers": "{\"content-type\":\"application/json\"}",
+                    "body": json.dumps({
+                        "msg": "操作成功",
+                        "code": 200,
+                        "data": {
+                            "total": 100001,
+                            "dataList": [
+                                {
+                                    "esDt": "2001-02-21",
+                                    "uscNo": "911100007109279199",
+                                    "regAddr": "北京市海淀区西直门北大街62号18、22、28层",
+                                    "isFollow": 0,
+                                }
+                            ],
+                        },
+                    }, ensure_ascii=False),
+                    "assertions": "pass",
+                    "error_message": None,
+                    "created_at": "2026-07-09T08:02:53",
+                },
+            ),
+            current_user=SimpleNamespace(id=1),
+        )
+
+        self.assertIn("响应结构", result.description)
+        self.assertIn("data.total", result.description)
+        self.assertIn("data.dataList[]", result.description)
+        self.assertIn("uscNo", result.description)
+        request_payload = json.loads(service.ai_service.requests[0].messages[1].content)
+        self.assertIn("response_structure", request_payload)
+        self.assertIn("data.dataList[]", request_payload["response_structure"])
 
     def test_scenario_composer_skill_normalizes_candidate_references(self):
         skill = get_ai_skill("scenario-composer")
@@ -1251,6 +1469,7 @@ class AISkillTests(unittest.TestCase):
 
         paths = create_app().openapi()["paths"]
 
+        self.assertIn("/api/v1/ai/skills/{skill_id}/run", paths)
         self.assertIn("/api/v1/ai/skills/{skill_id}/runs", paths)
         self.assertIn("/api/v1/ai/skill-runs/{run_id}", paths)
         self.assertIn("/api/v1/ai/skill-runs/{run_id}/events", paths)

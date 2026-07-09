@@ -13,6 +13,31 @@ class ProjectUpdateRequest(BaseModel):
     description: str | None = Field(default=None, description="项目描述")
 
 
+class ProjectMemberSummaryRead(BaseModel):
+    id: int
+    name: str
+    role: str
+
+
+class ProjectStatsRead(BaseModel):
+    api_case_count: int = 0
+    http_test_case_count: int = 0
+    websocket_test_case_count: int = 0
+    test_case_count: int = 0
+    scenario_count: int = 0
+    plan_count: int = 0
+    run_count: int = 0
+    pass_rate: int = 0
+    coverage_rate: int = 0
+    automation_rate: int = 0
+    defect_count: int = 0
+    last_run_at: datetime | None = None
+    last_execution_status: str | None = None
+    risk_score: int = 0
+    ai_recommendations: list[str] = Field(default_factory=list)
+    team_activity: list[str] = Field(default_factory=list)
+
+
 class ProjectRead(BaseModel):
     id: int
     name: str
@@ -21,6 +46,11 @@ class ProjectRead(BaseModel):
     is_deleted: bool
     created_at: datetime
     updated_at: datetime
+    owner_name: str | None = None
+    status: str = "active"
+    is_active: bool = True
+    members: list[ProjectMemberSummaryRead] = Field(default_factory=list)
+    stats: ProjectStatsRead = Field(default_factory=ProjectStatsRead)
 
     model_config = {"from_attributes": True}
 
@@ -78,6 +108,7 @@ class ProjectEnvironmentRead(BaseModel):
     base_url: str
     description: str | None
     is_default: bool
+    is_active: bool = True
     is_deleted: bool
     created_by_id: int
     created_at: datetime

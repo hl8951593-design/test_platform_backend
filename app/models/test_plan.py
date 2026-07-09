@@ -90,6 +90,20 @@ class TestPlanRun(Base):
     __table_args__ = (
         UniqueConstraint("project_id", "idempotency_key", name="uq_test_plan_runs_project_idempotency"),
         Index("ix_test_plan_runs_project_started", "project_id", "started_at"),
+        Index(
+            "ix_test_plan_runs_project_env_deleted_started",
+            "project_id",
+            "environment_id",
+            "is_deleted",
+            "started_at",
+        ),
+        Index(
+            "ix_test_plan_runs_project_status_deleted_started",
+            "project_id",
+            "status",
+            "is_deleted",
+            "started_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)

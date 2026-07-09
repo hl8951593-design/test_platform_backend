@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from app.ai_skills.base import AISkill, SkillPackage, load_model_json
 from app.ai_skills.registry import register_ai_skill
 from app.schemas.ai import AIChatMessage, AIChatRequest, AIGeneratedScenarioResponse
-from app.schemas.scenario import ScenarioActionRequest, ScenarioCreateRequest
+from app.schemas.scenario import ScenarioActionRequest, ScenarioCreateRequest, VARIABLE_NAME_PATTERN
 
 
 SCENARIO_ACTION_CAPABILITIES = [
@@ -305,6 +305,8 @@ class ScenarioComposerSkill(AISkill):
         if kind == "fixed_value":
             if "output" not in config and action.get("output") is not None:
                 config["output"] = action["output"]
+            if "output" in config:
+                config["output"] = self._safe_variable_identifier(config["output"])
             if "value" not in config and "value" in action:
                 config["value"] = action["value"]
             return config
@@ -312,6 +314,8 @@ class ScenarioComposerSkill(AISkill):
             for key in ("output", "type", "min", "max", "length"):
                 if key not in config and key in action:
                     config[key] = action[key]
+            if "output" in config:
+                config["output"] = self._safe_variable_identifier(config["output"])
             return config
         if kind == "condition":
             if "expression" not in config and action.get("expression") is not None:
@@ -323,6 +327,10 @@ class ScenarioComposerSkill(AISkill):
                     config[key] = action[key]
             if "timeout_ms" not in config and action.get("timeoutMs") is not None:
                 config["timeout_ms"] = action["timeoutMs"]
+            if isinstance(config.get("inputs"), list):
+                config["inputs"] = [self._safe_variable_identifier(item) for item in config["inputs"]]
+            if isinstance(config.get("outputs"), list):
+                config["outputs"] = [self._safe_variable_identifier(item) for item in config["outputs"]]
             return config
         return config
 
@@ -482,10 +490,27 @@ class ScenarioComposerSkill(AISkill):
         has_context = isinstance(scenario_context, dict)
         if not has_context:
             scenario_context = {}
-        bindings = [
-            dict(item)
-            for item in self._context_items(scenario_context, "bindings", "inputBindings", "input_bindings")
-        ]
+        bindings = []
+        for item in self._context_items(scenario_context, "bindings", "inputBindings", "input_bindings"):
+            binding = dict(item)
+            binding_name = str(
+                binding.get("name")
+                or binding.get("variable")
+                or binding.get("variable_name")
+                or binding.get("variableName")
+                or ""
+            )
+            source_name = self._find_variable_source_name(variable_sources, binding_name)
+            if source_name and source_name != binding_name:
+                binding["name"] = source_name
+                warnings.append(
+                    f"{step_label} 的绑定变量 {binding_name} 已改为合法变量名 {source_name}"
+                )
+            if source_name:
+                source = variable_sources[source_name]
+                binding.setdefault("source_step_id", source["source_step_id"])
+                binding.setdefault("source_extraction_id", source["source_extraction_id"])
+            bindings.append(binding)
         seen = {
             (
                 str(item.get("name") or item.get("variable") or item.get("variable_name") or ""),
@@ -497,10 +522,11 @@ class ScenarioComposerSkill(AISkill):
         }
         added = 0
         for target, target_path, variable_name in self._template_binding_candidates(config):
-            source = self._find_variable_source(variable_sources, variable_name)
-            if source is None:
+            source_name = self._find_variable_source_name(variable_sources, variable_name)
+            if source_name is None:
                 continue
-            key = (variable_name, target, target_path)
+            source = variable_sources[source_name]
+            key = (source_name, target, target_path)
             if key in seen:
                 continue
             bindings.append({
@@ -512,7 +538,7 @@ class ScenarioComposerSkill(AISkill):
                     target,
                     target_path,
                 ),
-                "name": variable_name,
+                "name": source_name,
                 "source_step_id": source["source_step_id"],
                 "source_extraction_id": source["source_extraction_id"],
                 "target": target,
@@ -556,12 +582,49 @@ class ScenarioComposerSkill(AISkill):
         variable_sources: dict[str, dict[str, str]],
         variable_name: str,
     ) -> dict[str, str] | None:
+        source_name = self._find_variable_source_name(variable_sources, variable_name)
+        return variable_sources[source_name] if source_name is not None else None
+
+    def _find_variable_source_name(
+        self,
+        variable_sources: dict[str, dict[str, str]],
+        variable_name: str,
+    ) -> str | None:
         if variable_name in variable_sources:
-            return variable_sources[variable_name]
+            return variable_name
         normalized = self._normalize_variable_name(variable_name)
-        for name, source in variable_sources.items():
+        for name in variable_sources:
             if self._normalize_variable_name(name) == normalized:
-                return source
+                return name
+        return None
+
+    def _rewrite_template_variables_to_available(
+        self,
+        value: str,
+        available_variables: set[str],
+    ) -> tuple[str, list[str]]:
+        rewrites: dict[str, str] = {}
+        for match in re.finditer(r"\{\{\s*([^{}]+?)\s*\}\}", value):
+            variable_name = match.group(1).strip()
+            if variable_name in available_variables:
+                continue
+            canonical = self._find_available_variable_name(available_variables, variable_name)
+            if canonical and canonical != variable_name:
+                rewrites[variable_name] = canonical
+        if not rewrites:
+            return value, []
+
+        def replace(match: re.Match[str]) -> str:
+            variable_name = match.group(1).strip()
+            return "{{" + rewrites.get(variable_name, variable_name) + "}}"
+
+        return re.sub(r"\{\{\s*([^{}]+?)\s*\}\}", replace, value), sorted(rewrites)
+
+    def _find_available_variable_name(self, available_variables: set[str], variable_name: str) -> str | None:
+        normalized = self._normalize_variable_name(variable_name)
+        for name in sorted(available_variables):
+            if self._normalize_variable_name(name) == normalized:
+                return name
         return None
 
     def _baseline_assertions(self, candidate: dict[str, Any]) -> list[dict[str, Any]]:
@@ -651,6 +714,13 @@ class ScenarioComposerSkill(AISkill):
     ) -> Any:
         if isinstance(value, str):
             names = [match.group(1).strip() for match in re.finditer(r"\{\{\s*([^{}]+?)\s*\}\}", value)]
+            rewritten_value, rewritten_names = self._rewrite_template_variables_to_available(value, available_variables)
+            if rewritten_names:
+                warnings.append(
+                    f"{step_label} 的 {root}.{'.'.join(path)} 引用了非平台变量名 "
+                    f"{', '.join(rewritten_names)}，已改为合法变量名"
+                )
+                return rewritten_value
             unknown_names = [name for name in names if name not in available_variables]
             if not unknown_names:
                 return value
@@ -887,6 +957,18 @@ class ScenarioComposerSkill(AISkill):
     @staticmethod
     def _normalize_variable_name(value: str) -> str:
         return re.sub(r"[^a-z0-9]", "", value.lower())
+
+    @staticmethod
+    def _safe_variable_identifier(value: Any) -> str:
+        raw = str(value or "").strip()
+        if re.fullmatch(VARIABLE_NAME_PATTERN, raw):
+            return raw
+        safe = re.sub(r"[^A-Za-z0-9_]+", "_", raw).strip("_")
+        if not safe:
+            safe = "value"
+        if not re.match(r"^[A-Za-z_]", safe):
+            safe = f"var_{safe}"
+        return safe[:128]
 
     @staticmethod
     def _context_items(context: dict[str, Any], *keys: str) -> list[dict[str, Any]]:

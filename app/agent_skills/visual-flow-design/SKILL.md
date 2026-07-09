@@ -1,6 +1,23 @@
 ---
 name: visual-flow-design
 description: Use when the user asks to design, review, troubleshoot, or explain TestAuto visual flows, DAG nodes, HTTP/WebSocket nodes, conditions, delays, data binding, node execution, flow reports, or visual flow execution records.
+capabilities:
+  - visual_flow.design
+  - visual_flow.review
+  - visual_flow.diagnose
+required_context:
+  - project_context
+  - visual_flow_inventory
+tools:
+  - project.read_context
+  - report.read_summary
+artifacts:
+  - visual_flow
+  - flow_report
+examples:
+  - review a visual flow DAG
+  - diagnose a flow report
+  - explain node data binding
 triggers:
   - visual flow
   - flow
@@ -10,7 +27,6 @@ triggers:
   - condition
   - delay
   - 可视化流程
-  - 流程
   - 节点
   - 条件
   - 延迟

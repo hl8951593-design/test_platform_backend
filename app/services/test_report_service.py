@@ -210,32 +210,29 @@ class TestReportService:
         days = self._range_days(range_value)
         reference_time = self._latest_report_reference_time(project_id=project_id, environment_id=environment_id)
         started_from = reference_time - timedelta(days=days - 1)
-        reports, _ = self.repository.list_reports(
+        comparison_reports = self.repository.list_report_comparison_periods(
             project_id=project_id,
-            source_type=None,
-            status=None,
             environment_id=environment_id,
-            started_from=started_from,
-            started_to=reference_time + timedelta(days=1),
-            page=1,
+            current_from=started_from,
+            current_to=reference_time + timedelta(days=1),
+            previous_from=started_from - timedelta(days=days),
+            previous_to=started_from,
             page_size=1000,
         )
-        summaries = [self._summary(row) for row in reports]
+        summaries = [
+            self._summary(row)
+            for row in comparison_reports
+            if row["comparison_period"] == "current"
+        ]
         total = sum(item.total_count for item in summaries)
         passed = sum(item.passed_count for item in summaries)
         failed = sum(item.failed_count for item in summaries)
         pass_rate = round(passed * 100 / total, 2) if total else 0.0
-        previous_reports, _ = self.repository.list_reports(
-            project_id=project_id,
-            source_type=None,
-            status=None,
-            environment_id=environment_id,
-            started_from=started_from - timedelta(days=days),
-            started_to=started_from,
-            page=1,
-            page_size=1000,
-        )
-        previous_summaries = [self._summary(row) for row in previous_reports]
+        previous_summaries = [
+            self._summary(row)
+            for row in comparison_reports
+            if row["comparison_period"] == "previous"
+        ]
         previous_total = sum(item.total_count for item in previous_summaries)
         previous_passed = sum(item.passed_count for item in previous_summaries)
         previous_rate = round(previous_passed * 100 / previous_total, 2) if previous_total else pass_rate
@@ -281,18 +278,12 @@ class TestReportService:
         return 7
 
     def _latest_report_reference_time(self, *, project_id: int, environment_id: int | None) -> datetime:
-        reports, _ = self.repository.list_reports(
+        reference_time = self.repository.get_latest_report_reference_time(
             project_id=project_id,
-            source_type=None,
-            status=None,
             environment_id=environment_id,
-            started_from=None,
-            started_to=None,
-            page=1,
-            page_size=1,
         )
-        if reports:
-            return reports[0].get("started_at") or reports[0].get("created_at") or datetime.now()
+        if reference_time is not None:
+            return reference_time
         latest_case_execution = (
             self.db.query(TestCaseExecution)
             .filter(TestCaseExecution.project_id == project_id)

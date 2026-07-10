@@ -1,5 +1,6 @@
 import unittest
 from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from fastapi import HTTPException
@@ -87,6 +88,69 @@ class TestReportServiceTests(unittest.TestCase):
 
         self.assertEqual(context.exception.status_code, 400)
         service.repository.list_reports.assert_not_called()
+
+    def test_intelligence_overview_uses_count_free_repository_queries(self):
+        service = build_service()
+        service.repository.get_latest_report_reference_time.return_value = NOW
+        service.repository.list_report_comparison_periods.return_value = [
+            {
+                "comparison_period": "current",
+                "source_type": "plan",
+                "source_id": 1,
+                "project_id": 1,
+                "name": "Current",
+                "status": "passed",
+                "trigger_type": "manual",
+                "trigger_user_id": 8,
+                "environment_id": None,
+                "environment_name": None,
+                "total_count": 10,
+                "passed_count": 8,
+                "failed_count": 2,
+                "duration_ms": 100,
+                "started_at": NOW,
+                "finished_at": NOW,
+                "created_at": NOW,
+            },
+            {
+                "comparison_period": "previous",
+                "source_type": "plan",
+                "source_id": 2,
+                "project_id": 1,
+                "name": "Previous",
+                "status": "passed",
+                "trigger_type": "manual",
+                "trigger_user_id": 8,
+                "environment_id": None,
+                "environment_name": None,
+                "total_count": 10,
+                "passed_count": 5,
+                "failed_count": 5,
+                "duration_ms": 100,
+                "started_at": NOW - timedelta(days=7),
+                "finished_at": NOW - timedelta(days=7),
+                "created_at": NOW - timedelta(days=7),
+            },
+        ]
+        service.repository.list_reports.return_value = ([], 0)
+        service.db.query.return_value.filter.return_value.order_by.return_value.first.return_value = SimpleNamespace(
+            created_at=NOW,
+        )
+        service._slow_tests = MagicMock(return_value=[])
+        service._open_defect_count = MagicMock(return_value=0)
+
+        result = service.get_intelligence_overview(
+            project_id=1,
+            current_user=self.user,
+            environment_id=None,
+            range_value="7d",
+        )
+
+        self.assertEqual(result.summary.pass_rate, 80.0)
+        self.assertEqual(result.summary.pass_rate_delta, 30.0)
+        service.repository.list_reports.assert_not_called()
+        service.repository.get_latest_report_reference_time.assert_called_once()
+        service.repository.list_report_comparison_periods.assert_called_once()
 
     def test_plan_report_expands_scenario_record_runs(self):
         service = build_service()

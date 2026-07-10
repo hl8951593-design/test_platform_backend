@@ -70,6 +70,33 @@ class TestReportRepository:
             node_counts, node_counts.c.execution_id == VisualFlowExecution.id
         )
 
+    def _reports(self):
+        return union_all(self._plan_select(), self._flow_select()).subquery("test_reports")
+
+    @staticmethod
+    def _report_filters(
+        reports,
+        *,
+        project_id: int,
+        source_type: str | None = None,
+        status: str | None = None,
+        environment_id: int | None = None,
+        started_from: datetime | None = None,
+        started_to: datetime | None = None,
+    ):
+        filters = [reports.c.project_id == project_id]
+        if source_type is not None:
+            filters.append(reports.c.source_type == source_type)
+        if status is not None:
+            filters.append(reports.c.status == status)
+        if environment_id is not None:
+            filters.append(reports.c.environment_id == environment_id)
+        if started_from is not None:
+            filters.append(reports.c.started_at >= started_from)
+        if started_to is not None:
+            filters.append(reports.c.started_at <= started_to)
+        return filters
+
     def list_reports(
         self,
         *,
@@ -82,18 +109,16 @@ class TestReportRepository:
         page: int,
         page_size: int,
     ) -> tuple[list[dict[str, Any]], int]:
-        reports = union_all(self._plan_select(), self._flow_select()).subquery("test_reports")
-        filters = [reports.c.project_id == project_id]
-        if source_type is not None:
-            filters.append(reports.c.source_type == source_type)
-        if status is not None:
-            filters.append(reports.c.status == status)
-        if environment_id is not None:
-            filters.append(reports.c.environment_id == environment_id)
-        if started_from is not None:
-            filters.append(reports.c.started_at >= started_from)
-        if started_to is not None:
-            filters.append(reports.c.started_at <= started_to)
+        reports = self._reports()
+        filters = self._report_filters(
+            reports,
+            project_id=project_id,
+            source_type=source_type,
+            status=status,
+            environment_id=environment_id,
+            started_from=started_from,
+            started_to=started_to,
+        )
 
         total = self.db.scalar(
             select(func.count()).select_from(reports).where(*filters)
@@ -106,6 +131,75 @@ class TestReportRepository:
             .limit(page_size)
         ).mappings().all()
         return [dict(row) for row in rows], int(total)
+
+    def get_latest_report_reference_time(
+        self,
+        *,
+        project_id: int,
+        environment_id: int | None,
+    ) -> datetime | None:
+        reports = self._reports()
+        filters = self._report_filters(
+            reports,
+            project_id=project_id,
+            environment_id=environment_id,
+        )
+        return self.db.scalar(
+            select(func.coalesce(
+                func.max(reports.c.started_at),
+                func.max(reports.c.created_at),
+            )).where(*filters)
+        )
+
+    def list_report_comparison_periods(
+        self,
+        *,
+        project_id: int,
+        environment_id: int | None,
+        current_from: datetime,
+        current_to: datetime,
+        previous_from: datetime,
+        previous_to: datetime,
+        page_size: int = 1000,
+    ) -> list[dict[str, Any]]:
+        reports = self._reports()
+
+        def period_query(
+            label_value: str,
+            started_from: datetime,
+            started_to: datetime,
+        ):
+            filters = self._report_filters(
+                reports,
+                project_id=project_id,
+                environment_id=environment_id,
+                started_from=started_from,
+                started_to=started_to,
+            )
+            return (
+                select(
+                    *reports.c,
+                    literal(label_value).label("comparison_period"),
+                )
+                .where(*filters)
+                .order_by(
+                    reports.c.started_at.desc(),
+                    reports.c.source_type,
+                    reports.c.source_id.desc(),
+                )
+                .limit(page_size)
+                .subquery(f"{label_value}_reports")
+            )
+
+        current = period_query("current", current_from, current_to)
+        previous = period_query("previous", previous_from, previous_to)
+        rows = self.db.execute(
+            union_all(
+                select(*current.c),
+                select(*previous.c),
+            )
+        ).mappings().all()
+        return [dict(row) for row in rows]
 
     def get_daily_trends(
         self,

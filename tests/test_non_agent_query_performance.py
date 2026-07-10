@@ -1,7 +1,7 @@
 import importlib
 import importlib.util
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -19,6 +19,7 @@ from app.schemas.browser_capture import BrowserCaptureEntryBatchRequest
 from app.services.browser_capture_service import BrowserCaptureService
 from app.services.scenario_service import ScenarioService
 from app.services.test_plan_service import TestPlanService
+from app.services.test_report_service import TestReportService
 
 
 class ScenarioRunQueryPerformanceTests(unittest.TestCase):
@@ -391,6 +392,101 @@ class BrowserCaptureUpsertPerformanceTests(unittest.TestCase):
         )
         self.assertLessEqual(len(statements), 10)
         self.assertLessEqual(select_count, 4)
+
+
+class ReportIntelligenceQueryPerformanceTests(unittest.TestCase):
+    REFERENCE_TIME = datetime(2026, 7, 11, 12, 0, 0)
+
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        self.db = sessionmaker(bind=self.engine, expire_on_commit=False)()
+        self.user = User(
+            username="report-owner",
+            account="report-owner",
+            password_hash="hash",
+            phone="13000000003",
+            email="report-owner@example.com",
+        )
+        self.db.add(self.user)
+        self.db.flush()
+        self.project = Project(
+            name="Report performance",
+            created_by_id=self.user.id,
+        )
+        self.db.add(self.project)
+        self.db.flush()
+
+        current_boundary = self.REFERENCE_TIME - timedelta(days=6)
+        self.db.add_all([
+            self._plan_run(
+                name="Latest",
+                started_at=self.REFERENCE_TIME,
+                total=10,
+                passed=8,
+                failed=2,
+            ),
+            self._plan_run(
+                name="Boundary",
+                started_at=current_boundary,
+                total=5,
+                passed=4,
+                failed=1,
+            ),
+            self._plan_run(
+                name="Previous",
+                started_at=current_boundary - timedelta(days=1),
+                total=5,
+                passed=1,
+                failed=4,
+            ),
+        ])
+        self.db.commit()
+        self.service = TestReportService(self.db)
+        self.service.permission_service.require_project_permission = MagicMock()
+
+    def tearDown(self):
+        self.db.close()
+        self.engine.dispose()
+
+    def _plan_run(self, *, name, started_at, total, passed, failed):
+        return TestPlanRun(
+            project_id=self.project.id,
+            plan_name=name,
+            plan_version=1,
+            status="failed" if failed else "passed",
+            trigger="manual",
+            plan_snapshot={},
+            target_results=[],
+            target_count=total,
+            passed_count=passed,
+            failed_count=failed,
+            operator_id=self.user.id,
+            started_at=started_at,
+            finished_at=started_at + timedelta(seconds=1),
+            duration_ms=1000,
+        )
+
+    def test_overview_preserves_period_semantics_with_bounded_sql(self):
+        statements = []
+
+        def record_statement(_conn, _cursor, statement, _params, _context, _many):
+            statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", record_statement)
+        try:
+            result = self.service.get_intelligence_overview(
+                project_id=self.project.id,
+                current_user=self.user,
+                environment_id=None,
+                range_value="7d",
+            )
+        finally:
+            event.remove(self.engine, "before_cursor_execute", record_statement)
+
+        self.assertEqual(result.summary.pass_rate, 80.0)
+        self.assertEqual(result.summary.pass_rate_delta, 30.0)
+        self.assertLessEqual(len(statements), 5)
 
 
 if __name__ == "__main__":

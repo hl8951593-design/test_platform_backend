@@ -487,6 +487,18 @@ class ReportIntelligenceQueryPerformanceTests(unittest.TestCase):
         self.assertEqual(result.summary.pass_rate, 80.0)
         self.assertEqual(result.summary.pass_rate_delta, 30.0)
         self.assertLessEqual(len(statements), 5)
+        slow_test_sql = next(
+            statement.lower()
+            for statement in statements
+            if "from test_case_executions" in statement.lower()
+        )
+        for unused_large_column in (
+            "request_snapshot",
+            "response_snapshot",
+            "assertion_results",
+            "attempt_history",
+        ):
+            self.assertNotIn(unused_large_column, slow_test_sql)
 
 
 if __name__ == "__main__":

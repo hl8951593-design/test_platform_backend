@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import HTTPException, status
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from app.core.permissions import ProjectPermission
 from app.models.defect import Defect
@@ -304,6 +304,15 @@ class TestReportService:
     ) -> list[ReportSlowTest]:
         query = (
             self.db.query(TestCaseExecution, TestCase, User)
+            .options(
+                load_only(
+                    TestCaseExecution.id,
+                    TestCaseExecution.test_case_id,
+                    TestCaseExecution.duration_ms,
+                ),
+                load_only(TestCase.id, TestCase.name),
+                load_only(User.id, User.username, User.account),
+            )
             .outerjoin(TestCase, TestCase.id == TestCaseExecution.test_case_id)
             .outerjoin(User, User.id == TestCaseExecution.executed_by_id)
             .filter(TestCaseExecution.project_id == project_id)

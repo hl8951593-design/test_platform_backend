@@ -1,5 +1,5 @@
 from fastapi import HTTPException, status
-from sqlalchemy import or_, select
+from sqlalchemy import insert, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.permissions import ProjectPermission
@@ -105,26 +105,34 @@ class BrowserCaptureService:
     def upsert_entries(self, *, project_id: int, capture_id: int, payload: BrowserCaptureEntryBatchRequest, current_user: User):
         self._require_manage(project_id, current_user)
         capture = self._capture_or_404(project_id, capture_id)
+        requested_ids = [entry.client_entry_id for entry in payload.entries]
         existing = {item.client_entry_id: item for item in self.db.scalars(select(BrowserCaptureEntry).where(
             BrowserCaptureEntry.capture_id == capture_id,
-            BrowserCaptureEntry.client_entry_id.in_([entry.client_entry_id for entry in payload.entries]),
+            BrowserCaptureEntry.client_entry_id.in_(requested_ids),
         )).all()}
-        result = []
+        new_values = []
         for entry_payload in payload.entries:
             values = entry_payload.model_dump()
             entry = existing.get(entry_payload.client_entry_id)
             if entry is None:
-                entry = BrowserCaptureEntry(capture_id=capture_id, project_id=project_id, **values)
-                self.db.add(entry)
+                new_values.append({
+                    "capture_id": capture_id,
+                    "project_id": project_id,
+                    **values,
+                })
             else:
                 for key, value in values.items():
                     setattr(entry, key, value)
-            result.append(entry)
+        if new_values:
+            self.db.execute(insert(BrowserCaptureEntry), new_values)
         capture.status = "reviewing"
         self.db.commit()
-        for entry in result:
-            self.db.refresh(entry)
-        return result
+        persisted = list(self.db.scalars(select(BrowserCaptureEntry).where(
+            BrowserCaptureEntry.capture_id == capture_id,
+            BrowserCaptureEntry.client_entry_id.in_(requested_ids),
+        )).all())
+        persisted_by_client_id = {entry.client_entry_id: entry for entry in persisted}
+        return [persisted_by_client_id[client_id] for client_id in requested_ids]
 
     def update_entry(self, *, project_id: int, capture_id: int, entry_id: int, payload: BrowserCaptureEntryUpdateRequest, current_user: User):
         entry = self.get_entry(project_id=project_id, capture_id=capture_id, entry_id=entry_id, current_user=current_user, manage=True)

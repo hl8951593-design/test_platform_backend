@@ -10,11 +10,13 @@ from sqlalchemy.orm import sessionmaker
 
 import app.models  # noqa: F401
 from app.db.base import Base
-from app.models.browser_capture import BrowserCaptureEntry
-from app.models.project import Project
+from app.models.browser_capture import BrowserCapture, BrowserCaptureEntry
+from app.models.project import Project, ProjectEnvironment
 from app.models.scenario import TestScenarioRun
 from app.models.test_plan import TestPlan, TestPlanRun
 from app.models.user import User
+from app.schemas.browser_capture import BrowserCaptureEntryBatchRequest
+from app.services.browser_capture_service import BrowserCaptureService
 from app.services.scenario_service import ScenarioService
 from app.services.test_plan_service import TestPlanService
 
@@ -265,6 +267,130 @@ class TestPlanQueryPerformanceTests(unittest.TestCase):
             "recent_failed": 1,
         })
         self.assertLessEqual(len(statements), 3)
+
+
+class BrowserCaptureUpsertPerformanceTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        self.db = sessionmaker(bind=self.engine, expire_on_commit=False)()
+        self.user = User(
+            username="capture-owner",
+            account="capture-owner",
+            password_hash="hash",
+            phone="13000000002",
+            email="capture-owner@example.com",
+        )
+        self.db.add(self.user)
+        self.db.flush()
+        self.project = Project(
+            name="Capture performance",
+            created_by_id=self.user.id,
+        )
+        self.db.add(self.project)
+        self.db.flush()
+        environment = ProjectEnvironment(
+            project_id=self.project.id,
+            name="test",
+            base_url="https://example.test",
+            is_default=True,
+            created_by_id=self.user.id,
+        )
+        self.db.add(environment)
+        self.db.flush()
+        self.capture = BrowserCapture(
+            project_id=self.project.id,
+            environment_id=environment.id,
+            name="Capture",
+            created_by_id=self.user.id,
+        )
+        self.db.add(self.capture)
+        self.db.commit()
+        self.service = BrowserCaptureService(self.db)
+        self.service.permission_service.require_project_permission = MagicMock()
+
+    def tearDown(self):
+        self.db.close()
+        self.engine.dispose()
+
+    @staticmethod
+    def _entry(client_id: str, *, name: str | None = None):
+        return {
+            "client_entry_id": client_id,
+            "protocol": "http",
+            "fingerprint": f"fingerprint-{client_id}",
+            "name": name or f"GET /items/{client_id}",
+            "method": "GET",
+            "path": f"/items/{client_id}",
+            "source_url": f"https://example.test/items/{client_id}",
+            "request_data": {},
+            "response_data": {"status_code": 200},
+            "draft_data": {},
+            "captured_at": "2026-07-11T10:00:00+08:00",
+        }
+
+    def _upsert(self, entries):
+        return self.service.upsert_entries(
+            project_id=self.project.id,
+            capture_id=self.capture.id,
+            payload=BrowserCaptureEntryBatchRequest(entries=entries),
+            current_user=self.user,
+        )
+
+    def test_new_and_mixed_batches_preserve_order_and_update_identity(self):
+        initial = self._upsert([
+            self._entry("entry-2"),
+            self._entry("entry-1"),
+        ])
+        original_id = initial[0].id
+        self.assertEqual(
+            [entry.client_entry_id for entry in initial],
+            ["entry-2", "entry-1"],
+        )
+
+        mixed = self._upsert([
+            self._entry("entry-2", name="Updated entry"),
+            self._entry("entry-3"),
+        ])
+
+        self.assertEqual(
+            [entry.client_entry_id for entry in mixed],
+            ["entry-2", "entry-3"],
+        )
+        self.assertEqual(mixed[0].id, original_id)
+        self.assertEqual(mixed[0].name, "Updated entry")
+        self.assertTrue(all(isinstance(entry.id, int) for entry in mixed))
+        stored_count = self.db.query(BrowserCaptureEntry).filter(
+            BrowserCaptureEntry.capture_id == self.capture.id,
+        ).count()
+        self.assertEqual(stored_count, 3)
+
+    def test_one_hundred_new_entries_use_constant_query_count(self):
+        statements = []
+
+        def record_statement(_conn, _cursor, statement, _params, _context, _many):
+            statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", record_statement)
+        try:
+            result = self._upsert([
+                self._entry(f"entry-{index}")
+                for index in range(100)
+            ])
+        finally:
+            event.remove(self.engine, "before_cursor_execute", record_statement)
+
+        select_count = sum(
+            statement.lstrip().upper().startswith("SELECT")
+            for statement in statements
+        )
+        self.assertEqual(len(result), 100)
+        self.assertEqual(
+            [entry.client_entry_id for entry in result],
+            [f"entry-{index}" for index in range(100)],
+        )
+        self.assertLessEqual(len(statements), 10)
+        self.assertLessEqual(select_count, 4)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -48,22 +48,49 @@ class TestPlanService:
             filters.append(TestPlan.enabled.is_(enabled))
         if trigger_type:
             filters.append(TestPlan.trigger_type == trigger_type)
-        total = self.db.scalar(select(func.count()).select_from(TestPlan).where(*filters)) or 0
+        all_filters = [TestPlan.project_id == project_id, TestPlan.is_deleted.is_(False)]
+        recent_failed = (
+            select(func.count())
+            .select_from(TestPlanRun)
+            .where(
+                TestPlanRun.project_id == project_id,
+                TestPlanRun.status == "failed",
+                TestPlanRun.is_deleted.is_(False),
+            )
+            .scalar_subquery()
+        )
+        statistics_row = self.db.execute(
+            select(
+                func.count(TestPlan.id).label("total"),
+                func.coalesce(
+                    func.sum(case((TestPlan.enabled.is_(True), 1), else_=0)),
+                    0,
+                ).label("enabled"),
+                func.coalesce(
+                    func.sum(case((
+                        TestPlan.enabled.is_(True) & (TestPlan.trigger_type == "cron"),
+                        1,
+                    ), else_=0)),
+                    0,
+                ).label("scheduled"),
+                recent_failed.label("recent_failed"),
+            ).where(*all_filters)
+        ).one()
+        has_filters = bool(keyword or enabled is not None or trigger_type)
+        total = (
+            self.db.scalar(select(func.count()).select_from(TestPlan).where(*filters)) or 0
+            if has_filters
+            else int(statistics_row.total or 0)
+        )
         plans = list(self.db.scalars(
             select(TestPlan).where(*filters).order_by(TestPlan.updated_at.desc(), TestPlan.id.desc())
             .offset((page - 1) * page_size).limit(page_size)
         ).all())
-        all_filters = [TestPlan.project_id == project_id, TestPlan.is_deleted.is_(False)]
         statistics = {
-            "total": self.db.scalar(select(func.count()).select_from(TestPlan).where(*all_filters)) or 0,
-            "enabled": self.db.scalar(select(func.count()).select_from(TestPlan).where(*all_filters, TestPlan.enabled.is_(True))) or 0,
-            "scheduled": self.db.scalar(select(func.count()).select_from(TestPlan).where(
-                *all_filters, TestPlan.enabled.is_(True), TestPlan.trigger_type == "cron"
-            )) or 0,
-            "recent_failed": self.db.scalar(select(func.count()).select_from(TestPlanRun).where(
-                TestPlanRun.project_id == project_id, TestPlanRun.status == "failed",
-                TestPlanRun.is_deleted.is_(False),
-            )) or 0,
+            "total": int(statistics_row.total or 0),
+            "enabled": int(statistics_row.enabled or 0),
+            "scheduled": int(statistics_row.scheduled or 0),
+            "recent_failed": int(statistics_row.recent_failed or 0),
         }
         return {"items": plans, "total": total, "page": page, "page_size": page_size, "statistics": statistics}
 

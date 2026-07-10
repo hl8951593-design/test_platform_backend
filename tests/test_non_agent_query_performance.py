@@ -1,12 +1,22 @@
 import importlib
 import importlib.util
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
+
+import app.models  # noqa: F401
+from app.db.base import Base
 from app.models.browser_capture import BrowserCaptureEntry
+from app.models.project import Project
 from app.models.scenario import TestScenarioRun
+from app.models.test_plan import TestPlan, TestPlanRun
+from app.models.user import User
 from app.services.scenario_service import ScenarioService
+from app.services.test_plan_service import TestPlanService
 
 
 class ScenarioRunQueryPerformanceTests(unittest.TestCase):
@@ -129,6 +139,132 @@ class NonAgentQueryIndexTests(unittest.TestCase):
                 ),
             ],
         )
+
+
+class TestPlanQueryPerformanceTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        self.db = sessionmaker(bind=self.engine, expire_on_commit=False)()
+        self.user = User(
+            username="planner",
+            account="planner",
+            password_hash="hash",
+            phone="13000000001",
+            email="planner@example.com",
+        )
+        self.db.add(self.user)
+        self.db.flush()
+        self.project = Project(name="Plan performance", created_by_id=self.user.id)
+        self.db.add(self.project)
+        self.db.flush()
+
+        plans = [
+            TestPlan(
+                project_id=self.project.id,
+                name="Manual enabled",
+                enabled=True,
+                trigger_type="manual",
+                environment_ids=[],
+                targets=[],
+                notification_emails=[],
+                tags=[],
+                created_by_id=self.user.id,
+                updated_by_id=self.user.id,
+            ),
+            TestPlan(
+                project_id=self.project.id,
+                name="Cron enabled",
+                enabled=True,
+                trigger_type="cron",
+                environment_ids=[],
+                targets=[],
+                notification_emails=[],
+                tags=[],
+                created_by_id=self.user.id,
+                updated_by_id=self.user.id,
+            ),
+            TestPlan(
+                project_id=self.project.id,
+                name="Manual disabled",
+                enabled=False,
+                trigger_type="manual",
+                environment_ids=[],
+                targets=[],
+                notification_emails=[],
+                tags=[],
+                created_by_id=self.user.id,
+                updated_by_id=self.user.id,
+            ),
+        ]
+        self.db.add_all(plans)
+        self.db.flush()
+        for status in ("failed", "passed"):
+            self.db.add(TestPlanRun(
+                plan_id=plans[0].id,
+                project_id=self.project.id,
+                plan_name=plans[0].name,
+                plan_version=1,
+                status=status,
+                trigger="manual",
+                plan_snapshot={},
+                target_results=[],
+                operator_id=self.user.id,
+                started_at=datetime(2026, 7, 11, 10, 0, 0),
+            ))
+        self.db.commit()
+        self.service = TestPlanService(self.db)
+        self.service.permission_service.require_project_permission = MagicMock()
+
+    def tearDown(self):
+        self.db.close()
+        self.engine.dispose()
+
+    def _list_with_statement_count(self, **filters):
+        statements = []
+
+        def record_statement(_conn, _cursor, statement, _params, _context, _many):
+            statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", record_statement)
+        try:
+            result = self.service.list_plans(
+                project_id=self.project.id,
+                current_user=self.user,
+                keyword=filters.get("keyword"),
+                enabled=filters.get("enabled"),
+                trigger_type=filters.get("trigger_type"),
+                page=1,
+                page_size=20,
+            )
+        finally:
+            event.remove(self.engine, "before_cursor_execute", record_statement)
+        return result, statements
+
+    def test_unfiltered_list_reuses_project_total_and_bounds_sql(self):
+        result, statements = self._list_with_statement_count()
+
+        self.assertEqual(result["total"], 3)
+        self.assertEqual(result["statistics"], {
+            "total": 3,
+            "enabled": 2,
+            "scheduled": 1,
+            "recent_failed": 1,
+        })
+        self.assertLessEqual(len(statements), 2)
+
+    def test_filtered_list_keeps_project_statistics_and_bounds_sql(self):
+        result, statements = self._list_with_statement_count(enabled=False)
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual([plan.name for plan in result["items"]], ["Manual disabled"])
+        self.assertEqual(result["statistics"], {
+            "total": 3,
+            "enabled": 2,
+            "scheduled": 1,
+            "recent_failed": 1,
+        })
+        self.assertLessEqual(len(statements), 3)
 
 
 if __name__ == "__main__":

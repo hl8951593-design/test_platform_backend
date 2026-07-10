@@ -12,7 +12,7 @@ from typing import Any, Callable
 from fastapi import HTTPException, status
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from app.core.permissions import ProjectPermission
 from app.core.sensitive_data import (
@@ -509,8 +509,12 @@ class ScenarioService:
             select(func.count()).select_from(TestScenarioRun).where(*filters)
         ) or 0
         items = list(self.db.scalars(
-            select(TestScenarioRun).where(*filters).order_by(TestScenarioRun.started_at.desc(), TestScenarioRun.id.desc())
-            .offset((page - 1) * page_size).limit(page_size)
+            select(TestScenarioRun)
+            .options(defer(TestScenarioRun.scenario_snapshot))
+            .where(*filters)
+            .order_by(TestScenarioRun.started_at.desc(), TestScenarioRun.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
         ).all())
         return {"items": items, "total": total, "page": page, "page_size": page_size}
 

@@ -75,6 +75,7 @@ class TestScenarioRun(Base):
         Index("ix_test_scenario_runs_project_env_started", "project_id", "environment_id", "started_at"),
         Index("ix_test_scenario_runs_project_user_started", "project_id", "triggered_by_id", "started_at"),
         Index("ix_test_scenario_runs_project_dataset_record", "project_id", "dataset_id", "record_id"),
+        Index("ix_test_scenario_runs_project_started_id", "project_id", "started_at", "id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)

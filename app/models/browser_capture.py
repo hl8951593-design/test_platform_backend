@@ -30,6 +30,7 @@ class BrowserCaptureEntry(Base):
         UniqueConstraint("capture_id", "client_entry_id", name="uq_browser_capture_entries_client"),
         Index("ix_browser_capture_entries_capture_status", "capture_id", "status"),
         Index("ix_browser_capture_entries_project_created", "project_id", "created_at"),
+        Index("ix_browser_capture_entries_capture_id_order", "capture_id", "id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)

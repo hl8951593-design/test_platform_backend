@@ -9,12 +9,19 @@
 | --- | --- |
 | 最近核对日期 | 2026-07-09 |
 | 开发基线 | `3.0.532-read-path-performance-cache` |
-| Alembic head | `0036_project_list_query_indexes` |
+| Alembic head | `0038_non_agent_query_performance_indexes` |
 | 回归命令 | `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v` |
 | 最近完整回归 | 上次完整回归为 `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v`，711 个用例执行完成，OK（skipped=3）；本次 `3.0.532-read-path-performance-cache` 已执行 `.\.venv\Scripts\python.exe -m unittest tests.test_notifications_contract tests.test_project_page_contract tests.test_resource_list_filters` 专项契约回归，12 个用例 OK；HTTP 并发验证覆盖 `/test-cases`、`/websocket-test-cases`、`/projects`、`/environment-configs`、`/notifications`；Alembic head 仍为 `0036_project_list_query_indexes` |
 
 数字基线只能在实际执行命令后更新。数据库结构以 Alembic migration 和当前模型共同为准，
 不能只修改模型而遗漏迁移。
+
+2026-07-11 非 Agent 业务接口性能批次已完成：场景运行列表不再读取未返回的
+`scenario_snapshot`；测试计划列表统计收敛到无筛选 2 条、有筛选 3 条服务 SQL；
+浏览器采集 100 条批量 upsert 保持在 10 条 SQL 以内；报告智能总览收敛到 4 条 SQL，
+真实 MySQL 复测约 0.75 秒。新增索引迁移为
+`0038_non_agent_query_performance_indexes`，HTTP 响应字段、排序、权限、幂等语义和既有异步执行架构均未改变。
+专项 40 项、非 Agent 161 项、完整 796 项测试均通过，完整回归 `skipped=3`。
 
 ## 文档收敛规则
 

@@ -59,6 +59,9 @@ class ValidatedAgentPlanningDecision:
     confidence: float
     reason_summary: str
     source: str = "llm_planning"
+    model_requested_effect_scope: str | None = None
+    required_effect_scope: str | None = None
+    effect_scope_normalized: bool = False
 
     def model_view(self) -> dict[str, Any]:
         return {
@@ -71,6 +74,9 @@ class ValidatedAgentPlanningDecision:
             "selected_artifact_ids": list(self.selected_artifact_ids),
             "required_facts": list(self.required_facts),
             "requested_effect_scope": self.requested_effect_scope,
+            "model_requested_effect_scope": self.model_requested_effect_scope or self.requested_effect_scope,
+            "required_effect_scope": self.required_effect_scope or self.requested_effect_scope,
+            "effect_scope_normalized": self.effect_scope_normalized,
             "confidence": self.confidence,
             "reason_summary": self.reason_summary,
             "source": self.source,
@@ -232,9 +238,7 @@ class AgentPlanningDecisionService:
                 details={"confidence": decision.confidence, "minimum": self.minimum_confidence},
             )
 
-        requested_rank = EFFECT_SCOPE_ORDER[decision.requested_effect_scope]
         tool_scopes: dict[str, str] = {}
-        excessive_tools: list[str] = []
         missing_permissions: dict[str, list[str]] = {}
         permission_set = set(_strings(permissions))
         for tool_name in selected_tools:
@@ -248,23 +252,22 @@ class AgentPlanningDecisionService:
                     details={"tool_name": tool_name, "side_effect_class": side_effect_class},
                 )
             tool_scopes[tool_name] = scope
-            if EFFECT_SCOPE_ORDER[scope] > requested_rank:
-                excessive_tools.append(tool_name)
             missing = sorted(set(_strings(tool.get("required_permissions"))) - permission_set)
             if missing:
                 missing_permissions[tool_name] = missing
-        if excessive_tools:
-            raise AgentPlanningError(
-                "planner selected Tools beyond the requested effect scope",
-                code="planner_effect_scope_exceeded",
-                details={"requested_effect_scope": decision.requested_effect_scope, "tool_names": excessive_tools},
-            )
         if missing_permissions:
             raise AgentPlanningError(
                 "planner selected Tools without required permissions",
                 code="planner_permission_missing",
                 details={"missing_permissions": missing_permissions},
             )
+
+        model_requested_effect_scope = decision.requested_effect_scope
+        required_effect_scope = required_effect_scope_for_tools(tool_scopes)
+        effective_effect_scope = max(
+            (model_requested_effect_scope, required_effect_scope),
+            key=EFFECT_SCOPE_ORDER.__getitem__,
+        )
 
         return ValidatedAgentPlanningDecision(
             goal=decision.goal.strip(),
@@ -275,9 +278,12 @@ class AgentPlanningDecisionService:
             selected_tools=selected_tools,
             selected_artifact_ids=selected_artifacts,
             required_facts=required_facts,
-            requested_effect_scope=decision.requested_effect_scope,
+            requested_effect_scope=effective_effect_scope,
             confidence=decision.confidence,
             reason_summary=decision.reason_summary.strip(),
+            model_requested_effect_scope=model_requested_effect_scope,
+            required_effect_scope=required_effect_scope,
+            effect_scope_normalized=effective_effect_scope != model_requested_effect_scope,
         )
 
     def _request(
@@ -315,7 +321,10 @@ class AgentPlanningDecisionService:
                         "JSON object that conforms to output_contract; do not wrap it in plan, result, data, or any "
                         "other key. Copy every required field name exactly. selected_skills must contain at least one "
                         "registered Skill. requested_effect_scope must be one of observe, derive, draft, execute, or "
-                        "persist; use observe for a read-only request and never return none. Select only registered "
+                        "persist; use observe for read_only, derive for deterministic_compute, draft for draft_only, "
+                        "execute for execution_record, and persist for business_update. Never return none. The backend "
+                        "derives the effective scope from frozen ToolSpecs and may safely normalize this advisory value. "
+                        "Select only registered "
                         "Skills, Tools, and artifact ids from the supplied frozen indexes. selected_tools may be empty "
                         "only when the selected Skill can answer without a Tool. The backend validates and executes "
                         "the plan. Do not include chain-of-thought; reason_summary must be a short decision explanation."
@@ -376,7 +385,16 @@ def _compact_tool(item: dict[str, Any]) -> dict[str, Any]:
         "required_permissions",
         "schema_hash",
     )
-    return {field: item.get(field) for field in fields if item.get(field) not in (None, [], {})}
+    compact = {field: item.get(field) for field in fields if item.get(field) not in (None, [], {})}
+    side_effect_class = str(item.get("side_effect_class") or "")
+    required_effect_scope = SIDE_EFFECT_SCOPE.get(side_effect_class)
+    if required_effect_scope is not None:
+        compact["required_effect_scope"] = required_effect_scope
+    return compact
+
+
+def required_effect_scope_for_tools(tool_scopes: dict[str, str]) -> str:
+    return max(tool_scopes.values(), key=EFFECT_SCOPE_ORDER.__getitem__, default="observe")
 
 
 def _compact_artifact(item: dict[str, Any]) -> dict[str, Any]:

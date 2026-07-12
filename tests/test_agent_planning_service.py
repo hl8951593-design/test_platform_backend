@@ -55,6 +55,36 @@ ARTIFACT_INDEX = [
     }
 ]
 
+DEFECT_SKILL_INDEX = [
+    {
+        "name": "defect-triage",
+        "description": "Inspect execution evidence and create persisted defects.",
+        "owns": ["defect"],
+        "consumes": ["test_case", "execution"],
+        "produces": ["defect"],
+        "tool_names": ["execution.read_detail", "defect.create_saved"],
+    }
+]
+
+DEFECT_TOOL_INDEX = [
+    {
+        "name": "execution.read_detail",
+        "summary": "Read execution evidence.",
+        "side_effect_class": "read_only",
+        "replay_policy": "reuse_allowed",
+        "required_permissions": ["test:execute"],
+        "schema_hash": "execution-detail-schema",
+    },
+    {
+        "name": "defect.create_saved",
+        "summary": "Create a persisted defect after approval.",
+        "side_effect_class": "business_update",
+        "replay_policy": "require_revalidation",
+        "required_permissions": ["defect:create"],
+        "schema_hash": "defect-create-schema",
+    },
+]
+
 
 def planning_json(**overrides):
     payload = {
@@ -232,6 +262,84 @@ class AgentPlanningDecisionServiceTests(unittest.TestCase):
 
         self.assertEqual(decision.selected_skills, ("future-contract-audit",))
         self.assertEqual(decision.selected_tools, ("contract.audit",))
+
+    def test_business_update_scope_is_normalized_to_persist(self):
+        from app.services.agent_planning_service import AgentPlanningDecisionService
+
+        decision_payload = planning_json(
+            goal="Inspect failed execution evidence and create a persisted defect.",
+            action="create",
+            target_domain="defect",
+            source_domains=["test_case", "execution"],
+            selected_skills=["defect-triage"],
+            selected_tools=["execution.read_detail", "defect.create_saved"],
+            selected_artifact_ids=[],
+            required_facts=["failure cause"],
+            requested_effect_scope="execute",
+            reason_summary="Use confirmed execution evidence before defect persistence.",
+        )
+        ai_service = FakeAIService(response(decision_payload), response(decision_payload))
+
+        try:
+            decision = AgentPlanningDecisionService(ai_service=ai_service).decide(
+                intent="查看失败用例并创建对应缺陷",
+                conversation_context=None,
+                skill_index=DEFECT_SKILL_INDEX,
+                tool_index=DEFECT_TOOL_INDEX,
+                artifact_index=[],
+                project_id=1,
+                permissions=("test:execute", "defect:create"),
+            )
+        except Exception as exc:
+            self.fail(f"registered Tool effect scope should be normalized, got {exc!r}")
+
+        self.assertEqual(decision.model_requested_effect_scope, "execute")
+        self.assertEqual(decision.required_effect_scope, "persist")
+        self.assertEqual(decision.requested_effect_scope, "persist")
+        self.assertTrue(decision.effect_scope_normalized)
+        request_payload = json.loads(ai_service.requests[0].messages[-1].content)
+        create_tool = next(
+            item for item in request_payload["tool_index"] if item["name"] == "defect.create_saved"
+        )
+        self.assertEqual(create_tool["required_effect_scope"], "persist")
+
+    def test_unknown_side_effect_class_still_fails_closed(self):
+        from app.services.agent_planning_service import AgentPlanningDecisionService, AgentPlanningFailed
+
+        invalid_tools = [
+            {
+                **DEFECT_TOOL_INDEX[1],
+                "side_effect_class": "unregistered_effect",
+            }
+        ]
+        decision_payload = planning_json(
+            goal="Create a persisted defect.",
+            action="create",
+            target_domain="defect",
+            source_domains=[],
+            selected_skills=["defect-triage"],
+            selected_tools=["defect.create_saved"],
+            selected_artifact_ids=[],
+            required_facts=[],
+            requested_effect_scope="persist",
+        )
+        ai_service = FakeAIService(response(decision_payload), response(decision_payload))
+
+        with self.assertRaises(AgentPlanningFailed) as raised:
+            AgentPlanningDecisionService(ai_service=ai_service).decide(
+                intent="create defect",
+                conversation_context=None,
+                skill_index=DEFECT_SKILL_INDEX,
+                tool_index=invalid_tools,
+                artifact_index=[],
+                project_id=1,
+                permissions=("defect:create",),
+            )
+
+        self.assertEqual(
+            raised.exception.details["last_error"]["code"],
+            "planner_tool_effect_unknown",
+        )
 
 
 if __name__ == "__main__":

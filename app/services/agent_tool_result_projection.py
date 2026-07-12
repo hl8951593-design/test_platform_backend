@@ -4,6 +4,11 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from app.schemas.execution_diagnostic import ExecutionDiagnosticQuery
+from app.services.execution_diagnostic_projection import (
+    ExecutionDiagnosticProjectionService,
+)
+
 
 TOOL_RESULT_PROJECTION_VERSION = "tool_result_projection_v1"
 QUERY_PROJECT_CASES_MODEL_VIEW_TARGET_CHARS = 3800
@@ -14,6 +19,8 @@ QUERY_PROJECT_CASES_MAX_DETAILS = 20
 PLATFORM_QUERY_MODEL_VIEW_TARGET_CHARS = 4200
 PLATFORM_QUERY_ITEMS_TARGET_CHARS = 3300
 PLATFORM_QUERY_MAX_ITEMS = 50
+EXECUTION_DIAGNOSTIC_MODEL_MAX_CHARS = 12000
+EXECUTION_DIAGNOSTIC_MESSAGE_MAX_CHARS = 14000
 PLATFORM_QUERY_CONFIG: dict[str, tuple[str, tuple[str, ...]]] = {
     "execution.query_records": (
         "executions",
@@ -57,6 +64,7 @@ class ToolResultProjection:
     model_view_chars: int
     compacted: bool
     projection_version: str | None = None
+    message_budget_chars: int | None = None
 
 
 class ToolResultProjectionService:
@@ -67,6 +75,8 @@ class ToolResultProjectionService:
     """
 
     def project(self, tool_name: str | None, output: Any) -> ToolResultProjection | None:
+        if tool_name == "execution.read_detail" and isinstance(output, dict):
+            return self.project_execution_read_detail(output)
         if tool_name == "testcase.query_project_cases" and isinstance(output, dict):
             return self.project_query_project_cases(output)
         if tool_name == "scenario.compose_draft" and isinstance(output, dict):
@@ -74,6 +84,38 @@ class ToolResultProjectionService:
         if tool_name in PLATFORM_QUERY_CONFIG and isinstance(output, dict):
             return self.project_platform_query(tool_name, output)
         return None
+
+    def project_execution_read_detail(
+        self, output: dict[str, Any]
+    ) -> ToolResultProjection:
+        execution = (
+            output.get("execution")
+            if isinstance(output.get("execution"), dict)
+            else {}
+        )
+        summary = (
+            execution.get("summary")
+            if isinstance(execution.get("summary"), dict)
+            else {}
+        )
+        status = str(summary.get("status") or "").lower()
+        view = "failures" if status in {"failed", "timeout", "error"} else "summary"
+        envelope = ExecutionDiagnosticProjectionService().project(
+            execution_type=str(output.get("execution_type") or "http"),
+            execution=execution,
+            query=ExecutionDiagnosticQuery(
+                view=view,
+                max_chars=EXECUTION_DIAGNOSTIC_MODEL_MAX_CHARS,
+            ),
+        ).model_dump(mode="json")
+        return ToolResultProjection(
+            model_output=envelope,
+            full_output_size_chars=self._json_size(output),
+            model_view_chars=self._json_size(envelope),
+            compacted=True,
+            projection_version="execution_diagnostic_projection_v1",
+            message_budget_chars=EXECUTION_DIAGNOSTIC_MESSAGE_MAX_CHARS,
+        )
 
     def project_scenario_compose_draft(self, output: dict[str, Any]) -> ToolResultProjection:
         draft = output.get("draft") if isinstance(output.get("draft"), dict) else {}

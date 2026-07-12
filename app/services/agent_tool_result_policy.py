@@ -177,9 +177,7 @@ class ToolResultPolicy:
         )
         return self.cap_model_message(
             message,
-            max_chars=QUERY_PROJECT_CASES_MODEL_MESSAGE_MAX_CHARS
-            if getattr(call, "tool_name", None) == "testcase.query_project_cases"
-            else TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS,
+            max_chars=self._model_message_budget(call=call, payload=payload),
         )
 
     def model_payload(self, call: Any) -> dict[str, Any]:
@@ -205,6 +203,10 @@ class ToolResultPolicy:
             payload["output_compacted_for_model"] = True
             if output_view.get("projection_version"):
                 payload["output_projection_version"] = output_view["projection_version"]
+            if output_view.get("message_budget_chars"):
+                payload["output_message_budget_chars"] = output_view[
+                    "message_budget_chars"
+                ]
             payload["full_output_reference"] = "ToolCall.output_json_redacted"
         return payload
 
@@ -219,6 +221,7 @@ class ToolResultPolicy:
                 "preview_chars": projection.model_view_chars,
                 "compacted": projection.compacted,
                 "projection_version": projection.projection_version,
+                "message_budget_chars": projection.message_budget_chars,
             }
         output_json = json.dumps(output, ensure_ascii=False, default=str)
         size_chars = len(output_json)
@@ -241,6 +244,15 @@ class ToolResultPolicy:
     def query_project_cases_model_output(self, output: dict[str, Any]) -> dict[str, Any]:
         projection = ToolResultProjectionService().project_query_project_cases(output)
         return projection.model_output
+
+    @staticmethod
+    def _model_message_budget(*, call: Any, payload: dict[str, Any]) -> int:
+        if getattr(call, "tool_name", None) == "testcase.query_project_cases":
+            return QUERY_PROJECT_CASES_MODEL_MESSAGE_MAX_CHARS
+        projected_budget = payload.get("output_message_budget_chars")
+        if isinstance(projected_budget, int):
+            return projected_budget
+        return TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS
 
     @staticmethod
     def cap_model_message(message: str, *, max_chars: int = TOOL_RESULT_MODEL_MESSAGE_MAX_CHARS) -> str:

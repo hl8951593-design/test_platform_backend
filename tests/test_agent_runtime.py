@@ -14,6 +14,8 @@ from sqlalchemy.exc import PendingRollbackError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from tests.test_execution_diagnostic_projection import run_220_shape
+
 import app.models  # noqa: F401
 from app.core.sensitive_data import request_fingerprint
 from app.db.base import Base
@@ -2525,6 +2527,39 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertIn("通用工具结果质量闭环", decision.followup_instruction)
         self.assertIn(FINAL_RESPONSE_BUDGET_INSTRUCTION, message)
+
+    def test_execution_detail_projection_keeps_failure_after_167k_success_body(self):
+        call = SimpleNamespace(
+            tool_call_id="agent-tool-run-220",
+            tool_name="execution.read_detail",
+            status="succeeded",
+            approval_required=False,
+            output_json_redacted={
+                "project_id": 1,
+                "execution_type": "scenario",
+                "execution_id": 220,
+                "execution": run_220_shape(),
+            },
+            output_hash="run-220-hash",
+            error_code=None,
+            error_message=None,
+        )
+
+        payload = ToolResultPolicy().model_payload(call)
+        encoded = json.dumps(payload["output"], ensure_ascii=False)
+        message = ToolResultPolicy().build_message(call)
+
+        self.assertTrue(payload["output_compacted_for_model"])
+        self.assertFalse(payload["output_truncated"])
+        self.assertIn("请求未授权", encoded)
+        self.assertIn("90001", encoded)
+        self.assertNotIn('"response_snapshot":', encoded)
+        self.assertLessEqual(len(encoded), 12000)
+        self.assertEqual(
+            payload["full_output_reference"], "ToolCall.output_json_redacted"
+        )
+        self.assertIn("请求未授权", message)
+        self.assertNotIn("tool_result_model_context_truncated", message)
 
     def test_tool_result_policy_bounds_large_outputs_for_model_context(self):
         large_blob = "x" * 5000

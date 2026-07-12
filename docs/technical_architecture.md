@@ -128,6 +128,12 @@ Harness Loop Agent 的业务工具调用走 Codex 式闭环：Runner 组装 run 
 
 Capability Resolver 对结构化 `analyze/query` 动作执行统一副作用裁剪：模型目录只允许 `read_only` 和 `deterministic_compute` ToolSpec。具体读取领域仍由 LLM 的 target/source 判断和 supporting Skills 扩展，因此不是锁死固定工具名单；写入、执行、状态流转和其他副作用工具不会出现在纯分析轮次。
 
+Capability Plan 的副作用范围采用“模型意图 + ToolSpec 权威元数据”的规范化模型：规划模型的 `effect_scope` 只作为 `model_requested_effect_scope` 留痕，后端根据所选工具的 `side_effect` 推导 `required_effect_scope`，再取更严格者作为有效范围。这样新增 Skill/Tool 不需要为模型偶发使用 `draft/execute/persist` 的不同措辞增加业务特判，同时也不会降低权限、审批、项目隔离、对象引用或 ToolRuntime preflight。未知副作用、缺少权限和未知引用仍 fail-closed；`persist` 类 ToolCall 仍必须先创建 pending Approval，审批通过前不执行业务 handler。
+
+多轮上下文分成“可见对话历史”和“运行状态历史”两条通道。只有 completed 且 assistant 可见的 Run 才回放自然语言；`failed/cancelled/paused/needs_human` Run 则投影为 `conversation_working_context_v2.recent_run_states[]`，只携带有界错误摘要、最近诊断事件和紧凑 ToolCall 状态。失败 Run 不再从下一轮上下文消失，也不会把可能不完整或错误的 assistant 文本混进对话。需要进一步定位时，模型可调用只读 `agent.run.read_summary`；该工具强制项目归属、字段白名单、长度上限和递归脱敏，不暴露原始 prompt 或完整 Tool payload。
+
+`testcase.query_project_cases` 的 SOURCE artifact 现在保留安全的 `case_status_summary`、`failed_case_count` 与有界 `failed_cases[]`，失败项只含后续缺陷分流需要的 ID、名称、类型、路径和状态；没有执行详情时显式标记 `failure_detail_available=false`。其 `available_followup_actions` 包含 `create_defect`，但用例状态本身不是缺陷根因证据：`defect-triage` 必须先读取真实执行详情或诊断结果，再决定是否调用 `defect.create_saved`，并继续经过人工审批。
+
 Agent runner 的异常面必须先收敛 run 事实，再让 worker 退出：普通 HTTP/model/tool-request 修复异常仍通过当前 `AgentRuntimeService.fail_run()` 写入 `run.failed`；如果异常发生时 MySQL 连接已断开，导致当前 SQLAlchemy session 进入 `PendingRollbackError` 或其他不可继续写入状态，Runner 会 rollback 主 session、dispose 断连连接池，并用新的 `SessionLocal` 重新读取同一 run 后写入 `run.failed`。这个 recovery session 只负责补齐终态和有界 `error_code/error_message`，不重放工具副作用、不覆盖已 terminal 的 run，也不改变 SSE 契约；前端继续只消费 EventStore/Run Summary 的 `failed` 终态。
 
 Agent 模型流和请求依赖的数据库连接边界也必须短事务化：`AgentConversationRunner._stream_model_response()` 写完 `model.started` 后，在进入 `AIService.chat_stream()` 前释放当前 SQLAlchemy transaction；流式期间每次只用短事务刷新 run terminal 状态，非终态立即 rollback 释放连接；写入 `model.delta`、`model.stream_retrying` 或撤回临时 markdown 后也释放事务，再继续等待 provider。FastAPI `get_db()` 依赖在 handler 抛异常时先 rollback 再 close，避免异常路径把未结束事务交回连接池。该策略不改变 EventStore 顺序、ToolCall 副作用或 SSE payload，只减少长 provider 静默、长 dashboard 聚合、网络抖动或 RDS TCP reset 放大成长事务/坏连接的概率。

@@ -1618,6 +1618,12 @@ saved_scenario 执行 follow-up 架构修正：最新“保存场景 42 后执�
 
 真实 HTTP 验收继续暴露三个通用边界问题并已收口。第一，规划请求只要求“返回规划字段”却没有携带 JSON Schema，真实模型会发明 `plan` 包装；现在每次规划和 repair 都携带 `AgentPlanningDecision.model_json_schema()`，明确顶层字段和 effect scope。第二，最终回复 ID guard 用宽泛自由文本正则把统计数字、项目 ID 和环境 ID 误判为用例 ID；现在硬校验只接受显式 `用例 ID` 或结构化 `object-ref://test_case/...`，副作用安全仍由 ObjectReferenceGuardRule 负责。第三，RuntimeSnapshot 已从仅冻结 Tool 扩展为同时冻结 Skill planner metadata、工具声明和 prompt body；规划、上下文注入和能力动态激活读取同一 snapshot，Skill 文件变化不会改变既有 Run。
 
+## 2026-07-12 Agent 规划失败恢复与缺陷审批链路
+
+最新“失败用例创建缺陷”多轮日志暴露的根因不是缺少 `defect.create_saved`，而是规划模型把写工具的 `effect_scope` 表达为 `execute/draft`，旧后端在创建 ToolCall 前直接抛出 `planner_effect_scope_exceeded`；失败 Run 随后又被 completed-only 历史过滤，下一轮模型看不到真实失败层级并误诊业务结果。本轮将 effect scope 改为 ToolSpec 元数据驱动的单调规范化，审计同时保留模型请求值、工具要求值和是否规范化；未知副作用、权限、引用、审批及项目隔离边界不变。
+
+同一会话工作上下文升级为 `conversation_working_context_v2`，以 `recent_run_states[]` 携带失败、取消、暂停及待审批 Run 的有界状态，不回放未完成 assistant 文本。新增只读 `agent.run.read_summary`，供后续 Skill 在项目隔离和脱敏边界内读取 Run/事件/ToolCall 摘要。`test_case_query_snapshot` artifact 新增失败计数、失败项摘要和 `create_defect` follow-up，但缺陷 Skill 明确要求先获取真实执行证据。真实写入仍由 `defect.create_saved -> ToolCall -> pending Approval -> approve -> handler` 控制；新增集成回归验证模型 scope 表述偏差会被规范化到 `persist`、审批前 Defect 表无新增记录。本轮无数据库迁移，capabilities 从 48 增至 49。
+
 Agent `scenario.compose_draft` 现为严格 `draft_only`：无论模型输入如何，均强制关闭 `execute_candidates/self_validate`，执行必须显式进入 `scenario.execute_dry_run`。候选草稿先按保存用例恢复真实 request/assertions/extractors，再把环境变量、dataset 和保存 extractor 分层解析；当前环境无法解析且没有证据来源的候选节点会被排除并记录原因。专用 ToolResult Planning View 将 source/candidate/grounded/omitted/excluded/validation/execution/persistence 和 authoritative summary 放在模型可见上下文前部，避免大草稿截断后最终回复沿用候选统计或推断遗漏原因。
 
 安全收口：敏感键识别补充 `lingxi-auth/auth/authentication/x-auth-token` 精确 header 名；历史 Agent ToolCall ledger 中 243 条输出和 5 条输入已就地递归掩码并验证剩余暴露计数为 0，不删除审计记录、不修改业务数据或原始审计 hash。

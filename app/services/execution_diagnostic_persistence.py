@@ -40,6 +40,7 @@ class ExecutionDiagnosticPersistence:
         execution_type: ExecutionType,
         execution_id: int,
         execution: dict[str, Any],
+        include_steps: bool = True,
     ) -> None:
         normalized = normalize_response_data(execution)
         canonical = self.projector.canonicalize(
@@ -54,7 +55,7 @@ class ExecutionDiagnosticPersistence:
                 execution=normalized,
             )
         )
-        for step in canonical.steps:
+        for step in canonical.steps if include_steps else []:
             self.repository.upsert_step(
                 self._step_values(
                     project_id=project_id,

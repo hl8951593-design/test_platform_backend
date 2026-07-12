@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from app.core.response import normalize_response_data  # noqa: E402
+from app.core.sensitive_data import mask_sensitive  # noqa: E402
 from app.db.session import SessionLocal  # noqa: E402
 from app.models.scenario import TestScenarioRun  # noqa: E402
 from app.models.test_case import TestCaseExecution  # noqa: E402
@@ -19,6 +20,9 @@ from app.services.execution_diagnostic_persistence import (  # noqa: E402
     ExecutionDiagnosticPersistence,
 )
 from app.services.execution_record_service import ExecutionRecordService  # noqa: E402
+from app.services.execution_diagnostic_service import (  # noqa: E402
+    ScenarioStepResultAssembler,
+)
 
 
 _SOURCE_MODELS = {
@@ -84,6 +88,7 @@ class ExecutionDiagnosticBackfillRunner:
         self.db = db
         self.source_reader = source_reader or ExecutionDiagnosticBackfillSourceReader(db)
         self.persistence = persistence or ExecutionDiagnosticPersistence(db)
+        self.scenario_assembler = ScenarioStepResultAssembler(db)
         self.progress = progress
 
     def run(
@@ -116,6 +121,18 @@ class ExecutionDiagnosticBackfillRunner:
                     execution_id=execution_id,
                     execution=execution,
                 )
+                if restore_legacy_snapshots and execution_type == "scenario":
+                    run = self.db.get(TestScenarioRun, execution_id)
+                    if run is not None:
+                        run.step_results = mask_sensitive(
+                            self.scenario_assembler.assemble_scenario_step_results(
+                                project_id=project_id,
+                                execution_id=execution_id,
+                                scenario_snapshot=run.scenario_snapshot or {},
+                                include_artifacts=False,
+                                legacy_step_results=run.step_results or [],
+                            )
+                        )
                 checkpoint = execution_id
             if dry_run:
                 self.db.rollback()

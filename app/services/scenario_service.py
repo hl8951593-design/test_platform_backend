@@ -14,6 +14,7 @@ from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, defer
 
+from app.core.config import settings
 from app.core.permissions import ProjectPermission
 from app.core.sensitive_data import (
     decrypt_sensitive,
@@ -47,7 +48,9 @@ from app.services.permission_service import PermissionService
 from app.services.execution_diagnostic_persistence import (
     ExecutionDiagnosticPersistence,
 )
+from app.services.execution_diagnostic_service import ScenarioStepResultAssembler
 from app.services.scenario_script_sandbox import run_scenario_script
+from app.services.scenario_step_order import ordered_scenario_steps
 from app.services.test_case_service import TestCaseService
 from app.services.websocket_test_case_service import WebSocketTestCaseService
 
@@ -57,6 +60,7 @@ class ScenarioService:
         self.db = db
         self.permission_service = PermissionService(db)
         self.diagnostic_persistence = ExecutionDiagnosticPersistence(db)
+        self.scenario_step_assembler = ScenarioStepResultAssembler(db)
 
     def list_scenarios(self, *, project_id: int, current_user: User, keyword: str | None,
                        page: int, page_size: int) -> dict[str, Any]:
@@ -409,10 +413,14 @@ class ScenarioService:
                 }),
                 scenario_snapshot=mask_sensitive(definition),
                 variables_snapshot=mask_sensitive(copy.deepcopy(dataset.get("variables") or {})),
-                step_results=[
-                    self._pending_result(step, index)
-                    for index, step in enumerate(execution_steps)
-                ],
+                step_results=(
+                    []
+                    if settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED
+                    else [
+                        self._pending_result(step, index)
+                        for index, step in enumerate(execution_steps)
+                    ]
+                ),
                 triggered_by_id=current_user.id,
                 started_at=now,
             )
@@ -539,12 +547,21 @@ class ScenarioService:
         run = self.get_run(
             project_id=project_id, run_id=run_id, current_user=current_user
         )
+        step_results = run.step_results or []
+        if settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED:
+            step_results = self.scenario_step_assembler.assemble_scenario_step_results(
+                project_id=project_id,
+                execution_id=run_id,
+                scenario_snapshot=run.scenario_snapshot or {},
+                include_artifacts=True,
+                legacy_step_results=step_results,
+            )
         return {
             column.name: getattr(run, column.name)
             for column in TestScenarioRun.__table__.columns
         } | {
             "step_results": self._hydrate_step_result_snapshots(
-                run, run.step_results or []
+                run, step_results
             )
         }
 
@@ -718,6 +735,14 @@ class ScenarioService:
                         "step_failed",
                         self._step_event_payload(result, step, continue_on_failure=False),
                     )
+                elif settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED:
+                    self._persist_step_result_normalized(
+                        run=run,
+                        result=result,
+                        variables=variables,
+                        variable_sources=variable_sources,
+                        fallback_index=index,
+                    )
                 stop_after_nodes.add(node_id)
                 continue
             if global_stop or (node_id in blocked_nodes and node_phase != "after"):
@@ -747,6 +772,14 @@ class ScenarioService:
                             ),
                         },
                     )
+                elif settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED:
+                    self._persist_step_result_normalized(
+                        run=run,
+                        result=result,
+                        variables=variables,
+                        variable_sources=variable_sources,
+                        fallback_index=index,
+                    )
                 continue
             if emit_events and previous_step is not None:
                 self._append_event(
@@ -773,24 +806,33 @@ class ScenarioService:
                 running_result = self._running_result(
                     current_step, current_index, step_started_at, bindings
                 )
-                run.step_results = [
-                    *copy.deepcopy(results),
-                    running_result,
-                    *[
-                        self._pending_result(item, pending_index)
-                        for pending_index, item in enumerate(
-                            ordered_steps[current_index + 1:],
-                            start=current_index + 1,
-                        )
-                    ],
-                ]
-                self.diagnostic_persistence.stage_step(
-                    project_id=run.project_id,
-                    execution_type="scenario",
-                    execution_id=run.id,
-                    step=running_result,
-                    fallback_index=current_index,
-                )
+                if settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED:
+                    self._persist_step_result_normalized(
+                        run=run,
+                        result=running_result,
+                        variables=variables,
+                        variable_sources=variable_sources,
+                        fallback_index=current_index,
+                    )
+                else:
+                    run.step_results = [
+                        *copy.deepcopy(results),
+                        running_result,
+                        *[
+                            self._pending_result(item, pending_index)
+                            for pending_index, item in enumerate(
+                                ordered_steps[current_index + 1:],
+                                start=current_index + 1,
+                            )
+                        ],
+                    ]
+                    self.diagnostic_persistence.stage_step(
+                        project_id=run.project_id,
+                        execution_type="scenario",
+                        execution_id=run.id,
+                        step=running_result,
+                        fallback_index=current_index,
+                    )
                 self._append_event(
                     run,
                     scenario_version,
@@ -841,6 +883,14 @@ class ScenarioService:
                         continue_on_failure=bool(step.get("continue_on_failure", False)),
                     ),
                 )
+            elif settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED:
+                self._persist_step_result_normalized(
+                    run=run,
+                    result=result,
+                    variables=variables,
+                    variable_sources=variable_sources,
+                    fallback_index=index,
+                )
             if result["status"] != "passed" and not step.get("continue_on_failure", False):
                 stop_after_nodes.add(node_id)
                 if node_phase == "before":
@@ -849,7 +899,8 @@ class ScenarioService:
             previous_step_index = index
 
         finished_at = datetime.utcnow()
-        run.step_results = results
+        if not settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED:
+            run.step_results = results
         run.variables_snapshot = self._masked_variables_snapshot(variables, variable_sources)
         run.status = (
             "timeout" if any(item["status"] == "timeout" for item in results)
@@ -865,6 +916,7 @@ class ScenarioService:
             execution_type="scenario",
             execution_id=run.id,
             execution=self._diagnostic_execution_view(run, results),
+            include_steps=not settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED,
         )
         if emit_events:
             summary = self._run_summary(results)
@@ -1359,29 +1411,7 @@ class ScenarioService:
 
     @staticmethod
     def _execution_steps(definition: dict[str, Any]) -> list[dict[str, Any]]:
-        nodes = definition.get("nodes")
-        if not isinstance(nodes, list):
-            raise RuntimeError("Scenario definition has not been migrated to nodes")
-        steps: list[dict[str, Any]] = []
-        for node_index, node in enumerate(nodes):
-            node_id = str(node.get("id") or "")
-            groups = (
-                ("before", node.get("before_actions") or []),
-                ("test_case", [node.get("test_case")]),
-                ("after", node.get("after_actions") or []),
-            )
-            for phase, items in groups:
-                for item in items:
-                    if not isinstance(item, dict):
-                        raise RuntimeError(
-                            f"Scenario node {node_id or node_index} is missing its test_case"
-                        )
-                    step = copy.deepcopy(item)
-                    step["_node_id"] = node_id
-                    step["_node_index"] = node_index
-                    step["_node_phase"] = phase
-                    steps.append(step)
-        return steps
+        return ordered_scenario_steps(definition)
 
     @classmethod
     def _test_case_steps(cls, definition: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1579,6 +1609,16 @@ class ScenarioService:
         pending_steps: list[dict[str, Any]],
         pending_start_index: int,
     ) -> None:
+        if settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED:
+            if results:
+                self._persist_step_result_normalized(
+                    run=run,
+                    result=results[-1],
+                    variables=variables,
+                    variable_sources=variable_sources,
+                    fallback_index=len(results) - 1,
+                )
+            return
         run.step_results = [
             *copy.deepcopy(results),
             *[
@@ -1599,6 +1639,26 @@ class ScenarioService:
                 step=results[-1],
                 fallback_index=len(results) - 1,
             )
+
+    def _persist_step_result_normalized(
+        self,
+        *,
+        run: TestScenarioRun,
+        result: dict[str, Any],
+        variables: dict[str, Any],
+        variable_sources: dict[str, dict[str, Any]],
+        fallback_index: int,
+    ) -> None:
+        run.variables_snapshot = self._masked_variables_snapshot(
+            variables, variable_sources
+        )
+        self.diagnostic_persistence.stage_step(
+            project_id=run.project_id,
+            execution_type="scenario",
+            execution_id=run.id,
+            step=result,
+            fallback_index=fallback_index,
+        )
 
     @staticmethod
     def _diagnostic_execution_view(

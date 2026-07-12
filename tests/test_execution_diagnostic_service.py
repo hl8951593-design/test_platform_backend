@@ -43,6 +43,7 @@ class ExecutionDiagnosticServiceTests(unittest.TestCase):
             execution_type="scenario",
             execution_id=220,
             current_user=self.user,
+            include_artifacts=False,
         )
 
     def test_artifact_view_returns_bounded_chunk_without_loading_full_detail(self):

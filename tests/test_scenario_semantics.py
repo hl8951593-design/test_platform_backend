@@ -164,10 +164,15 @@ class ScenarioNodeActionTests(unittest.TestCase):
         )
 
         self.assertEqual(executed, ["setup", "teardown-1", "teardown-2"])
-        self.assertEqual([item["step_id"] for item in run.step_results], [
+        normalized_results = [
+            call.kwargs["step"]
+            for call in service.diagnostic_persistence.stage_step.call_args_list
+        ]
+        self.assertEqual([item["step_id"] for item in normalized_results], [
             "setup", "main", "teardown-1", "teardown-2",
         ])
-        self.assertEqual(run.step_results[1]["status"], "skipped")
+        self.assertEqual(normalized_results[1]["status"], "skipped")
+        self.assertEqual(run.step_results, [])
         self.assertEqual(run.status, "failed")
 
 

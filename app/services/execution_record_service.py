@@ -5,6 +5,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.async_response import public_execution_status
+from app.core.config import settings
 from app.core.permissions import ProjectPermission
 from app.models.user import User
 from app.repositories.execution_record_repository import ExecutionRecordRepository
@@ -22,6 +23,7 @@ from app.schemas.execution_record import (
     ExecutionType,
 )
 from app.services.permission_service import PermissionService
+from app.services.execution_diagnostic_service import ScenarioStepResultAssembler
 
 
 class ExecutionRecordService:
@@ -29,6 +31,7 @@ class ExecutionRecordService:
         self.repository = ExecutionRecordRepository(db)
         self.diagnostic_repository = ExecutionDiagnosticRepository(db)
         self.permission_service = PermissionService(db)
+        self.scenario_step_assembler = ScenarioStepResultAssembler(db)
 
     def _require_view(self, current_user: User, project_id: int) -> None:
         self.permission_service.require_project_permission(
@@ -227,10 +230,26 @@ class ExecutionRecordService:
         execution_type: ExecutionType,
         execution_id: int,
         current_user: User,
+        include_artifacts: bool = True,
     ) -> ExecutionRecordDetail:
         self._require_view(current_user, project_id)
         loader = getattr(self, f"_get_{execution_type}_detail")
-        result = loader(project_id=project_id, execution_id=execution_id)
+        loader_kwargs = {
+            "project_id": project_id,
+            "execution_id": execution_id,
+        }
+        if execution_type == "scenario":
+            loader_kwargs.update(
+                {
+                    "include_artifacts": include_artifacts,
+                    "use_normalized": (
+                        True
+                        if not include_artifacts
+                        else settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED
+                    ),
+                }
+            )
+        result = loader(**loader_kwargs)
         if result is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -290,7 +309,14 @@ class ExecutionRecordService:
         detail["status"] = public_execution_status(detail.get("status"))
         return ExecutionRecordDetail(summary=summary, detail=detail)
 
-    def _get_scenario_detail(self, *, project_id: int, execution_id: int):
+    def _get_scenario_detail(
+        self,
+        *,
+        project_id: int,
+        execution_id: int,
+        include_artifacts: bool = True,
+        use_normalized: bool | None = None,
+    ):
         row = self.repository.get_scenario(project_id=project_id, execution_id=execution_id)
         if row is None:
             return None
@@ -318,6 +344,18 @@ class ExecutionRecordService:
         })
         detail = self._column_values(execution)
         detail["status"] = public_execution_status(detail.get("status"))
+        if use_normalized is None:
+            use_normalized = settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED
+        if use_normalized:
+            detail["step_results"] = (
+                self.scenario_step_assembler.assemble_scenario_step_results(
+                    project_id=project_id,
+                    execution_id=execution_id,
+                    scenario_snapshot=execution.scenario_snapshot or {},
+                    include_artifacts=include_artifacts,
+                    legacy_step_results=execution.step_results or [],
+                )
+            )
         detail["events"] = [
             self._column_values(event)
             for event in self.repository.list_scenario_events(execution.id)

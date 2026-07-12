@@ -124,6 +124,28 @@ class ExecutionDiagnosticRepository:
             )
         )
 
+    def list_all_steps(
+        self,
+        *,
+        project_id: int,
+        execution_type: str,
+        execution_id: int,
+    ) -> list[ExecutionStepDiagnostic]:
+        return list(
+            self.db.scalars(
+                select(ExecutionStepDiagnostic)
+                .where(
+                    ExecutionStepDiagnostic.project_id == project_id,
+                    ExecutionStepDiagnostic.execution_type == execution_type,
+                    ExecutionStepDiagnostic.execution_id == execution_id,
+                )
+                .order_by(
+                    ExecutionStepDiagnostic.step_index.asc(),
+                    ExecutionStepDiagnostic.id.asc(),
+                )
+            ).all()
+        )
+
     def count_indexes(
         self, *, project_id: int, execution_type: str, execution_id: int
     ) -> int:

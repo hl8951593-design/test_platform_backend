@@ -431,6 +431,7 @@ class AgentPlatformToolTests(unittest.TestCase):
             execution_type="scenario",
             execution_id=220,
             current_user=self.user,
+            include_artifacts=False,
         )
 
     def test_execution_read_detail_step_view_requires_exactly_one_step_id(self):

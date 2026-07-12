@@ -52,7 +52,7 @@ class Settings(BaseSettings):
         default=65536, ge=16384, le=1048576
     )
     EXECUTION_ARTIFACT_CHUNK_BYTES: int = Field(default=8192, ge=1024, le=65536)
-    EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED: bool = False
+    EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED: bool = True
     EXECUTION_METRICS_SCHEDULER_ENABLED: bool = True
     EXECUTION_METRICS_SCHEDULER_INTERVAL_SECONDS: int = Field(
         default=60, ge=10, le=3600

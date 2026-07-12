@@ -71,7 +71,7 @@ class ExecutionDiagnosticMigrationTests(unittest.TestCase):
         self.assertEqual(settings.EXECUTION_DIAGNOSTIC_MODEL_HARD_MAX_CHARS, 24000)
         self.assertEqual(settings.EXECUTION_ARTIFACT_INLINE_THRESHOLD_BYTES, 65536)
         self.assertEqual(settings.EXECUTION_ARTIFACT_CHUNK_BYTES, 8192)
-        self.assertFalse(settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED)
+        self.assertTrue(settings.EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED)
         self.assertTrue(settings.EXECUTION_METRICS_SCHEDULER_ENABLED)
         self.assertEqual(settings.EXECUTION_METRICS_SCHEDULER_INTERVAL_SECONDS, 60)
 

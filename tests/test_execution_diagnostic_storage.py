@@ -199,6 +199,40 @@ class ExecutionDiagnosticStorageTests(unittest.TestCase):
         db.commit.assert_not_called()
         db.rollback.assert_called_once_with()
 
+    def test_backfill_can_restore_reference_based_scenario_snapshots(self):
+        reader = _FakeSourceReader([(220, {"summary": {}, "detail": {}})])
+        db = MagicMock()
+        run = SimpleNamespace(scenario_snapshot={"nodes": []}, step_results=[])
+        db.get.return_value = run
+        runner = ExecutionDiagnosticBackfillRunner(
+            db=db,
+            source_reader=reader,
+            persistence=MagicMock(),
+        )
+        runner.scenario_assembler = MagicMock()
+        runner.scenario_assembler.assemble_scenario_step_results.return_value = [
+            {
+                "step_id": "STEP-1",
+                "response_snapshot": {
+                    "artifact_ref": "execution-artifact://1/scenario/220/abc",
+                    "externalized": True,
+                },
+            }
+        ]
+
+        runner.run(
+            project_id=1,
+            execution_type="scenario",
+            after_id=0,
+            batch_size=500,
+            dry_run=False,
+            restore_legacy_snapshots=True,
+        )
+
+        self.assertEqual(run.step_results[0]["step_id"], "STEP-1")
+        runner.scenario_assembler.assemble_scenario_step_results.assert_called_once()
+        db.commit.assert_called_once_with()
+
     def test_large_response_is_externalized_and_round_trips_by_chunk(self):
         store = DatabaseExecutionPayloadStore(self.db)
         value = {"body": "测" * 40000, "authorization": "Bearer secret"}

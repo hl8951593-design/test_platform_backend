@@ -87,7 +87,7 @@ class ScenarioRealtimeEventTests(unittest.TestCase):
         self.assertEqual(events[1][1]["step_index"], 0)
         self.assertEqual(events[4][1]["step_index"], 1)
         self.assertEqual(run.status, "passed")
-        self.assertEqual([item["step_index"] for item in run.step_results], [0, 1])
+        self.assertEqual(run.step_results, [])
         self.assertEqual(self.service.diagnostic_persistence.stage_step.call_count, 4)
         self.service.diagnostic_persistence.stage_execution.assert_called_once()
 
@@ -115,7 +115,7 @@ class ScenarioRealtimeEventTests(unittest.TestCase):
             ],
         )
         self.assertEqual(run.status, "failed")
-        self.assertEqual(run.step_results[1]["status"], "skipped")
+        self.assertEqual(run.step_results, [])
         statuses = [
             call.kwargs["step"]["status"]
             for call in self.service.diagnostic_persistence.stage_step.call_args_list

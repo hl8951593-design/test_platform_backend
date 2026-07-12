@@ -1,15 +1,24 @@
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.models.execution_diagnostic import ExecutionRecordIndex
+from app.core.config import settings
+from app.models.execution_diagnostic import (
+    ExecutionPayloadArtifact,
+    ExecutionStepDiagnostic,
+)
 from app.schemas.execution_record import ExecutionRecordCursorPage
+from app.services.execution_diagnostic_persistence import ExecutionDiagnosticPersistence
+from app.services.execution_diagnostic_service import ScenarioStepResultAssembler
 from app.services.execution_record_service import ExecutionRecordService
+from app.services.scenario_service import ScenarioService
+from tests.test_execution_diagnostic_projection import run_220_shape
 
 
 BASE_TIME = datetime(2026, 7, 13, 8, 0, 0)
@@ -18,7 +27,12 @@ BASE_TIME = datetime(2026, 7, 13, 8, 0, 0)
 class ExecutionDiagnosticScalingTests(unittest.TestCase):
     def setUp(self):
         engine = create_engine("sqlite+pysqlite:///:memory:")
-        ExecutionRecordIndex.__table__.create(engine)
+        for table in (
+            ExecutionRecordIndex.__table__,
+            ExecutionStepDiagnostic.__table__,
+            ExecutionPayloadArtifact.__table__,
+        ):
+            table.create(engine)
         self.db = sessionmaker(bind=engine)()
         self.service = ExecutionRecordService(self.db)
         self.service.permission_service = MagicMock()
@@ -111,6 +125,167 @@ class ExecutionDiagnosticScalingTests(unittest.TestCase):
                 with self.assertRaises(HTTPException) as raised:
                     self._page(cursor=cursor)
                 self.assertEqual(raised.exception.status_code, 422)
+
+    def test_normalized_steps_assemble_legacy_contract(self):
+        ExecutionDiagnosticPersistence(self.db).stage_execution(
+            project_id=1,
+            execution_type="scenario",
+            execution_id=220,
+            execution=run_220_shape(),
+        )
+        snapshot = {
+            "nodes": [
+                {
+                    "id": "NODE-1",
+                    "before_actions": [],
+                    "test_case": {
+                        "id": "STEP-1",
+                        "kind": "api_case",
+                        "name": "获取企业列表",
+                    },
+                    "after_actions": [
+                        {
+                            "id": "STEP-1-AFTER-1",
+                            "kind": "delay",
+                            "name": "获取企业列表-AFTER_ACTIONS-1",
+                        }
+                    ],
+                },
+                {
+                    "id": "NODE-2",
+                    "before_actions": [],
+                    "test_case": {
+                        "id": "STEP-2",
+                        "kind": "api_case",
+                        "name": "获取对应企业CT画像数",
+                    },
+                    "after_actions": [],
+                },
+            ]
+        }
+
+        result = ScenarioStepResultAssembler(self.db).assemble_scenario_step_results(
+            project_id=1,
+            execution_id=220,
+            scenario_snapshot=snapshot,
+            include_artifacts=True,
+        )
+
+        self.assertEqual(result[0]["name"], "获取企业列表")
+        self.assertEqual(result[2]["assertion_results"][1]["actual"], 90001)
+
+    def test_ten_thousand_steps_do_not_rewrite_growing_run_json(self):
+        db = MagicMock()
+        scenario_service = ScenarioService(db)
+        scenario_service.diagnostic_persistence = MagicMock()
+        run = SimpleNamespace(
+            id=220,
+            project_id=1,
+            step_results=[],
+            variables_snapshot={},
+        )
+
+        for index in range(10000):
+            scenario_service._persist_step_result_normalized(
+                run=run,
+                result={
+                    "step_id": f"STEP-{index}",
+                    "step_index": index,
+                    "name": f"step {index}",
+                    "kind": "delay",
+                    "status": "passed",
+                },
+                variables={},
+                variable_sources={},
+                fallback_index=index,
+            )
+
+        self.assertEqual(
+            scenario_service.diagnostic_persistence.stage_step.call_count,
+            10000,
+        )
+        self.assertEqual(run.step_results, [])
+        db.commit.assert_not_called()
+
+    def test_agent_assembly_keeps_artifact_refs_while_full_assembly_hydrates(self):
+        persistence = ExecutionDiagnosticPersistence(self.db)
+        persistence.stage_step(
+            project_id=1,
+            execution_type="scenario",
+            execution_id=221,
+            step={
+                "step_id": "STEP-1",
+                "step_index": 0,
+                "name": "large response",
+                "kind": "api_case",
+                "status": "failed",
+                "response_snapshot": {"body": "x" * 70000},
+            },
+            fallback_index=0,
+        )
+        snapshot = {
+            "nodes": [
+                {
+                    "id": "NODE-1",
+                    "before_actions": [],
+                    "test_case": {
+                        "id": "STEP-1",
+                        "name": "large response",
+                        "kind": "api_case",
+                    },
+                    "after_actions": [],
+                }
+            ]
+        }
+        assembler = ScenarioStepResultAssembler(self.db)
+
+        agent_view = assembler.assemble_scenario_step_results(
+            project_id=1,
+            execution_id=221,
+            scenario_snapshot=snapshot,
+            include_artifacts=False,
+        )
+        full_view = assembler.assemble_scenario_step_results(
+            project_id=1,
+            execution_id=221,
+            scenario_snapshot=snapshot,
+            include_artifacts=True,
+        )
+
+        self.assertTrue(agent_view[0]["response_snapshot"]["externalized"])
+        self.assertEqual(full_view[0]["response_snapshot"]["body"], "x" * 70000)
+
+    def test_rollback_flag_preserves_legacy_step_result_snapshot_writes(self):
+        scenario_service = ScenarioService(MagicMock())
+        scenario_service.diagnostic_persistence = MagicMock()
+        run = SimpleNamespace(
+            id=220,
+            project_id=1,
+            step_results=[],
+            variables_snapshot={},
+        )
+        completed = {
+            "step_id": "STEP-1",
+            "step_index": 0,
+            "name": "done",
+            "kind": "delay",
+            "status": "passed",
+        }
+        pending = {"id": "STEP-2", "name": "next", "kind": "delay"}
+
+        with patch.object(
+            settings, "EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED", False
+        ):
+            scenario_service._persist_step_result(
+                run,
+                [completed],
+                {},
+                {},
+                [pending],
+                1,
+            )
+
+        self.assertEqual([item["status"] for item in run.step_results], ["passed", "pending"])
 
 
 if __name__ == "__main__":

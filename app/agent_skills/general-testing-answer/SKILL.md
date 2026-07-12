@@ -1,6 +1,12 @@
 ---
 name: general-testing-answer
 description: Use when the user asks software testing, test automation, API testing, WebSocket testing, assertion, extractor, test data, mock, defect diagnosis, CI, risk coverage, report interpretation, or TestAuto platform usage questions that do not require live project data or platform object creation.
+owns:
+  - general
+consumes:
+  - project_context
+produces:
+  - answer
 triggers:
   - 边界值
   - 等价类

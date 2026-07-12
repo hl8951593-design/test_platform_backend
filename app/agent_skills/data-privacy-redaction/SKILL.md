@@ -1,6 +1,15 @@
 ---
 name: data-privacy-redaction
 description: Use when the user asks about sensitive data masking, token redaction, privacy handling, PII, secret leakage, AI prompt redaction, report/log sanitization, signed URL exposure, or data retention risk in TestAuto.
+owns:
+  - data_privacy
+consumes:
+  - execution
+  - report
+  - media
+  - agent_runtime
+produces:
+  - redaction
 triggers:
   - 脱敏
   - 敏感数据

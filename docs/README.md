@@ -7,11 +7,11 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 最近核对日期 | 2026-07-09 |
-| 开发基线 | `3.0.532-read-path-performance-cache` |
-| Alembic head | `0038_non_agent_query_performance_indexes` |
+| 最近核对日期 | 2026-07-12 |
+| 开发基线 | `3.0.536-agent-native-tool-wire-fix` |
+| Alembic head | `0040_agent_capability_plans` |
 | 回归命令 | `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v` |
-| 最近完整回归 | 上次完整回归为 `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v`，711 个用例执行完成，OK（skipped=3）；本次 `3.0.532-read-path-performance-cache` 已执行 `.\.venv\Scripts\python.exe -m unittest tests.test_notifications_contract tests.test_project_page_contract tests.test_resource_list_filters` 专项契约回归，12 个用例 OK；HTTP 并发验证覆盖 `/test-cases`、`/websocket-test-cases`、`/projects`、`/environment-configs`、`/notifications`；Alembic head 仍为 `0036_project_list_query_indexes` |
+| 最近完整回归 | `3.0.536-agent-native-tool-wire-fix` 已执行 `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q`，879 个用例 OK（skipped=3）；其中 Agent Runtime、结构化意图、Capability Plan、原生 Tool Calling、DeepSeek thinking 多轮回传、AI 传输层与平台工具回归全部通过；迁移链单 head 为 `0040_agent_capability_plans` |
 
 数字基线只能在实际执行命令后更新。数据库结构以 Alembic migration 和当前模型共同为准，
 不能只修改模型而遗漏迁移。

@@ -1,6 +1,15 @@
 ---
 name: notification-alerting-config
 description: Use when the user asks to configure, design, or diagnose notifications, alerts, email, SMTP, webhook callbacks, failure alerts, run completion notifications, readiness alerts, or release gate messaging for TestAuto.
+owns:
+  - notification
+consumes:
+  - report
+  - execution
+  - test_plan
+  - agent_runtime
+produces:
+  - notification
 triggers:
   - 通知
   - 告警

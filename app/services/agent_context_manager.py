@@ -10,6 +10,7 @@ from app.services.agent_capability_resolver import (
     AgentCapabilityResolver,
     MODEL_PRIVATE_TOOL_NAMES,
 )
+from app.services.agent_intent_action import parse_agent_intent_action
 from app.services.agent_skill_planner import AgentSkillPlan, AgentSkillPlanner
 from app.services.agent_skill_registry import AgentSkill, AgentSkillRegistry
 from app.services.agent_tool_service import SAFE_SIDE_EFFECT_CLASSES, ToolRegistry, ToolSpec
@@ -28,6 +29,8 @@ SKILL_TASK_TYPES = {
     "environment-config-management": "environment_management",
     "http-test-case-design": "http_case_design",
     "websocket-test-case-design": "websocket_case_design",
+    "defect-triage": "defect_triage",
+    "test-plan-management": "test_plan_management",
     "visual-flow-design": "visual_flow_design",
 }
 
@@ -108,12 +111,20 @@ class AgentContextManager:
         *,
         phase: str = "planning",
         working_context: dict[str, object] | None = None,
+        intent_action: object | None = None,
     ) -> AgentContextPlan:
+        # Derive intent only from the user's request. Internal routing hints
+        # contain tool and skill vocabulary that must not become new intent.
+        intent_action = intent_action or parse_agent_intent_action(
+            intent,
+            working_context=working_context,
+        )
         routing_intent = self.capability_resolver.routing_intent(intent, working_context=working_context)
         skill_plan = self.skill_planner.plan(
             intent,
             routing_intent=routing_intent,
             working_context=working_context,
+            intent_action=intent_action,
         )
         selected_skills = tuple(
             skill
@@ -133,6 +144,7 @@ class AgentContextManager:
                 code if code.startswith("planner:") else f"planner:{code}"
                 for code in skill_plan.reason_codes
             ),
+            intent_action=intent_action,
         )
 
         return AgentContextPlan(
@@ -146,6 +158,43 @@ class AgentContextManager:
             allowed_tools=capability_plan.allowed_tools,
             confidence=skill_plan.confidence,
             skill_plan=skill_plan,
+            capability_plan=capability_plan,
+        )
+
+    def route_planning_decision(
+        self,
+        intent: str,
+        *,
+        decision: object,
+        phase: str = "planning",
+    ) -> AgentContextPlan:
+        selected_skill_names = tuple(dict.fromkeys(getattr(decision, "selected_skills", ())))
+        selected_skills = tuple(
+            skill
+            for skill_name in selected_skill_names
+            if (skill := self.skill_registry.get_skill(str(skill_name))) is not None
+        )
+        if len(selected_skills) != len(selected_skill_names):
+            resolved_names = {skill.name for skill in selected_skills}
+            missing = sorted(set(selected_skill_names) - resolved_names)
+            raise ValueError(f"planning decision contains unavailable Skills: {missing}")
+        primary_name = selected_skill_names[0] if selected_skill_names else None
+        supporting_names = selected_skill_names[1:]
+        capability_plan = self.capability_resolver.resolve_planning_decision(
+            intent=intent,
+            decision=decision,
+        )
+        return AgentContextPlan(
+            schema_version=AGENT_CONTEXT_SCHEMA_VERSION,
+            task_type=SKILL_TASK_TYPES.get(primary_name or "", "general"),
+            goal=str(getattr(decision, "goal", intent)).strip(),
+            phase=phase,
+            primary_skill=primary_name,
+            supporting_skills=supporting_names,
+            selected_skills=selected_skills,
+            allowed_tools=capability_plan.allowed_tools,
+            confidence=float(getattr(decision, "confidence", 1.0)),
+            skill_plan=None,
             capability_plan=capability_plan,
         )
 
@@ -192,7 +241,17 @@ class AgentContextManager:
         )
 
     def skill_plan_message(self, plan: AgentContextPlan) -> AIChatMessage:
-        payload = plan.skill_plan.model_view() if plan.skill_plan is not None else {}
+        payload = (
+            plan.skill_plan.model_view()
+            if plan.skill_plan is not None
+            else {
+                "source": "llm_planning",
+                "primary_skill": plan.primary_skill,
+                "supporting_skills": list(plan.supporting_skills),
+                "allowed_skills": list(plan.skill_names),
+                "confidence": plan.confidence,
+            }
+        )
         return AIChatMessage(
             role="system",
             content=(

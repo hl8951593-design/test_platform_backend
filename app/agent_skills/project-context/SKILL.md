@@ -1,6 +1,18 @@
 ---
 name: project-context
 description: Use when the user asks to read or query current TestAuto project context, existing test cases, environments, resources, or other live platform facts.
+owns:
+  - project_context
+consumes:
+  - test_case
+  - environment
+  - scenario
+  - visual_flow
+  - test_plan
+  - defect
+  - report
+produces:
+  - project_context
 triggers:
   - 当前项目
   - 项目上下文

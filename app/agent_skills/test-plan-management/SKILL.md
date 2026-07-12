@@ -1,6 +1,27 @@
 ---
 name: test-plan-management
 description: Use when the user asks to design, explain, review, schedule, execute, diagnose, or report on TestAuto test plans, plan targets, plan runs, regression suites, smoke suites, coverage, pass rate, or release readiness.
+tools:
+  - project.read_context
+  - scenario.query_project_scenarios
+  - plan.query_project_plans
+  - plan.create_saved
+  - plan.update_saved
+  - plan.set_enabled
+  - plan.execute_saved
+  - plan.query_runs
+  - plan.read_run
+  - report.read_summary
+owns:
+  - test_plan
+consumes:
+  - report
+  - defect
+  - test_case
+  - scenario
+  - execution
+produces:
+  - test_plan
 triggers:
   - test plan
   - test suite
@@ -28,9 +49,12 @@ routing_requires_tool:
 ## Workflow
 
 1. For test-plan strategy, coverage design, suite grouping, and release-readiness advice, answer directly.
-2. For real plan run results, pass rate, and failure evidence, use `report.read_summary` where available.
-3. Use `project.read_context` when the plan needs current environments or project metadata.
-4. Do not claim that a plan, target, schedule, or run was created, updated, executed, cancelled, or archived unless a dedicated backend tool succeeds.
+2. For current plans, call `plan.query_project_plans`; for run history call `plan.query_runs`, then `plan.read_run` for target-level results.
+3. Before `plan.create_saved`, call `project.read_context` and `scenario.query_project_scenarios`, then use only their current environment/scenario ids. Creating a plan requires approval.
+4. Before `plan.update_saved` or `plan.set_enabled`, refresh `plan.query_project_plans` and copy its `object_ref`, snapshot id, and current version. Both actions require approval.
+5. Before `plan.execute_saved`, refresh the plan and project environment snapshots. Execution is asynchronous; after acceptance use `plan.query_runs` rather than submitting a duplicate.
+6. For report-level pass rate and failure evidence, use `report.read_summary` where available.
+7. Do not claim that a plan, target, schedule, or run was created, updated, enabled, disabled, or executed unless the matching tool succeeds.
 
 ## Planning Rules
 

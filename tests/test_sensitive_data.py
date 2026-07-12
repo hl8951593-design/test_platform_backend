@@ -17,13 +17,18 @@ from app.core.sensitive_data import (
 class SensitiveDataTests(unittest.TestCase):
     def test_sensitive_fields_are_encrypted_and_masked(self):
         source = {
-            "headers": {"Authorization": "Bearer secret", "Accept": "application/json"},
+            "headers": {
+                "Authorization": "Bearer secret",
+                "lingxi-auth": "bearer external-secret",
+                "Accept": "application/json",
+            },
             "body": {"password": "secret", "name": "tester"},
         }
         encrypted = encrypt_sensitive(source)
         self.assertNotEqual(encrypted["headers"]["Authorization"], source["headers"]["Authorization"])
         self.assertEqual(decrypt_sensitive(encrypted), source)
         self.assertEqual(mask_sensitive(encrypted)["headers"]["Authorization"], "***")
+        self.assertEqual(mask_sensitive(encrypted)["headers"]["lingxi-auth"], "***")
 
     def test_secret_text_round_trip(self):
         encrypted = protect_secret_text("secret-value")

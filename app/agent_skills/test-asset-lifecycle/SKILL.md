@@ -1,6 +1,19 @@
 ---
 name: test-asset-lifecycle
 description: Use when the user asks to organize, copy, rename, delete, archive, version, tag, classify, or assess dependencies of TestAuto test cases, scenarios, flows, plans, API definitions, datasets, or reusable test assets.
+owns:
+  - test_asset
+consumes:
+  - test_case
+  - scenario
+  - visual_flow
+  - test_plan
+  - dataset
+  - api_definition
+  - defect
+  - report
+produces:
+  - test_asset
 triggers:
   - 测试资产
   - 用例目录

@@ -1,6 +1,14 @@
 ---
 name: ai-skill-runtime-governance
 description: Use when the user asks about TestAuto AI Skill packages, AI draft generation, manifest/schema constraints, prompt repair, JSON parsing failures, model settings, AI Skill Run observability, or generated draft validation.
+owns:
+  - ai_skill
+consumes:
+  - model
+  - test_case
+  - scenario
+produces:
+  - ai_skill
 triggers:
   - AI Skill
   - ai_skill

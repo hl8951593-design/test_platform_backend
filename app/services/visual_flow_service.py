@@ -106,6 +106,35 @@ class VisualFlowService:
             raise HTTPException(status_code=404, detail="Flow version not found")
         return self._detail(flow, version.definition)
 
+    def validate_definition(
+        self,
+        *,
+        project_id: int,
+        definition: FlowDefinition,
+        executable: bool,
+        current_user: User,
+    ) -> dict[str, Any]:
+        """Validate a flow draft without persisting or executing it."""
+        self._require(current_user, project_id, ProjectPermission.VIEW_FLOW.value)
+        prepared = self._prepare_definition(definition, project_id=project_id)
+        try:
+            self._validate(prepared, project_id=project_id, executable=executable)
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_422_UNPROCESSABLE_ENTITY:
+                raise
+            detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+            return {
+                "valid": False,
+                "issues": detail.get("issues") or [],
+                "message": detail.get("message") or "Flow validation failed",
+            }
+        return {
+            "valid": True,
+            "issues": [],
+            "definition": self._stored_definition(prepared),
+            "executable": executable,
+        }
+
     def create_flow(self, *, project_id: int, payload, current_user: User) -> dict[str, Any]:
         self._require(current_user, project_id, ProjectPermission.MANAGE_FLOW.value)
         definition = self._prepare_definition(payload.definition, project_id=project_id)

@@ -24,6 +24,7 @@ AUTHORITATIVE_ARTIFACT_TYPES = frozenset({
     "test_case_query_snapshot",
 })
 DERIVED_ARTIFACT_TYPES = frozenset({
+    "scenario_draft_invalid",
     "testcase_assertion_draft",
     "testcase_extractor_draft",
     "testcase_draft",

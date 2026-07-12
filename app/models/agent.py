@@ -7,6 +7,7 @@ from app.db.base import Base
 
 
 AGENT_RUN_ITEM_ID_PREFIX = "agent-run"
+AGENT_CAPABILITY_PLAN_ITEM_ID_PREFIX = "agent-capability-plan"
 AGENT_RUNTIME_SNAPSHOT_ITEM_ID_PREFIX = "agent-runtime-snapshot"
 AGENT_EVENT_ITEM_ID_PREFIX = "agent-event"
 AGENT_TOOL_CALL_ITEM_ID_PREFIX = "agent-tool-call"
@@ -69,6 +70,7 @@ class AgentRun(Base):
     current_step_index: Mapped[int] = mapped_column(default=0, nullable=False)
     max_iterations: Mapped[int] = mapped_column(default=3, nullable=False)
     runtime_snapshot_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    active_capability_plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     last_checkpoint_id: Mapped[int | None] = mapped_column(nullable=True)
     last_event_sequence: Mapped[int] = mapped_column(default=0, nullable=False)
     migration_block_count: Mapped[int] = mapped_column(default=0, nullable=False)
@@ -84,6 +86,43 @@ class AgentRun(Base):
     @property
     def item_id(self) -> str:
         return f"{AGENT_RUN_ITEM_ID_PREFIX}://{self.run_id}"
+
+
+class AgentCapabilityPlanRecord(Base):
+    __tablename__ = "ai_agent_capability_plans"
+    __table_args__ = (
+        UniqueConstraint("capability_plan_id", name="uq_agent_capability_plans_plan_id"),
+        UniqueConstraint("run_id", "iteration", "revision", name="uq_agent_capability_plan_run_iter_rev"),
+        Index("ix_agent_capability_plans_run_iteration_status", "run_id", "iteration", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    capability_plan_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    iteration: Mapped[int] = mapped_column(nullable=False)
+    revision: Mapped[int] = mapped_column(nullable=False)
+    parent_capability_plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    runtime_snapshot_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    intent_decision_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    skill_plan_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    allowed_tools_json: Mapped[list] = mapped_column(JSON, nullable=False)
+    tool_aliases_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    required_facts_json: Mapped[list] = mapped_column(JSON, nullable=False)
+    reason_codes_json: Mapped[list] = mapped_column(JSON, nullable=False)
+    plan_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    @property
+    def item_id(self) -> str:
+        return f"{AGENT_CAPABILITY_PLAN_ITEM_ID_PREFIX}://{self.capability_plan_id}"
 
 
 class AgentEvent(Base):
@@ -163,6 +202,7 @@ class AgentToolCall(Base):
     step_index: Mapped[int] = mapped_column(nullable=False)
     attempt_index: Mapped[int] = mapped_column(nullable=False)
     runtime_snapshot_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    capability_plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
     tool_version: Mapped[str] = mapped_column(String(32), nullable=False)
     schema_hash: Mapped[str] = mapped_column(String(64), nullable=False)

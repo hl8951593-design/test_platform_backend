@@ -1,6 +1,16 @@
 ---
 name: assertion-extractor-binding
 description: Use when the user asks to design, repair, or diagnose assertions, extractors, variable paths, JSON path/dot path conversion, response-field binding, upstream/downstream parameter flow, or missing variable failures.
+owns:
+  - assertion
+consumes:
+  - test_case
+  - execution
+  - response
+  - scenario
+produces:
+  - assertion
+  - extractor
 triggers:
   - 断言
   - 提取器

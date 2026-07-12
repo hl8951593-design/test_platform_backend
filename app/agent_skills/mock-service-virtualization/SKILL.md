@@ -1,6 +1,14 @@
 ---
 name: mock-service-virtualization
 description: Use when the user asks to design mock APIs, stubs, service virtualization, fake dependencies, contract simulation, unavailable upstream replacement, or deterministic responses for TestAuto testing.
+owns:
+  - mock_service
+consumes:
+  - api_definition
+  - test_case
+  - browser_capture
+produces:
+  - mock_service
 triggers:
   - mock
   - Mock

@@ -59,6 +59,8 @@ class AIService:
             content=message.get("content") or "",
             usage=data.get("usage"),
             finish_reason=choice.get("finish_reason"),
+            tool_calls=message.get("tool_calls") or [],
+            reasoning_content=message.get("reasoning_content"),
         )
 
     def chat_stream(self, payload: AIChatRequest) -> Iterator[dict[str, Any]]:
@@ -113,7 +115,11 @@ class AIService:
         try:
             with httpx.Client(timeout=settings.DEEPSEEK_TIMEOUT_SECONDS) as client:
                 with client.stream("POST", endpoint, headers=headers, json=request_body) as response:
-                    response.raise_for_status()
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError:
+                        response.read()
+                        raise
                     for line in response.iter_lines():
                         if not line:
                             continue
@@ -129,6 +135,12 @@ class AIService:
                         content = delta.get("content")
                         if content:
                             yield {"type": "delta", "content": content}
+                        tool_calls = delta.get("tool_calls")
+                        if isinstance(tool_calls, list) and tool_calls:
+                            yield {"type": "tool_call_delta", "tool_calls": tool_calls}
+                        reasoning_content = delta.get("reasoning_content")
+                        if reasoning_content:
+                            yield {"type": "reasoning_delta", "content": reasoning_content}
                         finish_reason = choice.get("finish_reason")
                         if finish_reason:
                             yield {
@@ -166,9 +178,21 @@ class AIService:
         return str(exc.detail)
 
     def _build_chat_payload(self, payload: AIChatRequest) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = []
+        for message in payload.messages:
+            item = message.model_dump(exclude_none=True, exclude_defaults=True)
+            if message.tool_calls:
+                item["tool_calls"] = [
+                    {
+                        **tool_call.model_dump(exclude_none=True, exclude_defaults=True),
+                        "type": tool_call.type,
+                    }
+                    for tool_call in message.tool_calls
+                ]
+            messages.append(item)
         request_body: dict[str, Any] = {
             "model": payload.model or settings.DEEPSEEK_MODEL,
-            "messages": [message.model_dump() for message in payload.messages],
+            "messages": messages,
         }
         if payload.temperature is not None:
             request_body["temperature"] = payload.temperature
@@ -180,6 +204,16 @@ class AIService:
             request_body["reasoning_effort"] = payload.reasoning_effort
         if payload.response_format == "json":
             request_body["response_format"] = {"type": "json_object"}
+        if payload.tools:
+            request_body["tools"] = [
+                {
+                    **tool.model_dump(exclude_none=True, exclude_defaults=True),
+                    "type": tool.type,
+                }
+                for tool in payload.tools
+            ]
+            request_body["tool_choice"] = payload.tool_choice or "auto"
+            request_body["parallel_tool_calls"] = payload.parallel_tool_calls
         return request_body
 
     def _extract_error_message(self, response: httpx.Response) -> str:

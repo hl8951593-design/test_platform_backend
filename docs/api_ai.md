@@ -137,6 +137,30 @@ POST https://api.deepseek.com/chat/completions
 - AI 返回内容会先经过本地 JSON 解析兼容层：去除代码块、提取 JSON 片段、修复尾逗号、未转义引号、字符串中的控制字符、字段名断行等常见模型输出问题。
 - 本地解析仍失败时，`AISkillRunner` 会使用低温 JSON 修复请求重试一次；修复仍失败才返回 `502`。
 
+## AI 执行诊断
+
+`POST /ai/executions/diagnose?project_id={project_id}` 接收统一执行诊断输入：
+
+```json
+{
+  "protocol": "scenario",
+  "draft_data": {},
+  "execution_data": {}
+}
+```
+
+`protocol` 支持 `http`、`websocket`、`scenario`、`flow`。调用方必须提供已经按项目权限读取并脱敏的草稿与执行事实；响应包含 `summary`、`probable_causes`、`evidence`、`suggestions`、`risk_level` 和模型信息。Agent 的 `execution.diagnose` 会先读取统一执行详情，再复用本接口对应的 Service，不接受仅凭自然语言推断出的执行 ID。
+
+## Chat Completions 原生工具协议
+
+内部 `AIChatRequest` 支持 OpenAI-compatible 的 `tools`、`tool_choice` 和 `parallel_tool_calls`；assistant 消息支持 `tool_calls`，tool 消息支持 `tool_call_id`。流式响应会把 provider 的 tool-call argument delta 作为结构化增量交给 Agent Runtime，普通文本 delta 与既有接口保持兼容。
+
+OpenAI-compatible wire payload 中，`tools[]` 和 assistant `tool_calls[]` 的 `type="function"` 是 provider 必填字段，即使它在 Pydantic 模型中是默认值也不得被 `exclude_defaults` 省略。DeepSeek thinking 模式首轮返回原生 tool call 时，后续请求必须把该轮 `reasoning_content` 连同 assistant `tool_calls` 回传；Runner 只在运行内存中按 provider tool-call id 暂存这段内容，不写入 EventStore、ToolCall 输出或面向前端的 assistant 消息。
+
+流式请求返回 4xx/5xx 时，传输层会在离开 httpx stream context 前读取错误响应体，再转换为平台 502/503 诊断。这保证真实 provider 错误（例如 `tools[0]: missing field type`）不会被 httpx `ResponseNotRead` 二次异常覆盖。
+
+Agent Runtime 默认开启 `AGENT_NATIVE_TOOL_CALLING_ENABLED`，只把当前 Capability Plan 允许且存在于其 RuntimeSnapshot 的 ToolSpec 转换为 provider tools。当前版本强制串行调用；并行 tool calls 会被视为无效模型输出。旧 Markdown `agent_tool_request` 解析仍保留为兼容回退，但不会绕过 Capability Plan、schema、权限、审批或异步 ToolRuntime。
+
 ## AI Skills
 
 平台 AI 业务能力以正式 skill 包组织。每个 skill 包至少包含：
@@ -687,3 +711,23 @@ POST /api/v1/ai/websocket-test-cases/{test_case_id}/expand
 - 扩写必须基于源用例做单点或少量字段变异。
 - method、path、headers、body_type 默认沿用源用例。
 - 如果模型生成了疑似删除全部请求参数的结果，后端会在 `warnings` 中提示前端确认。
+
+## Agent 场景组合的权威来源契约
+
+Agent 调用 `scenario.compose_draft` 时推荐使用以下输入。`input` 嵌套模式继续兼容；顶层 `requirement` 模式用于 provider Tool schema 的简化调用。
+
+```json
+{
+  "project_id": 1,
+  "environment_reference": "object-ref://environment/project-snapshot/4",
+  "case_source": {
+    "artifact_id": "agent-tool-artifact://agent-tool-xxx/test_case_query_snapshot",
+    "output_hash": "sha256-output-hash"
+  },
+  "requirement": "根据已分析的真实保存用例构建可执行场景"
+}
+```
+
+后端根据 `_agent_run_id` 校验 artifact 属于同一 user/project/conversation，并读取完整 `AgentToolCall.output_json_redacted`。显式 `http_test_case_ids/websocket_test_case_ids` 若存在，必须是 `case_source` 集合的子集；最终 composer 候选使用 artifact 的完整集合，不受模型可见 projection 截断影响。`environment_reference` 必须解析为当前项目未删除环境。
+
+成功返回的 `draft` 新增 `evidence_sources`、`case_source_summary` 和 `scenario_validation`。`scenario_validation.valid=true` 只表示草稿已通过静态可执行性、引用和证据校验，不表示已经保存或向外部环境执行；正式保存仍调用 `scenario.create_saved/update_saved` 并审批，执行仍调用 `scenario.execute_dry_run` 并遵守现有异步执行与权限策略。

@@ -85,6 +85,7 @@ class AgentRunRead(BaseModel):
     current_step_index: int
     max_iterations: int
     runtime_snapshot_id: str
+    active_capability_plan_id: str | None = None
     last_checkpoint_id: int | None = None
     last_event_sequence: int
     migration_block_count: int = 0
@@ -326,6 +327,7 @@ class AgentWorkerQueueAuditRead(BaseModel):
 
 class AgentToolCallCreateRequest(BaseModel):
     run_id: str
+    capability_plan_id: str | None = Field(default=None, max_length=64)
     tool_name: str
     input: dict[str, Any] = Field(default_factory=dict)
     evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
@@ -344,6 +346,7 @@ class AgentToolCallRead(BaseModel):
     step_index: int
     attempt_index: int
     runtime_snapshot_id: str
+    capability_plan_id: str | None = None
     tool_name: str
     tool_version: str
     schema_hash: str

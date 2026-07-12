@@ -1,6 +1,14 @@
 ---
 name: api-error-contract-debugging
 description: Use when the user asks to diagnose backend API error responses, HTTP status mismatches, request validation errors, 401/403/404/409/422/500 responses, request_id log tracing, or frontend error-display contract issues.
+owns:
+  - api_error
+consumes:
+  - request
+  - frontend
+  - execution
+produces:
+  - diagnosis
 triggers:
   - 错误响应
   - 统一错误

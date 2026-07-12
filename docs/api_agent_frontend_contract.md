@@ -1,7 +1,7 @@
 # Agent 前端接口契约
 
 状态：前端接入契约方案
-最后核验：2026-07-08
+最后核验：2026-07-12
 
 本文档用于指导另一个 React 19 + Vite + TypeScript 前端项目接入 Harness Loop Agent 后端。接口基础路径沿用现有前端技术文档：
 
@@ -61,6 +61,12 @@ item_id,name,version,summary,side_effect_class,replay_policy,required_permission
 每个公开 tool manifest row 都携带稳定 `item_id=agent-tool-spec://{name}/{version}`。该字段由公开 tool name/version 派生，不新增数据库列，不替代 `name`、`version`、`schema_hash` 或 `manifest_hash`；`GET /agents/capabilities`、`AgentRuntimeSnapshot.tools_json` 与 `AgentRuntimeSnapshot.manifests_json.tools` 使用同一 `ToolSpec.to_json()` 形态，前端可直接用该值作为工具目录、冻结运行时解释和导出包里的稳定 key，不要自行拼接。
 
 后端私有字段 `backend_handler`、`required_context_requirements`、`missing_prerequisite_error_code`、`missing_prerequisite_next_action` 与 `tool_result_repair_guidance` 不进入 capabilities、模型初始工具清单或前端契约；这些字段只供后端 routing、上下文要求校验和工具结果修复策略使用。
+
+当前 capabilities 返回 48 个 ToolSpec。相对原有 29 个工具，本次新增 19 个平台业务工具：`execution.query_records/read_detail/diagnose`；`plan.query_project_plans/create_saved/update_saved/set_enabled/execute_saved/query_runs/read_run`；`flow.query_project_flows/validate_graph/create_saved/update_saved/execute_saved`；`defect.query_project_defects/create_saved/update_saved/transition_status`。这是对 `tools[]` 的加法扩展，没有删除或重命名旧工具。前端不得写死工具数量；应按 `name`、`item_id`、`schema_hash` 和 `manifest_hash` 渲染当前 capabilities/runtime snapshot。
+
+四类 query 工具会返回 `snapshot`、`object_reference_manifest` 和对象级 `object_ref`，供后续详情、更新、执行或状态流转工具引用。对测试计划、Flow 和缺陷的写入/执行动作，引用只代表当前 Agent 会话最新查询事实，不是长期业务主键；旧 snapshot、伪造 ref、跨项目 ID 或查询后已删除对象会在审批和业务 handler 前被 preflight 阻断。`flow.create_saved/update_saved` 还会按节点 `kind` 分别校验 `api_case` 与 `websocket_case` 引用来自同一个最新 `testcase.query_project_cases` 快照，不能把 HTTP ID 当成 WebSocket ID。执行详情/诊断是只读链路，由 Skill 要求先 `execution.query_records`，后端 `ExecutionRecordService` 再校验项目归属，不把只读查询错误提升成审批式引用门禁。`plan.execute_saved` 和 `flow.execute_saved` 成功表示后台 run/execution 已受理，前端应继续读取返回的 run/execution identity 和状态接口，不能把 ToolCall 成功等同于业务执行已经通过。
+
+模型可见目录仍由 Skill Planner 与 Capability Resolver 按本轮意图裁剪：执行失败分析加载 `execution-diagnosis`；测试计划管理加载 `test-plan-management`；可视化 Flow 管理加载 `visual-flow-design`；缺陷查询和流转加载 `defect-triage`。全局 capabilities 能看到 48 个工具，不表示单轮模型上下文会收到全部工具，也不改变 ToolRuntime 的权限、审批、schema 和引用预检边界。
 
 `project.read_context` 除返回项目基础信息、`environments[]` 和 `default_environment` 外，还返回 `environment_snapshot`、`environment_id_manifest` 和通用 `object_reference_manifest`。其中 `object_reference_manifest.object_family=environment`、`query_tool=project.read_context`，`environment_ids` / `environment_execute_ids` 是后续执行工具可引用的显式环境 ID。带 `environment_id` 的受控副作用工具会按同一 `ObjectReferenceGuardRule` 校验该 ID 是否来自同一 Agent 会话内最新成功 `project.read_context`，并再次确认 `project_environments.project_id` 匹配且 `is_deleted=false`。模型初始工具 schema 中所有顶层 `environment_id` 字段，以及 `testcase.create_saved`、`testcase.update_saved`、`websocket_testcase.create_saved`、`websocket_testcase.update_saved` 的嵌套 `case.environment_id` / `case.environment_ids` 字段、`scenario.create_saved` / `scenario.update_saved` 的嵌套 `scenario.environment_id` 字段，也必须声明 `Use only ids from project.read_context.object_reference_manifest.environment_ids`，让模型规划阶段先引用同一事实源；执行器校验仍是最终强边界。未查询或旧查询环境 ID 会以 `agent_environment_ids_not_from_query_result` 阻断，输出 `invalid_environment_ids` / `valid_environment_ids`；最新快照中的环境若执行前被删除，会以 `agent_environment_id_stale_or_deleted` 阻断，输出 `stale_environment_ids` / `valid_environment_ids`，`recovery_decision=refresh_project_context_before_retry`。
 
@@ -176,6 +182,14 @@ Only public metadata is returned. `SKILL.md` bodies, Skill-local private prompt 
 - If the unsupported capability classifier provider call fails, returns non-JSON content, or returns a long classification `reason`, the backend logs `agent_unsupported_capability_classification_failed`, `agent_unsupported_capability_classification_invalid_json`, or `agent_unsupported_capability_classified` and continues the normal conversation path when the guard is not triggered. Those logs use the same bounded error format as other Agent diagnostics: short errors/content/reasons remain readable, while values longer than `AGENT_ERROR_MESSAGE_MAX_CHARS=512` use `agent_error_message_summary_v1`, `agent_error_message_truncated`, original size, hash, and `full_error_reference=AgentConversationRunner.unsupported_capability_classifier`, `AgentConversationRunner.unsupported_capability_classifier.invalid_json`, or `AgentConversationRunner.unsupported_capability_classifier.reason`. If the run is cancelled while the classifier call is in flight, backend preserves `cancelled` and does not emit the guard's synthetic completion events. This does not add a frontend event or response field.
 - Current built-in skills are `agent-runtime-operations`, `ai-skill-runtime-governance`, `api-definition-import`, `api-error-contract-debugging`, `assertion-extractor-binding`, `batch-execution-scheduling`, `browser-capture-analysis`, `ci-release-integration`, `data-privacy-redaction`, `dataset-parameterization`, `defect-triage`, `environment-config-management`, `execution-diagnosis`, `general-testing-answer`, `http-test-case-design`, `media-evidence-management`, `migration-compatibility-planning`, `mock-service-virtualization`, `notification-alerting-config`, `project-context`, `project-permission-admin`, `report-archive-export`, `report-summary`, `scenario-composition`, `security-auth-testing`, `test-asset-lifecycle`, `test-plan-management`, `visual-flow-design`, and `websocket-test-case-design`.
 - The frontend may show the catalog in diagnostics or capability panels, but normal conversation behavior is still driven by `/agents/runs` and SSE events.
+
+模型工具调用现在以 provider 原生 `tools/tool_calls` 为主，Markdown `agent_tool_request` 仅是旧协议兼容回退。这是后端与模型之间的 wire 变更，不改变前端的 Run、EventStore、ToolCall、Approval 或 Summary 响应结构。DeepSeek thinking 轮次所需的 `reasoning_content` 只在后端内存中短暂回传 provider，不出现在 SSE、Run Summary 或对话气泡中；前端无需新增该字段。
+
+`scenario.compose_draft` 对 Agent 始终是纯草稿 Tool：即使模型输入 `execute_candidates=true` 或 `self_validate=true`，后端也会强制关闭，避免 `draft` Capability Plan 跨越到执行副作用。草稿节点的 request/assertions/extractors 会从 `case_source` 对应的保存用例恢复，无证据 binding 会被删除；`draft.scenario_grounding` 提供归一化摘要，`draft.scenario_validation.valid=true` 才能作为可保存的 AUTHORITATIVE 草稿。前端继续按普通 ToolCall 展示，不要把 compose 视为已执行。
+
+模型收到的 `scenario.compose_draft` Planning View 固定包含 `source.reference_ids`、`candidate.reference_ids/omitted_by_composer_reference_ids/omitted_reason_status`、`scenario.node_count/reference_ids`、`grounding.excluded_nodes`、`validation`、`execution.executed=false`、`persistence.saved=false` 和 `authoritative_summary`。这是模型回灌摘要，不新增前端 API 字段；前端查看完整依据时仍以 ToolCall `output_json_redacted.draft.scenario_grounding/scenario_validation` 为准。`omitted_reason_status=not_recorded_do_not_infer` 表示只能显示“原因未记录”，不能根据历史执行或模型 warning 猜测原因。
+
+当结构化意图动作为 `analyze` 或 `query` 时，Capability Resolver 只会向模型暴露 `read_only` / `deterministic_compute` 工具；目标领域和证据领域仍由本轮 LLM 意图决策与 supporting Skills 决定。前端应继续根据实际 ToolCall timeline 展示读取链，不要预设分析请求只有固定的一个工具序列。
 
 ### 3.2 Run 和流式事件
 
@@ -712,3 +726,46 @@ Fault injection catalog 与 run result 也暴露稳定 item identity：`AgentFau
 | History | 本地 conversation index 增删改、run 校准失败降级 |
 | 权限 | 403 展示无权限，不重试破坏性动作 |
 | 文档同步 | 字段与本文件和 Harness `Required ... contract` 保持一致 |
+## Agent Skill Orchestration v2 运行时语义
+
+后端 Agent 正在从“单 Skill 预路由”演进为“候选 Skill/Tool 召回 + LLM 规划 + Runtime 校验”的模式。`/agents/capabilities` 仍展示全量公开 ToolSpec；单个 run 的模型上下文只展示本轮候选工具，但候选工具由当前用户目标和历史 artifact 证据共同决定。前端不得假设单轮只会出现一个业务 Skill，也不得根据上一轮 artifact 类型推断本轮目标领域。
+
+当前用户明确目标优先于历史 artifact follow-up action。例如用户说“根据失败用例创建缺陷”时，失败用例快照是 evidence，缺陷是 target，后端会召回 `defect.create_saved` 以及必要的测试用例读取工具；只有“执行它”“保存这个”“修复这些断言”等省略指代请求，才允许 artifact action 成为主流程。所有写入、执行、状态流转仍以 ToolCall、Approval、ObjectReferenceGuardRule 和业务权限为准，模型文本不得被视为业务动作已完成。
+
+Run diagnostics 中的 `skill_plan.primary_skill` 表示目标领域主 Skill，`supporting_skills` 表示证据或辅助领域 Skill；前端应按列表渲染，不要假设只有一个 Skill。若后端写入 `model.capability_denial_guarded` 事件，表示模型曾错误否认一个 runtime snapshot 中实际存在的能力，前端可按普通模型事件展示该诊断，不需要新增审批入口。
+
+`skill_plan.reason_codes` 可能包含 `planner:supporting_skill:{skill}:evidence:{domain}`，用于说明 supporting Skill 来自 Skill contract 的 `owns/consumes/produces` 语义，而不是用户直接请求该 Skill。Supporting Skill 的存在不表示其所有写入工具都可用；后端默认只把 evidence Skill 的只读/确定性工具加入本轮候选工具，副作用工具仍必须由当前目标动作、审批策略和 Runtime preflight 明确允许。
+
+当 `model.capability_denial_guarded` 后紧跟 `model.capability_denial_replanned`，表示后端已经对错误能力否认做了一次隐藏重规划，并成功让模型重新输出工具请求。前端后续仍按既有 ToolCall/Approval 事件展示：写入类工具会进入 `needs_human` 或 pending approval 相关状态，前端不要因为 replan 事件新增独立审批入口。若只出现 guarded 而没有 replanned，表示后端阻止了错误结论但未得到可执行工具请求，应按普通诊断事件展示。
+
+## Capability Plan 增量字段与事件
+
+`AgentRunRead` 新增可空字段 `active_capability_plan_id`，表示该 run 当前有效的能力计划；`AgentToolCallRead` 新增可空字段 `capability_plan_id`，表示该次工具调用实际绑定的计划。没有 Capability Plan 的历史 run/ToolCall 可以为 `null`；run 一旦存在 active plan，后端会在 ToolCall 省略该字段时自动绑定当前计划并严格校验。前端必须按加法兼容处理，不能据此隐藏旧 ToolCall。
+
+前端可按普通诊断事件展示 `planner.intent_decision_created`、`planner.intent_decision_fallback`、`planner.capability_plan_created`、`planner.route_mismatch_detected`、`model.native_tool_call_detected` 和 `model.native_tool_call_invalid`。`planner.capability_plan_created.payload_json` 至少包含当前计划 ID、iteration、revision、source 与 plan hash；发生 carry-forward 或 route rebuild 时还包含上一计划 ID。计划变更不新增审批入口，也不替代 ToolCall/Approval 状态机。
+
+原生 provider tool call 不改变前端 SSE 主协议：模型规划文本仍保持隐藏，合法调用仍形成既有 AgentToolCall；工具结果仍通过原有 ToolCall、Approval、run event 和最终 assistant 消息展示。前端无需解析 provider tool alias、原生 arguments 或旧 fenced JSON，这些都属于后端模型传输层实现。
+
+## LLM-Driven Planning 与真实场景增量契约
+
+本节替代上文关于 `model.capability_denial_guarded/replanned`、`planner.intent_decision_fallback` 和 route rebuild 的旧前端语义。新生产路径不会因为模型自然语言否认而重建计划，也不会使用关键词 fallback 授权 Tool。
+
+| event_type | 中文显示名 | 前端处理 |
+| --- | --- | --- |
+| `planner.llm_decision_started` | 智能规划开始 | 普通运行诊断，不创建 Tool 卡片 |
+| `planner.llm_decision_completed` | 智能规划完成 | 可展示 selected Skills/Tools、effect scope 和 plan 摘要 |
+| `planner.llm_decision_invalid` | 规划校验未通过 | 展示结构化 code；不要展示 prompt 或推理链 |
+| `planner.llm_decision_retrying` | 正在修复规划 | 普通诊断；最多一次 |
+| `planner.llm_decision_failed` | 智能规划失败 | Run 最终错误码为 `agent_planning_failed` |
+| `planner.capability_activation_requested` | 请求扩展能力 | Runtime 控制事件，不是业务 ToolCall |
+| `planner.capability_activation_accepted` | 能力扩展成功 | 计划 revision 已提交，不代表业务动作已执行 |
+| `planner.capability_activation_rejected` | 能力扩展被拒绝 | 展示 rejected tools/reasons，不新增审批入口 |
+| `planner.capability_plan_revised` | 能力计划已更新 | 更新当前 plan id；仍按 ToolCall/Approval 展示业务动作 |
+| `planner.capability_call_rejected` | 工具尚未激活 | 模型会收到 `agent_capability_not_active` 并继续规划 |
+| `model.capability_denial_observed` | 模型能力判断诊断 | 仅观测，不替换 assistant 文本、不重建计划 |
+| `scenario.draft_validation_completed` | 场景草稿校验通过 | payload 提供引用/模板/依赖统计，可允许后续保存入口 |
+| `scenario.draft_validation_failed` | 场景草稿校验失败 | 显示问题计数并引导修复；不得显示“可保存” |
+
+`scenario.compose_draft` ToolResult 的 `draft.scenario_validation` 是新增 envelope，包含 `valid/referenced_case_count/unresolved_reference_count/dependency_edge_count/resolved_template_count/unresolved_template_count/extractor_count/binding_count/graph_errors/quality_issues/evidence_sources`。前端只有在 `valid=true` 时才能把 artifact 标为权威场景草稿；`scenario_draft_invalid` 是诊断 artifact，`available_followup_actions` 只有 `repair`。
+
+错误码增量：`agent_planning_failed` 表示两次结构化规划均未通过；`agent_capability_not_active` 表示模型调用了当前 plan 外的 Tool，Runtime 已阻止业务 handler；`agent_capability_activation_rejected` 表示内部能力扩展请求未通过注册表/Skill/权限校验；`agent_scenario_case_source_invalid` 表示 case artifact 的项目、用户、会话、hash、环境或用例引用无效；`agent_scenario_draft_invalid` 表示草稿未通过真实引用与证据质量门。上述错误都不改变 REST/SSE envelope。

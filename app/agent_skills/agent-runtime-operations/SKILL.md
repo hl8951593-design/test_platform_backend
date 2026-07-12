@@ -1,6 +1,17 @@
 ---
 name: agent-runtime-operations
 description: Use when the user asks to diagnose, operate, evaluate, or explain Harness Loop Agent runtime behavior, runs, SSE events, model streaming, readiness dashboard, runbook, worker queue, stale run, memory usage, model health, launch audit, backend completion audit, or behavior evaluation.
+owns:
+  - agent_runtime
+consumes:
+  - run
+  - event
+  - model
+  - tool
+  - approval
+  - worker
+produces:
+  - diagnosis
 triggers:
   - agent runtime
   - Harness Loop

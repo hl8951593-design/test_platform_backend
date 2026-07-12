@@ -21,6 +21,15 @@ tools:
   - testcase.batch_update_assertions
   - testcase.execute_saved
   - testcase.batch_execute
+owns:
+  - test_case
+consumes:
+  - defect
+  - report
+  - execution
+  - api_definition
+produces:
+  - test_case
 artifacts:
   - test_case_query_snapshot
   - testcase_draft

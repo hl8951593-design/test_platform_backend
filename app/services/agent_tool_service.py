@@ -23,6 +23,7 @@ from app.models.test_case import TestCase
 from app.models.user import User
 from app.models.websocket_test_case import WebSocketTestCase
 from app.schemas.ai import AIScenarioComposeRequest, AISkillRunRequest
+from app.schemas.defect import DefectCreateRequest, DefectStatusUpdateRequest, DefectUpdateRequest
 from app.schemas.project import (
     ProjectEnvironmentCreateRequest,
     ProjectEnvironmentRead,
@@ -30,6 +31,7 @@ from app.schemas.project import (
     ProjectEnvironmentVariableUpsertRequest,
 )
 from app.schemas.scenario import ScenarioCreateRequest, ScenarioRunRead, ScenarioUpdateRequest
+from app.schemas.test_plan import TestPlanCreateRequest, TestPlanUpdateRequest
 from app.schemas.test_case import (
     AssertionConfig,
     TestCaseCreateRequest,
@@ -44,7 +46,11 @@ from app.schemas.websocket_test_case import (
     WebSocketTestCaseRead,
     WebSocketTestCaseUpdateRequest,
 )
+from app.schemas.visual_flow import FlowCreateRequest, FlowDefinition, FlowUpdateRequest
 from app.services.agent_loop_service import EvidenceRefResolver
+from app.services.agent_platform_tool_service import AgentPlatformToolBackend
+from app.services.agent_scenario_source_service import AgentScenarioSourceService, ResolvedScenarioSource
+from app.services.agent_scenario_draft_validator import AgentScenarioDraftValidator
 from app.services.agent_trace import (
     trace_error,
     trace_full_payload,
@@ -529,6 +535,15 @@ class AgentToolBackend:
         self.db = db
         self.permission_service = PermissionService(db)
         self.router = router or AgentToolRouter()
+        self.platform_backend = AgentPlatformToolBackend(db)
+
+    def __getattr__(self, name: str):
+        platform_backend = self.__dict__.get("platform_backend")
+        if platform_backend is not None:
+            handler = getattr(platform_backend, name, None)
+            if callable(handler):
+                return handler
+        raise AttributeError(name)
 
     def execute(self, *, tool_name: str, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         started = time.perf_counter()
@@ -890,21 +905,60 @@ class AgentToolBackend:
 
     def _scenario_compose_draft(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         project_id = _require_int(payload, "project_id")
-        environment_id = _optional_int(payload, "environment_id")
-        if environment_id is None:
-            default_environment = self._default_environment(project_id)
-            if default_environment is None:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"code": "agent_default_environment_missing", "project_id": project_id},
-                )
-            environment_id = int(default_environment["id"])
-            logger.info(
-                "agent_tool_default_environment_selected tool_name=scenario.compose_draft project_id=%s environment_id=%s",
-                project_id,
-                environment_id,
-            )
         compose_input = _normalize_scenario_compose_input(payload)
+        selector_payload = {**payload, **compose_input}
+        environment_id = self._resolve_environment_id(
+            selector_payload,
+            project_id=project_id,
+            allow_default=True,
+        )
+        if environment_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "agent_default_environment_missing", "project_id": project_id},
+            )
+        resolved_source: ResolvedScenarioSource | None = None
+        raw_case_source = compose_input.get("case_source")
+        if isinstance(raw_case_source, dict):
+            conversation_id = None
+            agent_run_id = str(payload.get("_agent_run_id") or "").strip()
+            if agent_run_id:
+                source_run = self.db.scalar(
+                    select(AgentRun).where(
+                        AgentRun.run_id == agent_run_id,
+                        AgentRun.project_id == project_id,
+                        AgentRun.user_id == current_user.id,
+                    )
+                )
+                if source_run is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        detail={"code": "agent_scenario_case_source_invalid", "reason": "agent_run_not_accessible"},
+                    )
+                conversation_id = source_run.conversation_id
+            resolved_source = AgentScenarioSourceService(self.db).resolve(
+                project_id=project_id,
+                user_id=current_user.id,
+                conversation_id=conversation_id,
+                case_source=raw_case_source,
+                environment_id=environment_id,
+            )
+            explicit_http_ids = set(_merge_int_lists(compose_input.get("http_test_case_ids"), []))
+            explicit_websocket_ids = set(_merge_int_lists(compose_input.get("websocket_test_case_ids"), []))
+            invalid_http_ids = sorted(explicit_http_ids - set(resolved_source.http_case_ids))
+            invalid_websocket_ids = sorted(explicit_websocket_ids - set(resolved_source.websocket_case_ids))
+            if invalid_http_ids or invalid_websocket_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail={
+                        "code": "agent_scenario_case_source_invalid",
+                        "reason": "explicit_case_ids_not_in_source",
+                        "invalid_http_test_case_ids": invalid_http_ids,
+                        "invalid_websocket_test_case_ids": invalid_websocket_ids,
+                    },
+                )
+            compose_input["http_test_case_ids"] = list(resolved_source.http_case_ids)
+            compose_input["websocket_test_case_ids"] = list(resolved_source.websocket_case_ids)
         full_candidate_pool = _scenario_compose_requests_full_candidate_pool(compose_input)
         if not compose_input.get("http_test_case_ids") and not compose_input.get("websocket_test_case_ids"):
             candidate_ids = self._default_candidate_case_ids(
@@ -949,6 +1003,11 @@ class AgentToolBackend:
                 compose_input,
                 "Full-coverage request: backend expanded the candidate id set from current project inventory; do not omit supplied candidates because of model context truncation.",
             )
+        # scenario.compose_draft is declared draft_only. Candidate execution and
+        # self-validation belong to explicit execution tools and must never cross
+        # this Tool's effect boundary, even when the model requests them.
+        compose_input["execute_candidates"] = False
+        compose_input["self_validate"] = False
         request = AISkillRunRequest(
             operation="compose",
             project_id=project_id,
@@ -961,11 +1020,39 @@ class AgentToolBackend:
             current_user=current_user,
         )
         draft = normalize_response_data(result)
+        if isinstance(draft, dict) and resolved_source is not None:
+            draft["evidence_sources"] = [dict(item) for item in resolved_source.evidence_sources]
+            draft["case_source_summary"] = {
+                "case_snapshot_id": resolved_source.case_snapshot_id,
+                "http_test_case_ids": list(resolved_source.http_case_ids),
+                "websocket_test_case_ids": list(resolved_source.websocket_case_ids),
+                "case_count": len(resolved_source.case_snapshots),
+            }
         if isinstance(draft, dict) and isinstance(draft.get("scenario"), dict):
             graph_result = ScenarioGraphValidator().validate_and_repair(draft["scenario"])
             draft["scenario"] = graph_result.scenario
             draft["graph_validation"] = graph_result.validation
             draft["graph_repair"] = graph_result.repair
+            if resolved_source is not None:
+                validator = AgentScenarioDraftValidator()
+                grounding_result = validator.ground(
+                    draft=draft["scenario"],
+                    source=resolved_source,
+                )
+                draft["scenario_grounding"] = grounding_result.grounding
+                quality_result = validator.validate(
+                    draft=grounding_result.scenario,
+                    source=resolved_source,
+                )
+                draft["scenario"] = quality_result.scenario
+                draft["scenario_validation"] = quality_result.validation
+                draft["graph_validation"] = quality_result.validation["graph_validation"]
+                draft["graph_repair"] = quality_result.validation["graph_repair"]
+                if not quality_result.valid:
+                    draft["error"] = {
+                        "code": "agent_scenario_draft_invalid",
+                        "message": "Scenario draft failed authoritative reference and evidence validation.",
+                    }
         return {"draft": draft}
 
     def _project_environments(self, project_id: int) -> list[dict[str, Any]]:
@@ -2557,7 +2644,11 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
         },
         "scenario_compose_input": {
             "type": "object",
-            "required": ["project_id", "input"],
+            "required": ["project_id"],
+            "anyOf": [
+                {"required": ["input"]},
+                {"required": ["requirement"]},
+            ],
             "properties": {
                 "project_id": {"type": "integer"},
                 "environment_id": {
@@ -2567,6 +2658,20 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                         f"{ENVIRONMENT_ID_SOURCE_RULE}."
                     ),
                 },
+                "environment_reference": {
+                    "type": "string",
+                    "description": "Environment object-ref returned by project.read_context.",
+                },
+                "case_source": {
+                    "type": "object",
+                    "properties": {
+                        "artifact_id": {"type": "string"},
+                        "output_hash": {"type": "string"},
+                    },
+                    "required": ["artifact_id", "output_hash"],
+                    "additionalProperties": False,
+                },
+                "requirement": {"type": "string", "minLength": 1},
                 "input": {
                     "oneOf": [
                         AIScenarioComposeRequest.model_json_schema(),
@@ -2956,6 +3061,271 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
             },
         },
     }
+
+    entity_reference_schema = {
+        "type": "string",
+        "description": "Use an object_ref from the latest matching query tool result; do not invent or edit it.",
+    }
+    entity_snapshot_schema = {
+        "type": "string",
+        "description": "Use object_reference_manifest.snapshot_id from the latest matching query tool result.",
+    }
+    execution_type_schema = {
+        "type": "string",
+        "enum": ["http", "websocket", "scenario", "flow"],
+    }
+    page_properties = {
+        "page": {"type": "integer", "minimum": 1, "default": 1},
+        "page_size": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+    }
+    schemas.update({
+        "execution_query_records_input": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "execution_type": execution_type_schema,
+                "status": {"type": "string"},
+                "environment_id": environment_filter_schema,
+                "trigger_user_id": {"type": "integer"},
+                "started_from": {"type": "string", "format": "date-time"},
+                "started_to": {"type": "string", "format": "date-time"},
+                "keyword": {"type": "string"},
+                **page_properties,
+            },
+        },
+        "execution_read_detail_input": {
+            "type": "object",
+            "required": ["project_id", "execution_type"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "execution_type": execution_type_schema,
+                "execution_id": {"type": "integer"},
+                "object_reference": entity_reference_schema,
+            },
+        },
+        "execution_diagnose_input": {
+            "type": "object",
+            "required": ["project_id", "execution_type"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "execution_type": execution_type_schema,
+                "execution_id": {"type": "integer"},
+                "object_reference": entity_reference_schema,
+            },
+        },
+        "plan_query_project_plans_input": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "keyword": {"type": "string"},
+                "enabled": {"type": "boolean"},
+                "trigger_type": {"type": "string", "enum": ["manual", "cron", "webhook"]},
+                "detail_level": {"type": "string", "enum": ["summary", "full"], "default": "summary"},
+                **page_properties,
+            },
+        },
+        "plan_create_saved_input": {
+            "type": "object",
+            "required": ["project_id", "plan"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "plan": TestPlanCreateRequest.model_json_schema(),
+                "environment_snapshot_id": environment_snapshot_id_schema,
+                "scenario_snapshot_id": scenario_snapshot_id_schema,
+            },
+        },
+        "plan_update_saved_input": {
+            "type": "object",
+            "required": ["project_id", "plan"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "plan_id": {"type": "integer"},
+                "object_reference": entity_reference_schema,
+                "plan_snapshot_id": entity_snapshot_schema,
+                "plan": TestPlanUpdateRequest.model_json_schema(),
+                "environment_snapshot_id": environment_snapshot_id_schema,
+                "scenario_snapshot_id": scenario_snapshot_id_schema,
+            },
+        },
+        "plan_set_enabled_input": {
+            "type": "object",
+            "required": ["project_id", "enabled"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "plan_id": {"type": "integer"},
+                "object_reference": entity_reference_schema,
+                "plan_snapshot_id": entity_snapshot_schema,
+                "enabled": {"type": "boolean"},
+                "version": {"type": "integer", "minimum": 1},
+            },
+        },
+        "plan_execute_saved_input": {
+            "type": "object",
+            "required": ["project_id", "environment_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "plan_id": {"type": "integer"},
+                "object_reference": entity_reference_schema,
+                "plan_snapshot_id": entity_snapshot_schema,
+                "environment_id": environment_id_schema,
+                "environment_reference": environment_object_reference_schema,
+                "environment_snapshot_id": environment_snapshot_id_schema,
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128},
+            },
+        },
+        "plan_query_runs_input": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {"project_id": {"type": "integer"}, **page_properties},
+        },
+        "plan_read_run_input": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "run_id": {"type": "integer"},
+                "object_reference": entity_reference_schema,
+                "plan_run_snapshot_id": entity_snapshot_schema,
+            },
+        },
+        "flow_query_project_flows_input": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "keyword": {"type": "string"},
+                "status": {"type": "string"},
+                "detail_level": {"type": "string", "enum": ["summary", "full"], "default": "summary"},
+                **page_properties,
+            },
+        },
+        "flow_validate_graph_input": {
+            "type": "object",
+            "required": ["project_id", "definition"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "definition": FlowDefinition.model_json_schema(),
+                "executable": {"type": "boolean", "default": True},
+            },
+        },
+        "flow_create_saved_input": {
+            "type": "object",
+            "required": ["project_id", "flow"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "flow": FlowCreateRequest.model_json_schema(),
+                "environment_snapshot_id": environment_snapshot_id_schema,
+                "case_snapshot_id": case_snapshot_id_schema,
+            },
+        },
+        "flow_update_saved_input": {
+            "type": "object",
+            "required": ["project_id", "flow"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "flow_id": {"type": "integer"},
+                "object_reference": entity_reference_schema,
+                "flow_snapshot_id": entity_snapshot_schema,
+                "flow": FlowUpdateRequest.model_json_schema(),
+                "environment_snapshot_id": environment_snapshot_id_schema,
+                "case_snapshot_id": case_snapshot_id_schema,
+            },
+        },
+        "flow_execute_saved_input": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "flow_id": {"type": "integer"},
+                "object_reference": entity_reference_schema,
+                "flow_snapshot_id": entity_snapshot_schema,
+                "environment_id": environment_id_schema,
+                "environment_reference": environment_object_reference_schema,
+                "environment_snapshot_id": environment_snapshot_id_schema,
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128},
+            },
+        },
+        "defect_query_project_defects_input": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "keyword": {"type": "string"},
+                "status": DefectStatusUpdateRequest.model_json_schema()["properties"]["status"],
+                "urgency": DefectCreateRequest.model_json_schema()["properties"]["urgency"],
+                "detail_level": {"type": "string", "enum": ["summary", "full"], "default": "summary"},
+                **page_properties,
+            },
+        },
+        "defect_create_saved_input": {
+            "type": "object",
+            "required": ["project_id", "defect"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "defect": DefectCreateRequest.model_json_schema(),
+            },
+        },
+        "defect_update_saved_input": {
+            "type": "object",
+            "required": ["project_id", "defect"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "defect_id": {"type": "integer"},
+                "object_reference": entity_reference_schema,
+                "defect_snapshot_id": entity_snapshot_schema,
+                "defect": DefectUpdateRequest.model_json_schema(),
+            },
+        },
+        "defect_transition_status_input": {
+            "type": "object",
+            "required": ["project_id", "status"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "defect_id": {"type": "integer"},
+                "object_reference": entity_reference_schema,
+                "defect_snapshot_id": entity_snapshot_schema,
+                "status": DefectStatusUpdateRequest.model_json_schema()["properties"]["status"],
+            },
+        },
+    })
+
+    def platform_tool_spec(
+        *,
+        name: str,
+        summary: str,
+        side_effect_class: str,
+        required_permissions: tuple[str, ...],
+        schema_key: str,
+        backend_name: str,
+        backend_operation: str,
+        backend_handler: str,
+        repair_guidance: str | None = None,
+    ) -> ToolSpec:
+        input_schema = schemas[schema_key]
+        output_schema = {"type": "object"}
+        return ToolSpec(
+            name=name,
+            version="1.0.0",
+            summary=summary,
+            side_effect_class=side_effect_class,
+            replay_policy="reuse_allowed" if side_effect_class in {"read_only", "deterministic_compute", "draft_only"} else "require_revalidation",
+            required_permissions=required_permissions,
+            input_schema=input_schema,
+            output_schema=output_schema,
+            backend_contract=BackendContractSpec(
+                backend_name=backend_name,
+                backend_operation=backend_operation,
+                backend_contract_version="v1",
+                effect_capability="idempotency_index_only",
+                request_schema_hash=request_fingerprint(input_schema),
+                output_schema_hash=request_fingerprint(output_schema),
+            ),
+            backend_handler=backend_handler,
+            tool_result_repair_guidance=repair_guidance,
+        )
+
     return {
         "project.read_context": ToolSpec(
             name="project.read_context",
@@ -3690,5 +4060,207 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 output_schema_hash=request_fingerprint({"type": "object"}),
             ),
             backend_handler="_report_read_summary",
+        ),
+        "execution.query_records": platform_tool_spec(
+            name="execution.query_records",
+            summary="Query unified HTTP, WebSocket, scenario, and visual-flow execution records with filters and stable object references.",
+            side_effect_class="read_only",
+            required_permissions=(ProjectPermission.VIEW_REPORT.value,),
+            schema_key="execution_query_records_input",
+            backend_name="execution-record-service",
+            backend_operation="query_records",
+            backend_handler="_execution_query_records",
+        ),
+        "execution.read_detail": platform_tool_spec(
+            name="execution.read_detail",
+            summary="Read protocol-specific request, response, assertion, retry, scenario, or flow details for one execution record.",
+            side_effect_class="read_only",
+            required_permissions=(ProjectPermission.VIEW_REPORT.value,),
+            schema_key="execution_read_detail_input",
+            backend_name="execution-record-service",
+            backend_operation="read_detail",
+            backend_handler="_execution_read_detail",
+        ),
+        "execution.diagnose": platform_tool_spec(
+            name="execution.diagnose",
+            summary="Use the configured AI provider to diagnose one real execution record without changing business data.",
+            side_effect_class="draft_only",
+            required_permissions=(ProjectPermission.VIEW_REPORT.value, ProjectPermission.ANALYZE_AI.value),
+            schema_key="execution_diagnose_input",
+            backend_name="ai-execution-diagnosis-service",
+            backend_operation="diagnose",
+            backend_handler="_execution_diagnose",
+            repair_guidance="Call execution.read_detail first when evidence is incomplete; never invent logs, responses, or credentials.",
+        ),
+        "plan.query_project_plans": platform_tool_spec(
+            name="plan.query_project_plans",
+            summary="Query current project test plans and return a fresh plan snapshot with object references for later actions.",
+            side_effect_class="read_only",
+            required_permissions=(ProjectPermission.VIEW_PLAN.value,),
+            schema_key="plan_query_project_plans_input",
+            backend_name="test-plan-service",
+            backend_operation="query_project_plans",
+            backend_handler="_plan_query_project_plans",
+        ),
+        "plan.create_saved": platform_tool_spec(
+            name="plan.create_saved",
+            summary="Create a persisted test plan from validated scenario targets and environments; requires human approval.",
+            side_effect_class="business_update",
+            required_permissions=(ProjectPermission.CREATE_PLAN.value,),
+            schema_key="plan_create_saved_input",
+            backend_name="test-plan-service",
+            backend_operation="create_saved",
+            backend_handler="_plan_create_saved",
+            repair_guidance="Query project environments and scenarios before creating the plan; fix validation errors before resubmitting approval.",
+        ),
+        "plan.update_saved": platform_tool_spec(
+            name="plan.update_saved",
+            summary="Update one persisted test plan using its current version and a fresh plan reference; requires human approval.",
+            side_effect_class="business_update",
+            required_permissions=(ProjectPermission.UPDATE_PLAN.value,),
+            schema_key="plan_update_saved_input",
+            backend_name="test-plan-service",
+            backend_operation="update_saved",
+            backend_handler="_plan_update_saved",
+            repair_guidance="Refresh plan.query_project_plans after a version conflict and preserve validated targets and environment bindings.",
+        ),
+        "plan.set_enabled": platform_tool_spec(
+            name="plan.set_enabled",
+            summary="Enable or disable one persisted test plan and recalculate its schedule; requires human approval.",
+            side_effect_class="business_update",
+            required_permissions=(ProjectPermission.UPDATE_PLAN.value,),
+            schema_key="plan_set_enabled_input",
+            backend_name="test-plan-service",
+            backend_operation="set_enabled",
+            backend_handler="_plan_set_enabled",
+            repair_guidance="Refresh the latest plan snapshot and version before retrying a conflicting enable or disable request.",
+        ),
+        "plan.execute_saved": platform_tool_spec(
+            name="plan.execute_saved",
+            summary="Queue one saved test plan for asynchronous execution and return its persisted run identity.",
+            side_effect_class="execution_record",
+            required_permissions=(ProjectPermission.RUN_PLAN.value,),
+            schema_key="plan_execute_saved_input",
+            backend_name="test-plan-service",
+            backend_operation="execute_saved",
+            backend_handler="_plan_execute_saved",
+            repair_guidance="Use a fresh plan and environment snapshot; after acceptance inspect plan.query_runs instead of submitting duplicates.",
+        ),
+        "plan.query_runs": platform_tool_spec(
+            name="plan.query_runs",
+            summary="Query persisted test-plan run history and return fresh run references for detailed inspection.",
+            side_effect_class="read_only",
+            required_permissions=(ProjectPermission.VIEW_PLAN.value,),
+            schema_key="plan_query_runs_input",
+            backend_name="test-plan-service",
+            backend_operation="query_runs",
+            backend_handler="_plan_query_runs",
+        ),
+        "plan.read_run": platform_tool_spec(
+            name="plan.read_run",
+            summary="Read one test-plan run including target results, counts, status, timing, and failure information.",
+            side_effect_class="read_only",
+            required_permissions=(ProjectPermission.VIEW_PLAN.value,),
+            schema_key="plan_read_run_input",
+            backend_name="test-plan-service",
+            backend_operation="read_run",
+            backend_handler="_plan_read_run",
+        ),
+        "flow.query_project_flows": platform_tool_spec(
+            name="flow.query_project_flows",
+            summary="Query project visual flows and return a fresh flow snapshot with object references for later actions.",
+            side_effect_class="read_only",
+            required_permissions=(ProjectPermission.VIEW_FLOW.value,),
+            schema_key="flow_query_project_flows_input",
+            backend_name="visual-flow-service",
+            backend_operation="query_project_flows",
+            backend_handler="_flow_query_project_flows",
+        ),
+        "flow.validate_graph": platform_tool_spec(
+            name="flow.validate_graph",
+            summary="Deterministically validate a visual-flow DAG, node references, bindings, routes, and executable structure without saving it.",
+            side_effect_class="deterministic_compute",
+            required_permissions=(ProjectPermission.VIEW_FLOW.value,),
+            schema_key="flow_validate_graph_input",
+            backend_name="visual-flow-service",
+            backend_operation="validate_graph",
+            backend_handler="_flow_validate_graph",
+            repair_guidance="Repair every returned graph issue and call flow.validate_graph again before requesting a save.",
+        ),
+        "flow.create_saved": platform_tool_spec(
+            name="flow.create_saved",
+            summary="Create a persisted versioned visual flow from a validated graph; requires human approval.",
+            side_effect_class="business_update",
+            required_permissions=(ProjectPermission.MANAGE_FLOW.value,),
+            schema_key="flow_create_saved_input",
+            backend_name="visual-flow-service",
+            backend_operation="create_saved",
+            backend_handler="_flow_create_saved",
+            repair_guidance="Call flow.validate_graph first and use only real case and environment references from current project queries.",
+        ),
+        "flow.update_saved": platform_tool_spec(
+            name="flow.update_saved",
+            summary="Create a new version of one saved visual flow using optimistic locking; requires human approval.",
+            side_effect_class="business_update",
+            required_permissions=(ProjectPermission.MANAGE_FLOW.value,),
+            schema_key="flow_update_saved_input",
+            backend_name="visual-flow-service",
+            backend_operation="update_saved",
+            backend_handler="_flow_update_saved",
+            repair_guidance="Refresh the flow snapshot after version conflicts and validate the graph before resubmitting approval.",
+        ),
+        "flow.execute_saved": platform_tool_spec(
+            name="flow.execute_saved",
+            summary="Queue one saved visual flow for asynchronous execution and return its persisted execution identity.",
+            side_effect_class="execution_record",
+            required_permissions=(ProjectPermission.EXECUTE_TEST.value,),
+            schema_key="flow_execute_saved_input",
+            backend_name="visual-flow-service",
+            backend_operation="execute_saved",
+            backend_handler="_flow_execute_saved",
+            repair_guidance="Use fresh flow and environment references; inspect execution.read_detail before retrying a failed execution.",
+        ),
+        "defect.query_project_defects": platform_tool_spec(
+            name="defect.query_project_defects",
+            summary="Query project defects and return a fresh defect snapshot with object references for updates and transitions.",
+            side_effect_class="read_only",
+            required_permissions=(ProjectPermission.VIEW_DEFECT.value,),
+            schema_key="defect_query_project_defects_input",
+            backend_name="defect-service",
+            backend_operation="query_project_defects",
+            backend_handler="_defect_query_project_defects",
+        ),
+        "defect.create_saved": platform_tool_spec(
+            name="defect.create_saved",
+            summary="Create a persisted project defect from evidence-backed triage content; requires human approval.",
+            side_effect_class="business_update",
+            required_permissions=(ProjectPermission.CREATE_DEFECT.value,),
+            schema_key="defect_create_saved_input",
+            backend_name="defect-service",
+            backend_operation="create_saved",
+            backend_handler="_defect_create_saved",
+            repair_guidance="Keep evidence factual and redacted; correct invalid fields or media ownership before resubmitting approval.",
+        ),
+        "defect.update_saved": platform_tool_spec(
+            name="defect.update_saved",
+            summary="Update one persisted defect using a fresh defect reference; requires human approval.",
+            side_effect_class="business_update",
+            required_permissions=(ProjectPermission.UPDATE_DEFECT.value,),
+            schema_key="defect_update_saved_input",
+            backend_name="defect-service",
+            backend_operation="update_saved",
+            backend_handler="_defect_update_saved",
+            repair_guidance="Refresh defect.query_project_defects before retrying and preserve evidence that the user did not ask to replace.",
+        ),
+        "defect.transition_status": platform_tool_spec(
+            name="defect.transition_status",
+            summary="Apply one validated defect lifecycle transition using a fresh defect reference; requires human approval.",
+            side_effect_class="business_update",
+            required_permissions=(ProjectPermission.TRANSITION_DEFECT.value,),
+            schema_key="defect_transition_status_input",
+            backend_name="defect-service",
+            backend_operation="transition_status",
+            backend_handler="_defect_transition_status",
+            repair_guidance="Use the current defect status and follow the backend lifecycle transition rules; do not skip required states.",
         ),
     }

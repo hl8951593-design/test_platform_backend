@@ -161,6 +161,9 @@ class AgentSkill:
     artifact_types: tuple[str, ...]
     dependencies: tuple[str, ...]
     examples: tuple[str, ...]
+    owns: tuple[str, ...]
+    consumes: tuple[str, ...]
+    produces: tuple[str, ...]
     routing_hints: dict[str, tuple[str, ...]]
     private_values: dict[str, str]
     body: str
@@ -182,6 +185,20 @@ class AgentSkill:
             "artifact_types": list(self.artifact_types),
             "dependencies": list(self.dependencies),
             "examples": list(self.examples),
+            "owns": list(self.owns),
+            "consumes": list(self.consumes),
+            "produces": list(self.produces),
+        }
+
+    def snapshot_manifest(self) -> dict[str, Any]:
+        """Return the immutable Skill contract and prompt used by one runtime snapshot."""
+        return {
+            **self.planner_metadata(),
+            "triggers": list(self.triggers),
+            "routing_hints": {key: list(values) for key, values in self.routing_hints.items()},
+            "private_values": dict(self.private_values),
+            "body": self.body,
+            "path": str(self.path),
         }
 
     def prompt_block(self) -> str:
@@ -228,6 +245,41 @@ class AgentSkillRegistry:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or AGENT_SKILL_ROOT
         self._skills = _load_agent_skills(self.root)
+
+    @classmethod
+    def from_snapshot_manifests(cls, manifests: dict[str, Any]) -> "AgentSkillRegistry":
+        """Rebuild a registry from a persisted RuntimeSnapshot without reading live files."""
+        registry = cls.__new__(cls)
+        registry.root = AGENT_SKILL_ROOT
+        registry._skills = {}
+        for name, raw in sorted((manifests or {}).items()):
+            if not isinstance(raw, dict) or str(raw.get("name") or name) != str(name):
+                continue
+            registry._skills[str(name)] = AgentSkill(
+                name=str(name),
+                description=str(raw.get("description") or ""),
+                triggers=tuple(str(item) for item in raw.get("triggers") or ()),
+                capabilities=tuple(str(item) for item in raw.get("capabilities") or ()),
+                required_context=tuple(str(item) for item in raw.get("required_context") or ()),
+                tool_names=tuple(str(item) for item in raw.get("tool_names") or ()),
+                artifact_types=tuple(str(item) for item in raw.get("artifact_types") or ()),
+                dependencies=tuple(str(item) for item in raw.get("dependencies") or ()),
+                examples=tuple(str(item) for item in raw.get("examples") or ()),
+                owns=tuple(str(item) for item in raw.get("owns") or ()),
+                consumes=tuple(str(item) for item in raw.get("consumes") or ()),
+                produces=tuple(str(item) for item in raw.get("produces") or ()),
+                routing_hints={
+                    str(key): tuple(str(item) for item in values or ())
+                    for key, values in (raw.get("routing_hints") or {}).items()
+                },
+                private_values={
+                    str(key): str(value)
+                    for key, value in (raw.get("private_values") or {}).items()
+                },
+                body=str(raw.get("body") or ""),
+                path=Path(str(raw.get("path") or (AGENT_SKILL_ROOT / str(name) / "SKILL.md"))),
+            )
+        return registry
 
     def list_skills(self) -> list[AgentSkill]:
         return [self._skills[name] for name in sorted(self._skills)]
@@ -346,6 +398,9 @@ def _parse_skill_file(path: Path) -> AgentSkill:
     artifact_types = _coerce_frontmatter_list(frontmatter.get("artifacts"))
     dependencies = _coerce_frontmatter_list(frontmatter.get("dependencies"))
     examples = _coerce_frontmatter_list(frontmatter.get("examples"))
+    owns = _coerce_frontmatter_list(frontmatter.get("owns"))
+    consumes = _coerce_frontmatter_list(frontmatter.get("consumes"))
+    produces = _coerce_frontmatter_list(frontmatter.get("produces"))
     routing_hints: dict[str, tuple[str, ...]] = {}
     private_values: dict[str, str] = {}
     for key, value in frontmatter.items():
@@ -369,6 +424,9 @@ def _parse_skill_file(path: Path) -> AgentSkill:
         artifact_types=artifact_types,
         dependencies=dependencies,
         examples=examples,
+        owns=owns,
+        consumes=consumes,
+        produces=produces,
         routing_hints=routing_hints,
         private_values=private_values,
         body=body,

@@ -1,6 +1,15 @@
 ---
 name: security-auth-testing
 description: Use when the user asks to design or diagnose authentication, authorization, token, session, cookie, permission boundary, rate limit, CSRF, replay, or security-negative tests for TestAuto APIs and scenarios.
+owns:
+  - security
+consumes:
+  - environment
+  - test_case
+  - execution
+  - permission
+produces:
+  - security_test
 triggers:
   - 鉴权
   - 认证

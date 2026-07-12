@@ -1,7 +1,7 @@
 ﻿# 自动化测试平台后端技术架构文档
 
 状态：当前实现
-最后核验：2026-07-08
+最后核验：2026-07-12
 
 文档入口、权威范围和维护要求见 [文档索引与维护规范](README.md)。
 
@@ -9,7 +9,8 @@
 
 项目权限底座接口见 [项目权限接口文档](api_project_permissions.md)。
 
-测试用例接口见 [测试用例接口文档](api_test_cases.md)。
+测试用例接口见 [测试用例接口文档](api_test_cases.md)，系统测试用例接口见
+[系统测试用例接口文档](api_system_test_cases.md)。
 
 WebSocket 测试用例接口见 [WebSocket 测试用例接口技术文档](api_websocket_test_cases.md)。
 
@@ -33,7 +34,13 @@ MinIO 图片附件接口和部署配置见 [媒体存储接口文档](api_media.
 
 ## 1. 项目定位
 
+平台业务 ToolRegistry 当前包含 48 个 ToolSpec，原有 29 个工具名、handler 和调用链保持不变；新增的 19 个工具按执行记录、测试计划、可视化流程和缺陷四个领域落在独立 `AgentPlatformToolBackend`，再由 `AgentToolBackend` 统一委派，避免在旧 handler 上增加按领域分支。四个领域的 query 工具返回本次查询的 snapshot、`object_reference_manifest` 和对象级 `object_ref`；后续更新、启停、执行或状态流转由 `ObjectReferenceGuardRule` 校验同一会话最新事实快照并再次校验项目归属。Flow 保存还会按节点 `kind` 分别把 `api_case` 和 `websocket_case` 的 `referenceId/reference_id` 绑定到最新用例快照，避免两种协议 ID 混用。只读执行详情按 Skill 约束先 query，再由 `ExecutionRecordService` 校验项目归属。测试计划和 Flow 执行工具只创建 queued run/execution 并提交共享 `execution_worker`，立即返回可查询身份，不在 Agent Tool worker 中嵌套同步执行。query 结果进入下一轮模型前由 `ToolResultProjectionService` 生成有界 Planning View，完整脱敏结果仍留在 ToolCall Ledger View。
+
+新增工具集合为：执行记录 `execution.query_records/read_detail/diagnose`；测试计划 `plan.query_project_plans/create_saved/update_saved/set_enabled/execute_saved/query_runs/read_run`；可视化流程 `flow.query_project_flows/validate_graph/create_saved/update_saved/execute_saved`；缺陷 `defect.query_project_defects/create_saved/update_saved/transition_status`。其中 read/query/validate 是安全读取或确定性计算；create/update/enable/execute/transition 仍按 `business_update + require_revalidation` 进入权限与审批链。`execution.diagnose` 先通过统一执行详情读取真实 HTTP、WebSocket、场景或 Flow 记录，再把脱敏后的 draft/execution 数据交给现有 AI 诊断服务，不允许模型用自然语言中的 ID 绕过查询快照。
+
 非 Agent 业务读写路径保持“服务层语义不变、持久化边界减负”的优化原则：场景运行列表只延迟加载未进入列表响应的 `scenario_snapshot`；测试计划统计使用条件聚合与标量子查询；浏览器采集批量写入使用 executemany 并在提交后一次回读恢复输入顺序；报告智能总览使用无 count 的内部比较周期查询，慢用例仅投影展示所需字段。`0038_non_agent_query_performance_indexes` 为场景运行项目时间排序与采集条目批次顺序补齐索引。上述调整不改变路由、响应模型、权限、幂等策略、SSE、执行工作池或任何异步受理流程。
+
+系统测试用例是独立于 HTTP 执行用例的项目级业务资产：`system_test_cases` 保存业务模块、测试目标、优先级、状态、AI 标记和标签；`system_case_api_relations` 保存它与现有 HTTP `test_cases` 的关联。所有接口必须先校验项目权限，并在 SQL 条件中带上 `project_id`。API 候选只从同项目 HTTP 用例投影 method/path/environment/last execution status/assertion count；保存关系时再次校验每个 `apiCaseId` 归属，避免前端或模型传入跨项目 ID。
 
 本项目是一个基于 FastAPI 的自动化测试平台后端，主要面向接口自动化测试场景。
 
@@ -95,7 +102,7 @@ Agent 环境管理能力走同一 Runtime 边界：`environment.query_project_co
 
 对象引用 preflight 的失败诊断同时收口为 `object_reference_preflight_v1` envelope，挂在 ToolCall `output_json_redacted.object_reference_preflight` 下，并同步写入实时 `tool.failed.payload.object_reference_preflight`。该 envelope 固定包含 status、reason、object_type、query_tool、blocked_tool、requested_ids、valid_ids、requested_snapshot_ids 与 latest_snapshot_id，并按失败类型补充 invalid_ids 或 stale_ids；旧平铺诊断字段继续保留，保证前端和历史调试工具兼容。这样前端可以在实时 timeline 和 ToolCall Detail 中用同一结构展示 ID 未查询、对象已删除、snapshot 过期三类问题，而不需要从 error_code 或多个 `invalid_*` 字段反推失败类型。
 
-`AgentRuntimeSnapshot` 是每个 run 冻结运行时工具集合和 hash 解释的事实源：`tools_json` 来自同一时刻的 `ToolRegistry.registry_json()`，`manifests_json.tools` 是同一公开工具 manifest 按名称 keyed 的映射；`runtime_hash`、`tool_registry_hash` 和 `manifest_bundle_hash` 分别由 `ToolRegistry.runtime_hash()`、`ToolRegistry.registry_hash()` 与 `ToolRegistry.manifest_bundle_hash()` 计算。Snapshot 工具 manifest 与 capabilities 一样只包含 `ToolSpec.to_json()` 公开字段、`agent-tool-spec://{name}/{version}` 工具 row identity 和 schema/manifest hash，后端私有 handler、前置工具和修复 guidance 仍留在 registry/runtime 内部。`AgentRuntimeSnapshotRead.item_id=agent-runtime-snapshot://{snapshot_id}` 把该冻结运行时事实作为独立 timeline/debug/download item 暴露，但不替代 run/tool/approval 里的 `runtime_snapshot_id` 引用。Harness 文档用 `Required RuntimeSnapshot entity payload contract` 机器契约锁住 snapshot、registry、hash 来源和 item prefix，避免冻结运行时事实、模型提示工具清单与诊断解释分叉。
+`AgentRuntimeSnapshot` 是每个 run 冻结运行时 Tool 与 Skill 能力集合和 hash 解释的事实源：`tools_json` 来自同一时刻的 `ToolRegistry.registry_json()`，`manifests_json.tools` 是公开 Tool manifest 按名称 keyed 的映射，`manifests_json.skills` 保存 Skill 的规划元数据、工具声明和本次 Run 使用的 prompt body。`runtime_hash` 与 `manifest_bundle_hash` 都由 Tool 和 Skill 两部分联合计算，Skill 声明或正文变化会生成新 snapshot，既有 Run 不会改读实时 Skill 文件；`tool_registry_hash` 仍只表示公开 ToolRegistry。Snapshot 工具 manifest 与 capabilities 一样只包含 `ToolSpec.to_json()` 公开字段、`agent-tool-spec://{name}/{version}` 工具 row identity 和 schema/manifest hash，后端私有 handler、前置工具和修复 guidance 仍留在 registry/runtime 内部。`AgentRuntimeSnapshotRead.item_id=agent-runtime-snapshot://{snapshot_id}` 把该冻结运行时事实作为独立 timeline/debug/download item 暴露，但不替代 run/tool/approval 里的 `runtime_snapshot_id` 引用。Harness 文档用 `Required RuntimeSnapshot entity payload contract` 机器契约锁住 snapshot、registry、hash 来源和 item prefix，避免冻结运行时事实、模型提示工具清单与诊断解释分叉。
 
 模型工具提示分为稳定快照和本轮运行上下文两层：`_conversation_system_prompt()` 仍作为缓存/机器契约入口，从 `ToolRegistry.list_specs()` 派生全量稳定 catalog，字段只包含 `approval_required,name,side_effect_class,summary`，不包含完整 `input_schema` 或后端私有 handler/repair guidance；真正进入 `AgentConversationRunner._build_chat_messages()` 的 Plan 阶段上下文由 `AgentContextManager` 生成。`AgentContextManager.route(intent, working_context=...)` 先用 `AgentCapabilityResolver.routing_intent()` 把明确的 active artifact action 转成短 routing hint，再由 Skill Router 选择 primary Skill；随后 `AgentCapabilityResolver.resolve()` 统一基于当前 intent、selected Skill、同会话 `active_artifact_action/current_artifact_candidates` 和 artifact `available_followup_actions` 裁决本轮 `allowed_tools`。因此 Global Capability、Skill Routed Capability 和 Model Tool Catalog 之间有一个显式 Capability Resolver 层：Skill 只提供领域候选，Resolver 才是最终模型可见工具目录边界。Resolver 还会生成 `agent_capability_plan_v1` model view，记录 `available_actions`、`required_facts`、`tool_input_hints` 和 `reason_codes`；该消息用于模型和调试解释，不替代 ToolRuntime 的权限、审批、schema、ObjectReferenceGuardRule 或业务 preflight。`input_summary` 由 `tool_contract_message()` 作为 Layer 2 contract 渐进注入，并在模型预算中单独归入 `tool_contract` 层，完整 schema、权限与副作用仍由 Runtime Validation、capabilities/runtime snapshot 和 ToolCall 诊断承载。`input_summary` 不复制完整 schema，但会暴露直接可行动的嵌套必填摘要，例如 `scenario.compose_draft.input_summary.nested_required={"input":["requirement"]}`，避免对象模式下只看到顶层 `input` 却漏填 `input.requirement`。所有模型可见顶层 `environment_id` schema，以及保存类工具的嵌套 `case.environment_id` / `case.environment_ids` schema，都必须写明 `Use only ids from project.read_context.object_reference_manifest.environment_ids`，使模型在规划阶段先读取环境事实快照；执行器的 environment `ObjectReferenceGuardRule` 仍负责副作用边界前的硬校验。Harness 文档用 `Required Agent initial tool prompt contract` 机器契约锁住全量稳定快照，同时由 Agent Runtime 回归锁住真实首轮 routed context 的 `<10000` 字符预算和无关工具隔离。
 
@@ -114,6 +121,12 @@ ToolCall Detail 中的 `recent_reconcile_attempts[]` 也补齐稳定 item identi
 Reconcile summary 中被 backoff 节流跳过的 `skipped_backoff_tool_calls[]` 也补齐稳定 item identity：`item_id=agent-reconcile-skipped-backoff://{tool_call_id}/{attempt_seq}`。该字段由最新 reconcile attempt 的 ToolCall id 与 attempt 序号派生，不新增数据库列，也不改变 next_retry_at、backoff eligibility、adapter 分流或 retry 窗口；它只用于前端稳定定位本次 reconcile summary 的 skipped row 和导出包 debug item。
 
 Harness Loop Agent 的业务工具调用走 Codex 式闭环：Runner 组装 run context、ToolRegistry、权限边界、会话工作上下文和历史上下文后调用 `AIService`，模型只能通过受控 `agent_tool_request` 发起 ToolCall，Harness 执行后把 `tool.result_observed` 回灌给下一轮模型；其中项目 Memory 以 `conversation_context` 注入时只进入有界系统消息，title/content 字段级截断且整条消息受 `AGENT_MEMORY_CONTEXT_MESSAGE_MAX_CHARS` 保护，完整 Memory 正文仍以 Memory/usage 审计接口为准。同一 conversation 的已完成历史除了按 user/assistant 消息回放，还会生成 redaction-safe 的“同一会话工作上下文”system 消息：最近轮次被整理为 `recent_turns`，可识别产物被整理为 `current_artifact_candidates`，当前请求若包含“直接、刚才、上面、这个”等省略表达，或是“保存/保存后执行/直接保存”这类必须依赖上文对象的 action-only follow-up，会标记 `current_intent_is_deictic_followup=true`，模型必须先解析回指再选择工具或询问澄清。该上下文只向模型暴露 `active_artifact_handles[]`，这是同一会话和当前 run 成功 ToolCall ledger 的权威 artifact model view，优先级高于从 assistant 文本推断的 SUMMARY artifact；`scenario.compose_draft` 会暴露为 `artifact_class=AUTHORITATIVE` 的 `scenario_draft`，`testcase.query_project_cases` 会暴露为权威 `test_case_query_snapshot` 并保留摘要计数、`snapshot_id` 与 `available_followup_actions`，模型多轮后需要更多事实时必须通过业务 query 工具做 summary/selected/assertions/execution_ready 受控查询，而不是读取 full ToolResult 或从摘要重构。assistant 文本推断只是兜底，只有出现“草稿/生成/分析/保存/更改/审批”等产物信号才生成 SUMMARY 候选，普通资产清单里的“已有场景/0 个场景”不能被当成可保存草稿。保存类 action-only follow-up 会基于 AUTHORITATIVE `scenario_draft` handle 生成 `active_artifact_action_v1`，只把 `scenario_draft`、`save`、`scenario.create_saved` 和 `scenario_source` 输入 hint 交给路由与模型；Skill selection 消费的是这个轻量 action hint，而不是完整 working context JSON 或历史 assistant 文本，避免 API 错误、旧工具清单、旧“不能保存”结论污染本轮路由。Unsupported capability guard 只能用显式领域 subject 命中，`直接/刚才/上面/这个` 等回指词不能单独触发某个领域 guard；否则会在模型读取工作上下文前错误终止同一会话的多轮理解。
+
+从 `3.0.535-agent-capability-plan-native-tools` 起，上述闭环中的 `agent_tool_request` 只代表旧协议兼容 envelope，不再是模型工具调用的唯一入口。Capability Plan 提供 provider tools 时必须优先使用原生 `tool_calls`；两条入口都进入同一 ToolCall ledger、Capability Plan 校验、schema、权限、审批和异步 ToolRuntime。
+
+原生工具 wire contract 把 `tools[].type` 和 assistant `tool_calls[].type` 视为必填协议字段，不受 Pydantic 默认值省略影响。DeepSeek thinking 模式的 `reasoning_content` 仅在当前 Runner 内存中按 tool-call id 临时保留，用于满足下一轮 provider 回传要求，不持久化、不发送前端、不作为可见 Chain of Thought。模型流返回 HTTP 错误时，`AIService` 必须在 stream context 关闭前读取 body，避免 `ResponseNotRead` 覆盖真实 provider 诊断。
+
+Capability Resolver 对结构化 `analyze/query` 动作执行统一副作用裁剪：模型目录只允许 `read_only` 和 `deterministic_compute` ToolSpec。具体读取领域仍由 LLM 的 target/source 判断和 supporting Skills 扩展，因此不是锁死固定工具名单；写入、执行、状态流转和其他副作用工具不会出现在纯分析轮次。
 
 Agent runner 的异常面必须先收敛 run 事实，再让 worker 退出：普通 HTTP/model/tool-request 修复异常仍通过当前 `AgentRuntimeService.fail_run()` 写入 `run.failed`；如果异常发生时 MySQL 连接已断开，导致当前 SQLAlchemy session 进入 `PendingRollbackError` 或其他不可继续写入状态，Runner 会 rollback 主 session、dispose 断连连接池，并用新的 `SessionLocal` 重新读取同一 run 后写入 `run.failed`。这个 recovery session 只负责补齐终态和有界 `error_code/error_message`，不重放工具副作用、不覆盖已 terminal 的 run，也不改变 SSE 契约；前端继续只消费 EventStore/Run Summary 的 `failed` 终态。
 
@@ -1173,3 +1186,42 @@ FastAPI API 服务
 ```
 
 这套架构更适合建设一个真正的平台型后端，而不是简单调用第三方测试框架。它的前期建设成本略高，但对可视化编排、执行历史、报告分析、权限管理和后续扩展更友好。
+## Agent Skill Orchestration v2：候选召回、LLM 规划与系统边界
+
+Agent Runtime 的 Skill 选择不再被视为单一路由器，而是逐步演进为 Codex/Claude Code 风格的候选能力召回层：LLM 负责理解用户目标、组合证据并规划工具使用；后端负责压缩上下文、召回候选 Skill/Tool、执行权限与审批、schema 预校验、对象引用新鲜度、项目隔离和审计留痕。`AgentIntentAction` 会先提取当前用户动作、目标领域和证据来源领域，例如“根据失败用例创建缺陷”会被解释为目标 `defect.create`、证据来源 `test_case`，而不是让历史 `test_case_query_snapshot.update_assertions` 抢占本轮主流程。
+
+历史 artifact 在 v2 中分为 target 与 evidence 两种角色。只有“执行它 / 保存这个 / 修复这些”等省略指代请求才允许 artifact follow-up action 强主导路由；当用户明确说出目标对象，如缺陷、测试计划、Flow、场景或测试用例时，目标领域 Skill 优先，artifact 只补充证据读取工具。ToolRuntime 的权限、审批、业务写入、对象引用和异步执行边界保持最终权威，模型看到候选工具不等于工具已执行或可绕过审批。
+
+完整闭环中，`AgentSkillPlanner` 会把证据来源领域映射为 `supporting_skills`，因此跨域任务不再只加载一个 Skill：例如失败用例创建缺陷会加载 `defect-triage` 作为 primary，同时加载 `http-test-case-design` 作为 evidence skill；报告生成测试计划会加载 `test-plan-management` 与 `report-summary`；缺陷生成回归用例会加载 `http-test-case-design` 与 `defect-triage`。如果模型最终仍输出“没有接口 / 不支持 / 无法创建”等能力否认，`AgentConversationRunner` 会用 runtime snapshot 的完整工具目录复核；若工具实际存在，会写入 `model.capability_denial_guarded` 事件并阻止错误否认直接作为成功结论展示。
+
+Skill frontmatter 现在可以声明扁平 orchestration contract：`owns` 表示该 Skill 主责领域，`consumes` 表示可作为证据读取的来源领域，`produces` 表示该 Skill 产出的业务领域。Planner 不再依赖固定 Python source-domain 映射，而是扫描 `owns` contract 选择 evidence supporting skill，并在 `reason_codes` 中记录 `planner:supporting_skill:{skill}:evidence:{domain}`。Capability Resolver 对 primary skill 保留目标动作工具，对 supporting skill 只自动贡献 `read_only` / `deterministic_compute` 工具；写入、执行、状态流转工具必须来自当前目标动作或 ToolRuntime 显式解锁，避免证据 Skill 把无关副作用工具暴露给模型。
+
+二阶段完成后，能力否认 guard 具备一次受控 hidden replan：在普通 assistant 回复阶段，如果模型自然语言错误否认 runtime snapshot 中实际存在的能力，Runner 会先写入 `model.capability_denial_guarded`，然后用 `capability_denial_replan` loop step 要求模型只输出合法 `agent_tool_request` 或简短阻断诊断。若重规划产出工具请求，会写入 `model.capability_denial_replanned` 并继续进入既有 ToolCall ledger、权限、审批和异步执行路径；若重规划失败或仍不请求工具，则回退到诊断消息而不是展示错误“不支持”结论。`final_summary` 阶段仍禁止工具请求，避免工具执行后的总结阶段重复触发写入。
+
+所有 bundled Agent Skill 均声明 `owns/consumes/produces`，包括项目上下文、WebSocket 用例、场景、可视化流程、缺陷、报告、计划、环境、权限、通知、Mock、数据集、CI、迁移、隐私脱敏和 Agent Runtime 运维等领域。新增 Skill 时必须补齐这三个字段，否则 registry 回归会失败；字段用于候选召回和 evidence supporting skill 推断，不代表权限或执行许可。
+
+## Agent 统一 Capability Plan 与原生 Tool Calling
+
+Agent 每轮先由 LLM 输出结构化意图 `{action,target_domain,source_domains,confidence}`。后端只接受已登记领域、合法动作和达到置信度阈值的结果，写入/执行类动作还必须提供已登记的 `target_domain`；低置信度、非法领域、结构不完整或模型调用失败时回退到确定性解析，同时取消写入授权，只保留只读和确定性计算工具。确定性 fallback 只接受单领域无歧义目标；多领域请求不会根据领域词顺序猜测 target，也不会把所有出现的领域猜成 sources，而是记录 `intent:fallback_cross_domain_ambiguous` 等待结构化重判。Skill Planner、Capability Resolver、模型上下文、Guard 与 ToolRuntime 因此消费同一份已校验意图，不再各自从自然语言重复推断；只有来源为 `llm_intent` 的已校验目标才能强制 primary Skill，历史 artifact 只能作为 supporting/evidence。
+
+每个 run/iteration 的能力决策持久化到 `ai_agent_capability_plans`。记录包含 `capability_plan_id`、父计划、revision、runtime snapshot、结构化意图、Skill plan、allowed tools、provider alias、required facts、reason codes 和稳定 hash；`ai_agent_runs.active_capability_plan_id` 指向当前有效计划，`ai_agent_tool_calls.capability_plan_id` 固化实际执行所依据的计划。普通迭代通过 carry-forward 生成有父子关系的新计划；Guard 发现 runtime snapshot 中存在但当前计划漏召回的能力时，只能经过受控 expansion/rebuild 生成新 revision，并刷新 Skill plan、工具 catalog、完整 schema 和模型上下文。
+
+ToolRuntime 在 ToolSpec/schema/权限/审批和业务 handler 之前校验工具是否属于 ToolCall 引用的 Capability Plan。只要 run 存在 active plan，即使调用方省略 `capability_plan_id`，Runtime 也会自动绑定当前计划并执行成员校验；只有真正没有 Capability Plan 的历史 run 才保留空值兼容。计划外工具不会隐式执行；只有经过正式扩展并产生新 `capability_plan_id` 后才能进入原有 ledger。路由重建生成模型消息时，以新持久化计划的 allowed tools 为权威生成 catalog 和完整 schema，而不是再次信任可能仍漏召回的临时 Resolver 结果。该 ID 同时进入 execution context、dispatch trace 与 Runbook 白名单摘要，并参与对应 envelope hash，便于从模型决策追踪到最终业务效果。
+
+模型工具协议优先使用 provider 原生 `tools/tool_calls`。每个 provider tool 的参数统一为 `{input,reason,evidence_refs}`，其中 `input` 直接复用 ToolSpec JSON Schema；provider 名称通过计划内稳定 alias 映射回 canonical tool name。流式参数按 call index 累积后一次 JSON 解析，因此 HTML、嵌套 JSON、引号、反斜杠、Unicode 和换行不会经过 Markdown fenced JSON 二次转义。并行 tool call 当前显式拒绝，旧 `agent_tool_request` fenced JSON 仍作为兼容回退，两条入口最终进入同一个 ToolCall ledger、权限、审批、异步执行和结果回灌链路。
+
+## 2026-07-12 LLM-Driven Agent Runtime 最终语义
+
+本节替代上文把 `AgentSkillPlanner`、关键词 action/domain 解析和 capability-denial 文本修复描述为生产路由权威的旧语义。生产配置 `AGENT_LLM_INTENT_DECISION_ENABLED=true` 时，`AgentPlanningDecisionService` 使用独立结构化 profile（`thinking=disabled`、`temperature=0`、JSON、`max_tokens=2048`）一次性输出 `goal/action/target_domain/source_domains/selected_skills/selected_tools/selected_artifact_ids/required_facts/requested_effect_scope/confidence/reason_summary`。后端只验证注册表引用、Skill 声明、权限和 effect scope，不用第二套关键词本体改写模型选择；首次无效结果只允许一次有界修复，两次失败以 `agent_planning_failed` 结束。确定性 Intent/Skill 解析仅在显式关闭该配置的离线测试或诊断模式使用，不得授权生产 Tool。
+
+Capability Plan 是上述 LLM 决策的持久化安全边界。`read_only/deterministic_compute/draft_only/execution_record/business_update` 分别映射为 `observe/derive/draft/execute/persist`，因此 `scenario.compose_draft` 不再被写授权布尔值误删。模型每轮始终可见内部原生控制 Tool `runtime.request_capability`；该 Tool 不进入公共 ToolRegistry，也不调用业务 handler。Runtime 对请求的全部 Tool 名称、当前 Run 冻结的 RuntimeSnapshot Skill/Tool 声明和用户权限进行完整验证后，才事务化 supersede 当前 Capability Plan；任一名称非法则不创建 revision。规划器、上下文注入和能力扩展读取同一份冻结 Skill 索引，不允许运行中 Skill 文件变化改变既有 Run。直接调用非激活 Tool 会向模型返回 `agent_capability_not_active` 和 `next_action=call runtime.request_capability`，不会创建 AgentToolCall，也不会转成 `agent_conversation_unhandled_error`。
+
+旧 `_repair_available_capability_denial`、`model.capability_denial_replanned` 和“解析 assistant 否认文本后自动 expand plan”路径已删除。否认检测只写 `model.capability_denial_observed` 诊断，不改变文本、不激活 Tool、不合成 fenced 请求。旧 fenced `agent_tool_request` 仍是兼容入口，但必须通过同一 active-plan membership、schema、权限、审批、幂等和异步 ToolRuntime。
+
+真实场景组合使用 `case_source={artifact_id,output_hash}` 和 `environment_reference`。后端根据当前 AgentRun 的 user/project/conversation 从 ToolCall ledger 读取完整 `testcase.query_project_cases.output_json_redacted`，验证 output hash 后重新查询数据库确认用例和环境当前有效；模型 projection 是否截断不再影响候选集合。Agent 侧 `scenario.compose_draft` 固定为纯草稿边界，强制 `execute_candidates=false`、`self_validate=false`；实际执行只能通过显式 `scenario.execute_dry_run` 进入 execution scope。模型候选生成后，证据归一化层按 `reference_id` 恢复保存用例的真实 method/path/request/assertions/extractors，删除无证据的模型依赖，再由 `AgentScenarioDraftValidator` 校验环境、模板和依赖图。没有真实依赖的保存用例保持独立，不能为了流程外观发明边。只有 `scenario_validation.valid=true` 的结果投影为 AUTHORITATIVE `scenario_draft`；无效结果投影为 DERIVED `scenario_draft_invalid`，只有 `repair` follow-up，不能直接保存。
+
+场景模板变量按来源分为环境变量、dataset 变量和上游保存 extractor；环境变量只作为外部已解析事实，不生成节点依赖边。保存用例若引用当前环境不存在、dataset 未声明且无保存 extractor 能提供的模板变量，grounding 会排除该候选节点并记录 `excluded_nodes(reason=saved_case_external_template_unresolved)`，不会发明变量。`scenario.compose_draft` 的模型回灌使用专用 Planning View，明确区分 source、composer candidate、grounded final、`omitted_by_composer` 与 `excluded_by_grounding`，并声明 omission 原因未记录时禁止推断；完整草稿仍只保存在 ToolCall ledger。
+
+Agent ledger 的递归脱敏同时识别 `Authorization`、`lingxi-auth`、`auth`、`authentication` 和 `x-auth-token` 等鉴权 header 名。Tool 输入、输出、事件和 Run 结果在持久化/回灌前均经过同一掩码边界；本轮已对历史 Agent ToolCall 中遗留的同类 header 做就地掩码，不删除审计记录或改变业务表。
+
+新增事件包括 `planner.llm_decision_started/completed/invalid/retrying/failed`、`planner.capability_activation_requested/accepted/rejected`、`planner.capability_plan_revised`、`planner.capability_call_rejected`、`model.capability_denial_observed` 和 `scenario.draft_validation_completed/failed`。REST、SSE envelope、AgentRun、ToolCall、Approval、worker、resume、cancel 和 EventStore 架构保持不变；本轮复用 `ai_agent_capability_plans` JSON 字段，无新增数据库迁移。

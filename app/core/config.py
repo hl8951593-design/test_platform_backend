@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     AGENT_TRACE_VERBOSE_PAYLOADS: bool = False
     AGENT_TRACE_FULL_PAYLOADS: bool = False
     AGENT_TRACE_PAYLOAD_MAX_CHARS: int = 12000
+    AGENT_LLM_INTENT_DECISION_ENABLED: bool = True
+    AGENT_NATIVE_TOOL_CALLING_ENABLED: bool = True
     LOG_LEVEL: str = "INFO"
     LOG_FILE_PATH: str = "logs/app.log"
     LOG_REQUESTS: bool = True

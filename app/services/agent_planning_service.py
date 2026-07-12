@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -111,6 +111,7 @@ class AgentPlanningDecisionService:
         artifact_index: Sequence[dict[str, Any]],
         project_id: int,
         permissions: Sequence[str],
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> ValidatedAgentPlanningDecision:
         last_error: AgentPlanningError | None = None
         for attempt in (1, 2):
@@ -152,6 +153,10 @@ class AgentPlanningDecisionService:
                 )
             except AgentPlanningError as exc:
                 last_error = exc
+                if on_event is not None:
+                    on_event("invalid", exc.model_view())
+                    if attempt == 1:
+                        on_event("retrying", {"next_attempt": 2, "reason_code": exc.code})
         assert last_error is not None
         raise AgentPlanningFailed(last_error=last_error)
 
@@ -290,6 +295,7 @@ class AgentPlanningDecisionService:
     ) -> AIChatRequest:
         payload = {
             "attempt": attempt,
+            "output_contract": AgentPlanningDecision.model_json_schema(),
             "intent": intent,
             "project_id": project_id,
             "permissions": list(_strings(permissions)),
@@ -305,10 +311,14 @@ class AgentPlanningDecisionService:
                 AIChatMessage(
                     role="system",
                     content=(
-                        "You are the semantic planning control plane for TestAuto Agent. Return exactly one JSON "
-                        "object matching the requested planning fields. Select only registered Skills, Tools, and "
-                        "artifact ids from the supplied frozen indexes. The backend validates and executes the plan. "
-                        "Do not include chain-of-thought; reason_summary must be a short decision explanation."
+                        "You are the semantic planning control plane for TestAuto Agent. Return exactly one top-level "
+                        "JSON object that conforms to output_contract; do not wrap it in plan, result, data, or any "
+                        "other key. Copy every required field name exactly. selected_skills must contain at least one "
+                        "registered Skill. requested_effect_scope must be one of observe, derive, draft, execute, or "
+                        "persist; use observe for a read-only request and never return none. Select only registered "
+                        "Skills, Tools, and artifact ids from the supplied frozen indexes. selected_tools may be empty "
+                        "only when the selected Skill can answer without a Tool. The backend validates and executes "
+                        "the plan. Do not include chain-of-thought; reason_summary must be a short decision explanation."
                     ),
                 ),
                 AIChatMessage(role="user", content=json.dumps(payload, ensure_ascii=False, sort_keys=True)),

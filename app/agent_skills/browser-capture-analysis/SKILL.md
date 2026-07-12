@@ -1,6 +1,15 @@
 ---
 name: browser-capture-analysis
 description: Use when the user asks to analyze, import, clean, deduplicate, convert, or explain Chrome browser-captured HTTP/WebSocket traffic, capture batches, HAR-like records, API drafts, websocket drafts, or capture-to-test-case workflows.
+owns:
+  - browser_capture
+consumes:
+  - api_definition
+  - test_case
+  - websocket_test_case
+produces:
+  - test_case
+  - websocket_test_case
 triggers:
   - 浏览器采集
   - Chrome插件

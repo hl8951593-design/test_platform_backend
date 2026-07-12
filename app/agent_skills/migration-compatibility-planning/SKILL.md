@@ -1,6 +1,14 @@
 ---
 name: migration-compatibility-planning
 description: Use when the user asks to plan or diagnose database migrations, backward compatibility, legacy data repair, schema upgrades, API compatibility, rollout order, rollback, or old-client behavior for TestAuto.
+owns:
+  - migration
+consumes:
+  - schema
+  - api_contract
+  - legacy_data
+produces:
+  - migration_plan
 triggers:
   - 迁移
   - 数据迁移

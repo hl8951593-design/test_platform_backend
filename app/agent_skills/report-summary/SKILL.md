@@ -10,6 +10,16 @@ required_context:
   - report_inventory
 tools:
   - report.read_summary
+owns:
+  - report
+consumes:
+  - execution
+  - test_case
+  - scenario
+  - visual_flow
+  - defect
+produces:
+  - report
 artifacts:
   - report_summary
   - scenario_run_failure

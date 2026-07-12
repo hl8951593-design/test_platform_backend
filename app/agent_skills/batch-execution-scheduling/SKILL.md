@@ -1,6 +1,17 @@
 ---
 name: batch-execution-scheduling
 description: Use when the user asks to plan, diagnose, or optimize batch execution, scheduled runs, parallelism, worker queue behavior, retries, timeout policy, cancellation, or execution ordering for TestAuto test cases, scenarios, flows, or plans.
+owns:
+  - execution_schedule
+consumes:
+  - execution
+  - test_case
+  - scenario
+  - visual_flow
+  - test_plan
+  - worker
+produces:
+  - execution_schedule
 triggers:
   - 批量执行
   - 调度

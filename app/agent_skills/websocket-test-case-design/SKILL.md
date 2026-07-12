@@ -1,6 +1,14 @@
 ---
 name: websocket-test-case-design
 description: Use when the user asks to design, generate, expand, validate, debug, or explain TestAuto WebSocket test cases, handshake headers, subprotocols, message sequence, receive assertions, timeout, close behavior, or long-connection debugging.
+owns:
+  - websocket_test_case
+consumes:
+  - project_context
+  - api_definition
+  - execution
+produces:
+  - websocket_test_case
 triggers:
   - WebSocket
   - websocket

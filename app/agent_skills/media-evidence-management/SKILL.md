@@ -1,6 +1,14 @@
 ---
 name: media-evidence-management
 description: Use when the user asks to upload, attach, review, explain, troubleshoot, or manage screenshots, media evidence, MinIO objects, defect attachments, signed URLs, image format validation, media cleanup, or evidence redaction.
+owns:
+  - media
+consumes:
+  - defect
+  - execution
+  - report
+produces:
+  - media
 triggers:
   - media
   - MinIO

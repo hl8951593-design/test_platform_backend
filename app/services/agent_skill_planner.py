@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.services.agent_artifact_resolver import AgentArtifactResolver
+from app.services.agent_intent_action import parse_agent_intent_action
 from app.services.agent_skill_registry import AgentSkill, AgentSkillRegistry
 
 
@@ -14,6 +15,11 @@ REPORT_SKILL_NAME = "report-summary"
 HTTP_CASE_SKILL_NAME = "http-test-case-design"
 WEBSOCKET_CASE_SKILL_NAME = "websocket-test-case-design"
 ENVIRONMENT_SKILL_NAME = "environment-config-management"
+GENERAL_TESTING_SKILL_NAME = "general-testing-answer"
+EXECUTION_DIAGNOSIS_SKILL_NAME = "execution-diagnosis"
+TEST_PLAN_SKILL_NAME = "test-plan-management"
+VISUAL_FLOW_SKILL_NAME = "visual-flow-design"
+DEFECT_SKILL_NAME = "defect-triage"
 
 EXECUTE_TERMS = (
     "execute",
@@ -69,6 +75,34 @@ ENVIRONMENT_MANAGEMENT_TERMS = (
     "认证",
     "过期",
 )
+EXECUTION_RECORD_TERMS = ("execution", "run record", "执行", "执行记录", "运行记录")
+EXECUTION_DIAGNOSIS_TERMS = (
+    "diagnose",
+    "diagnosis",
+    "failed",
+    "failure",
+    "cause",
+    "失败",
+    "诊断",
+    "原因",
+    "超时",
+    "断言",
+)
+TEST_PLAN_TERMS = (
+    "test plan",
+    "test suite",
+    "plan run",
+    "smoke suite",
+    "regression suite",
+    "测试计划",
+    "测试套件",
+    "计划执行",
+    "冒烟计划",
+    "回归计划",
+)
+VISUAL_FLOW_TERMS = ("visual flow", "flow dag", "可视化流程", "流程 dag", "流程节点", "节点连线")
+DEFECT_TERMS = ("defect", "bug", "缺陷", "故障单", "关闭缺陷", "重新激活")
+CONCEPTUAL_TESTING_TERMS = ("是什么", "什么是", "有啥区别", "有什么区别", "区别是什么", "概念", "原理", "解释")
 
 
 @dataclass(frozen=True)
@@ -137,6 +171,7 @@ class AgentSkillPlanner:
         *,
         routing_intent: str | None = None,
         working_context: dict[str, Any] | None = None,
+        intent_action: Any | None = None,
     ) -> AgentSkillPlan:
         original_intent = (intent or "").strip()
         effective_intent = (routing_intent or intent or "").strip()
@@ -177,6 +212,7 @@ class AgentSkillPlanner:
 
         self._apply_intent_overrides(
             intent=effective_intent,
+            intent_action=intent_action,
             scores=scores,
             reasons=reasons,
             global_reasons=global_reasons,
@@ -189,10 +225,15 @@ class AgentSkillPlanner:
             global_reasons=global_reasons,
         )
 
+        intent_action = intent_action or parse_agent_intent_action(effective_intent, working_context=working_context)
         candidates = self._ranked_candidates(scores=scores, reasons=reasons)
-        primary = candidates[0].name if candidates else None
-        supporting: tuple[str, ...] = ()
-        allowed = (primary,) if primary else ()
+        primary = self._primary_skill_for_target(
+            intent_action=intent_action,
+            candidates=candidates,
+        )
+        supporting, supporting_reasons = self._supporting_skills_for_action(intent_action, primary=primary)
+        global_reasons.update(supporting_reasons)
+        allowed = tuple(name for name in (primary, *supporting) if name)
         confidence = _planner_confidence(candidates[0].score if candidates else 0)
         return AgentSkillPlan(
             schema_version=AGENT_SKILL_PLAN_SCHEMA_VERSION,
@@ -207,6 +248,50 @@ class AgentSkillPlanner:
             candidates=candidates,
             reason_codes=tuple(sorted(global_reasons)),
         )
+
+    def _primary_skill_for_target(
+        self,
+        *,
+        intent_action: Any,
+        candidates: tuple[AgentSkillPlanCandidate, ...],
+    ) -> str | None:
+        target_domain = getattr(intent_action, "target_domain", None)
+        decision_source = getattr(intent_action, "source", "deterministic_fallback")
+        if target_domain and decision_source == "llm_intent":
+            owner_names = {
+                skill.name
+                for skill in self.skill_registry.list_skills()
+                if target_domain in getattr(skill, "owns", ())
+            }
+            for candidate in candidates:
+                if candidate.name in owner_names:
+                    return candidate.name
+            if owner_names:
+                return sorted(owner_names)[0]
+        return candidates[0].name if candidates else None
+
+    def _supporting_skills_for_action(
+        self,
+        intent_action: Any,
+        *,
+        primary: str | None,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        supporting: list[str] = []
+        reasons: list[str] = []
+        for source_domain in getattr(intent_action, "source_domains", ()):
+            owner_skills = [
+                skill
+                for skill in self.skill_registry.list_skills()
+                if source_domain in getattr(skill, "owns", ())
+            ]
+            owner_skills.sort(key=lambda skill: (0 if source_domain in getattr(skill, "produces", ()) else 1, skill.name))
+            for skill in owner_skills:
+                if skill.name == primary or skill.name in supporting:
+                    continue
+                supporting.append(skill.name)
+                reasons.append(f"planner:supporting_skill:{skill.name}:evidence:{source_domain}")
+                break
+        return tuple(supporting), tuple(reasons)
 
     def _metadata_score(self, skill: AgentSkill, intent: str) -> int:
         if not intent:
@@ -230,11 +315,24 @@ class AgentSkillPlanner:
         self,
         *,
         intent: str,
+        intent_action: Any | None,
         scores: dict[str, int],
         reasons: dict[str, set[str]],
         global_reasons: set[str],
     ) -> None:
         lowered = intent.casefold()
+        intent_action = intent_action or parse_agent_intent_action(intent)
+        if any(term in lowered for term in CONCEPTUAL_TESTING_TERMS) and not any(
+            term in lowered for term in (*SAVE_TERMS, *EXECUTE_TERMS, "创建", "生成", "更新", "删除")
+        ):
+            self._add_candidate(
+                scores=scores,
+                reasons=reasons,
+                skill_name=GENERAL_TESTING_SKILL_NAME,
+                score=12,
+                reason="intent:conceptual_testing_answer",
+            )
+            global_reasons.add("planner:intent_conceptual_testing_answer")
         if any(term in lowered for term in CASE_CREATION_TERMS):
             self._add_candidate(
                 scores=scores,
@@ -271,6 +369,62 @@ class AgentSkillPlanner:
                 score=report_score,
                 reason="intent:report_terms",
             )
+        if any(term in lowered for term in EXECUTION_RECORD_TERMS) and any(
+            term in lowered for term in EXECUTION_DIAGNOSIS_TERMS
+        ):
+            self._add_candidate(
+                scores=scores,
+                reasons=reasons,
+                skill_name=EXECUTION_DIAGNOSIS_SKILL_NAME,
+                score=12,
+                reason="intent:execution_diagnosis",
+            )
+            global_reasons.add("planner:intent_execution_diagnosis")
+        if any(term in lowered for term in TEST_PLAN_TERMS):
+            self._add_candidate(
+                scores=scores,
+                reasons=reasons,
+                skill_name=TEST_PLAN_SKILL_NAME,
+                score=12,
+                reason="intent:test_plan_management",
+            )
+            global_reasons.add("planner:intent_test_plan_management")
+        if any(term in lowered for term in VISUAL_FLOW_TERMS):
+            self._add_candidate(
+                scores=scores,
+                reasons=reasons,
+                skill_name=VISUAL_FLOW_SKILL_NAME,
+                score=11,
+                reason="intent:visual_flow",
+            )
+            global_reasons.add("planner:intent_visual_flow")
+        if any(term in lowered for term in DEFECT_TERMS):
+            self._add_candidate(
+                scores=scores,
+                reasons=reasons,
+                skill_name=DEFECT_SKILL_NAME,
+                score=11,
+                reason="intent:defect_triage",
+            )
+            global_reasons.add("planner:intent_defect_triage")
+        if intent_action.target_domain == "defect":
+            self._add_candidate(
+                scores=scores,
+                reasons=reasons,
+                skill_name=DEFECT_SKILL_NAME,
+                score=18,
+                reason="intent_action:target_domain:defect",
+            )
+            global_reasons.add("planner:intent_defect_triage")
+        if intent_action.target_domain == "test_case" and intent_action.action == "create":
+            self._add_candidate(
+                scores=scores,
+                reasons=reasons,
+                skill_name=HTTP_CASE_SKILL_NAME,
+                score=18,
+                reason="intent_action:target_domain:test_case",
+            )
+            global_reasons.add("planner:intent_test_case_creation")
 
     def _apply_artifact_context(
         self,
@@ -371,6 +525,10 @@ class AgentSkillPlanner:
         lowered = intent.casefold()
         if not lowered:
             return True
+        intent_action = parse_agent_intent_action(intent)
+        if artifact_type == "test_case_query_snapshot" and action == "update_assertions":
+            if intent_action.target_domain and intent_action.target_domain != "test_case":
+                return intent_action.is_deictic_followup
         if artifact_type == "scenario_draft" and action == "save":
             return any(term in lowered for term in SAVE_TERMS)
         if artifact_type == "saved_scenario" and action == "execute":

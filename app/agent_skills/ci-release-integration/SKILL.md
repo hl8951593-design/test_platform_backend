@@ -1,6 +1,15 @@
 ---
 name: ci-release-integration
 description: Use when the user asks to integrate TestAuto runs with CI/CD pipelines, webhooks, Jenkins, GitLab, GitHub Actions, release gates, promotion checks, scheduled regression, or deployment readiness.
+owns:
+  - ci_release
+consumes:
+  - test_plan
+  - report
+  - execution
+  - notification
+produces:
+  - ci_release
 triggers:
   - CI
   - CD

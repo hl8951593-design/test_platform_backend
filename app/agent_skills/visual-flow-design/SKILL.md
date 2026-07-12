@@ -10,7 +10,23 @@ required_context:
   - visual_flow_inventory
 tools:
   - project.read_context
+  - testcase.query_project_cases
+  - flow.query_project_flows
+  - flow.validate_graph
+  - flow.create_saved
+  - flow.update_saved
+  - flow.execute_saved
+  - execution.read_detail
   - report.read_summary
+owns:
+  - visual_flow
+consumes:
+  - test_case
+  - scenario
+  - execution
+  - report
+produces:
+  - visual_flow
 artifacts:
   - visual_flow
   - flow_report
@@ -45,9 +61,12 @@ routing_requires_tool:
 ## Workflow
 
 1. For conceptual flow design and troubleshooting advice, answer directly.
-2. For real execution or report facts, use `report.read_summary` when the user asks about completed flow reports, failures, or pass rate.
-3. Use `project.read_context` when the flow advice depends on environments or project resources.
-4. Do not claim that a flow, node, edge, version, or execution was created, updated, saved, deleted, or started unless a dedicated backend tool succeeds.
+2. For current Flow inventory, call `flow.query_project_flows`. Use its latest `object_ref` for update or execution.
+3. Before creating or changing a Flow, use `project.read_context` and `testcase.query_project_cases` for real environments and HTTP/WebSocket case ids.
+4. Always call `flow.validate_graph` before `flow.create_saved` or `flow.update_saved`; repair every returned issue before requesting approval.
+5. `flow.create_saved` and `flow.update_saved` persist a version and require approval. Do not claim a save before approval and tool success.
+6. `flow.execute_saved` queues an asynchronous execution. Use `execution.read_detail` or `report.read_summary` for the resulting evidence instead of immediately rerunning it.
+7. Do not claim that a flow, node, edge, version, or execution was created, updated, saved, or started unless the dedicated tool succeeds.
 
 ## Design Rules
 

@@ -1,6 +1,14 @@
 ---
 name: environment-config-management
 description: Use when the user asks to explain, inspect, design, troubleshoot, or plan TestAuto project environments, default environment, base_url, environment variables, variable substitution, auth token variables, or multi-environment binding.
+owns:
+  - environment
+consumes:
+  - project_context
+  - test_case
+  - scenario
+produces:
+  - environment
 triggers:
   - environment
   - env

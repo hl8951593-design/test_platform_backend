@@ -367,6 +367,13 @@ import app.services.agent_runtime_service as agent_runtime_service
 
 class AgentRuntimeTests(unittest.TestCase):
     def setUp(self):
+        self.llm_intent_decision_patch = patch.object(
+            agent_runtime_service.settings,
+            "AGENT_LLM_INTENT_DECISION_ENABLED",
+            False,
+        )
+        self.llm_intent_decision_patch.start()
+        self.addCleanup(self.llm_intent_decision_patch.stop)
         self.engine = create_engine(
             "sqlite:///:memory:",
             connect_args={"check_same_thread": False},
@@ -642,15 +649,16 @@ class AgentRuntimeTests(unittest.TestCase):
             [
                 "run.queued",
                 "run.started",
+                "planner.capability_plan_created",
                 "model.started",
                 "model.delta",
                 "model.completed",
                 "run.completed",
             ],
         )
-        self.assertEqual(events[3].payload_json["content"], "我可以帮你编排测试。")
         self.assertEqual(events[4].payload_json["content"], "我可以帮你编排测试。")
-        self.assertEqual(events[5].payload_json["result"]["model"], "deepseek-test")
+        self.assertEqual(events[5].payload_json["content"], "我可以帮你编排测试。")
+        self.assertEqual(events[6].payload_json["result"]["model"], "deepseek-test")
 
     def test_model_started_event_records_phase_zero_context_metrics(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -1479,8 +1487,8 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["model"], "deepseek-test")
         self.assertEqual(payload["finish_reason"], "stop")
         self.assertEqual(payload["usage"], {"total_tokens": "***"})
-        self.assertEqual(payload["event_count"], 6)
-        self.assertEqual(payload["latest_event_sequence"], 6)
+        self.assertEqual(payload["event_count"], 7)
+        self.assertEqual(payload["latest_event_sequence"], 7)
         self.assertEqual(payload["latest_event_types"][-2:], ["model.completed", "run.completed"])
         self.assertEqual(payload["tool_call_count"], 0)
         self.assertEqual(payload["pending_tool_call_count"], 0)
@@ -1751,14 +1759,15 @@ class AgentRuntimeTests(unittest.TestCase):
             [
                 "run.queued",
                 "run.started",
+                "planner.capability_plan_created",
                 "model.started",
                 "model.delta",
                 "model.completed",
                 "run.completed",
             ],
         )
-        self.assertEqual(events[3].payload_json["content"], "第一段第二段")
-        self.assertEqual(events[3].payload_json["loop_step"], "tool_planning")
+        self.assertEqual(events[4].payload_json["content"], "第一段第二段")
+        self.assertEqual(events[4].payload_json["loop_step"], "tool_planning")
         self.assertEqual(completed.result_json["message"], "第一段第二段")
 
     def test_conversation_runner_suppresses_visible_intro_before_tool_request(self):
@@ -1977,6 +1986,41 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn("我先读取项目上下文。", [item.payload_json.get("content") for item in visible_model_events])
         self.assertNotIn("上下文已确认，现在查询测试用例清单。", [item.payload_json.get("content") for item in visible_model_events])
 
+    def test_conversation_runner_repairs_empty_model_response_before_completion(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="根据测试用例构建自动化测试流程",
+                max_iterations=3,
+            ),
+            current_user=self.owner,
+        )
+        calls = {"count": 0}
+
+        def fake_stream(_service_self, _payload):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+                return
+            yield {"type": "delta", "content": "已识别到需要基于已有用例构建自动化测试流程。\n"}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        )
+        event_types = [item.event_type for item in events]
+
+        self.assertEqual(completed.status, "completed")
+        self.assertIn("已识别", completed.result_json["message"])
+        self.assertIn("model.empty_response_invalid", event_types)
+        self.assertEqual(calls["count"], 2)
+        self.assertTrue(completed.result_json["message"].strip())
+
 
     def test_conversation_runner_repairs_final_response_with_invalid_test_case_ids(self):
         from app.models.test_case import TestCase
@@ -2183,6 +2227,94 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("已补查 Missing Case（ID: 17）", completed.result_json["message"])
         self.assertNotIn("agent_tool_request", visible_content)
         self.assertEqual(len(captured_messages), 4)
+
+    def test_final_response_reference_check_accepts_ids_from_prior_same_run_case_queries(self):
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="分析项目测试用例",
+                max_iterations=4,
+            ),
+            current_user=self.owner,
+        )
+        captured_messages = []
+
+        def fake_stream(_service_self, payload):
+            captured_messages.append(payload.messages)
+            if len(captured_messages) == 1:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"testcase.query_project_cases",'
+                        '"input":{"project_id":10,"detail_level":"summary"},'
+                        '"reason":"查询项目用例概览","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+            elif len(captured_messages) == 2:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "```agent_tool_request\n"
+                        '{"tool_name":"testcase.query_project_cases",'
+                        '"input":{"project_id":10,"detail_level":"selected","test_case_ids":[10,12]},'
+                        '"reason":"查看失败用例细节","evidence_refs":[]}'
+                        "\n```"
+                    ),
+                }
+            else:
+                yield {
+                    "type": "delta",
+                    "content": (
+                        "项目共有 3 个 HTTP 用例；失败用例包括取消关注（ID: 10）和商标信息接口（ID: 12）。"
+                        "另一个需要关注的企业相关用例是获取企业列表-缺少必填参数pageNum（ID: 53）。"
+                    ),
+                }
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        def fake_execute(_backend_self, *, tool_name, payload, current_user):
+            self.assertEqual(tool_name, "testcase.query_project_cases")
+            all_rows = {
+                10: {"name": "取消关注", "method": "POST", "path": "/cancel", "last_execution_status": "failed"},
+                12: {"name": "商标信息接口", "method": "GET", "path": "/trademark", "last_execution_status": "failed"},
+                53: {
+                    "name": "获取企业列表-缺少必填参数pageNum",
+                    "method": "POST",
+                    "path": "/getEntPageList",
+                    "last_execution_status": "failed",
+                },
+            }
+            ids = list(payload.get("test_case_ids") or sorted(all_rows))
+            return {
+                "project_id": 10,
+                "detail_level": payload.get("detail_level", "summary"),
+                "case_id_manifest": {
+                    "http_test_case_ids": ids,
+                    "websocket_test_case_ids": [],
+                },
+                "http_test_case_ids": ids,
+                "websocket_test_case_ids": [],
+                "case_display_rows": [{"id": case_id, **all_rows[case_id]} for case_id in ids],
+            }
+
+        with (
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+            patch("app.services.agent_tool_service.AgentToolBackend.execute", new=fake_execute),
+        ):
+            completed = AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        event_types = [
+            item.event_type
+            for item in self.db.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.run_id).order_by(AgentEvent.event_seq)
+            ).all()
+        ]
+
+        self.assertEqual(completed.status, "completed")
+        self.assertIn("ID: 53", completed.result_json["message"])
+        self.assertNotIn("model.final_response_reference_invalid", event_types)
+        self.assertEqual(len(captured_messages), 3)
 
     def test_conversation_runner_does_not_complete_after_cancel_during_post_stream_normalization(self):
         run = AgentRuntimeService(self.db).create_run(
@@ -2675,6 +2807,17 @@ class AgentRuntimeTests(unittest.TestCase):
             "项目 testauto（ID: 1）当前共有 17 个 HTTP 测试用例，0 个 WebSocket 用例，"
             "全部关联环境 ID 4。\n"
             "失败用例包括 发展优势接口-资质认定接口（ID: 16）和 获取我的发布接口（ID: 19）。"
+        )
+
+        self.assertEqual(_invalid_test_case_ids_in_final_response(content, valid_ids=valid_ids), [])
+
+    def test_final_response_reference_check_does_not_reparse_free_text_as_case_ids(self):
+        from app.services.agent_runtime_service import _invalid_test_case_ids_in_final_response
+
+        valid_ids = {7, 10, 16}
+        content = (
+            "用例统计：3 个失败，17 条断言；项目 ID: 1；环境 ID: 4。"
+            "取消关注（ID: 10）失败。"
         )
 
         self.assertEqual(_invalid_test_case_ids_in_final_response(content, valid_ids=valid_ids), [])
@@ -3349,6 +3492,274 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn(draft_call.tool_call_id, system_context)
         self.assertNotIn("full_output_reference", system_context)
         self.assertNotIn("暂不包含场景保存相关的工具", joined_messages)
+
+    def test_agent_intent_action_parses_defect_creation_from_failed_cases(self):
+        from app.services.agent_intent_action import parse_agent_intent_action
+
+        action = parse_agent_intent_action("\u4f60\u53ef\u4ee5\u6839\u636e\u5931\u8d25\u7528\u4f8b\u521b\u5efa\u5bf9\u5e94\u7684\u7f3a\u9677")
+
+        self.assertEqual(action.action, "create")
+        self.assertIsNone(action.target_domain)
+        self.assertEqual(action.source_domains, ())
+        self.assertIn("intent:fallback_cross_domain_ambiguous", action.reason_codes)
+        self.assertTrue(action.explicit)
+        self.assertFalse(action.is_deictic_followup)
+
+    def test_agent_intent_action_parses_report_to_plan_cross_domain(self):
+        from app.services.agent_intent_action import parse_agent_intent_action
+
+        action = parse_agent_intent_action("\u6839\u636e\u8fd9\u4efd\u62a5\u544a\u751f\u6210\u6d4b\u8bd5\u8ba1\u5212")
+
+        self.assertEqual(action.action, "create")
+        self.assertIsNone(action.target_domain)
+        self.assertEqual(action.source_domains, ())
+        self.assertIn("intent:fallback_cross_domain_ambiguous", action.reason_codes)
+        self.assertTrue(action.explicit)
+
+    def test_skill_planner_treats_failed_cases_as_evidence_for_defect_creation(self):
+        from app.services.agent_intent_action import AgentIntentAction
+        from app.services.agent_skill_planner import AgentSkillPlanner
+
+        artifact = {
+            "artifact_type": "test_case_query_snapshot",
+            "artifact_class": "AUTHORITATIVE",
+            "artifact_trust": "SOURCE",
+            "domain": "test_case",
+            "available_followup_actions": [
+                "analyze_cases",
+                "update_assertions",
+                "execute",
+            ],
+            "artifact_summary": {"project_id": 1, "http_total": 15},
+        }
+        working_context = {
+            "active_artifact_handles": [
+                {**artifact, "artifact_id": f"agent-tool-artifact://active-{index}"}
+                for index in range(4)
+            ],
+            "current_artifact_candidates": [
+                {**artifact, "artifact_id": f"agent-tool-artifact://candidate-{index}"}
+                for index in range(5)
+            ],
+        }
+
+        plan = AgentSkillPlanner().plan(
+            "\u4f60\u53ef\u4ee5\u6839\u636e\u5931\u8d25\u7528\u4f8b\u521b\u5efa\u5bf9\u5e94\u7684\u7f3a\u9677",
+            working_context=working_context,
+            intent_action=AgentIntentAction(
+                action="create",
+                target_domain="defect",
+                source_domains=("test_case",),
+                source="llm_intent",
+            ),
+        )
+
+        self.assertEqual(plan.primary_skill, "defect-triage")
+        self.assertIn("defect-triage", plan.allowed_skills)
+        self.assertNotEqual(plan.primary_skill, "http-test-case-design")
+        self.assertIn("planner:intent_defect_triage", plan.reason_codes)
+
+    def test_context_manager_exposes_defect_create_and_case_evidence_tools(self):
+        from app.services.agent_context_manager import AgentContextManager
+        from app.services.agent_intent_action import AgentIntentAction
+        from app.services.agent_skill_registry import AgentSkillRegistry
+
+        artifact = {
+            "artifact_type": "test_case_query_snapshot",
+            "artifact_class": "AUTHORITATIVE",
+            "artifact_trust": "SOURCE",
+            "domain": "test_case",
+            "available_followup_actions": ["update_assertions", "execute"],
+            "artifact_summary": {"project_id": 1, "http_total": 15},
+        }
+        working_context = {
+            "active_artifact_handles": [
+                {**artifact, "artifact_id": f"agent-tool-artifact://active-{index}"}
+                for index in range(4)
+            ],
+            "current_artifact_candidates": [
+                {**artifact, "artifact_id": f"agent-tool-artifact://candidate-{index}"}
+                for index in range(5)
+            ],
+        }
+
+        plan = AgentContextManager().route(
+            "\u4f60\u53ef\u4ee5\u6839\u636e\u5931\u8d25\u7528\u4f8b\u521b\u5efa\u5bf9\u5e94\u7684\u7f3a\u9677",
+            working_context=working_context,
+            intent_action=AgentIntentAction(
+                action="create",
+                target_domain="defect",
+                source_domains=("test_case",),
+                source="llm_intent",
+            ),
+        )
+
+        self.assertEqual(plan.primary_skill, "defect-triage")
+        self.assertIn("http-test-case-design", plan.supporting_skills)
+        self.assertIn("test_case", AgentSkillRegistry().get_skill("http-test-case-design").owns)
+        self.assertIn("planner:supporting_skill:http-test-case-design:evidence:test_case", plan.skill_plan.reason_codes)
+        self.assertIn("defect.create_saved", plan.allowed_tools)
+        self.assertIn("defect.query_project_defects", plan.allowed_tools)
+        self.assertIn("testcase.query_project_cases", plan.allowed_tools)
+        self.assertNotIn("defect.update_saved", plan.allowed_tools)
+        self.assertNotIn("defect.transition_status", plan.allowed_tools)
+        self.assertNotIn("testcase.create_saved", plan.allowed_tools)
+        self.assertNotIn("testcase.update_saved", plan.allowed_tools)
+
+    def test_context_manager_uses_first_class_defect_task_type(self):
+        from app.services.agent_context_manager import AgentContextManager
+
+        plan = AgentContextManager().route("\u521b\u5efa\u4e00\u4e2a\u7f3a\u9677")
+
+        self.assertEqual(plan.primary_skill, "defect-triage")
+        self.assertEqual(plan.task_type, "defect_triage")
+
+    def test_context_manager_routes_execution_failure_to_defect_with_execution_evidence(self):
+        from app.services.agent_context_manager import AgentContextManager
+        from app.services.agent_intent_action import AgentIntentAction
+
+        plan = AgentContextManager().route(
+            "\u6839\u636e\u8fd9\u6b21\u6267\u884c\u5931\u8d25\u521b\u5efa\u7f3a\u9677",
+            intent_action=AgentIntentAction(
+                action="create",
+                target_domain="defect",
+                source_domains=("execution",),
+                source="llm_intent",
+            ),
+        )
+
+        self.assertEqual(plan.primary_skill, "defect-triage")
+        self.assertIn("execution-diagnosis", plan.supporting_skills)
+        self.assertIn("defect.create_saved", plan.allowed_tools)
+        self.assertIn("execution.query_records", plan.allowed_tools)
+
+    def test_context_manager_routes_report_to_test_plan_with_report_evidence(self):
+        from app.services.agent_context_manager import AgentContextManager
+        from app.services.agent_intent_action import AgentIntentAction
+
+        plan = AgentContextManager().route(
+            "\u6839\u636e\u8fd9\u4efd\u62a5\u544a\u751f\u6210\u6d4b\u8bd5\u8ba1\u5212",
+            intent_action=AgentIntentAction(
+                action="create",
+                target_domain="test_plan",
+                source_domains=("report",),
+                source="llm_intent",
+            ),
+        )
+
+        self.assertEqual(plan.primary_skill, "test-plan-management")
+        self.assertIn("report-summary", plan.supporting_skills)
+        self.assertIn("plan.create_saved", plan.allowed_tools)
+        self.assertIn("report.read_summary", plan.allowed_tools)
+
+    def test_context_manager_routes_defect_to_regression_case_with_defect_evidence(self):
+        from app.services.agent_context_manager import AgentContextManager
+        from app.services.agent_intent_action import AgentIntentAction
+
+        plan = AgentContextManager().route(
+            "\u6839\u636e\u8fd9\u4e2a\u7f3a\u9677\u751f\u6210\u56de\u5f52\u6d4b\u8bd5\u7528\u4f8b",
+            intent_action=AgentIntentAction(
+                action="create",
+                target_domain="test_case",
+                source_domains=("defect",),
+                source="llm_intent",
+            ),
+        )
+
+        self.assertEqual(plan.primary_skill, "http-test-case-design")
+        self.assertIn("defect-triage", plan.supporting_skills)
+        self.assertIn("testcase.create_saved", plan.allowed_tools)
+        self.assertIn("defect.query_project_defects", plan.allowed_tools)
+
+    def test_runtime_guard_detects_false_defect_tool_denial(self):
+        from app.services.agent_runtime_service import _assistant_denies_available_capability
+
+        reason = _assistant_denies_available_capability(
+            "\u5f53\u524d\u5e73\u53f0\u6ca1\u6709\u63d0\u4f9b\u76f4\u63a5\u521b\u5efa\u7f3a\u9677\u7684\u63a5\u53e3\uff0c\u53ea\u80fd\u6574\u7406\u8349\u7a3f\u3002",
+            [{"name": "defect.create_saved"}],
+        )
+
+        self.assertEqual(reason, "route_missed_available_defect_create")
+
+    def test_conversation_runner_observes_false_defect_capability_denial_without_rewriting(self):
+        runtime = AgentRuntimeService(self.db)
+        run = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="\u4f60\u53ef\u4ee5\u6839\u636e\u5931\u8d25\u7528\u4f8b\u521b\u5efa\u5bf9\u5e94\u7684\u7f3a\u9677",
+            ),
+            current_user=self.owner,
+        )
+
+        def fake_stream(self, payload):
+            yield {
+                "type": "delta",
+                "content": "\u5f53\u524d\u5e73\u53f0\u6ca1\u6709\u63d0\u4f9b\u76f4\u63a5\u521b\u5efa\u7f3a\u9677\u7684\u63a5\u53e3\uff0c\u53ea\u80fd\u6574\u7406\u8349\u7a3f\u3002",
+            }
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        self.db.refresh(run)
+        self.assertEqual(run.status, "completed")
+        message = (run.result_json or {}).get("message", "")
+        self.assertIn("没有提供直接创建缺陷的接口", message)
+        event_types = [
+            event.event_type
+            for event in self.db.scalars(select(AgentEvent).where(AgentEvent.run_id == run.run_id))
+        ]
+        self.assertIn("model.capability_denial_observed", event_types)
+        self.assertNotIn("model.capability_denial_guarded", event_types)
+
+    def test_conversation_runner_does_not_turn_denial_text_into_tool_request(self):
+        runtime = AgentRuntimeService(self.db)
+        run = runtime.create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="\u4f60\u53ef\u4ee5\u6839\u636e\u5931\u8d25\u7528\u4f8b\u521b\u5efa\u5bf9\u5e94\u7684\u7f3a\u9677",
+            ),
+            current_user=self.owner,
+        )
+
+        responses = iter(
+            [
+                "\u5f53\u524d\u5e73\u53f0\u6ca1\u6709\u63d0\u4f9b\u76f4\u63a5\u521b\u5efa\u7f3a\u9677\u7684\u63a5\u53e3\uff0c\u53ea\u80fd\u6574\u7406\u8349\u7a3f\u3002",
+                (
+                    "```agent_tool_request\n"
+                    '{"tool_name":"defect.create_saved","input":{"project_id":10,'
+                    '"defect":{"title":"取消关注接口业务码断言失败","bug_type":"functional",'
+                    '"urgency":"medium","status":"new","content_html":"<p>失败用例显示取消关注接口断言不匹配，需要记录缺陷并关联后续排查。</p>",'
+                    '"media_ids":[]}},"reason":"根据失败用例创建缺陷草稿，等待人工审批保存。","evidence_refs":[]}'
+                    "\n```"
+                ),
+            ]
+        )
+
+        def fake_stream(self, payload):
+            content = next(responses)
+            yield {"type": "delta", "content": content}
+            yield {"type": "done", "finish_reason": "stop", "model": "deepseek-test"}
+
+        with patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream):
+            AgentConversationRunner(self.db).run(run_id=run.run_id, user_id=self.owner.id)
+
+        self.db.refresh(run)
+        self.assertEqual(run.status, "completed")
+        tool_call = self.db.scalar(
+            select(AgentToolCall).where(
+                AgentToolCall.run_id == run.run_id,
+                AgentToolCall.tool_name == "defect.create_saved",
+            )
+        )
+        self.assertIsNone(tool_call)
+        event_types = [
+            event.event_type
+            for event in self.db.scalars(select(AgentEvent).where(AgentEvent.run_id == run.run_id))
+        ]
+        self.assertIn("model.capability_denial_observed", event_types)
+        self.assertNotIn("model.capability_denial_replanned", event_types)
+        self.assertNotIn("model.tool_request_detected", event_types)
 
     def test_context_manager_routes_equivalence_class_case_creation_to_create_tools(self):
         from app.services.agent_context_manager import AgentContextManager
@@ -12240,6 +12651,7 @@ class AgentRuntimeTests(unittest.TestCase):
 
         import app.services.agent_tool_service as agent_tool_service
         from app.api.v1.routers.agents import create_agent_run, get_agent_runtime_snapshot
+        from app.services.agent_skill_registry import AgentSkillRegistry
         from app.services.agent_tool_service import SAFE_SIDE_EFFECT_CLASSES, ToolRegistry
 
         def _parse_payload_contract(text: str) -> dict[str, list[str] | str]:
@@ -12296,6 +12708,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 "tool_item_prefix",
                 "tools_source",
                 "manifests_tools_source",
+                "manifests_skills_source",
                 "runtime_hash_source",
                 "tool_registry_hash_source",
                 "manifest_bundle_hash_source",
@@ -12309,9 +12722,10 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(contract["source"], "AgentRuntimeSnapshotRead")
             self.assertEqual(contract["tools_source"], "ToolRegistry.registry_json")
             self.assertEqual(contract["manifests_tools_source"], "tools_json_by_name")
-            self.assertEqual(contract["runtime_hash_source"], "ToolRegistry.runtime_hash")
+            self.assertEqual(contract["manifests_skills_source"], "AgentSkillRegistry.snapshot_manifest_by_name")
+            self.assertEqual(contract["runtime_hash_source"], "combined_tool_and_skill_snapshot_hash")
             self.assertEqual(contract["tool_registry_hash_source"], "ToolRegistry.registry_hash")
-            self.assertEqual(contract["manifest_bundle_hash_source"], "ToolRegistry.manifest_bundle_hash")
+            self.assertEqual(contract["manifest_bundle_hash_source"], "combined_tool_and_skill_manifest_hash")
         self.assertEqual(item_id_prefix, "agent-runtime-snapshot")
         self.assertEqual(tool_item_prefix, "agent-tool-spec")
         self.assertEqual(expected_tool_fields[0], "item_id")
@@ -12324,14 +12738,31 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(snapshot_payload["snapshot_id"], run_payload["runtime_snapshot_id"])
         self.assertEqual(snapshot_payload["project_id"], 10)
         self.assertEqual(snapshot_payload["created_by"], self.owner.id)
-        self.assertEqual(snapshot_payload["runtime_hash"], registry.runtime_hash())
+        skill_manifests = {
+            skill.name: skill.snapshot_manifest()
+            for skill in AgentSkillRegistry().list_skills()
+        }
+        self.assertEqual(
+            snapshot_payload["runtime_hash"],
+            request_fingerprint({
+                "tool_runtime_hash": registry.runtime_hash(),
+                "skills": skill_manifests,
+            }),
+        )
         self.assertEqual(snapshot_payload["tool_registry_hash"], registry.registry_hash())
-        self.assertEqual(snapshot_payload["manifest_bundle_hash"], registry.manifest_bundle_hash())
+        self.assertEqual(
+            snapshot_payload["manifest_bundle_hash"],
+            request_fingerprint({
+                "tool_manifest_bundle_hash": registry.manifest_bundle_hash(),
+                "skills": skill_manifests,
+            }),
+        )
         self.assertEqual(snapshot_payload["tools_json"], registry_tools)
         self.assertEqual(
             snapshot_payload["manifests_json"]["tools"],
             {item["name"]: item for item in registry_tools},
         )
+        self.assertEqual(snapshot_payload["manifests_json"]["skills"], skill_manifests)
         self.assertGreaterEqual(len(snapshot_payload["tools_json"]), 1)
         for tool in snapshot_payload["tools_json"]:
             self.assertEqual(list(tool), expected_tool_fields)
@@ -13600,6 +14031,96 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("planner:artifact_action:saved_scenario.execute", view["capability_plan"]["reason_codes"])
         self.assertIn("Skill Planner", manager.skill_plan_message(plan).content)
 
+    def test_context_manager_routes_chinese_corresponding_flow_execution_followup_to_dry_run_tools(self):
+        from app.services.agent_context_manager import AgentContextManager
+
+        working_context = {
+            "schema_version": "conversation_working_context_v1",
+            "current_intent": "运行对应自动化测试流程，分析结果",
+            "active_artifact_handles": [
+                {
+                    "artifact_id": "agent-tool-artifact://save-call-1/saved_scenario",
+                    "artifact_type": "saved_scenario",
+                    "artifact_class": "AUTHORITATIVE",
+                    "artifact_trust": "SOURCE",
+                    "domain": "scenario",
+                    "available_followup_actions": ["execute", "query_runs", "update_saved"],
+                    "artifact_summary": {
+                        "scenario_id": 41,
+                        "name": "企业信息查询与操作完整流程",
+                        "environment_id": 4,
+                    },
+                }
+            ],
+        }
+
+        plan = AgentContextManager().route(
+            "运行对应自动化测试流程，分析结果",
+            working_context=working_context,
+        )
+
+        self.assertEqual(plan.primary_skill, "scenario-composition")
+        self.assertIn("scenario.query_project_scenarios", plan.allowed_tools)
+        self.assertIn("scenario.execute_dry_run", plan.allowed_tools)
+        self.assertIn("planner:artifact_action:saved_scenario.execute", plan.capability_plan.reason_codes)
+        self.assertNotIn("report.read_summary", plan.allowed_tools)
+
+    def test_context_manager_prioritizes_saved_scenario_execute_over_prior_case_snapshot(self):
+        from app.services.agent_context_manager import AgentContextManager
+
+        working_context = {
+            "schema_version": "conversation_working_context_v1",
+            "current_intent": "现在需要你执行这个自动化测试场景进行验证",
+            "active_artifact_handles": [
+                {
+                    "artifact_id": "agent-tool-artifact://case-query-1/test_case_query_snapshot",
+                    "artifact_type": "test_case_query_snapshot",
+                    "artifact_class": "AUTHORITATIVE",
+                    "artifact_trust": "SOURCE",
+                    "domain": "test_case",
+                    "tool_name": "testcase.query_project_cases",
+                    "available_followup_actions": [
+                        "analyze_cases",
+                        "compose_scenario",
+                        "update_assertions",
+                        "batch_update_assertions",
+                        "execute",
+                    ],
+                    "artifact_summary": {
+                        "project_id": 1,
+                        "detail_level": "summary",
+                        "http_total": 15,
+                    },
+                },
+                {
+                    "artifact_id": "agent-tool-artifact://save-call-42/saved_scenario",
+                    "artifact_type": "saved_scenario",
+                    "artifact_class": "AUTHORITATIVE",
+                    "artifact_trust": "SOURCE",
+                    "domain": "scenario",
+                    "tool_name": "scenario.create_saved",
+                    "available_followup_actions": ["execute", "query_runs", "update_saved"],
+                    "artifact_summary": {
+                        "scenario_id": 42,
+                        "name": "企业信息-关注管理-知识产权综合场景",
+                        "environment_id": 4,
+                    },
+                },
+            ],
+        }
+
+        plan = AgentContextManager().route(
+            "现在需要你执行这个自动化测试场景进行验证",
+            working_context=working_context,
+        )
+
+        self.assertEqual(plan.primary_skill, "scenario-composition")
+        self.assertEqual(plan.skill_plan.allowed_skills, ("scenario-composition",))
+        self.assertIn("scenario.query_project_scenarios", plan.allowed_tools)
+        self.assertIn("scenario.execute_dry_run", plan.allowed_tools)
+        self.assertNotIn("ai_skill.run_draft", plan.allowed_tools)
+        self.assertIn("planner:artifact_action:saved_scenario.execute", plan.capability_plan.reason_codes)
+
     def test_agent_context_manager_uses_capability_resolver_for_active_scenario_artifact_save(self):
         from app.services.agent_context_manager import AgentContextManager
 
@@ -13802,7 +14323,10 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertIn(tool_name, catalog_names)
         self.assertEqual(
             contract_by_name["scenario.compose_draft"]["input_summary"]["nested_required"],
-            {"input": ["requirement"]},
+            {
+                "case_source": ["artifact_id", "output_hash"],
+                "input": ["requirement"],
+            },
         )
         self.assertNotIn("scenario.create_saved", contract_by_name)
         self.assertNotIn("scenario.create_saved", catalog_names)
@@ -13822,6 +14346,18 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn(
             "不要从历史回复、用户口述、连续数字范围、summary 查询或 selected/assertions 查询拼批量输入",
             prompt,
+        )
+
+    def test_conversation_prompt_prefers_native_tools_with_fenced_compatibility_fallback(self):
+        prompt = _conversation_system_prompt()
+
+        self.assertIn("优先使用 provider 原生 Tool Calling", prompt)
+        self.assertIn("仅在本轮没有提供原生 tools", prompt)
+        self.assertIn("agent_tool_request", prompt)
+        self.assertNotIn("如果需要调用工具，请只输出一个 fenced block", prompt)
+        self.assertIn(
+            "优先使用 provider 原生 Tool Calling",
+            agent_runtime_service.AGENT_CAPABILITY_DENIAL_REPLAN_SYSTEM_PROMPT,
         )
 
     def test_harness_initial_tool_prompt_contract_matches_system_prompt(self):
@@ -14448,6 +14984,35 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("scenario.execute_dry_run", scenario_skill.tool_names)
         self.assertIn("saved_scenario", scenario_skill.artifact_types)
         self.assertEqual(set(public_catalog_item), {"name", "description"})
+
+    def test_agent_skill_registry_loads_orchestration_contract_fields(self):
+        from app.services.agent_skill_registry import AgentSkillRegistry
+
+        defect_skill = AgentSkillRegistry().get_skill("defect-triage")
+
+        self.assertIsNotNone(defect_skill)
+        self.assertIn("defect", defect_skill.owns)
+        self.assertIn("test_case", defect_skill.consumes)
+        self.assertIn("defect", defect_skill.produces)
+        metadata = defect_skill.planner_metadata()
+        self.assertIn("owns", metadata)
+        self.assertIn("consumes", metadata)
+        self.assertIn("produces", metadata)
+
+    def test_all_bundled_agent_skills_declare_orchestration_contract_fields(self):
+        from app.services.agent_skill_registry import AgentSkillRegistry
+
+        missing = {
+            skill.name: {
+                field
+                for field in ("owns", "consumes", "produces")
+                if not getattr(skill, field)
+            }
+            for skill in AgentSkillRegistry().list_skills()
+        }
+        missing = {name: fields for name, fields in missing.items() if fields}
+
+        self.assertEqual(missing, {})
 
     def test_skill_router_loads_single_primary_skill_for_enterprise_scenario_context(self):
         from app.services.agent_skill_registry import AgentSkillRegistry
@@ -22192,6 +22757,7 @@ class AgentRuntimeTests(unittest.TestCase):
             "tool_call_id": call.tool_call_id,
             "run_id": run.run_id,
             "runtime_snapshot_id": call.runtime_snapshot_id,
+            "capability_plan_id": call.capability_plan_id,
             "tool_name": "project.read_context",
             "tool_version": "1.0.0",
             "worker_id": "worker-capability",
@@ -22803,6 +23369,7 @@ class AgentRuntimeTests(unittest.TestCase):
             "tool_call_id": call.tool_call_id,
             "run_id": run.run_id,
             "runtime_snapshot_id": call.runtime_snapshot_id,
+            "capability_plan_id": call.capability_plan_id,
             "tool_name": "project.read_context",
             "tool_version": "1.0.0",
             "worker_id": "worker-execution-context",
@@ -22870,6 +23437,7 @@ class AgentRuntimeTests(unittest.TestCase):
             "tool_call_id": call.tool_call_id,
             "run_id": run.run_id,
             "runtime_snapshot_id": call.runtime_snapshot_id,
+            "capability_plan_id": call.capability_plan_id,
             "tool_name": "project.read_context",
             "tool_version": "1.0.0",
             "schema_hash": call.schema_hash,
@@ -22932,6 +23500,7 @@ class AgentRuntimeTests(unittest.TestCase):
             "tool_call_id": call.tool_call_id,
             "run_id": run.run_id,
             "runtime_snapshot_id": call.runtime_snapshot_id,
+            "capability_plan_id": call.capability_plan_id,
             "tool_name": "project.read_context",
             "tool_version": "1.0.0",
             "schema_hash": call.schema_hash,
@@ -23046,6 +23615,7 @@ class AgentRuntimeTests(unittest.TestCase):
             "tool_call_id": call.tool_call_id,
             "run_id": run.run_id,
             "runtime_snapshot_id": call.runtime_snapshot_id,
+            "capability_plan_id": call.capability_plan_id,
             "tool_name": "project.read_context",
             "tool_version": "1.0.0",
             "worker_id": "worker-failure",
@@ -24772,6 +25342,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 "tool_call_id": call.tool_call_id,
                 "run_id": run.run_id,
                 "runtime_snapshot_id": call.runtime_snapshot_id,
+                "capability_plan_id": call.capability_plan_id,
                 "tool_name": call.tool_name,
                 "tool_version": call.tool_version,
                 "worker_id": "worker-runbook-context",
@@ -24804,6 +25375,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 "tool_call_id": call.tool_call_id,
                 "run_id": run.run_id,
                 "runtime_snapshot_id": call.runtime_snapshot_id,
+                "capability_plan_id": call.capability_plan_id,
                 "tool_name": call.tool_name,
                 "tool_version": call.tool_version,
                 "schema_hash": call.schema_hash,

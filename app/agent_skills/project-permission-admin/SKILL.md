@@ -1,6 +1,14 @@
 ---
 name: project-permission-admin
 description: Use when the user asks to explain, inspect, troubleshoot, or plan TestAuto projects, members, roles, permissions, project access, administrator rights, project creator rights, ordinary tester permissions, or authorization failures.
+owns:
+  - permission
+consumes:
+  - project_context
+  - user
+  - role
+produces:
+  - permission
 triggers:
   - permission
   - permissions

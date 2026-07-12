@@ -7,9 +7,44 @@ from app.schemas.test_case import TestCaseCreateRequest
 from app.schemas.websocket_test_case import WebSocketTestCaseCreateRequest
 
 
+class AIChatFunctionDefinition(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    description: str = Field(default="", max_length=1024)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class AIChatToolDefinition(BaseModel):
+    type: Literal["function"] = "function"
+    function: AIChatFunctionDefinition
+
+
+class AIChatToolCallFunction(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    arguments: str
+
+
+class AIChatToolCall(BaseModel):
+    id: str = Field(min_length=1, max_length=128)
+    type: Literal["function"] = "function"
+    function: AIChatToolCallFunction
+
+
 class AIChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str = Field(min_length=1, description="消息内容")
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str | None = None
+    tool_calls: list[AIChatToolCall] = Field(default_factory=list)
+    tool_call_id: str | None = Field(default=None, max_length=128)
+    reasoning_content: str | None = None
+
+    @model_validator(mode="after")
+    def validate_role_payload(self):
+        if self.role in {"system", "user"} and not (self.content or "").strip():
+            raise ValueError(f"{self.role} message requires non-empty content")
+        if self.role == "assistant" and not (self.content or "").strip() and not self.tool_calls:
+            raise ValueError("assistant message requires content or tool_calls")
+        if self.role == "tool" and (not self.tool_call_id or self.content is None):
+            raise ValueError("tool message requires tool_call_id and content")
+        return self
 
 
 class AIChatRequest(BaseModel):
@@ -20,6 +55,9 @@ class AIChatRequest(BaseModel):
     temperature: float | None = Field(default=None, ge=0, le=2, description="采样温度")
     max_tokens: int | None = Field(default=None, gt=0, description="最大输出 token 数")
     response_format: Literal["text", "json"] = Field(default="text", description="返回文本或 JSON 模式")
+    tools: list[AIChatToolDefinition] = Field(default_factory=list)
+    tool_choice: Literal["auto", "none"] | None = None
+    parallel_tool_calls: bool = False
 
 
 class AIChatResponse(BaseModel):
@@ -28,6 +66,8 @@ class AIChatResponse(BaseModel):
     content: str
     usage: dict[str, Any] | None = None
     finish_reason: str | None = None
+    tool_calls: list[AIChatToolCall] = Field(default_factory=list)
+    reasoning_content: str | None = None
 
 
 class AIProviderRead(BaseModel):
@@ -93,8 +133,21 @@ class AISkillRunRead(BaseModel):
     updated_at: str
 
 
+class AIAgentArtifactSource(BaseModel):
+    artifact_id: str = Field(min_length=1, description="Agent ToolCall artifact id")
+    output_hash: str = Field(min_length=1, description="Exact ToolCall output hash")
+
+
 class AIScenarioComposeRequest(BaseModel):
     requirement: str = Field(min_length=1, description="自然语言场景组合目标")
+    case_source: AIAgentArtifactSource | None = Field(
+        default=None,
+        description="Authoritative testcase.query_project_cases artifact resolved by the backend ledger.",
+    )
+    environment_reference: str | None = Field(
+        default=None,
+        description="Project environment object-ref returned by project.read_context.",
+    )
     scenario_name: str | None = Field(default=None, max_length=128, description="期望场景名称")
     http_test_case_ids: list[int] = Field(default_factory=list, max_length=50, description="候选 HTTP 测试用例 ID")
     websocket_test_case_ids: list[int] = Field(default_factory=list, max_length=50, description="候选 WebSocket 测试用例 ID")
@@ -348,7 +401,7 @@ class AIBrowserCaptureScenarioRequest(AIBrowserCaptureRelationsRequest):
 
 
 class AIExecutionDiagnoseRequest(BaseModel):
-    protocol: Literal["http", "websocket"]
+    protocol: Literal["http", "websocket", "scenario", "flow"]
     draft_data: dict[str, Any]
     execution_data: dict[str, Any]
 

@@ -1,7 +1,27 @@
 ---
 name: execution-diagnosis
 description: Use when the user asks to diagnose TestAuto execution records, failed runs, flaky behavior, timeout, retry, environment mismatch, assertion failure, extractor failure, scenario run, visual flow execution, or SSE progress issues.
+tools:
+  - execution.query_records
+  - execution.read_detail
+  - execution.diagnose
+  - report.read_summary
+  - project.read_context
+owns:
+  - execution
+consumes:
+  - test_case
+  - scenario
+  - visual_flow
+  - report
+produces:
+  - execution
+  - diagnosis
 triggers:
+  - execution diagnosis
+  - diagnose execution
+  - failed execution
+  - execution detail
   - 执行记录
   - 执行失败
   - 运行失败
@@ -33,10 +53,11 @@ routing_requires_tool:
 
 ## Workflow
 
-1. For real project execution status, use `report.read_summary` when report or failure context is available.
-2. Use `project.read_context` when diagnosis depends on environments, default base URL, or project metadata.
-3. If no tool can read the requested execution detail, explain the missing backend read capability and provide a manual triage checklist.
-4. Distinguish backend run/SSE delivery problems from target API failures, assertion failures, extractor failures, and environment/authentication failures.
+1. For current execution history, call `execution.query_records` first. Use its explicit `execution_type`, `execution_id`, and `object_ref`; never guess an id.
+2. Call `execution.read_detail` for the selected record before diagnosing request, response, assertion, retry, scenario, or Flow evidence.
+3. Call `execution.diagnose` only when the user requests AI diagnosis or the detailed evidence needs cause classification. It creates analysis only and does not modify cases or executions.
+4. Use `report.read_summary` for report-level trends and `project.read_context` for environment metadata.
+5. Distinguish backend run/SSE delivery problems from target API failures, assertion failures, extractor failures, and environment/authentication failures.
 
 ## Diagnosis Checklist
 

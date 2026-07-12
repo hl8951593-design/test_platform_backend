@@ -1,6 +1,13 @@
 ---
 name: report-archive-export
 description: Use when the user asks about report export, HTML/PDF delivery, archived reports, retention policy, historical trend, shareable report links, audit evidence, or long-term report storage.
+owns:
+  - report_archive
+consumes:
+  - report
+  - execution
+produces:
+  - report_archive
 triggers:
   - 报告导出
   - 报告归档

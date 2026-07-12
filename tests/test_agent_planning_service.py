@@ -116,6 +116,16 @@ class AgentPlanningDecisionServiceTests(unittest.TestCase):
         self.assertEqual(request.temperature, 0)
         self.assertEqual(request.response_format, "json")
         self.assertGreaterEqual(request.max_tokens or 0, 1024)
+        request_payload = json.loads(request.messages[-1].content)
+        contract = request_payload["output_contract"]
+        self.assertEqual(contract["type"], "object")
+        self.assertIn("goal", contract["required"])
+        self.assertIn("selected_skills", contract["required"])
+        self.assertEqual(
+            contract["properties"]["requested_effect_scope"]["enum"],
+            ["observe", "derive", "draft", "execute", "persist"],
+        )
+        self.assertIn("top-level JSON object", request.messages[0].content)
         self.assertEqual(decision.selected_skills, ("scenario-composition",))
         self.assertEqual(decision.selected_tools[-1], "scenario.compose_draft")
         self.assertEqual(
@@ -137,6 +147,30 @@ class AgentPlanningDecisionServiceTests(unittest.TestCase):
         repair_payload = json.loads(ai_service.requests[1].messages[-1].content)
         self.assertEqual(repair_payload["attempt"], 2)
         self.assertEqual(repair_payload["validation_error"]["code"], "planner_response_incomplete")
+
+    def test_bounded_repair_emits_invalid_and_retrying_observability_events(self):
+        from app.services.agent_planning_service import AgentPlanningDecisionService
+
+        ai_service = FakeAIService(
+            response("", finish_reason="length"),
+            response(planning_json()),
+        )
+        events = []
+
+        AgentPlanningDecisionService(ai_service=ai_service).decide(
+            intent="build scenario",
+            conversation_context={"active_artifact_handles": ARTIFACT_INDEX},
+            skill_index=SKILL_INDEX,
+            tool_index=TOOL_INDEX,
+            artifact_index=ARTIFACT_INDEX,
+            project_id=1,
+            permissions=("view_project", "view_test_case", "view_scenario", "execute_test"),
+            on_event=lambda event_type, payload: events.append((event_type, payload)),
+        )
+
+        self.assertEqual([item[0] for item in events], ["invalid", "retrying"])
+        self.assertEqual(events[0][1]["code"], "planner_response_incomplete")
+        self.assertEqual(events[1][1]["next_attempt"], 2)
 
     def test_unknown_tool_is_never_silently_rewritten(self):
         from app.services.agent_planning_service import AgentPlanningFailed

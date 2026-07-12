@@ -157,6 +157,22 @@ class TestPlanService:
         )
         return self.execute_run(run.id)
 
+    @staticmethod
+    def execute_queued_run(run_id: int) -> None:
+        """Execute an already-persisted plan run outside the request/tool worker session."""
+        with SessionLocal() as db:
+            try:
+                TestPlanService(db).execute_run(run_id)
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                run = db.get(TestPlanRun, run_id)
+                if run is not None and run.status in {"pending", "running"}:
+                    run.status = "failed"
+                    run.error_message = str(exc)
+                    run.finished_at = datetime.utcnow()
+                    db.commit()
+                logger.exception("Test plan run %s failed in queued execution", run_id)
+
     def create_plan_run(self, *, project_id: int, plan_id: int, environment_id: int,
                         idempotency_key: str | None, current_user: User, trigger: str = "manual",
                         scheduled_at: datetime | None = None,

@@ -1,6 +1,14 @@
 ---
 name: dataset-parameterization
 description: Use when the user asks to design, review, generate, debug, or explain TestAuto datasets, dataset records, parameterization, request overrides, per-record runs, variables, CSV/JSON data, boundary data, or data-driven scenario execution.
+owns:
+  - dataset
+consumes:
+  - scenario
+  - test_case
+  - api_definition
+produces:
+  - dataset
 triggers:
   - dataset
   - datasets

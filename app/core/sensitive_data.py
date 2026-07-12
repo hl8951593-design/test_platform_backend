@@ -21,6 +21,12 @@ SENSITIVE_KEYS = {
     "access_key",
     "client_secret",
 }
+SENSITIVE_EXACT_KEYS = {
+    "auth",
+    "authentication",
+    "lingxi_auth",
+    "x_auth_token",
+}
 ENCRYPTED_MARKER = "__encrypted_value__"
 SECRET_TEXT_PREFIX = "enc:v1:"
 
@@ -88,7 +94,7 @@ def verify_webhook_signature(*, timestamp: str, body: bytes, signature: str) -> 
 
 def _is_sensitive_key(key: object) -> bool:
     normalized = str(key).lower().replace("-", "_")
-    return any(item in normalized for item in SENSITIVE_KEYS)
+    return normalized in SENSITIVE_EXACT_KEYS or any(item in normalized for item in SENSITIVE_KEYS)
 
 
 def _key() -> bytes:

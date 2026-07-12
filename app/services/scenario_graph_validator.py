@@ -21,10 +21,22 @@ class ScenarioGraphValidation:
 class ScenarioGraphValidator:
     """Validates scenario variable graph and applies deterministic safe repairs."""
 
-    def validate_and_repair(self, scenario: dict[str, Any]) -> ScenarioGraphValidation:
+    def validate_and_repair(
+        self,
+        scenario: dict[str, Any],
+        *,
+        external_variables: set[str] | tuple[str, ...] | list[str] = (),
+    ) -> ScenarioGraphValidation:
         repaired = copy.deepcopy(scenario)
-        initial_issues = self._repair_missing_context_metadata(repaired)
-        open_issues = self._validate_open_issues(repaired)
+        external_variable_names = {str(item) for item in external_variables if str(item)}
+        initial_issues = self._repair_missing_context_metadata(
+            repaired,
+            external_variables=external_variable_names,
+        )
+        open_issues = self._validate_open_issues(
+            repaired,
+            external_variables=external_variable_names,
+        )
         repaired_issue_codes = sorted({issue["code"] for issue in initial_issues if issue.get("status") == "repaired"})
         validation = {
             "schema_version": SCENARIO_GRAPH_VALIDATION_SCHEMA_VERSION,
@@ -40,11 +52,19 @@ class ScenarioGraphValidator:
         }
         return ScenarioGraphValidation(scenario=repaired, validation=validation, repair=repair)
 
-    def _repair_missing_context_metadata(self, scenario: dict[str, Any]) -> list[dict[str, Any]]:
+    def _repair_missing_context_metadata(
+        self,
+        scenario: dict[str, Any],
+        *,
+        external_variables: set[str],
+    ) -> list[dict[str, Any]]:
         issues: list[dict[str, Any]] = []
-        variables = self._dataset_variables(scenario)
+        variables = self._dataset_variables(scenario) | external_variables
         variable_sources: dict[str, dict[str, str]] = {
-            name: {"source_step_id": "dataset", "source_extraction_id": ""}
+            name: {
+                "source_step_id": "environment" if name in external_variables else "dataset",
+                "source_extraction_id": "",
+            }
             for name in variables
         }
         for step in self._execution_steps(scenario):
@@ -110,9 +130,14 @@ class ScenarioGraphValidator:
                 }
         return issues
 
-    def _validate_open_issues(self, scenario: dict[str, Any]) -> list[dict[str, Any]]:
+    def _validate_open_issues(
+        self,
+        scenario: dict[str, Any],
+        *,
+        external_variables: set[str],
+    ) -> list[dict[str, Any]]:
         issues: list[dict[str, Any]] = []
-        variables = self._dataset_variables(scenario)
+        variables = self._dataset_variables(scenario) | external_variables
         for step in self._execution_steps(scenario):
             config = step.get("config")
             if not isinstance(config, dict):

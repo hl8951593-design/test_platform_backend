@@ -9,6 +9,8 @@ from app.services.agent_artifact_resolver import (
     ARTIFACT_TRUST_SOURCE,
     AgentArtifactResolver,
 )
+from app.services.agent_intent_action import parse_agent_intent_action
+from app.services.agent_planning_service import EFFECT_SCOPE_ORDER, SIDE_EFFECT_SCOPE
 from app.services.agent_skill_registry import AgentSkill
 from app.services.agent_tool_service import ToolRegistry
 
@@ -66,6 +68,19 @@ HTTP_TEST_CASE_CREATION_TOOLS = (
     "testcase.create_saved",
 )
 
+DEFECT_CREATE_TOOLS = (
+    "project.read_context",
+    "defect.query_project_defects",
+    "defect.create_saved",
+)
+
+EVIDENCE_READ_TOOLS_BY_DOMAIN = {
+    "defect": ("defect.query_project_defects",),
+    "execution": ("execution.query_records", "execution.read_detail"),
+    "report": ("report.read_summary",),
+    "test_case": ("testcase.query_project_cases",),
+}
+
 ENVIRONMENT_MANAGEMENT_TOOLS = (
     "project.read_context",
     "environment.query_project_configs",
@@ -75,6 +90,8 @@ ENVIRONMENT_MANAGEMENT_TOOLS = (
     "environment.upsert_variable",
     "environment.delete_variable",
 )
+
+READ_ONLY_INTENT_SIDE_EFFECT_CLASSES = frozenset({"read_only", "deterministic_compute"})
 
 
 @dataclass(frozen=True)
@@ -116,6 +133,8 @@ class AgentCapabilityPlan:
     required_facts: tuple[str, ...] = ()
     tool_input_hints: dict[str, dict[str, Any]] = field(default_factory=dict)
     reason_codes: tuple[str, ...] = ()
+    requested_effect_scope: str | None = None
+    selected_artifact_ids: tuple[str, ...] = ()
 
     def model_view(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -138,6 +157,10 @@ class AgentCapabilityPlan:
             payload["tool_input_hints"] = self.tool_input_hints
         if self.reason_codes:
             payload["reason_codes"] = list(self.reason_codes)
+        if self.requested_effect_scope:
+            payload["requested_effect_scope"] = self.requested_effect_scope
+        if self.selected_artifact_ids:
+            payload["selected_artifact_ids"] = list(self.selected_artifact_ids)
         return payload
 
 
@@ -171,6 +194,7 @@ class AgentCapabilityResolver:
         original_intent: str | None = None,
         allowed_skills: tuple[str, ...] = (),
         planner_reason_codes: tuple[str, ...] = (),
+        intent_action: Any | None = None,
     ) -> AgentCapabilityPlan:
         available_names = {spec.name for spec in self.tool_registry.list_specs()}
         names: set[str] = set()
@@ -180,28 +204,51 @@ class AgentCapabilityResolver:
         reason_codes: set[str] = set()
         tool_input_hints: dict[str, dict[str, Any]] = {}
         reason_codes.update(planner_reason_codes)
+        intent_action = intent_action or parse_agent_intent_action(
+            original_intent or intent,
+            working_context=working_context,
+        )
 
-        search_text = "\n".join([intent, *(skill.prompt_block() for skill in selected_skills)])
+        primary_skill = selected_skills[0] if selected_skills else None
+        supporting_skills = selected_skills[1:]
+        search_text = "\n".join([intent, primary_skill.prompt_block() if primary_skill is not None else ""])
         names.update(tool_name for tool_name in self._tool_names_from_text(search_text) if tool_name in available_names)
+        for skill in supporting_skills:
+            for tool_name in skill.tool_names:
+                spec = self.tool_registry.get(tool_name)
+                if spec is not None and spec.side_effect_class in {"read_only", "deterministic_compute"}:
+                    names.add(tool_name)
+                    reason_codes.add(f"supporting_skill:evidence_tools:{skill.name}")
 
-        if any(skill.name == "scenario-composition" for skill in selected_skills):
+        if primary_skill is not None and primary_skill.name == "scenario-composition":
             names.update(DEFAULT_SCENARIO_TOOL_NAMES)
             reason_codes.add("skill:scenario-composition")
-        if any(skill.name == "environment-config-management" for skill in selected_skills):
+        if primary_skill is not None and primary_skill.name == "environment-config-management":
             names.update(ENVIRONMENT_MANAGEMENT_TOOLS)
             required_facts.add("environment_config_context")
             reason_codes.add("skill:environment-config-management")
-        if self._intent_requests_case_creation(intent):
+        if self._intent_requests_case_creation(intent) and intent_action.target_domain in {None, "test_case"}:
             names.update(HTTP_TEST_CASE_CREATION_TOOLS)
             required_facts.add("test_case_source_inventory")
             reason_codes.add("intent:test_case_creation")
+        if intent_action.target_domain == "test_case" and intent_action.action == "create":
+            names.update(HTTP_TEST_CASE_CREATION_TOOLS)
+            required_facts.add("test_case_source_inventory")
+            reason_codes.add("intent_action:target:test_case")
+        if intent_action.target_domain == "defect" and intent_action.action == "create":
+            names.update(DEFECT_CREATE_TOOLS)
+            reason_codes.add("intent_action:target:defect")
+        for source_domain in intent_action.source_domains:
+            evidence_tools = EVIDENCE_READ_TOOLS_BY_DOMAIN.get(source_domain, ())
+            if evidence_tools:
+                names.update(evidence_tools)
+                reason_codes.add(f"intent_action:evidence:{source_domain}")
         if self._intent_mentions_environment_management(intent):
             names.update(ENVIRONMENT_MANAGEMENT_TOOLS)
             required_facts.add("environment_config_context")
             reason_codes.add("intent:environment_management")
-        if selected_skills:
-            names.update(BASE_CONTEXT_TOOL_NAMES)
-            reason_codes.add("skill_context:base")
+        names.update(BASE_CONTEXT_TOOL_NAMES)
+        reason_codes.add("skill_context:base")
         if self._intent_mentions_project_context(intent):
             names.add("project.read_context")
             reason_codes.add("intent:project_context")
@@ -226,6 +273,15 @@ class AgentCapabilityResolver:
             reason_codes=reason_codes,
             tool_input_hints=tool_input_hints,
         )
+        self._prune_intent_action_tools(intent_action=intent_action, names=names)
+        if intent_action.action in {"analyze", "query"}:
+            reason_codes.add("intent_action:read_only")
+        if not getattr(intent_action, "write_authorized", True):
+            for tool_name in tuple(names):
+                spec = self.tool_registry.get(tool_name)
+                if spec is not None and spec.side_effect_class not in {"read_only", "deterministic_compute"}:
+                    names.discard(tool_name)
+            reason_codes.add("intent_action:writes_not_authorized")
         self._prune_context_locked_tools(intent=intent, names=names, available_actions=available_actions)
 
         allowed_tools = tuple(
@@ -233,13 +289,17 @@ class AgentCapabilityResolver:
             for tool_name in sorted(names)
             if tool_name in available_names and tool_name not in self.model_private_tool_names
         )
-        domain = self._infer_domain(intent, selected_skills, available_actions)
-        intent_action = self._infer_intent_action(intent, available_actions)
+        domain = intent_action.target_domain or self._infer_domain(intent, selected_skills, available_actions)
+        inferred_intent_action = self._infer_intent_action(intent, available_actions)
+        if intent_action.target_domain == "test_case" and intent_action.action == "create":
+            inferred_intent_action = "create_cases"
+        elif intent_action.action:
+            inferred_intent_action = intent_action.action
         return AgentCapabilityPlan(
             schema_version=AGENT_CAPABILITY_PLAN_SCHEMA_VERSION,
             intent=(original_intent or intent).strip(),
             domain=domain,
-            intent_action=intent_action,
+            intent_action=inferred_intent_action,
             allowed_tools=allowed_tools,
             allowed_skills=allowed_skills,
             available_actions=tuple(available_actions),
@@ -248,6 +308,70 @@ class AgentCapabilityResolver:
             tool_input_hints=tool_input_hints,
             reason_codes=tuple(sorted(reason_codes)),
         )
+
+    def resolve_planning_decision(
+        self,
+        *,
+        intent: str,
+        decision: Any,
+    ) -> AgentCapabilityPlan:
+        """Build a Capability Plan from an already validated LLM planning decision.
+
+        This path intentionally does not inspect ``intent`` to infer a domain, action,
+        Skill, or Tool. The text is retained only as auditable plan context.
+        """
+
+        allowed_tools = tuple(dict.fromkeys(str(name) for name in decision.selected_tools if str(name)))
+        requested_scope = str(decision.requested_effect_scope)
+        if requested_scope not in EFFECT_SCOPE_ORDER:
+            raise ValueError(f"unknown requested effect scope: {requested_scope}")
+
+        unknown_tools: list[str] = []
+        excessive_tools: list[str] = []
+        for tool_name in allowed_tools:
+            spec = self.tool_registry.get(tool_name)
+            if spec is None or tool_name in self.model_private_tool_names:
+                unknown_tools.append(tool_name)
+                continue
+            tool_scope = SIDE_EFFECT_SCOPE.get(spec.side_effect_class)
+            if tool_scope is None or EFFECT_SCOPE_ORDER[tool_scope] > EFFECT_SCOPE_ORDER[requested_scope]:
+                excessive_tools.append(tool_name)
+        if unknown_tools:
+            raise ValueError(f"planning decision contains unavailable tools: {sorted(unknown_tools)}")
+        if excessive_tools:
+            raise ValueError(
+                f"planning decision exceeds effect scope {requested_scope}: {sorted(excessive_tools)}"
+            )
+
+        return AgentCapabilityPlan(
+            schema_version=AGENT_CAPABILITY_PLAN_SCHEMA_VERSION,
+            intent=intent.strip(),
+            domain=decision.target_domain,
+            intent_action=decision.action,
+            allowed_tools=allowed_tools,
+            allowed_skills=tuple(dict.fromkeys(decision.selected_skills)),
+            required_facts=tuple(dict.fromkeys(decision.required_facts)),
+            reason_codes=("planning_decision:validated",),
+            requested_effect_scope=requested_scope,
+            selected_artifact_ids=tuple(dict.fromkeys(decision.selected_artifact_ids)),
+        )
+
+    def _prune_intent_action_tools(self, *, intent_action: Any, names: set[str]) -> None:
+        if intent_action.action in {"analyze", "query"}:
+            for tool_name in tuple(names):
+                spec = self.tool_registry.get(tool_name)
+                if spec is not None and spec.side_effect_class not in READ_ONLY_INTENT_SIDE_EFFECT_CLASSES:
+                    names.discard(tool_name)
+        if intent_action.target_domain == "defect" and intent_action.action == "create":
+            names.discard("defect.update_saved")
+            names.discard("defect.transition_status")
+        if intent_action.target_domain != "test_case":
+            names.discard("testcase.create_saved")
+            names.discard("testcase.update_saved")
+            names.discard("testcase.update_assertions")
+            names.discard("testcase.batch_update_assertions")
+            names.discard("testcase.execute_saved")
+            names.discard("testcase.batch_execute")
 
     def _prune_context_locked_tools(
         self,
@@ -399,7 +523,11 @@ class AgentCapabilityResolver:
                 },
             }
 
-        if artifact_type == "saved_scenario" and self._intent_mentions_scenario_execution(intent):
+        if artifact_type == "saved_scenario" and self._intent_matches_artifact_action(
+            intent,
+            artifact_type=artifact_type,
+            action="execute",
+        ):
             if action_names and "execute" not in action_names:
                 return None
             summary = candidate.get("artifact_summary") if isinstance(candidate.get("artifact_summary"), dict) else {}
@@ -462,6 +590,16 @@ class AgentCapabilityResolver:
                 "artifact_id": artifact_id,
             }
         return None
+
+    def _intent_matches_artifact_action(self, intent: str, *, artifact_type: str, action: str) -> bool:
+        intent_action = parse_agent_intent_action(intent)
+        if artifact_type == "saved_scenario" and action == "execute":
+            if intent_action.action == "execute" and intent_action.target_domain in {None, "scenario"}:
+                return True
+            if intent_action.is_deictic_followup and intent_action.action == "execute":
+                return True
+            return self._intent_mentions_scenario_execution(intent)
+        return False
 
     def _routing_hint_for_working_context(self, intent: str, working_context: dict[str, Any] | None) -> str:
         active_action = self._active_artifact_action(working_context)
@@ -645,7 +783,10 @@ class AgentCapabilityResolver:
 
     def _intent_mentions_case_inventory(self, intent: str) -> bool:
         lowered = intent.lower()
-        return any(term in lowered for term in ("用例", "case", "接口", "api"))
+        return any(
+            term in lowered
+            for term in ("用例", "case", "接口", "api", "test resource", "test resources")
+        )
 
     def _intent_requests_case_creation(self, intent: str) -> bool:
         lowered = intent.lower()
@@ -706,6 +847,8 @@ class AgentCapabilityResolver:
                 "rerun",
                 "执行测试",
                 "运行测试",
+                "运行流程",
+                "执行流程",
                 "执行场景",
                 "运行场景",
                 "场景执行",
@@ -717,7 +860,7 @@ class AgentCapabilityResolver:
                 "dryrun",
             )
         )
-        if not has_execution_action and any(term in lowered for term in ("执行", "execute", "run")) and any(
+        if not has_execution_action and any(term in lowered for term in ("执行", "运行", "execute", "run")) and any(
             term in lowered for term in ("流程", "flow", "刚创建", "刚才", "just created", "this", "that", "该")
         ):
             has_execution_action = True

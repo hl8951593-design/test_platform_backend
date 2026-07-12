@@ -1,6 +1,14 @@
 ---
 name: api-definition-import
 description: Use when the user asks to design, import, normalize, review, or troubleshoot API definitions, OpenAPI/Swagger specs, endpoint assets, interface catalogs, path/method/schema extraction, or generating test cases from API definitions.
+owns:
+  - api_definition
+consumes:
+  - project_context
+  - test_case
+produces:
+  - api_definition
+  - test_case
 triggers:
   - OpenAPI
   - Swagger

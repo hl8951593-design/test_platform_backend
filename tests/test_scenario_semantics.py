@@ -113,6 +113,7 @@ class ScenarioNodeActionTests(unittest.TestCase):
     def test_before_failure_skips_case_but_always_runs_every_after_action(self):
         db = MagicMock()
         service = ScenarioService(db)
+        service.diagnostic_persistence = MagicMock()
         executed: list[str] = []
 
         def execute_step(**kwargs):

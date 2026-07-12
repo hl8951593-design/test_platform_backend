@@ -9,6 +9,7 @@ class ScenarioRealtimeEventTests(unittest.TestCase):
     def setUp(self):
         self.db = MagicMock()
         self.service = ScenarioService(self.db)
+        self.service.diagnostic_persistence = MagicMock()
         self.user = SimpleNamespace(id=7)
 
     @staticmethod
@@ -87,6 +88,8 @@ class ScenarioRealtimeEventTests(unittest.TestCase):
         self.assertEqual(events[4][1]["step_index"], 1)
         self.assertEqual(run.status, "passed")
         self.assertEqual([item["step_index"] for item in run.step_results], [0, 1])
+        self.assertEqual(self.service.diagnostic_persistence.stage_step.call_count, 4)
+        self.service.diagnostic_persistence.stage_execution.assert_called_once()
 
     def test_failure_skips_remaining_steps(self):
         condition = {
@@ -113,6 +116,12 @@ class ScenarioRealtimeEventTests(unittest.TestCase):
         )
         self.assertEqual(run.status, "failed")
         self.assertEqual(run.step_results[1]["status"], "skipped")
+        statuses = [
+            call.kwargs["step"]["status"]
+            for call in self.service.diagnostic_persistence.stage_step.call_args_list
+        ]
+        self.assertEqual(statuses, ["running", "failed", "skipped"])
+        self.service.diagnostic_persistence.stage_execution.assert_called_once()
 
     def test_realtime_index_does_not_change_step_variable_names(self):
         variables = {}

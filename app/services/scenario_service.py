@@ -44,6 +44,9 @@ from app.schemas.scenario import (
 from app.schemas.test_case import TestCaseRequestConfig
 from app.schemas.websocket_test_case import WebSocketTestCaseConfig
 from app.services.permission_service import PermissionService
+from app.services.execution_diagnostic_persistence import (
+    ExecutionDiagnosticPersistence,
+)
 from app.services.scenario_script_sandbox import run_scenario_script
 from app.services.test_case_service import TestCaseService
 from app.services.websocket_test_case_service import WebSocketTestCaseService
@@ -53,6 +56,7 @@ class ScenarioService:
     def __init__(self, db: Session):
         self.db = db
         self.permission_service = PermissionService(db)
+        self.diagnostic_persistence = ExecutionDiagnosticPersistence(db)
 
     def list_scenarios(self, *, project_id: int, current_user: User, keyword: str | None,
                        page: int, page_size: int) -> dict[str, Any]:
@@ -766,11 +770,12 @@ class ScenarioService:
             ) -> None:
                 run.current_step_id = current_step["id"]
                 run.current_step_index = current_index
+                running_result = self._running_result(
+                    current_step, current_index, step_started_at, bindings
+                )
                 run.step_results = [
                     *copy.deepcopy(results),
-                    self._running_result(
-                        current_step, current_index, step_started_at, bindings
-                    ),
+                    running_result,
                     *[
                         self._pending_result(item, pending_index)
                         for pending_index, item in enumerate(
@@ -779,6 +784,13 @@ class ScenarioService:
                         )
                     ],
                 ]
+                self.diagnostic_persistence.stage_step(
+                    project_id=run.project_id,
+                    execution_type="scenario",
+                    execution_id=run.id,
+                    step=running_result,
+                    fallback_index=current_index,
+                )
                 self._append_event(
                     run,
                     scenario_version,
@@ -848,6 +860,12 @@ class ScenarioService:
         run.duration_ms = int((finished_at - started_at).total_seconds() * 1000)
         run.current_step_id = None
         run.current_step_index = None
+        self.diagnostic_persistence.stage_execution(
+            project_id=run.project_id,
+            execution_type="scenario",
+            execution_id=run.id,
+            execution=self._diagnostic_execution_view(run, results),
+        )
         if emit_events:
             summary = self._run_summary(results)
             if run.status == "passed":
@@ -1573,6 +1591,36 @@ class ScenarioService:
         run.variables_snapshot = self._masked_variables_snapshot(
             variables, variable_sources
         )
+        if results:
+            self.diagnostic_persistence.stage_step(
+                project_id=run.project_id,
+                execution_type="scenario",
+                execution_id=run.id,
+                step=results[-1],
+                fallback_index=len(results) - 1,
+            )
+
+    @staticmethod
+    def _diagnostic_execution_view(
+        run: TestScenarioRun, results: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return {
+            "summary": {
+                "id": f"scenario:{run.id}",
+                "execution_type": "scenario",
+                "execution_id": run.id,
+                "project_id": run.project_id,
+                "resource_id": getattr(run, "scenario_id", None),
+                "environment_id": getattr(run, "environment_id", None),
+                "status": run.status,
+                "trigger_type": getattr(run, "trigger_type", None),
+                "trigger_user_id": getattr(run, "triggered_by_id", None),
+                "duration_ms": getattr(run, "duration_ms", None),
+                "started_at": getattr(run, "started_at", None),
+                "finished_at": getattr(run, "finished_at", None),
+            },
+            "detail": {"step_results": copy.deepcopy(results)},
+        }
 
     def _step_event_payload(
         self,
@@ -1701,6 +1749,14 @@ class ScenarioService:
             run.finished_at = execution.finished_at
             run.duration_ms = 0
             version = self.db.get(TestScenarioVersion, run.scenario_version_id)
+            self.diagnostic_persistence.stage_execution(
+                project_id=run.project_id,
+                execution_type="scenario",
+                execution_id=run.id,
+                execution=self._diagnostic_execution_view(
+                    run, list(run.step_results or [])
+                ),
+            )
             self._append_event(
                 run,
                 version.version if version else 0,

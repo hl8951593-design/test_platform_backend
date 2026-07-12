@@ -3079,6 +3079,19 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
         "page_size": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
     }
     schemas.update({
+        "agent_run_read_summary_input": {
+            "type": "object",
+            "required": ["project_id", "run_id"],
+            "properties": {
+                "project_id": {"type": "integer"},
+                "run_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^agent-run-[A-Za-z0-9_-]+$",
+                },
+            },
+        },
         "execution_query_records_input": {
             "type": "object",
             "required": ["project_id"],
@@ -4060,6 +4073,16 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 output_schema_hash=request_fingerprint({"type": "object"}),
             ),
             backend_handler="_report_read_summary",
+        ),
+        "agent.run.read_summary": platform_tool_spec(
+            name="agent.run.read_summary",
+            summary="Read a bounded project-scoped Agent run diagnostic summary without raw prompts or Tool payloads.",
+            side_effect_class="read_only",
+            required_permissions=(ProjectPermission.VIEW_PROJECT.value,),
+            schema_key="agent_run_read_summary_input",
+            backend_name="agent-runtime-service",
+            backend_operation="read_summary",
+            backend_handler="_agent_run_read_summary",
         ),
         "execution.query_records": platform_tool_spec(
             name="execution.query_records",

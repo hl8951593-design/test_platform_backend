@@ -4,6 +4,9 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from fastapi import HTTPException
+
+from app.core.permissions import ProjectPermission
 from app.schemas.defect import DefectRead
 from app.schemas.execution_record import ExecutionRecordPage, ExecutionRecordSummary
 from app.schemas.test_plan import TestPlanRead
@@ -54,6 +57,7 @@ OLD_TOOL_NAMES = {
 }
 
 NEW_TOOL_NAMES = {
+    "agent.run.read_summary",
     "execution.query_records",
     "execution.read_detail",
     "execution.diagnose",
@@ -86,13 +90,22 @@ class AgentPlatformToolTests(unittest.TestCase):
         specs = {item.name: item for item in ToolRegistry().list_specs()}
 
         self.assertEqual(set(specs), OLD_TOOL_NAMES | NEW_TOOL_NAMES)
-        self.assertEqual(len(specs), 48)
+        self.assertEqual(len(specs), 49)
         self.assertEqual(specs["testcase.query_project_cases"].backend_handler, "_testcase_query_project_cases")
         self.assertEqual(specs["scenario.execute_dry_run"].side_effect_class, "execution_record")
         self.assertEqual(specs["plan.execute_saved"].side_effect_class, "execution_record")
         self.assertEqual(specs["flow.validate_graph"].side_effect_class, "deterministic_compute")
         self.assertEqual(specs["defect.create_saved"].side_effect_class, "business_update")
         self.assertEqual(specs["execution.diagnose"].side_effect_class, "draft_only")
+        self.assertEqual(specs["agent.run.read_summary"].side_effect_class, "read_only")
+        self.assertEqual(
+            specs["agent.run.read_summary"].required_permissions,
+            (ProjectPermission.VIEW_PROJECT.value,),
+        )
+        self.assertEqual(
+            specs["agent.run.read_summary"].backend_handler,
+            "_agent_run_read_summary",
+        )
         for spec in specs.values():
             self.assertTrue(callable(getattr(self.backend, spec.backend_handler or "", None)), spec.name)
 
@@ -131,6 +144,96 @@ class AgentPlatformToolTests(unittest.TestCase):
                 }
                 self.assertTrue(all(item["required"] for item in contracts.values()))
                 self.assertTrue(all("project_id" in item["properties"] for item in contracts.values()))
+
+    @patch("app.services.permission_service.PermissionService.require_project_access")
+    def test_agent_run_summary_returns_bounded_runtime_diagnostics(self, require_project_access):
+        self.assertIn("agent.run.read_summary", {item.name for item in ToolRegistry().list_specs()})
+        run = SimpleNamespace(
+            run_id="agent-run-failed-1",
+            project_id=10,
+            conversation_id="agent-conv-1",
+            intent="create defects from failed cases",
+            status="failed",
+            error_code="agent_planning_failed",
+            error_message="bounded planning failure",
+            current_iteration=0,
+            current_step_index=0,
+            last_event_sequence=8,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            created_at=datetime.now(UTC),
+        )
+        events = [
+            SimpleNamespace(
+                event_seq=7,
+                event_type="planner.llm_decision_failed",
+                payload_json={
+                    "code": "agent_planning_failed",
+                    "details": {
+                        "last_error": {
+                            "code": "planner_effect_scope_exceeded",
+                            "requested_effect_scope": "draft",
+                        }
+                    },
+                    "raw_prompt": "must never be returned",
+                },
+                created_at=datetime.now(UTC),
+            )
+        ]
+        calls = [
+            SimpleNamespace(
+                tool_call_id="agent-tool-1",
+                tool_name="defect.create_saved",
+                status="planned",
+                resolved_side_effect_class="business_update",
+                approval_required=True,
+                approved_approval_id=None,
+                error_code=None,
+                error_message=None,
+                input_json_redacted={"private": "must never be returned"},
+                output_json_redacted={"private": "must never be returned"},
+            )
+        ]
+        self.db.scalar.return_value = run
+        self.db.scalars.side_effect = [
+            SimpleNamespace(all=lambda: events),
+            SimpleNamespace(all=lambda: calls),
+        ]
+
+        try:
+            result = self.backend.execute(
+                tool_name="agent.run.read_summary",
+                payload={"project_id": 10, "run_id": run.run_id},
+                current_user=self.user,
+            )
+        except HTTPException as exc:
+            self.fail(f"registered runtime summary Tool should execute, got {exc.detail!r}")
+
+        require_project_access.assert_called_once_with(self.user, 10)
+        self.assertEqual(result["run"]["status"], "failed")
+        self.assertEqual(result["run"]["error_code"], "agent_planning_failed")
+        self.assertEqual(result["diagnostic_events"][0]["event_type"], "planner.llm_decision_failed")
+        self.assertEqual(result["tool_calls"][0]["tool_name"], "defect.create_saved")
+        encoded = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn('"raw_prompt":', encoded)
+        self.assertNotIn("input_json_redacted", encoded)
+        self.assertNotIn("output_json_redacted", encoded)
+        self.assertNotIn("must never be returned", encoded)
+
+    @patch("app.services.permission_service.PermissionService.require_project_access")
+    def test_agent_run_summary_hides_cross_project_run(self, require_project_access):
+        self.assertIn("agent.run.read_summary", {item.name for item in ToolRegistry().list_specs()})
+        self.db.scalar.return_value = None
+
+        with self.assertRaises(HTTPException) as raised:
+            self.backend.execute(
+                tool_name="agent.run.read_summary",
+                payload={"project_id": 10, "run_id": "agent-run-other-project"},
+                current_user=self.user,
+            )
+
+        require_project_access.assert_called_once_with(self.user, 10)
+        self.assertEqual(raised.exception.status_code, 404)
 
     @patch("app.services.agent_platform_tool_service.ExecutionRecordService.list_records")
     def test_execution_query_returns_snapshot_and_object_reference(self, list_records):

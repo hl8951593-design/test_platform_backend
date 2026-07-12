@@ -6,12 +6,14 @@ from typing import Any
 
 from fastapi import HTTPException, status
 from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.async_response import public_execution_status
 from app.core.execution_worker import execution_worker
 from app.core.response import normalize_response_data
 from app.core.sensitive_data import mask_sensitive, request_fingerprint
+from app.models.agent import AgentEvent, AgentRun, AgentToolCall
 from app.models.test_plan import TestPlanRun
 from app.models.user import User
 from app.schemas.ai import AIExecutionDiagnoseRequest
@@ -35,12 +37,52 @@ from app.schemas.visual_flow import (
 from app.services.ai_browser_capture_service import AIBrowserCaptureService
 from app.services.defect_service import DefectService
 from app.services.execution_record_service import ExecutionRecordService
+from app.services.permission_service import PermissionService
 from app.services.test_plan_service import TestPlanService
 from app.services.visual_flow_service import VisualFlowService
 
 
 _OBJECT_REF_ID_RE = re.compile(r"/(?P<object_id>\d+)$")
 _EXECUTION_TYPES = {"http", "websocket", "scenario", "flow"}
+_AGENT_DIAGNOSTIC_EVENT_TYPES = {
+    "run.started",
+    "run.completed",
+    "run.failed",
+    "run.cancelled",
+    "planner.llm_decision_started",
+    "planner.llm_decision_invalid",
+    "planner.llm_decision_retrying",
+    "planner.llm_decision_failed",
+    "planner.llm_decision_completed",
+    "planner.capability_plan_created",
+    "tool.created",
+    "tool.completed",
+    "tool.failed",
+    "approval.created",
+    "approval.approved",
+    "approval.rejected",
+    "approval.expired",
+}
+_AGENT_DIAGNOSTIC_EVENT_FIELDS = {
+    "code",
+    "reason_code",
+    "requested_effect_scope",
+    "model_requested_effect_scope",
+    "required_effect_scope",
+    "effect_scope_normalized",
+    "tool_names",
+    "details",
+    "error_code",
+    "error_message",
+    "next_attempt",
+    "tool_call_id",
+    "approval_id",
+    "approval_epoch",
+    "status",
+    "iteration",
+    "revision",
+    "source",
+}
 
 
 class AgentPlatformToolBackend:
@@ -48,6 +90,64 @@ class AgentPlatformToolBackend:
 
     def __init__(self, db: Session):
         self.db = db
+
+    def _agent_run_read_summary(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
+        project_id = _require_int(payload, "project_id")
+        run_id = _require_str(payload, "run_id")
+        PermissionService(self.db).require_project_access(current_user, project_id)
+        run = self.db.scalar(
+            select(AgentRun).where(
+                AgentRun.project_id == project_id,
+                AgentRun.run_id == run_id,
+            )
+        )
+        if run is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent run 不存在")
+
+        events = list(
+            self.db.scalars(
+                select(AgentEvent)
+                .where(
+                    AgentEvent.run_id == run_id,
+                    AgentEvent.event_type.in_(_AGENT_DIAGNOSTIC_EVENT_TYPES),
+                )
+                .order_by(AgentEvent.event_seq.asc())
+                .limit(100)
+            ).all()
+        )
+        calls = list(
+            self.db.scalars(
+                select(AgentToolCall)
+                .where(AgentToolCall.run_id == run_id)
+                .order_by(AgentToolCall.step_index.asc(), AgentToolCall.id.asc())
+                .limit(100)
+            ).all()
+        )
+        return {
+            "project_id": project_id,
+            "run": {
+                "run_id": run.run_id,
+                "conversation_id": run.conversation_id,
+                "intent": _bounded_masked_text(run.intent, 800),
+                "status": run.status,
+                "error_code": run.error_code,
+                "error_message": _bounded_masked_text(run.error_message, 512),
+                "current_iteration": run.current_iteration,
+                "current_step_index": run.current_step_index,
+                "last_event_sequence": run.last_event_sequence,
+                "started_at": _isoformat(run.started_at),
+                "completed_at": _isoformat(run.completed_at),
+                "created_at": _isoformat(run.created_at),
+            },
+            "diagnostic_events": [_agent_diagnostic_event_view(item) for item in events],
+            "tool_calls": [_agent_tool_call_summary(item) for item in calls],
+            "diagnostic_contract": {
+                "schema_version": "agent_run_diagnostic_summary_v1",
+                "bounded": True,
+                "raw_prompts_included": False,
+                "raw_tool_payloads_included": False,
+            },
+        }
 
     def _execution_query_records(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         project_id = _require_int(payload, "project_id")
@@ -698,6 +798,67 @@ def _optional_datetime(payload: dict[str, Any], key: str) -> datetime | None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"{key} must be an ISO datetime",
         ) from exc
+
+
+def _bounded_masked_text(value: Any, max_chars: int) -> str | None:
+    if value is None:
+        return None
+    masked = str(mask_sensitive(value))
+    return masked if len(masked) <= max_chars else f"{masked[:max_chars]}[agent_diagnostic_truncated]"
+
+
+def _bounded_diagnostic_value(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 4:
+        return "[agent_diagnostic_depth_limited]"
+    masked = mask_sensitive(value)
+    if isinstance(masked, str):
+        return _bounded_masked_text(masked, 512)
+    if isinstance(masked, dict):
+        return {
+            str(key): _bounded_diagnostic_value(item, depth=depth + 1)
+            for key, item in list(masked.items())[:20]
+        }
+    if isinstance(masked, (list, tuple)):
+        return [_bounded_diagnostic_value(item, depth=depth + 1) for item in list(masked)[:20]]
+    if isinstance(masked, (int, float, bool)) or masked is None:
+        return masked
+    return _bounded_masked_text(masked, 512)
+
+
+def _isoformat(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return _bounded_masked_text(value, 64)
+
+
+def _agent_diagnostic_event_view(event: AgentEvent) -> dict[str, Any]:
+    payload = event.payload_json if isinstance(event.payload_json, dict) else {}
+    details = {
+        key: _bounded_diagnostic_value(payload[key])
+        for key in _AGENT_DIAGNOSTIC_EVENT_FIELDS
+        if payload.get(key) is not None
+    }
+    return {
+        "event_seq": event.event_seq,
+        "event_type": event.event_type,
+        "details": details,
+        "created_at": _isoformat(event.created_at),
+    }
+
+
+def _agent_tool_call_summary(call: AgentToolCall) -> dict[str, Any]:
+    return {
+        "tool_call_id": call.tool_call_id,
+        "tool_name": call.tool_name,
+        "status": call.status,
+        "side_effect_class": call.resolved_side_effect_class,
+        "approval_required": bool(call.approval_required),
+        "approved": bool(call.approved_approval_id),
+        "error_code": call.error_code,
+        "error_message": _bounded_masked_text(call.error_message, 512),
+    }
 
 
 def _page_bounds(payload: dict[str, Any]) -> tuple[int, int]:

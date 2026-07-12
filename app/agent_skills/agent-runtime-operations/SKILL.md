@@ -12,6 +12,8 @@ consumes:
   - worker
 produces:
   - diagnosis
+tools:
+  - agent.run.read_summary
 triggers:
   - agent runtime
   - Harness Loop
@@ -45,7 +47,7 @@ routing_requires_tool:
 ## Workflow
 
 1. Use this skill for the Agent system itself: run lifecycle, SSE delivery, model calls, tool loop, readiness, runbook, worker queue, stale active runs, and behavior evaluation.
-2. For real run facts, prefer existing Agent run summary, event snapshot, dashboard, model-health, runbook, and behavior-eval evidence when available.
+2. For real run facts, call `agent.run.read_summary` with the project-scoped run id before diagnosing the failure. Prefer its bounded run, planner event, ToolCall, and approval facts over business execution records.
 3. Do not confuse target API test failures with Agent runtime failures. Separate model/provider latency, silent tool-planning rounds, EventStore replay, frontend cursor issues, and backend worker loss.
 4. If a ToolCall result is compacted, use scoped business query tools, artifact ids, run summaries, event snapshots, or frontend ToolCall Detail evidence; do not pull full ledger output into the model path.
 5. Do not claim a run was cancelled, resumed, reconciled, archived, or fixed unless the corresponding backend action succeeds.

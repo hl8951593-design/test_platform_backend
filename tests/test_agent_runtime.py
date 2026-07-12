@@ -23,6 +23,7 @@ from app.models.agent import (
     AgentApprovalMutationLog,
     AgentBackendContract,
     AgentCheckpoint,
+    AgentCapabilityPlanRecord,
     AgentContextBuild,
     AgentEvidenceWatch,
     AgentEvent,
@@ -7912,6 +7913,113 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(approval.required_permissions_json, [ProjectPermission.MANAGE_CASE.value])
         self.assertEqual(saved_count, 0)
         self.assertIsNone(queued)
+
+    def test_failed_case_defect_creation_normalizes_scope_and_stops_at_approval(self):
+        from app.core.permissions import ProjectPermission
+        from app.models.defect import Defect
+        from app.services.agent_planning_service import AgentPlanningDecisionService
+
+        planning_payload = {
+            "goal": "Inspect failed cases and create an evidence-backed defect.",
+            "action": "create",
+            "target_domain": "defect",
+            "source_domains": ["test_case", "execution"],
+            "selected_skills": ["defect-triage"],
+            "selected_tools": ["execution.query_records", "execution.read_detail", "defect.create_saved"],
+            "selected_artifact_ids": [],
+            "required_facts": ["failed_case_execution_detail"],
+            "requested_effect_scope": "execute",
+            "confidence": 0.98,
+            "reason_summary": "Read failure evidence before creating a persisted defect.",
+        }
+
+        class PlanningAIService:
+            def chat(self, request):
+                return SimpleNamespace(
+                    content=json.dumps(planning_payload, ensure_ascii=False),
+                    finish_reason="stop",
+                )
+
+        run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                intent="查看失败的用例，并创建对应缺陷，需要描述清楚失败原因",
+                max_iterations=1,
+            ),
+            current_user=self.owner,
+        )
+        defect_title = "取消关注接口最近执行失败"
+        tool_request = {
+            "tool_name": "defect.create_saved",
+            "input": {
+                "project_id": 10,
+                "defect": {
+                    "title": defect_title,
+                    "bug_type": "functional",
+                    "urgency": "medium",
+                    "status": "new",
+                    "content_html": (
+                        "<p>执行证据显示取消关注接口最近一次运行失败，"
+                        "需要在审批后保存缺陷并继续核对响应与断言。</p>"
+                    ),
+                    "media_ids": [],
+                },
+            },
+            "reason": "根据失败执行证据创建缺陷，等待人工审批",
+            "evidence_refs": [],
+        }
+        stream_events = [
+            {"type": "delta", "content": "```agent_tool_request\n" + json.dumps(tool_request) + "\n```"},
+            {"type": "done", "finish_reason": "stop", "model": "deepseek-test"},
+        ]
+        runner = AgentConversationRunner(
+            self.db,
+            planning_decision_service=AgentPlanningDecisionService(ai_service=PlanningAIService()),
+        )
+
+        with patch.object(
+            agent_runtime_service.settings,
+            "AGENT_LLM_INTENT_DECISION_ENABLED",
+            True,
+        ), patch(
+            "app.services.agent_runtime_service.AIService.chat_stream",
+            return_value=iter(stream_events),
+        ):
+            blocked = runner.run(run_id=run.run_id, user_id=self.owner.id)
+
+        self.db.refresh(run)
+        plan = self.db.scalar(
+            select(AgentCapabilityPlanRecord).where(
+                AgentCapabilityPlanRecord.capability_plan_id == run.active_capability_plan_id
+            )
+        )
+        call = self.db.scalar(
+            select(AgentToolCall).where(
+                AgentToolCall.run_id == run.run_id,
+                AgentToolCall.tool_name == "defect.create_saved",
+            )
+        )
+        approval = self.db.scalar(select(AgentApproval).where(AgentApproval.run_id == run.run_id))
+        saved_count = self.db.scalar(
+            select(func.count()).select_from(Defect).where(Defect.title == defect_title)
+        )
+
+        self.assertEqual(blocked.status, "needs_human")
+        self.assertNotEqual(run.error_code, "agent_planning_failed")
+        self.assertIn("model_requested_effect_scope", plan.intent_decision_json)
+        self.assertIn("required_effect_scope", plan.intent_decision_json)
+        self.assertIn("effect_scope_normalized", plan.intent_decision_json)
+        self.assertEqual(plan.intent_decision_json["model_requested_effect_scope"], "execute")
+        self.assertEqual(plan.intent_decision_json["required_effect_scope"], "persist")
+        self.assertEqual(plan.intent_decision_json["requested_effect_scope"], "persist")
+        self.assertTrue(plan.intent_decision_json["effect_scope_normalized"])
+        self.assertEqual(call.status, "planned")
+        self.assertTrue(call.approval_required)
+        self.assertIsNone(call.approved_approval_id)
+        self.assertIsNone(call.output_json_redacted)
+        self.assertEqual(approval.approval_status, "pending")
+        self.assertEqual(approval.required_permissions_json, [ProjectPermission.CREATE_DEFECT.value])
+        self.assertEqual(saved_count, 0)
 
     def test_agent_query_project_cases_returns_explicit_case_id_lists(self):
         from app.models.project import ProjectEnvironment

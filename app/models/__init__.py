@@ -27,6 +27,13 @@ from app.models.agent import (
     ProjectMemory,
 )
 from app.models.defect import Defect
+from app.models.execution_diagnostic import (
+    ExecutionMetricDaily,
+    ExecutionMetricHourly,
+    ExecutionPayloadArtifact,
+    ExecutionRecordIndex,
+    ExecutionStepDiagnostic,
+)
 from app.models.media import MediaObject
 from app.models.notification import NotificationReadState
 from app.models.project import (
@@ -85,6 +92,11 @@ __all__ = [
     "BrowserCapture",
     "BrowserCaptureEntry",
     "Defect",
+    "ExecutionMetricDaily",
+    "ExecutionMetricHourly",
+    "ExecutionPayloadArtifact",
+    "ExecutionRecordIndex",
+    "ExecutionStepDiagnostic",
     "MediaObject",
     "NotificationReadState",
     "Project",

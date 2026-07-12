@@ -2839,16 +2839,33 @@ class AgentConversationRunner:
                     if run.status in RUN_TERMINAL_STATUSES:
                         return run
                     continue
-                content, chunks, clean_model_payload, tool_request = self._repair_empty_model_response(
-                    run=run,
-                    runtime=runtime,
-                    messages=messages,
-                    content=content,
-                    chunks=chunks,
-                    model_payload=clean_model_payload,
-                    iteration=iteration,
-                    final_summary=False,
-                )
+                native_tool_call_error = clean_model_payload.get("native_tool_call_error")
+                if (
+                    isinstance(native_tool_call_error, str)
+                    and clean_model_payload.get("finish_reason") == "tool_calls"
+                ):
+                    content, chunks, clean_model_payload, tool_request = self._repair_invalid_tool_request(
+                        run=run,
+                        current_user=user,
+                        messages=messages,
+                        invalid_content=content,
+                        error_message=native_tool_call_error,
+                        model_payload=clean_model_payload,
+                        runtime=runtime,
+                        iteration=iteration,
+                        require_tool=True,
+                    )
+                else:
+                    content, chunks, clean_model_payload, tool_request = self._repair_empty_model_response(
+                        run=run,
+                        runtime=runtime,
+                        messages=messages,
+                        content=content,
+                        chunks=chunks,
+                        model_payload=clean_model_payload,
+                        iteration=iteration,
+                        final_summary=False,
+                    )
                 self.db.refresh(run)
                 if run.status in RUN_TERMINAL_STATUSES:
                     return run
@@ -4628,6 +4645,7 @@ class AgentConversationRunner:
         model_payload: dict[str, Any],
         runtime: AgentRuntimeService,
         iteration: int,
+        require_tool: bool = False,
     ) -> tuple[str, list[str], dict[str, Any], AgentToolRequest | None]:
         self.db.refresh(run)
         if run.status in RUN_TERMINAL_STATUSES:
@@ -4694,16 +4712,32 @@ class AgentConversationRunner:
             return invalid_content, [], model_payload, salvaged_tool_request
 
         _ = messages
+        current_goal_context = (
+            f"当前用户目标：{_truncate_history_text(run.intent, 800)}\n"
+            if require_tool
+            else ""
+        )
         repair_messages = [
             AIChatMessage(role="system", content=AGENT_TOOL_REQUEST_REPAIR_SYSTEM_PROMPT),
             AIChatMessage(role="assistant", content=_bounded_repair_context(invalid_content)),
             AIChatMessage(
                 role="user",
                 content=(
+                    current_goal_context
+                    +
                     "上一条回复看起来想调用工具，但 agent_tool_request 格式无效。"
                     f"错误：{error_message}\n"
-                    "请重新输出：如果仍需工具，请只输出一个合法的 ```agent_tool_request fenced JSON block；"
-                    "如果不需要工具，请直接给用户自然语言回复。不要解释格式错误。"
+                    + (
+                        "provider 已明确以 finish_reason=tool_calls 结束，因此本次修复必须产生一个合法工具请求，"
+                        "不能改成自然语言成功声明。优先使用 provider 原生 Tool Calling；"
+                        "仅在本轮没有原生 tools 时输出一个合法的 ```agent_tool_request fenced JSON block。"
+                        if require_tool
+                        else (
+                            "请重新输出：如果仍需工具，请只输出一个合法的 ```agent_tool_request fenced JSON block；"
+                            "如果不需要工具，请直接给用户自然语言回复。"
+                        )
+                    )
+                    + "不要解释格式错误。"
                 ),
             ),
         ]
@@ -4721,7 +4755,11 @@ class AgentConversationRunner:
         clean_payload = {key: value for key, value in repaired_payload.items() if value is not None}
         repair_strategy = None
         try:
-            tool_request, repair_strategy = self._parse_repaired_tool_request(repaired_content)
+            tool_request = _agent_tool_request_from_native_payload(clean_payload.get("native_tool_request"))
+            if tool_request is not None:
+                repair_strategy = "repaired_native_tool_request"
+            else:
+                tool_request, repair_strategy = self._parse_repaired_tool_request(repaired_content)
         except HTTPException as exc:
             self.db.refresh(run)
             if run.status in RUN_TERMINAL_STATUSES:
@@ -4745,6 +4783,23 @@ class AgentConversationRunner:
                 commit=True,
             )
             raise
+        if require_tool and tool_request is None:
+            repair_error_message = "native tool call repair did not produce a valid tool request"
+            runtime.append_event(
+                run,
+                "model.tool_request_repair_failed",
+                {
+                    "iteration": iteration,
+                    "error_message": repair_error_message,
+                    "content_preview": _bounded_agent_content_preview(
+                        repaired_content,
+                        reference="AgentConversationRunner.model.native_tool_request_repair_failed.content",
+                    ),
+                    **_model_trace_from_payload(clean_payload),
+                },
+                commit=True,
+            )
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=repair_error_message)
         self.db.refresh(run)
         if run.status in RUN_TERMINAL_STATUSES:
             return repaired_content, repaired_chunks, clean_payload, None

@@ -126,6 +126,8 @@ Harness Loop Agent 的业务工具调用走 Codex 式闭环：Runner 组装 run 
 
 原生工具 wire contract 把 `tools[].type` 和 assistant `tool_calls[].type` 视为必填协议字段，不受 Pydantic 默认值省略影响。DeepSeek thinking 模式的 `reasoning_content` 仅在当前 Runner 内存中按 tool-call id 临时保留，用于满足下一轮 provider 回传要求，不持久化、不发送前端、不作为可见 Chain of Thought。模型流返回 HTTP 错误时，`AIService` 必须在 stream context 关闭前读取 body，避免 `ResponseNotRead` 覆盖真实 provider 诊断。
 
+原生 Tool Calling 的 `finish_reason=tool_calls` 是动作意图，不允许降级成同一响应里的自然语言成功声明。`NativeToolCallAccumulator` 可容忍 provider 参数字符串中的未转义控制字符，并可补齐最多有限个确定性的 JSON 尾部闭合符；其他非法 JSON 进入一次 bounded repair，repair 上下文只包含修复 prompt、当前用户目标、上一响应有界片段、错误摘要和当前 Capability Plan 的工具 schema。repair 可继续使用 provider 原生 Tool Calling；若没有产生合法 ToolCall，Runner 必须写入失败事件并结束为 failed，不能以 `run.completed(requested_tool=false)` 伪造成功。
+
 Capability Resolver 对结构化 `analyze/query` 动作执行统一副作用裁剪：模型目录只允许 `read_only` 和 `deterministic_compute` ToolSpec。具体读取领域仍由 LLM 的 target/source 判断和 supporting Skills 扩展，因此不是锁死固定工具名单；写入、执行、状态流转和其他副作用工具不会出现在纯分析轮次。
 
 Capability Plan 的副作用范围采用“模型意图 + ToolSpec 权威元数据”的规范化模型：规划模型的 `effect_scope` 只作为 `model_requested_effect_scope` 留痕，后端根据所选工具的 `side_effect` 推导 `required_effect_scope`，再取更严格者作为有效范围。这样新增 Skill/Tool 不需要为模型偶发使用 `draft/execute/persist` 的不同措辞增加业务特判，同时也不会降低权限、审批、项目隔离、对象引用或 ToolRuntime preflight。未知副作用、缺少权限和未知引用仍 fail-closed；`persist` 类 ToolCall 仍必须先创建 pending Approval，审批通过前不执行业务 handler。

@@ -8,6 +8,7 @@ from app.schemas.ai import AIChatFunctionDefinition, AIChatToolDefinition
 
 
 RUNTIME_REQUEST_CAPABILITY_ALIAS = "runtime_request_capability"
+NATIVE_ARGUMENT_JSON_REPAIR_MAX_CLOSERS = 8
 
 
 class NativeToolCallError(ValueError):
@@ -71,10 +72,7 @@ class NativeToolCallAccumulator:
         if canonical_name is None and alias != RUNTIME_REQUEST_CAPABILITY_ALIAS:
             raise NativeToolCallError("native tool call used an unknown provider alias")
         raw_arguments = "".join(self._argument_parts)
-        try:
-            payload = json.loads(raw_arguments)
-        except (TypeError, ValueError) as exc:
-            raise NativeToolCallError("native tool call arguments are not valid JSON") from exc
+        payload = _load_native_argument_payload(raw_arguments)
         if alias == RUNTIME_REQUEST_CAPABILITY_ALIAS:
             if not isinstance(payload, dict):
                 raise NativeToolCallError("capability request arguments must be an object")
@@ -173,3 +171,49 @@ def build_native_tool_definitions(
             )
         ))
     return definitions
+
+
+def _load_native_argument_payload(raw_arguments: str) -> Any:
+    candidates = [raw_arguments]
+    completed = _complete_missing_native_argument_closers(raw_arguments)
+    if completed is not None and completed != raw_arguments:
+        candidates.append(completed)
+    last_error: Exception | None = None
+    for candidate in candidates:
+        for strict in (True, False):
+            try:
+                return json.loads(candidate, strict=strict)
+            except (TypeError, ValueError) as exc:
+                last_error = exc
+    raise NativeToolCallError("native tool call arguments are not valid JSON") from last_error
+
+
+def _complete_missing_native_argument_closers(raw: str) -> str | None:
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char == "}":
+            if not stack or stack[-1] != "{":
+                return None
+            stack.pop()
+        elif char == "]":
+            if not stack or stack[-1] != "[":
+                return None
+            stack.pop()
+    if in_string or escaped or len(stack) > NATIVE_ARGUMENT_JSON_REPAIR_MAX_CLOSERS:
+        return None
+    closers = "".join("}" if opener == "{" else "]" for opener in reversed(stack))
+    return f"{raw}{closers}" if closers else raw

@@ -1624,6 +1624,8 @@ saved_scenario 执行 follow-up 架构修正：最新“保存场景 42 后执�
 
 同一会话工作上下文升级为 `conversation_working_context_v2`，以 `recent_run_states[]` 携带失败、取消、暂停及待审批 Run 的有界状态，不回放未完成 assistant 文本。新增只读 `agent.run.read_summary`，供后续 Skill 在项目隔离和脱敏边界内读取 Run/事件/ToolCall 摘要。`test_case_query_snapshot` artifact 新增失败计数、失败项摘要和 `create_defect` follow-up，但缺陷 Skill 明确要求先获取真实执行证据。真实写入仍由 `defect.create_saved -> ToolCall -> pending Approval -> approve -> handler` 控制；新增集成回归验证模型 scope 表述偏差会被规范化到 `persist`、审批前 Defect 表无新增记录。本轮无数据库迁移，capabilities 从 48 增至 49。
 
+真实 DeepSeek 多轮验收还发现 provider 返回 `finish_reason=tool_calls` 时，某次 `defect.create_saved` arguments 含非法 JSON，旧 Runner 记录 `model.native_tool_call_invalid` 后却把“我现在创建缺陷”的 content 当成普通成功回复。现已增加两层收口：未转义控制字符和有限尾部闭合缺失先做确定性兼容；其他非法参数进入一次 bounded native ToolCall repair，且该分支必须产出真实 ToolCall，否则 Run 失败。新增回归验证修复会进入 `defect.create_saved` pending approval，并禁止 `run.completed` 假成功。
+
 Agent `scenario.compose_draft` 现为严格 `draft_only`：无论模型输入如何，均强制关闭 `execute_candidates/self_validate`，执行必须显式进入 `scenario.execute_dry_run`。候选草稿先按保存用例恢复真实 request/assertions/extractors，再把环境变量、dataset 和保存 extractor 分层解析；当前环境无法解析且没有证据来源的候选节点会被排除并记录原因。专用 ToolResult Planning View 将 source/candidate/grounded/omitted/excluded/validation/execution/persistence 和 authoritative summary 放在模型可见上下文前部，避免大草稿截断后最终回复沿用候选统计或推断遗漏原因。
 
 安全收口：敏感键识别补充 `lingxi-auth/auth/authentication/x-auth-token` 精确 header 名；历史 Agent ToolCall ledger 中 243 条输出和 5 条输入已就地递归掩码并验证剩余暴露计数为 0，不删除审计记录、不修改业务数据或原始审计 hash。

@@ -464,6 +464,95 @@ class AgentCapabilityPlanTests(unittest.TestCase):
             expected_html,
         )
 
+    def test_runner_repairs_invalid_native_tool_call_instead_of_completing_claim_text(self):
+        from app.services.agent_capability_plan_service import AgentCapabilityPlanService
+
+        model_turn = 0
+
+        def fake_chat(_service, _payload):
+            return SimpleNamespace(
+                content=(
+                    '{"action":"create","target_domain":"defect",'
+                    '"source_domains":["test_case"],"confidence":0.97}'
+                )
+            )
+
+        def fake_stream(_service, _payload):
+            nonlocal model_turn
+            model_turn += 1
+            plan = AgentCapabilityPlanService(self.db).get_active_plan(run=self.run)
+            alias = next(
+                provider_alias
+                for provider_alias, canonical in plan.tool_aliases_json.items()
+                if canonical == "defect.create_saved"
+            )
+            if model_turn == 1:
+                yield {
+                    "type": "delta",
+                    "content": "我现在创建缺陷记录，并停在人工审批。",
+                }
+                yield {
+                    "type": "tool_call_delta",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "native-invalid-1",
+                        "type": "function",
+                        "function": {
+                            "name": alias,
+                            "arguments": '{"input":{"project_id":10,"defect":{"title":"unterminated',
+                        },
+                    }],
+                }
+                yield {"type": "done", "finish_reason": "tool_calls", "model": "deepseek-test"}
+                return
+            arguments = json.dumps({
+                "input": {
+                    "project_id": 10,
+                    "defect": {
+                        "title": "商标信息接口断言期望值配置错误",
+                        "bug_type": "functional",
+                        "urgency": "medium",
+                        "content_html": "<p>expected=666666, actual=200</p>",
+                    },
+                },
+                "reason": "repair malformed native arguments",
+                "evidence_refs": [],
+            }, ensure_ascii=False)
+            yield {
+                "type": "tool_call_delta",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "native-repaired-1",
+                    "type": "function",
+                    "function": {"name": alias, "arguments": arguments},
+                }],
+            }
+            yield {"type": "done", "finish_reason": "tool_calls", "model": "deepseek-test"}
+
+        with (
+            patch("app.services.agent_intent_decision_service.AIService.chat", new=fake_chat),
+            patch("app.services.agent_runtime_service.AIService.chat_stream", new=fake_stream),
+        ):
+            completed = AgentConversationRunner(self.db).run(
+                run_id=self.run.run_id,
+                user_id=self.owner.id,
+            )
+
+        tool_calls = list(self.db.scalars(
+            select(AgentToolCall).where(AgentToolCall.run_id == self.run.run_id)
+        ).all())
+        event_types = list(self.db.scalars(
+            select(AgentEvent.event_type).where(AgentEvent.run_id == self.run.run_id)
+        ).all())
+        self.assertEqual(model_turn, 2)
+        self.assertEqual(completed.status, "needs_human")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].tool_name, "defect.create_saved")
+        self.assertTrue(tool_calls[0].approval_required)
+        self.assertIn("model.native_tool_call_invalid", event_types)
+        self.assertIn("model.tool_request_repaired", event_types)
+        self.assertNotIn("run.completed", event_types)
+
     def test_runner_carries_plan_identity_forward_for_each_model_iteration(self):
         model_turn = 0
 

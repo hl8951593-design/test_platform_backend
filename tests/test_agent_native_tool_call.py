@@ -96,6 +96,30 @@ class AgentNativeToolCallTests(unittest.TestCase):
         )
         self.assertEqual(request.reason, "create from failed execution")
 
+    def test_native_arguments_accept_provider_unescaped_control_characters(self):
+        from app.services.agent_native_tool_call import NativeToolCallAccumulator
+
+        canonical_name = "defect.create_saved"
+        alias = provider_tool_alias(canonical_name)
+        raw_arguments = (
+            '{"input":{"project_id":1,"defect":{"title":"断言缺陷",'
+            '"bug_type":"test_script","urgency":"medium",'
+            '"content_html":"<p>expected=666666\nactual=200</p>"}},'
+            '"reason":"create from evidence","evidence_refs":[]}'
+        )
+        accumulator = NativeToolCallAccumulator(tool_aliases={alias: canonical_name})
+        accumulator.feed({
+            "index": 0,
+            "id": "call-native-control-char",
+            "type": "function",
+            "function": {"name": alias, "arguments": raw_arguments},
+        })
+
+        request = accumulator.finalize()
+
+        self.assertEqual(request.tool_name, canonical_name)
+        self.assertIn("expected=666666\nactual=200", request.tool_input["defect"]["content_html"])
+
     def test_unexpected_parallel_native_calls_are_rejected(self):
         from app.services.agent_native_tool_call import NativeToolCallAccumulator, NativeToolCallError
 

@@ -187,6 +187,8 @@ Only public metadata is returned. `SKILL.md` bodies, Skill-local private prompt 
 
 模型工具调用现在以 provider 原生 `tools/tool_calls` 为主，Markdown `agent_tool_request` 仅是旧协议兼容回退。这是后端与模型之间的 wire 变更，不改变前端的 Run、EventStore、ToolCall、Approval 或 Summary 响应结构。DeepSeek thinking 轮次所需的 `reasoning_content` 只在后端内存中短暂回传 provider，不出现在 SSE、Run Summary 或对话气泡中；前端无需新增该字段。
 
+当 provider 以 `finish_reason=tool_calls` 结束但流式 `arguments` 含未转义控制字符时，后端会在不改变字段语义的前提下做受限 JSON 兼容解析；缺少有限个尾部 `}`/`]` 时也只补齐闭合符。仍不可解析的原生调用写入 `model.native_tool_call_invalid`，随后进行一次隐藏、受限的工具请求修复。该修复必须产出真实 ToolCall；若再次只返回自然语言，Run 以 `model.tool_request_repair_failed` 失败，前端不得把“我现在创建/执行”的承诺文本渲染为成功结果。只有 ToolCall/Approval/ToolResult ledger 才是动作已提交或完成的事实源。
+
 `scenario.compose_draft` 对 Agent 始终是纯草稿 Tool：即使模型输入 `execute_candidates=true` 或 `self_validate=true`，后端也会强制关闭，避免 `draft` Capability Plan 跨越到执行副作用。草稿节点的 request/assertions/extractors 会从 `case_source` 对应的保存用例恢复，无证据 binding 会被删除；`draft.scenario_grounding` 提供归一化摘要，`draft.scenario_validation.valid=true` 才能作为可保存的 AUTHORITATIVE 草稿。前端继续按普通 ToolCall 展示，不要把 compose 视为已执行。
 
 模型收到的 `scenario.compose_draft` Planning View 固定包含 `source.reference_ids`、`candidate.reference_ids/omitted_by_composer_reference_ids/omitted_reason_status`、`scenario.node_count/reference_ids`、`grounding.excluded_nodes`、`validation`、`execution.executed=false`、`persistence.saved=false` 和 `authoritative_summary`。这是模型回灌摘要，不新增前端 API 字段；前端查看完整依据时仍以 ToolCall `output_json_redacted.draft.scenario_grounding/scenario_validation` 为准。`omitted_reason_status=not_recorded_do_not_infer` 表示只能显示“原因未记录”，不能根据历史执行或模型 warning 猜测原因。

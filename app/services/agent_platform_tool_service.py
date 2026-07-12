@@ -248,21 +248,31 @@ class AgentPlatformToolBackend:
         project_id = _require_int(payload, "project_id")
         execution_type = _require_execution_type(payload, "execution_type")
         execution_id = _entity_id(payload, id_key="execution_id")
-        detail = ExecutionRecordService(self.db).get_detail(
+        evidence = ExecutionDiagnosticService(self.db).read(
             project_id=project_id,
             execution_type=execution_type,
             execution_id=execution_id,
+            query=ExecutionDiagnosticQuery(
+                view="failures",
+                include=[
+                    "assertions",
+                    "response_summary",
+                    "bindings",
+                    "upstream",
+                ],
+                max_chars=12000,
+            ),
             current_user=current_user,
         )
-        execution_data = mask_sensitive(normalize_response_data(detail))
-        summary = execution_data.get("summary") if isinstance(execution_data, dict) else {}
+        summary = evidence.data.get("summary")
+        summary = summary if isinstance(summary, dict) else {}
         request = AIExecutionDiagnoseRequest(
             protocol=execution_type,
             draft_data={
-                "resource_id": summary.get("resource_id") if isinstance(summary, dict) else None,
-                "resource_name": summary.get("resource_name") if isinstance(summary, dict) else None,
+                "resource_id": summary.get("resource_id"),
+                "resource_name": summary.get("resource_name"),
             },
-            execution_data=execution_data,
+            evidence=evidence.model_dump(mode="json"),
         )
         diagnosis = AIBrowserCaptureService(self.db).diagnose_execution(
             project_id=project_id,
@@ -274,7 +284,7 @@ class AgentPlatformToolBackend:
             "execution_type": execution_type,
             "execution_id": execution_id,
             "diagnosis": normalize_response_data(diagnosis),
-            "source": "execution.read_detail",
+            "source": "execution.diagnostic",
         }
 
     def _plan_query_project_plans(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:

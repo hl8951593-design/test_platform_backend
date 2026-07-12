@@ -278,17 +278,27 @@ class AIBrowserCaptureService:
 
     def diagnose_execution(self, *, project_id: int, payload: AIExecutionDiagnoseRequest, current_user: User):
         self.permission_service.require_project_permission(current_user, project_id, ProjectPermission.ANALYZE_AI.value)
+        user_payload = json.dumps(
+            {
+                "protocol": payload.protocol,
+                "draft": payload.draft_data,
+                "evidence": payload.evidence,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        if len(user_payload) > 16000:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="execution diagnostic evidence exceeds 16000 chars",
+            )
         response = AIService().chat(AIChatRequest(
             messages=[
                 AIChatMessage(role="system", content=(
                     "你是接口自动化测试失败诊断助手。只输出合法 JSON，包含 summary、probable_causes、"
                     "evidence、suggestions、risk_level。不要编造未提供的日志、字段或业务规则。"
                 )),
-                AIChatMessage(role="user", content=json.dumps({
-                    "protocol": payload.protocol,
-                    "draft": payload.draft_data,
-                    "execution": payload.execution_data,
-                }, ensure_ascii=False, indent=2)),
+                AIChatMessage(role="user", content=user_payload),
             ],
             thinking="disabled", temperature=0.1, max_tokens=2500, response_format="json",
         ))

@@ -54,10 +54,13 @@ routing_requires_tool:
 ## Workflow
 
 1. For current execution history, call `execution.query_records` first. Use its explicit `execution_type`, `execution_id`, and `object_ref`; never guess an id.
-2. Call `execution.read_detail` for the selected record before diagnosing request, response, assertion, retry, scenario, or Flow evidence.
-3. Call `execution.diagnose` only when the user requests AI diagnosis or the detailed evidence needs cause classification. It creates analysis only and does not modify cases or executions.
-4. Use `report.read_summary` for report-level trends and `project.read_context` for environment metadata.
-5. Distinguish backend run/SSE delivery problems from target API failures, assertion failures, extractor failures, and environment/authentication failures.
+2. Read `view=summary` with `execution.read_detail` for the selected execution.
+3. If the terminal status is failed, timeout, or error, read `view=failures` before replying.
+4. Read `view=step` only when `diagnostic_complete=false` or the user requests exact step evidence.
+5. Read `view=artifact` only for an explicit evidence reference; never request full raw output by default.
+6. Call `execution.diagnose` only after deterministic evidence is available. It creates analysis only and does not modify cases or executions.
+7. Use `report.read_summary` for report-level trends and `project.read_context` for environment metadata.
+8. Distinguish backend run/SSE delivery problems from target API failures, assertion failures, extractor failures, and environment/authentication failures.
 
 ## Diagnosis Checklist
 

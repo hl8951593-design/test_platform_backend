@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 from app.schemas.scenario import ScenarioCreateRequest
 from app.schemas.test_case import TestCaseCreateRequest
@@ -403,7 +403,9 @@ class AIBrowserCaptureScenarioRequest(AIBrowserCaptureRelationsRequest):
 class AIExecutionDiagnoseRequest(BaseModel):
     protocol: Literal["http", "websocket", "scenario", "flow"]
     draft_data: dict[str, Any]
-    execution_data: dict[str, Any]
+    evidence: dict[str, Any] = Field(
+        validation_alias=AliasChoices("evidence", "execution_data")
+    )
 
 
 class AIGeneratedWebSocketTestCaseResponse(BaseModel):

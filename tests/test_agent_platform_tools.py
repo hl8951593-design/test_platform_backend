@@ -86,6 +86,50 @@ NEW_TOOL_NAMES = {
 
 
 class AgentPlatformToolTests(unittest.TestCase):
+    @patch("app.services.agent_platform_tool_service.ExecutionMetricsService")
+    @patch("app.services.execution_record_service.ExecutionRecordService._require_view")
+    def test_execution_query_failure_clusters_uses_bounded_aggregate_view(
+        self, require_view, metrics_service
+    ):
+        metrics_service.return_value.query_failure_clusters.return_value = {
+            "failure_clusters": [
+                {
+                    "failure_signature": "AUTH",
+                    "count": 9,
+                    "distinct_resource_count": 2,
+                    "sample_execution_refs": ["scenario:12"],
+                }
+            ],
+            "watermark": "2026-07-12T10:59:00",
+        }
+
+        result = self.backend._execution_query_records(
+            {
+                "project_id": 10,
+                "result_view": "failure_clusters",
+                "started_from": "2026-07-12T10:00:00",
+                "started_to": "2026-07-12T11:00:00",
+                "limit": 20,
+            },
+            self.user,
+        )
+
+        self.assertEqual(result["result_view"], "failure_clusters")
+        self.assertEqual(result["failure_clusters"][0]["count"], 9)
+        self.assertNotIn("executions", result)
+        require_view.assert_called_once_with(self.user, 10)
+        model_output = ToolResultProjectionService().project(
+            "execution.query_records", result
+        ).model_output
+        self.assertEqual(model_output["result_view"], "failure_clusters")
+        self.assertEqual(model_output["failure_clusters"][0]["count"], 9)
+
+    def test_execution_query_aggregate_views_require_time_range(self):
+        with self.assertRaises(HTTPException) as raised:
+            self.backend._execution_query_records(
+                {"project_id": 10, "result_view": "metrics"}, self.user
+            )
+        self.assertEqual(raised.exception.status_code, 422)
     def setUp(self):
         self.db = MagicMock()
         self.user = SimpleNamespace(id=1, username="owner", is_active=True)
@@ -328,7 +372,13 @@ class AgentPlatformToolTests(unittest.TestCase):
             "properties"
         ]
 
-        for field in ("pagination_mode", "cursor", "limit", "include_total"):
+        for field in (
+            "result_view",
+            "pagination_mode",
+            "cursor",
+            "limit",
+            "include_total",
+        ):
             self.assertIn(field, properties)
 
     @patch("app.services.agent_platform_tool_service.ExecutionRecordService.get_detail")

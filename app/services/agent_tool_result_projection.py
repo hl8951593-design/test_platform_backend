@@ -231,6 +231,11 @@ class ToolResultProjectionService:
         )
 
     def project_platform_query(self, tool_name: str, output: dict[str, Any]) -> ToolResultProjection:
+        if tool_name == "execution.query_records" and output.get("result_view") in {
+            "failure_clusters",
+            "metrics",
+        }:
+            return self._project_execution_aggregate(output)
         list_key, allowed_keys = PLATFORM_QUERY_CONFIG[tool_name]
         rows = [
             {
@@ -289,6 +294,58 @@ class ToolResultProjectionService:
                 "total": len(rows),
                 "full_result_reference": "ToolCall.output_json_redacted",
             }
+        return ToolResultProjection(
+            model_output=model_output,
+            full_output_size_chars=self._json_size(output),
+            model_view_chars=self._json_size(model_output),
+            compacted=True,
+            projection_version=TOOL_RESULT_PROJECTION_VERSION,
+        )
+
+    def _project_execution_aggregate(
+        self, output: dict[str, Any]
+    ) -> ToolResultProjection:
+        result_view = str(output.get("result_view"))
+        allowed_keys = (
+            (
+                "failure_signature",
+                "count",
+                "distinct_resource_count",
+                "first_seen_at",
+                "last_seen_at",
+                "sample_execution_refs",
+            )
+            if result_view == "failure_clusters"
+            else (
+                "time_bucket",
+                "environment_id",
+                "execution_type",
+                "status",
+                "failure_signature",
+                "execution_count",
+                "duration_sum_ms",
+                "duration_max_ms",
+            )
+        )
+        rows = [
+            {
+                key: self._compact_value(item.get(key), max_string_chars=255)
+                for key in allowed_keys
+                if item.get(key) is not None
+            }
+            for item in (output.get(result_view) or [])[:50]
+            if isinstance(item, dict)
+        ]
+        model_output = {
+            "projection_version": TOOL_RESULT_PROJECTION_VERSION,
+            "tool_name": "execution.query_records",
+            "project_id": output.get("project_id"),
+            "result_view": result_view,
+            "granularity": output.get("granularity"),
+            "watermark": output.get("watermark"),
+            "filters": output.get("filters"),
+            result_view: rows,
+        }
         return ToolResultProjection(
             model_output=model_output,
             full_output_size_chars=self._json_size(output),

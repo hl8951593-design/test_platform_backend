@@ -8,6 +8,7 @@ from app.core.logging import configure_logging
 from app.core.request_logging import register_request_logging_middleware
 from app.services.websocket_debug_session_service import debug_session_manager
 from app.services.test_plan_scheduler import test_plan_scheduler
+from app.services.execution_metrics_scheduler import execution_metrics_scheduler
 
 
 def create_app() -> FastAPI:
@@ -30,6 +31,8 @@ def create_app() -> FastAPI:
     application.router.add_event_handler("shutdown", debug_session_manager.close_all)
     application.router.add_event_handler("startup", test_plan_scheduler.start)
     application.router.add_event_handler("shutdown", test_plan_scheduler.stop)
+    application.router.add_event_handler("startup", execution_metrics_scheduler.start)
+    application.router.add_event_handler("shutdown", execution_metrics_scheduler.stop)
     register_exception_handlers(application)
 
     @application.get("/")

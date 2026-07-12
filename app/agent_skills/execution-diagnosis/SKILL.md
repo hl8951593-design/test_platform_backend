@@ -53,7 +53,7 @@ routing_requires_tool:
 
 ## Workflow
 
-1. For current execution history, call `execution.query_records` first. Use its explicit `execution_type`, `execution_id`, and `object_ref`; never guess an id.
+1. For current execution history, call `execution.query_records` with `result_view=records` first. Use its explicit `execution_type`, `execution_id`, and `object_ref`; never guess an id.
 2. Read `view=summary` with `execution.read_detail` for the selected execution.
 3. If the terminal status is failed, timeout, or error, read `view=failures` before replying.
 4. Read `view=step` only when `diagnostic_complete=false` or the user requests exact step evidence.
@@ -61,6 +61,7 @@ routing_requires_tool:
 6. Call `execution.diagnose` only after deterministic evidence is available. It creates analysis only and does not modify cases or executions.
 7. Use `report.read_summary` for report-level trends and `project.read_context` for environment metadata.
 8. Distinguish backend run/SSE delivery problems from target API failures, assertion failures, extractor failures, and environment/authentication failures.
+9. For broad or recurring failure analysis, query a bounded time range with `result_view=failure_clusters`; use `result_view=metrics` for volume and duration trends. Select representative execution refs from the aggregate result before reading details; do not fetch every raw execution.
 
 ## Diagnosis Checklist
 

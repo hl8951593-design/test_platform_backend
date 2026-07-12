@@ -38,6 +38,7 @@ from app.schemas.visual_flow import (
 from app.services.ai_browser_capture_service import AIBrowserCaptureService
 from app.services.defect_service import DefectService
 from app.services.execution_diagnostic_service import ExecutionDiagnosticService
+from app.services.execution_metrics_service import ExecutionMetricsService
 from app.services.execution_record_service import ExecutionRecordService
 from app.services.permission_service import PermissionService
 from app.services.test_plan_service import TestPlanService
@@ -154,6 +155,20 @@ class AgentPlatformToolBackend:
     def _execution_query_records(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         project_id = _require_int(payload, "project_id")
         execution_type = _optional_execution_type(payload, "execution_type")
+        result_view = _optional_str(payload, "result_view") or "records"
+        if result_view not in {"records", "failure_clusters", "metrics"}:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="result_view must be records, failure_clusters, or metrics",
+            )
+        if result_view != "records":
+            return self._execution_query_aggregate(
+                payload=payload,
+                current_user=current_user,
+                project_id=project_id,
+                execution_type=execution_type,
+                result_view=result_view,
+            )
         pagination_mode = _optional_str(payload, "pagination_mode") or "page"
         if pagination_mode not in {"page", "cursor"}:
             raise HTTPException(
@@ -255,6 +270,58 @@ class AgentPlatformToolBackend:
             )
             result["filters"].update({"page": page, "page_size": page_size})
         return result
+
+    def _execution_query_aggregate(
+        self,
+        *,
+        payload: dict[str, Any],
+        current_user: User,
+        project_id: int,
+        execution_type: str | None,
+        result_view: str,
+    ) -> dict[str, Any]:
+        started_from = _optional_datetime(payload, "started_from")
+        started_to = _optional_datetime(payload, "started_to")
+        if started_from is None or started_to is None or started_from >= started_to:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    "failure_clusters and metrics require started_from < started_to"
+                ),
+            )
+        limit = _optional_int(payload, "limit") or 20
+        if limit < 1 or limit > 200:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="aggregate limit must be between 1 and 200",
+            )
+        ExecutionRecordService(self.db)._require_view(current_user, project_id)
+        service = ExecutionMetricsService(self.db)
+        common = {
+            "project_id": project_id,
+            "started_from": started_from,
+            "started_to": started_to,
+            "limit": limit,
+            "execution_type": execution_type,
+            "environment_id": _optional_int(payload, "environment_id"),
+            "status_filter": _optional_str(payload, "status"),
+        }
+        if result_view == "failure_clusters":
+            aggregate = service.query_failure_clusters(**common)
+        else:
+            aggregate = service.query_metrics(**common)
+        return {
+            "project_id": project_id,
+            "result_view": result_view,
+            "filters": {
+                "execution_type": execution_type,
+                "environment_id": common["environment_id"],
+                "started_from": started_from,
+                "started_to": started_to,
+                "limit": limit,
+            },
+            **normalize_response_data(aggregate),
+        }
 
     def _execution_read_detail(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         project_id = _require_int(payload, "project_id")

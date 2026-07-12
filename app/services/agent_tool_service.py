@@ -3104,6 +3104,11 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 "started_from": {"type": "string", "format": "date-time"},
                 "started_to": {"type": "string", "format": "date-time"},
                 "keyword": {"type": "string"},
+                "result_view": {
+                    "type": "string",
+                    "enum": ["records", "failure_clusters", "metrics"],
+                    "default": "records",
+                },
                 "pagination_mode": {
                     "type": "string",
                     "enum": ["page", "cursor"],

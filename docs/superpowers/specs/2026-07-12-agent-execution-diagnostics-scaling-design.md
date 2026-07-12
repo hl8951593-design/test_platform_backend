@@ -180,6 +180,7 @@ response_summary_json
 binding_summary_json
 extraction_summary_json
 retry_summary_json
+detail_json
 request_artifact_ref
 response_artifact_ref
 detail_artifact_ref
@@ -197,9 +198,12 @@ INDEX(project_id, execution_type, execution_id, status, step_index)
 INDEX(project_id, status, error_code, created_at)
 ```
 
+`detail_json` 保存完成脱敏和大字段抽离后的步骤兼容结构。`request_artifact_ref`、
+`response_artifact_ref` 和 `detail_artifact_ref` 保存被抽离部分或整步超限内容的引用。
+
 `execution_step_diagnostics` 在阶段 3 是现有协议记录的附加读模型；完成阶段 5 后，场景步骤以该表
-为增量权威来源，兼容详情由该表组装。HTTP、WebSocket 和已有独立节点表的 Flow 继续以各自协议
-执行表为权威来源，统一步骤表保持读模型身份。
+的 `detail_json + artifact refs` 为增量权威来源，兼容详情由该表组装。HTTP、WebSocket 和已有独立
+节点表的 Flow 继续以各自协议执行表为权威来源，统一步骤表保持读模型身份。
 
 ### 6.3 `execution_payload_artifacts`
 
@@ -226,8 +230,9 @@ created_at
 ```
 
 默认只有序列化后超过 64 KiB 的独立请求、响应、日志或重试片段才外置；配置可以覆盖该默认值，
-但首期允许范围固定为 16 KiB 至 1 MiB。低于阈值的内容可以继续保存在协议记录中，但普通诊断
-视图仍只返回摘要。
+但首期允许范围固定为 16 KiB 至 1 MiB。低于阈值的场景步骤兼容详情写入
+`execution_step_diagnostics.detail_json`；其他协议可以继续保存在权威协议记录中。普通诊断视图
+始终只返回摘要。
 
 ### 6.4 时间聚合
 

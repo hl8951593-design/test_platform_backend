@@ -4,6 +4,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.response import normalize_response_data
+from app.core.config import settings
 from app.schemas.execution_diagnostic import (
     CanonicalExecutionDiagnostic,
     CanonicalStepDiagnostic,
@@ -14,6 +15,10 @@ from app.repositories.execution_diagnostic_repository import (
 )
 from app.services.execution_diagnostic_projection import (
     ExecutionDiagnosticProjectionService,
+)
+from app.services.execution_payload_store import (
+    DatabaseExecutionPayloadStore,
+    serialized_redacted_size,
 )
 
 
@@ -26,6 +31,7 @@ class ExecutionDiagnosticPersistence:
     def __init__(self, db: Session):
         self.repository = ExecutionDiagnosticRepository(db)
         self.projector = ExecutionDiagnosticProjectionService()
+        self.payload_store = DatabaseExecutionPayloadStore(db)
 
     def stage_execution(
         self,
@@ -127,30 +133,35 @@ class ExecutionDiagnosticPersistence:
             "projection_version": PROJECTION_VERSION,
         }
 
-    @classmethod
     def _step_values(
-        cls,
+        self,
         *,
         project_id: int,
         execution_id: int,
         canonical: CanonicalExecutionDiagnostic,
         step: CanonicalStepDiagnostic,
     ) -> dict[str, Any]:
-        return cls._single_step_values(
+        return self._single_step_values(
             project_id=project_id,
             execution_type=canonical.execution_type,
             execution_id=execution_id,
             step=step,
         )
 
-    @staticmethod
     def _single_step_values(
+        self,
         *,
         project_id: int,
         execution_type: ExecutionType,
         execution_id: int,
         step: CanonicalStepDiagnostic,
     ) -> dict[str, Any]:
+        detail, artifact_refs = self._externalize_step_sections(
+            project_id=project_id,
+            execution_type=execution_type,
+            execution_id=execution_id,
+            step=step,
+        )
         return {
             "project_id": project_id,
             "execution_type": execution_type,
@@ -170,12 +181,62 @@ class ExecutionDiagnosticPersistence:
             "binding_summary_json": step.bindings,
             "extraction_summary_json": step.extractors,
             "retry_summary_json": step.retries,
-            "detail_json": step.normalized_detail,
-            "request_artifact_ref": None,
-            "response_artifact_ref": None,
-            "detail_artifact_ref": None,
+            "detail_json": detail,
+            "request_artifact_ref": artifact_refs.get("request"),
+            "response_artifact_ref": artifact_refs.get("response"),
+            "detail_artifact_ref": artifact_refs.get("detail"),
             "projection_version": PROJECTION_VERSION,
         }
+
+    def _externalize_step_sections(
+        self,
+        *,
+        project_id: int,
+        execution_type: ExecutionType,
+        execution_id: int,
+        step: CanonicalStepDiagnostic,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        detail = dict(step.normalized_detail)
+        artifact_refs: dict[str, str] = {}
+        section_groups = {
+            "request": ("request", "request_snapshot", "session", "session_snapshot"),
+            "response": ("response", "response_snapshot"),
+            "detail": (
+                "logs",
+                "messages",
+                "message_logs",
+                "received_messages",
+                "sent_messages",
+                "retries",
+                "retry_history",
+                "attempt_history",
+            ),
+        }
+        for ref_kind, keys in section_groups.items():
+            for key in keys:
+                value = detail.get(key)
+                raw_size_bytes = serialized_redacted_size(value)
+                if (
+                    value is None
+                    or raw_size_bytes
+                    <= settings.EXECUTION_ARTIFACT_INLINE_THRESHOLD_BYTES
+                ):
+                    continue
+                artifact_ref = self.payload_store.put(
+                    project_id=project_id,
+                    execution_type=execution_type,
+                    execution_id=execution_id,
+                    step_id=step.step_id,
+                    section=key,
+                    value=value,
+                )
+                detail[key] = {
+                    "artifact_ref": artifact_ref,
+                    "raw_size_bytes": raw_size_bytes,
+                    "externalized": True,
+                }
+                artifact_refs.setdefault(ref_kind, artifact_ref)
+        return detail, artifact_refs
 
 
 def _bounded(value: Any, max_chars: int) -> str | None:

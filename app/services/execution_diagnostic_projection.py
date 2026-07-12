@@ -128,11 +128,16 @@ class ExecutionDiagnosticProjectionService:
             execution_type=execution_type, execution=execution
         )
         if query.view == "summary":
-            return self._envelope(
+            envelope = self._envelope(
                 canonical,
                 query,
                 data=self._summary_data(canonical),
                 recommended=["failures"] if canonical.first_failure_step_id else [],
+            )
+            return self._with_externalized_evidence(
+                envelope=envelope,
+                steps=canonical.steps,
+                max_chars=query.max_chars,
             )
         if query.view == "artifact":
             return self._envelope(
@@ -175,11 +180,16 @@ class ExecutionDiagnosticProjectionService:
                 **self._summary_data(canonical),
                 "steps": [self._step_view(step) for step in selected],
             }
-        return self._budgeted_envelope(
+        envelope = self._budgeted_envelope(
             canonical=canonical,
             query=query,
             data=data,
             selected=selected,
+        )
+        return self._with_externalized_evidence(
+            envelope=envelope,
+            steps=selected,
+            max_chars=query.max_chars,
         )
 
     @staticmethod
@@ -368,6 +378,54 @@ class ExecutionDiagnosticProjectionService:
         return step.model_dump(exclude={"normalized_detail"}, exclude_none=True)
 
     @staticmethod
+    def _with_externalized_evidence(
+        *,
+        envelope: ExecutionDiagnosticEnvelope,
+        steps: list[CanonicalStepDiagnostic],
+        max_chars: int,
+    ) -> ExecutionDiagnosticEnvelope:
+        seen = {
+            str(item.get("artifact_ref"))
+            for item in envelope.evidence_refs
+            if item.get("artifact_ref")
+        }
+        candidates: list[tuple[dict[str, Any], DiagnosticOmission]] = []
+        for step in steps:
+            for path, placeholder in _externalized_sections(step.normalized_detail):
+                artifact_ref = str(placeholder["artifact_ref"])
+                if artifact_ref in seen:
+                    continue
+                seen.add(artifact_ref)
+                evidence = {
+                    "artifact_ref": artifact_ref,
+                    "step_id": step.step_id,
+                    "section": path,
+                    "raw_size_bytes": placeholder.get("raw_size_bytes"),
+                }
+                candidates.append(
+                    (
+                        {key: value for key, value in evidence.items() if value is not None},
+                        DiagnosticOmission(
+                            section=f"steps.{step.step_id}.{path}",
+                            reason="artifact_externalized",
+                            reference=artifact_ref,
+                        ),
+                    )
+                )
+        for evidence, omission in candidates:
+            envelope.evidence_refs.append(evidence)
+            envelope.omissions.append(omission)
+            if len(envelope.model_dump_json()) > max_chars:
+                envelope.evidence_refs.pop()
+                envelope.omissions.pop()
+                break
+        if envelope.evidence_refs:
+            envelope.diagnostic_complete = False
+            if "artifact" not in envelope.recommended_next_views:
+                envelope.recommended_next_views.append("artifact")
+        return envelope
+
+    @staticmethod
     def _compact_step(step: dict[str, Any]) -> dict[str, Any]:
         keys = (
             "step_id",
@@ -537,3 +595,23 @@ class ExecutionDiagnosticProjectionService:
             return int(base64.urlsafe_b64decode(cursor.encode()).decode())
         except (ValueError, UnicodeDecodeError):
             return fallback
+
+
+def _externalized_sections(
+    value: Any, *, path: str = "detail"
+) -> list[tuple[str, dict[str, Any]]]:
+    if isinstance(value, dict):
+        if value.get("externalized") is True and isinstance(
+            value.get("artifact_ref"), str
+        ):
+            return [(path, value)]
+        result: list[tuple[str, dict[str, Any]]] = []
+        for key, item in value.items():
+            result.extend(_externalized_sections(item, path=f"{path}.{key}"))
+        return result
+    if isinstance(value, list):
+        result = []
+        for index, item in enumerate(value):
+            result.extend(_externalized_sections(item, path=f"{path}[{index}]"))
+        return result
+    return []

@@ -13,6 +13,7 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
 from app.models.execution_diagnostic import (
+    ExecutionPayloadArtifact,
     ExecutionRecordIndex,
     ExecutionStepDiagnostic,
 )
@@ -63,6 +64,36 @@ class ExecutionDiagnosticRepository:
             model=ExecutionStepDiagnostic,
             existing=existing,
             values=values,
+        )
+
+    def upsert_artifact(self, values: dict[str, Any]) -> None:
+        if self._dialect_name() == "mysql":
+            statement = mysql_insert(ExecutionPayloadArtifact).values(**values)
+            updates = {
+                key: statement.inserted[key]
+                for key in values
+                if key not in {"id", "created_at"}
+            }
+            self.db.execute(statement.on_duplicate_key_update(**updates))
+            return
+        existing = self.get_artifact(
+            project_id=int(values["project_id"]),
+            artifact_ref=str(values["artifact_ref"]),
+        )
+        self._select_then_update(
+            model=ExecutionPayloadArtifact,
+            existing=existing,
+            values=values,
+        )
+
+    def get_artifact(
+        self, *, project_id: int, artifact_ref: str
+    ) -> ExecutionPayloadArtifact | None:
+        return self.db.scalar(
+            select(ExecutionPayloadArtifact).where(
+                ExecutionPayloadArtifact.project_id == project_id,
+                ExecutionPayloadArtifact.artifact_ref == artifact_ref,
+            )
         )
 
     def get_execution_index(

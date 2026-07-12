@@ -134,6 +134,28 @@ def protocol_fixtures() -> dict[str, dict]:
 
 
 class ExecutionDiagnosticProjectionTests(unittest.TestCase):
+    def test_externalized_sections_are_returned_as_evidence_refs_and_omissions(self):
+        execution = run_220_shape()
+        execution["detail"]["step_results"][2]["response"] = {
+            "artifact_ref": "execution-artifact://1/scenario/220/abc",
+            "raw_size_bytes": 100000,
+            "externalized": True,
+        }
+
+        result = self.projector.project(
+            execution_type="scenario",
+            execution=execution,
+            query=ExecutionDiagnosticQuery(view="failures"),
+        )
+
+        self.assertEqual(
+            result.evidence_refs[0]["artifact_ref"],
+            "execution-artifact://1/scenario/220/abc",
+        )
+        self.assertTrue(
+            any(item.reason == "artifact_externalized" for item in result.omissions)
+        )
+        self.assertNotIn("x" * 1000, result.model_dump_json())
     def setUp(self):
         self.projector = ExecutionDiagnosticProjectionService()
 

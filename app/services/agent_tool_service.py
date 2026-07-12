@@ -3148,6 +3148,11 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                         },
                         "artifact_ref": {"type": "string", "maxLength": 128},
                         "offset": {"type": "integer", "minimum": 0},
+                        "max_bytes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 65536,
+                        },
                     },
                 },
                 "include": {

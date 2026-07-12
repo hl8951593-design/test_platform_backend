@@ -436,6 +436,10 @@ class AgentPlatformToolTests(unittest.TestCase):
         for field in ("view", "selector", "include", "cursor", "limit", "max_chars"):
             self.assertIn(field, schema["properties"])
         self.assertEqual(schema["properties"]["max_chars"]["maximum"], 24000)
+        self.assertEqual(
+            schema["properties"]["selector"]["properties"]["max_bytes"]["maximum"],
+            65536,
+        )
 
     @patch("app.services.agent_platform_tool_service.TestPlanService.list_plans")
     def test_plan_query_returns_fact_snapshot(self, list_plans):

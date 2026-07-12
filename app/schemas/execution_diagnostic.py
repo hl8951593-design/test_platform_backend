@@ -24,6 +24,7 @@ class ExecutionDiagnosticSelector(BaseModel):
     step_ids: list[str] = Field(default_factory=list, max_length=200)
     artifact_ref: str | None = Field(default=None, max_length=128)
     offset: int = Field(default=0, ge=0)
+    max_bytes: int = Field(default=8192, ge=1, le=65536)
 
 
 class ExecutionDiagnosticQuery(BaseModel):

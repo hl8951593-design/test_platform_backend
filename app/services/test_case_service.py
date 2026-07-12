@@ -33,6 +33,9 @@ from app.schemas.test_case import (
     UnsavedTestCaseExecuteRequest,
 )
 from app.services.permission_service import PermissionService
+from app.services.execution_diagnostic_persistence import (
+    ExecutionDiagnosticPersistence,
+)
 
 
 class TestCaseService:
@@ -40,6 +43,7 @@ class TestCaseService:
         self.db = db
         self.repository = TestCaseRepository(db)
         self.permission_service = PermissionService(db)
+        self.diagnostic_persistence = ExecutionDiagnosticPersistence(db)
         self._environment_context_cache: dict[int, tuple[Any, dict[str, str]]] = {}
 
     def list_cases(
@@ -256,6 +260,8 @@ class TestCaseService:
         test_case.last_execution_status = "running"
         test_case.last_executed_at = datetime.utcnow()
         self.db.add(execution)
+        self.db.flush()
+        self._stage_execution_diagnostic(execution)
         self.db.commit()
         self.db.refresh(execution)
         return execution
@@ -271,12 +277,18 @@ class TestCaseService:
                 execution.status = "failed"
                 execution.error_message = "执行用户不存在或已停用"
                 execution.duration_ms = 0
+                TestCaseService._stage_execution_with(
+                    ExecutionDiagnosticPersistence(db), execution
+                )
                 db.commit()
                 return
             if execution.test_case_id is None:
                 execution.status = "failed"
                 execution.error_message = "异步执行暂不支持未保存测试用例"
                 execution.duration_ms = 0
+                TestCaseService._stage_execution_with(
+                    ExecutionDiagnosticPersistence(db), execution
+                )
                 db.commit()
                 return
             try:
@@ -290,6 +302,7 @@ class TestCaseService:
                     environment_id=execution.environment_id,
                 )
                 execution.status = "running"
+                service._stage_execution_diagnostic(execution)
                 db.commit()
                 service._execute(
                     project_id=execution.project_id,
@@ -305,6 +318,9 @@ class TestCaseService:
                     failed.status = "failed"
                     failed.error_message = str(exc)
                     failed.duration_ms = 0
+                    TestCaseService._stage_execution_with(
+                        ExecutionDiagnosticPersistence(db), failed
+                    )
                     db.commit()
 
     def execute_unsaved_case(
@@ -519,11 +535,12 @@ class TestCaseService:
                 if test_case is not None and test_case.project_id == project_id:
                     test_case.last_execution_status = status_value
                     test_case.last_executed_at = datetime.utcnow()
+            self._stage_execution_diagnostic(execution)
             self.db.commit()
             self.db.refresh(execution)
             return execution
 
-        return self._create_execution_record(
+        execution = self._create_execution_record(
             project_id=project_id,
             test_case_id=test_case_id,
             environment_id=payload.environment_id,
@@ -540,7 +557,12 @@ class TestCaseService:
             attempt_history=attempt_history,
             error_message=error_message,
             duration_ms=duration_ms,
+            commit=False,
         )
+        self._stage_execution_diagnostic(execution)
+        self.db.commit()
+        self.db.refresh(execution)
+        return execution
 
     def _create_execution_record(self, **values) -> TestCaseExecution:
         try:
@@ -551,7 +573,46 @@ class TestCaseService:
             fallback = dict(values)
             fallback.pop("scenario_run_id", None)
             fallback.pop("attempt_history", None)
+            fallback.pop("commit", None)
             return self.repository.create_execution(**fallback)
+
+    def _stage_execution_diagnostic(self, execution: TestCaseExecution) -> None:
+        self._stage_execution_with(self.diagnostic_persistence, execution)
+
+    @staticmethod
+    def _stage_execution_with(
+        persistence: ExecutionDiagnosticPersistence,
+        execution: TestCaseExecution,
+    ) -> None:
+        persistence.stage_execution(
+            project_id=execution.project_id,
+            execution_type="http",
+            execution_id=execution.id,
+            execution={
+                "summary": {
+                    "id": f"http:{execution.id}",
+                    "execution_type": "http",
+                    "execution_id": execution.id,
+                    "project_id": execution.project_id,
+                    "resource_id": execution.test_case_id,
+                    "environment_id": execution.environment_id,
+                    "status": execution.status,
+                    "trigger_type": getattr(execution, "trigger_source", "manual"),
+                    "trigger_user_id": execution.executed_by_id,
+                    "duration_ms": execution.duration_ms,
+                    "created_at": getattr(execution, "created_at", None),
+                },
+                "detail": {
+                    "status": execution.status,
+                    "request_snapshot": execution.request_snapshot,
+                    "response_snapshot": execution.response_snapshot,
+                    "assertion_results": execution.assertion_results,
+                    "attempt_history": execution.attempt_history,
+                    "error_message": execution.error_message,
+                    "duration_ms": execution.duration_ms,
+                },
+            },
+        )
 
     @staticmethod
     def _saved_case_payload(

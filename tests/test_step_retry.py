@@ -18,6 +18,7 @@ class StepRetryTests(unittest.TestCase):
 
     def http_service(self):
         service = TestCaseService(MagicMock())
+        service.diagnostic_persistence = MagicMock()
         service._load_environment_context = MagicMock(return_value=(None, {}))
         service.repository.create_execution = MagicMock(
             side_effect=lambda **values: SimpleNamespace(**values, id=101)
@@ -187,6 +188,7 @@ class StepRetryTests(unittest.TestCase):
 
     def test_websocket_reconnects_inside_step(self):
         service = WebSocketTestCaseService(MagicMock())
+        service.diagnostic_persistence = MagicMock()
         service._load_environment_context = MagicMock(return_value=(None, {}))
         service.repository.create_execution = MagicMock(
             side_effect=lambda **values: SimpleNamespace(**values, id=201)

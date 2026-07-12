@@ -126,7 +126,9 @@ class WebSocketTestCaseRepository:
             for item in self.db.scalars(statement).all()
         }
 
-    def create_execution(self, **values) -> WebSocketTestCaseExecution:
+    def create_execution(
+        self, *, commit: bool = True, **values
+    ) -> WebSocketTestCaseExecution:
         execution = WebSocketTestCaseExecution(**values)
         self.db.add(execution)
         test_case_id = values.get("websocket_test_case_id")
@@ -135,6 +137,12 @@ class WebSocketTestCaseRepository:
                 WebSocketTestCase.id == test_case_id,
                 WebSocketTestCase.project_id == values["project_id"],
             ).values(last_execution_status=values["status"], last_executed_at=func.now()))
-        self.db.commit()
-        self.db.refresh(execution)
+        self._finish_write(execution, commit=commit)
         return execution
+
+    def _finish_write(self, entity, *, commit: bool) -> None:
+        if commit:
+            self.db.commit()
+            self.db.refresh(entity)
+        else:
+            self.db.flush()

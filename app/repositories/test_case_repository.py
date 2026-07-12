@@ -236,6 +236,7 @@ class TestCaseRepository:
         agent_run_id: str | None = None,
         agent_tool_call_id: str | None = None,
         trigger_tool_name: str | None = None,
+        commit: bool = True,
     ) -> TestCaseExecution:
         execution = TestCaseExecution(
             project_id=project_id,
@@ -262,6 +263,12 @@ class TestCaseRepository:
                 .where(TestCase.id == test_case_id, TestCase.project_id == project_id)
                 .values(last_execution_status=status, last_executed_at=func.now())
             )
-        self.db.commit()
-        self.db.refresh(execution)
+        self._finish_write(execution, commit=commit)
         return execution
+
+    def _finish_write(self, entity, *, commit: bool) -> None:
+        if commit:
+            self.db.commit()
+            self.db.refresh(entity)
+        else:
+            self.db.flush()

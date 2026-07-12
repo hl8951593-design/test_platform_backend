@@ -203,6 +203,7 @@ class VisualFlowRepository:
         idempotency_key: str | None,
         context_snapshot: dict,
         status: str = "running",
+        commit: bool = True,
     ) -> VisualFlowExecution:
         now = datetime.utcnow()
         execution = VisualFlowExecution(
@@ -217,8 +218,7 @@ class VisualFlowRepository:
             started_at=now if status == "running" else None,
         )
         self.db.add(execution)
-        self.db.commit()
-        self.db.refresh(execution)
+        self._finish_write(execution, commit=commit)
         return execution
 
     def create_node_execution(
@@ -232,6 +232,7 @@ class VisualFlowRepository:
         error: dict | None,
         started_at: datetime | None,
         finished_at: datetime | None,
+        commit: bool = True,
     ) -> VisualFlowNodeExecution:
         node_execution = VisualFlowNodeExecution(
             execution_id=execution_id,
@@ -244,16 +245,27 @@ class VisualFlowRepository:
             finished_at=finished_at,
         )
         self.db.add(node_execution)
-        self.db.commit()
-        self.db.refresh(node_execution)
+        self._finish_write(node_execution, commit=commit)
         return node_execution
 
-    def finish_execution(self, *, execution: VisualFlowExecution, status: str) -> VisualFlowExecution:
+    def finish_execution(
+        self,
+        *,
+        execution: VisualFlowExecution,
+        status: str,
+        commit: bool = True,
+    ) -> VisualFlowExecution:
         execution.status = status
         execution.finished_at = datetime.utcnow()
-        self.db.commit()
-        self.db.refresh(execution)
+        self._finish_write(execution, commit=commit)
         return execution
+
+    def _finish_write(self, entity, *, commit: bool) -> None:
+        if commit:
+            self.db.commit()
+            self.db.refresh(entity)
+        else:
+            self.db.flush()
 
     def list_node_executions(self, execution_id: int) -> list[VisualFlowNodeExecution]:
         statement = (

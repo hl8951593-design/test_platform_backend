@@ -28,12 +28,16 @@ from app.schemas.websocket_test_case import (
     WebSocketTestCaseUpdateRequest,
 )
 from app.services.permission_service import PermissionService
+from app.services.execution_diagnostic_persistence import (
+    ExecutionDiagnosticPersistence,
+)
 
 
 class WebSocketTestCaseService:
     def __init__(self, db: Session):
         self.repository = WebSocketTestCaseRepository(db)
         self.permission_service = PermissionService(db)
+        self.diagnostic_persistence = ExecutionDiagnosticPersistence(db)
         self._environment_context_cache: dict[int, tuple[Any, dict[str, str]]] = {}
 
     def list_cases(
@@ -162,6 +166,8 @@ class WebSocketTestCaseService:
         case.last_execution_status = "running"
         case.last_executed_at = datetime.utcnow()
         self.repository.db.add(execution)
+        self.repository.db.flush()
+        self._stage_execution_diagnostic(execution)
         self.repository.db.commit()
         self.repository.db.refresh(execution)
         return execution
@@ -177,12 +183,18 @@ class WebSocketTestCaseService:
                 execution.status = "failed"
                 execution.error_message = "执行用户不存在或已停用"
                 execution.duration_ms = 0
+                WebSocketTestCaseService._stage_execution_with(
+                    ExecutionDiagnosticPersistence(db), execution
+                )
                 db.commit()
                 return
             if execution.websocket_test_case_id is None:
                 execution.status = "failed"
                 execution.error_message = "异步执行暂不支持未保存 WebSocket 测试用例"
                 execution.duration_ms = 0
+                WebSocketTestCaseService._stage_execution_with(
+                    ExecutionDiagnosticPersistence(db), execution
+                )
                 db.commit()
                 return
             try:
@@ -190,6 +202,7 @@ class WebSocketTestCaseService:
                 case = service._get_case(execution.project_id, execution.websocket_test_case_id)
                 payload = service._saved_case_payload(case, environment_id=execution.environment_id)
                 execution.status = "running"
+                service._stage_execution_diagnostic(execution)
                 db.commit()
                 service._execute(
                     execution.project_id,
@@ -205,6 +218,9 @@ class WebSocketTestCaseService:
                     failed.status = "failed"
                     failed.error_message = str(exc)
                     failed.duration_ms = 0
+                    WebSocketTestCaseService._stage_execution_with(
+                        ExecutionDiagnosticPersistence(db), failed
+                    )
                     db.commit()
 
     def _execute(
@@ -346,11 +362,12 @@ class WebSocketTestCaseService:
                 if case is not None and case.project_id == project_id:
                     case.last_execution_status = status_value
                     case.last_executed_at = datetime.utcnow()
+            self._stage_execution_diagnostic(execution)
             self.repository.db.commit()
             self.repository.db.refresh(execution)
             return execution
 
-        return self.repository.create_execution(
+        execution = self.repository.create_execution(
             project_id=project_id, websocket_test_case_id=test_case_id, environment_id=payload.environment_id,
             scenario_run_id=scenario_run_id, executed_by_id=current_user.id,
             trigger_source=trigger_source,
@@ -362,6 +379,51 @@ class WebSocketTestCaseService:
             response_snapshot=response_snapshot, assertion_results=assertion_results,
             attempt_history=attempt_history, error_message=error_message,
             duration_ms=duration_ms,
+            commit=False,
+        )
+        self._stage_execution_diagnostic(execution)
+        self.repository.db.commit()
+        self.repository.db.refresh(execution)
+        return execution
+
+    def _stage_execution_diagnostic(
+        self, execution: WebSocketTestCaseExecution
+    ) -> None:
+        self._stage_execution_with(self.diagnostic_persistence, execution)
+
+    @staticmethod
+    def _stage_execution_with(
+        persistence: ExecutionDiagnosticPersistence,
+        execution: WebSocketTestCaseExecution,
+    ) -> None:
+        persistence.stage_execution(
+            project_id=execution.project_id,
+            execution_type="websocket",
+            execution_id=execution.id,
+            execution={
+                "summary": {
+                    "id": f"websocket:{execution.id}",
+                    "execution_type": "websocket",
+                    "execution_id": execution.id,
+                    "project_id": execution.project_id,
+                    "resource_id": execution.websocket_test_case_id,
+                    "environment_id": execution.environment_id,
+                    "status": execution.status,
+                    "trigger_type": getattr(execution, "trigger_source", "manual"),
+                    "trigger_user_id": execution.executed_by_id,
+                    "duration_ms": execution.duration_ms,
+                    "created_at": getattr(execution, "created_at", None),
+                },
+                "detail": {
+                    "status": execution.status,
+                    "session_snapshot": execution.session_snapshot,
+                    "response_snapshot": execution.response_snapshot,
+                    "assertion_results": execution.assertion_results,
+                    "attempt_history": execution.attempt_history,
+                    "error_message": execution.error_message,
+                    "duration_ms": execution.duration_ms,
+                },
+            },
         )
 
     @staticmethod

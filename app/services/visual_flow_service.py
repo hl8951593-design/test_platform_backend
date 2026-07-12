@@ -13,12 +13,20 @@ from app.core.permissions import ProjectPermission
 from app.core.variable_renderer import render_variables
 from app.db.session import SessionLocal
 from app.models.user import User
-from app.models.visual_flow import VisualFlow, VisualFlowExecution, VisualFlowVersion
+from app.models.visual_flow import (
+    VisualFlow,
+    VisualFlowExecution,
+    VisualFlowNodeExecution,
+    VisualFlowVersion,
+)
 from app.repositories.visual_flow_repository import VisualFlowRepository
 from app.schemas.test_case import TestCaseRequestConfig
 from app.schemas.visual_flow import FlowDefinition, FlowNode
 from app.schemas.websocket_test_case import WebSocketTestCaseConfig
 from app.services.permission_service import PermissionService
+from app.services.execution_diagnostic_persistence import (
+    ExecutionDiagnosticPersistence,
+)
 from app.services.test_case_service import TestCaseService
 from app.services.websocket_test_case_service import WebSocketTestCaseService
 
@@ -58,6 +66,7 @@ class VisualFlowService:
         self.db = db
         self.repository = VisualFlowRepository(db)
         self.permission_service = PermissionService(db)
+        self.diagnostic_persistence = ExecutionDiagnosticPersistence(db)
 
     def list_flows(
         self,
@@ -244,7 +253,11 @@ class VisualFlowService:
                 "referencedCases": self._mask(case_snapshots),
             },
             status="queued",
+            commit=False,
         )
+        self._stage_execution_diagnostic(execution, [])
+        self.db.commit()
+        self.db.refresh(execution)
         return execution, version.version, []
 
     @staticmethod
@@ -257,17 +270,26 @@ class VisualFlowService:
             if current_user is None or not current_user.is_active:
                 execution.status = "failed"
                 execution.finished_at = datetime.utcnow()
+                VisualFlowService._stage_execution_with(
+                    ExecutionDiagnosticPersistence(db), execution, []
+                )
                 db.commit()
                 return
             if execution.flow_version_id is None:
                 execution.status = "failed"
                 execution.finished_at = datetime.utcnow()
+                VisualFlowService._stage_execution_with(
+                    ExecutionDiagnosticPersistence(db), execution, []
+                )
                 db.commit()
                 return
             version = db.get(VisualFlowVersion, execution.flow_version_id)
             if version is None:
                 execution.status = "failed"
                 execution.finished_at = datetime.utcnow()
+                VisualFlowService._stage_execution_with(
+                    ExecutionDiagnosticPersistence(db), execution, []
+                )
                 db.commit()
                 return
             try:
@@ -288,6 +310,16 @@ class VisualFlowService:
                 if failed is not None and failed.status in {"queued", "running"}:
                     failed.status = "failed"
                     failed.finished_at = datetime.utcnow()
+                    repository = VisualFlowRepository(db)
+                    nodes = [
+                        VisualFlowService._flow_node_record_view(item, index)
+                        for index, item in enumerate(
+                            repository.list_node_executions(failed.id)
+                        )
+                    ]
+                    VisualFlowService._stage_execution_with(
+                        ExecutionDiagnosticPersistence(db), failed, nodes
+                    )
                     db.commit()
 
     def execute_unsaved(
@@ -350,12 +382,17 @@ class VisualFlowService:
                     "definition": self._mask(self._stored_definition(definition)),
                     "referencedCases": self._mask(case_snapshots),
                 },
+                commit=False,
             )
+            self._stage_execution_diagnostic(execution, [])
+            self.db.commit()
+            self.db.refresh(execution)
         else:
             execution = existing_execution
             execution.status = "running"
             execution.started_at = datetime.utcnow()
             execution.finished_at = None
+            self._stage_execution_diagnostic(execution, [])
             self.db.commit()
         nodes = {node.id: node for node in definition.nodes}
         incoming = {node_id: [] for node_id in nodes}
@@ -366,6 +403,7 @@ class VisualFlowService:
 
         active_edges: set[str] = set()
         outputs: dict[str, dict[str, Any]] = {}
+        diagnostic_steps: list[dict[str, Any]] = []
         fatal_failure = False
         for node_id in self._topological_order(definition):
             node = nodes[node_id]
@@ -374,7 +412,7 @@ class VisualFlowService:
                 now = datetime.utcnow()
                 output = self._node_output(node_id, "skipped", now, now, 0)
                 outputs[node_id] = output
-                self.repository.create_node_execution(
+                node_execution = self.repository.create_node_execution(
                     execution_id=execution.id,
                     node_id=node_id,
                     status="skipped",
@@ -383,7 +421,24 @@ class VisualFlowService:
                     error=None,
                     started_at=now,
                     finished_at=now,
+                    commit=False,
                 )
+                diagnostic_step = self._flow_node_record_view(
+                    node_execution,
+                    len(diagnostic_steps),
+                    name=node.name,
+                    kind=node.kind,
+                )
+                self.diagnostic_persistence.stage_step(
+                    project_id=project_id,
+                    execution_type="flow",
+                    execution_id=execution.id,
+                    step=diagnostic_step,
+                    fallback_index=len(diagnostic_steps),
+                )
+                self.db.commit()
+                self.db.refresh(node_execution)
+                diagnostic_steps.append(diagnostic_step)
                 continue
 
             started = datetime.utcnow()
@@ -416,7 +471,7 @@ class VisualFlowService:
             for edge in outgoing[node_id]:
                 if self._route_matches(edge.route, node, output):
                     active_edges.add(edge.id)
-            self.repository.create_node_execution(
+            node_execution = self.repository.create_node_execution(
                 execution_id=execution.id,
                 node_id=node_id,
                 status=output["status"],
@@ -425,11 +480,111 @@ class VisualFlowService:
                 error=error,
                 started_at=started,
                 finished_at=datetime.utcnow(),
+                commit=False,
             )
-        return self.repository.finish_execution(
+            diagnostic_step = self._flow_node_record_view(
+                node_execution,
+                len(diagnostic_steps),
+                name=node.name,
+                kind=node.kind,
+            )
+            self.diagnostic_persistence.stage_step(
+                project_id=project_id,
+                execution_type="flow",
+                execution_id=execution.id,
+                step=diagnostic_step,
+                fallback_index=len(diagnostic_steps),
+            )
+            self.db.commit()
+            self.db.refresh(node_execution)
+            diagnostic_steps.append(diagnostic_step)
+        execution = self.repository.finish_execution(
             execution=execution,
             status="failed" if fatal_failure else "passed",
+            commit=False,
         )
+        self._stage_execution_diagnostic(execution, diagnostic_steps)
+        self.db.commit()
+        self.db.refresh(execution)
+        return execution
+
+    def _stage_execution_diagnostic(
+        self,
+        execution: VisualFlowExecution,
+        steps: list[dict[str, Any]],
+    ) -> None:
+        self._stage_execution_with(self.diagnostic_persistence, execution, steps)
+
+    @staticmethod
+    def _stage_execution_with(
+        persistence: ExecutionDiagnosticPersistence,
+        execution: VisualFlowExecution,
+        steps: list[dict[str, Any]],
+    ) -> None:
+        duration_ms = None
+        if execution.started_at is not None and execution.finished_at is not None:
+            duration_ms = int(
+                (execution.finished_at - execution.started_at).total_seconds() * 1000
+            )
+        persistence.stage_execution(
+            project_id=execution.project_id,
+            execution_type="flow",
+            execution_id=execution.id,
+            execution={
+                "summary": {
+                    "id": f"flow:{execution.id}",
+                    "execution_type": "flow",
+                    "execution_id": execution.id,
+                    "project_id": execution.project_id,
+                    "resource_id": execution.flow_id,
+                    "environment_id": execution.environment_id,
+                    "status": execution.status,
+                    "trigger_type": getattr(execution, "trigger_type", "manual"),
+                    "trigger_user_id": execution.trigger_user_id,
+                    "duration_ms": duration_ms,
+                    "started_at": execution.started_at,
+                    "finished_at": execution.finished_at,
+                    "created_at": getattr(execution, "created_at", None),
+                },
+                "detail": {"node_executions": copy.deepcopy(steps)},
+            },
+        )
+
+    @staticmethod
+    def _flow_node_record_view(
+        node_execution: VisualFlowNodeExecution,
+        step_index: int,
+        *,
+        name: str | None = None,
+        kind: str | None = None,
+    ) -> dict[str, Any]:
+        duration_ms = None
+        if (
+            node_execution.started_at is not None
+            and node_execution.finished_at is not None
+        ):
+            duration_ms = int(
+                (
+                    node_execution.finished_at - node_execution.started_at
+                ).total_seconds()
+                * 1000
+            )
+        error = node_execution.error if isinstance(node_execution.error, dict) else {}
+        return {
+            "step_id": node_execution.node_id,
+            "step_index": step_index,
+            "node_id": node_execution.node_id,
+            "name": name or node_execution.node_id,
+            "kind": kind or "flow_node",
+            "status": node_execution.status,
+            "duration_ms": duration_ms,
+            "error_code": error.get("code"),
+            "error_message": error.get("message"),
+            "request_snapshot": node_execution.request_snapshot,
+            "response_snapshot": node_execution.output_snapshot,
+            "output_snapshot": node_execution.output_snapshot,
+            "error": node_execution.error,
+        }
 
     def _execute_node(
         self,

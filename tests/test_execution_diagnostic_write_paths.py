@@ -3,7 +3,16 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from app.repositories.test_case_repository import TestCaseRepository
+from app.repositories.visual_flow_repository import VisualFlowRepository
+from app.repositories.websocket_test_case_repository import WebSocketTestCaseRepository
+from app.schemas.test_case import TestCaseRequestConfig
+from app.schemas.visual_flow import FlowDefinition
+from app.schemas.websocket_test_case import WebSocketTestCaseConfig
 from app.services.scenario_service import ScenarioService
+from app.services.test_case_service import TestCaseService
+from app.services.visual_flow_service import VisualFlowService
+from app.services.websocket_test_case_service import WebSocketTestCaseService
 
 
 def _run(**overrides):
@@ -105,6 +114,218 @@ class ExecutionDiagnosticWritePathTests(unittest.TestCase):
 
         self.assertEqual(timeline, ["diagnostic", "event", "commit"])
         self.service.diagnostic_persistence.stage_execution.assert_called_once()
+
+    def test_protocol_repositories_support_flush_without_commit(self):
+        db = MagicMock()
+        TestCaseRepository(db).create_execution(
+            project_id=1,
+            test_case_id=None,
+            environment_id=None,
+            scenario_run_id=None,
+            executed_by_id=7,
+            status="passed",
+            request_snapshot={},
+            response_snapshot={},
+            assertion_results=[],
+            attempt_history=[],
+            error_message=None,
+            duration_ms=1,
+            commit=False,
+        )
+        WebSocketTestCaseRepository(db).create_execution(
+            project_id=1,
+            websocket_test_case_id=None,
+            environment_id=None,
+            scenario_run_id=None,
+            executed_by_id=7,
+            status="passed",
+            session_snapshot={},
+            response_snapshot={},
+            assertion_results=[],
+            attempt_history=[],
+            error_message=None,
+            duration_ms=1,
+            commit=False,
+        )
+        VisualFlowRepository(db).create_execution(
+            flow_id=None,
+            flow_version_id=None,
+            project_id=1,
+            environment_id=None,
+            user_id=7,
+            idempotency_key=None,
+            context_snapshot={},
+            commit=False,
+        )
+
+        db.commit.assert_not_called()
+        self.assertEqual(db.flush.call_count, 3)
+
+    def test_http_terminal_projection_adds_no_commit(self):
+        db = MagicMock()
+        service = TestCaseService(db)
+        service.diagnostic_persistence = MagicMock()
+        service._load_environment_context = MagicMock(return_value=(None, {}))
+        service._send_request = MagicMock(
+            return_value={
+                "status_code": 200,
+                "headers": {},
+                "body": '{"code":200}',
+                "json": {"code": 200},
+            }
+        )
+
+        def create_execution(*, commit=True, **values):
+            execution = SimpleNamespace(id=31, created_at=datetime.utcnow(), **values)
+            if commit:
+                db.commit()
+                db.refresh(execution)
+            else:
+                db.flush()
+            return execution
+
+        service.repository.create_execution = MagicMock(side_effect=create_execution)
+        payload = TestCaseRequestConfig.model_validate(
+            {
+                "method": "GET",
+                "path": "https://example.test/ping",
+                "assertions": [],
+                "extractors": [],
+            }
+        )
+
+        execution = service._execute(
+            project_id=1,
+            test_case_id=None,
+            payload=payload,
+            current_user=SimpleNamespace(id=7),
+        )
+
+        self.assertEqual(execution.status, "passed")
+        self.assertEqual(db.commit.call_count, 1)
+        self.assertFalse(service.repository.create_execution.call_args.kwargs["commit"])
+        service.diagnostic_persistence.stage_execution.assert_called_once()
+
+    def test_websocket_terminal_projection_adds_no_commit(self):
+        db = MagicMock()
+        service = WebSocketTestCaseService(db)
+        service.diagnostic_persistence = MagicMock()
+        service._load_environment_context = MagicMock(return_value=(None, {}))
+        service._run_session = MagicMock(
+            return_value={"sent_messages": [], "received_messages": []}
+        )
+
+        def create_execution(*, commit=True, **values):
+            execution = SimpleNamespace(id=32, created_at=datetime.utcnow(), **values)
+            if commit:
+                db.commit()
+                db.refresh(execution)
+            else:
+                db.flush()
+            return execution
+
+        service.repository.create_execution = MagicMock(side_effect=create_execution)
+        payload = WebSocketTestCaseConfig.model_validate(
+            {"path": "wss://example.test/events", "assertions": [], "extractors": []}
+        )
+
+        execution = service._execute(1, None, payload, SimpleNamespace(id=7))
+
+        self.assertEqual(execution.status, "passed")
+        self.assertEqual(db.commit.call_count, 1)
+        self.assertFalse(service.repository.create_execution.call_args.kwargs["commit"])
+        service.diagnostic_persistence.stage_execution.assert_called_once()
+
+    def test_flow_node_projection_reuses_every_existing_commit_boundary(self):
+        db = MagicMock()
+        service = VisualFlowService(db)
+        service.diagnostic_persistence = MagicMock()
+        service._validate = MagicMock()
+        service._case_snapshots = MagicMock(return_value={})
+        next_node_id = 0
+
+        def create_execution(*, commit=True, **values):
+            execution = SimpleNamespace(
+                id=41,
+                status=values.get("status", "running"),
+                started_at=datetime.utcnow(),
+                finished_at=None,
+                trigger_type="manual",
+                trigger_user_id=values["user_id"],
+                created_at=datetime.utcnow(),
+                **{key: value for key, value in values.items() if key not in {"status", "user_id"}},
+            )
+            (db.commit if commit else db.flush)()
+            return execution
+
+        def create_node_execution(*, commit=True, **values):
+            nonlocal next_node_id
+            next_node_id += 1
+            node = SimpleNamespace(id=next_node_id, **values)
+            (db.commit if commit else db.flush)()
+            return node
+
+        def finish_execution(*, execution, status, commit=True):
+            execution.status = status
+            execution.finished_at = datetime.utcnow()
+            (db.commit if commit else db.flush)()
+            return execution
+
+        service.repository.create_execution = MagicMock(side_effect=create_execution)
+        service.repository.create_node_execution = MagicMock(
+            side_effect=create_node_execution
+        )
+        service.repository.finish_execution = MagicMock(side_effect=finish_execution)
+        definition = FlowDefinition.model_validate(
+            {
+                "schemaVersion": "1.0",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "start",
+                        "name": "Start",
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "end",
+                        "kind": "end",
+                        "name": "End",
+                        "position": {"x": 200, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {
+                        "id": "edge-1",
+                        "source": "start",
+                        "target": "end",
+                        "route": "success",
+                    }
+                ],
+            }
+        )
+
+        execution = service._execute(
+            definition=definition,
+            project_id=1,
+            environment_id=None,
+            flow_id=None,
+            flow_version_id=None,
+            idempotency_key=None,
+            current_user=SimpleNamespace(id=7),
+        )
+
+        self.assertEqual(execution.status, "passed")
+        self.assertEqual(db.commit.call_count, 4)
+        self.assertEqual(service.diagnostic_persistence.stage_step.call_count, 2)
+        self.assertGreaterEqual(
+            service.diagnostic_persistence.stage_execution.call_count, 2
+        )
+        self.assertTrue(
+            all(
+                call.kwargs["commit"] is False
+                for call in service.repository.create_node_execution.call_args_list
+            )
+        )
 
 
 if __name__ == "__main__":

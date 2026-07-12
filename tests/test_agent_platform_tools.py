@@ -22,6 +22,7 @@ from app.services.agent_runtime_service import (
 )
 from app.services.agent_tool_result_projection import ToolResultProjectionService
 from app.services.agent_tool_service import AgentToolBackend, ToolRegistry
+from tests.test_execution_diagnostic_projection import run_220_shape
 
 
 OLD_TOOL_NAMES = {
@@ -266,6 +267,112 @@ class AgentPlatformToolTests(unittest.TestCase):
         self.assertEqual(result["executions"][0]["execution_id"], 41)
         self.assertTrue(result["executions"][0]["object_ref"].endswith("/41"))
         self.assertEqual(result["object_reference_manifest"]["query_tool"], "execution.query_records")
+
+    @patch("app.services.agent_platform_tool_service.ExecutionRecordService.get_detail")
+    def test_execution_read_detail_without_view_keeps_legacy_full_output(
+        self, get_detail
+    ):
+        get_detail.return_value = run_220_shape()
+
+        result = self.backend.execute(
+            tool_name="execution.read_detail",
+            payload={
+                "project_id": 10,
+                "execution_type": "scenario",
+                "execution_id": 220,
+            },
+            current_user=self.user,
+        )
+
+        self.assertIn("execution", result)
+        self.assertIn("step_results", result["execution"]["detail"])
+        self.assertNotIn("diagnostic", result)
+
+    @patch("app.services.agent_platform_tool_service.ExecutionRecordService.get_detail")
+    def test_execution_read_detail_failure_view_returns_bounded_diagnostic(
+        self, get_detail
+    ):
+        get_detail.return_value = run_220_shape()
+
+        result = self.backend.execute(
+            tool_name="execution.read_detail",
+            payload={
+                "project_id": 10,
+                "execution_type": "scenario",
+                "execution_id": 220,
+                "view": "failures",
+                "max_chars": 12000,
+            },
+            current_user=self.user,
+        )
+
+        self.assertNotIn("execution", result)
+        self.assertEqual(
+            result["diagnostic"]["data"]["first_failure"]["step_id"], "STEP-2"
+        )
+        self.assertLessEqual(
+            len(json.dumps(result["diagnostic"], ensure_ascii=False)), 12000
+        )
+        get_detail.assert_called_once_with(
+            project_id=10,
+            execution_type="scenario",
+            execution_id=220,
+            current_user=self.user,
+        )
+
+    def test_execution_read_detail_step_view_requires_exactly_one_step_id(self):
+        with self.assertRaises(HTTPException) as raised:
+            self.backend.execute(
+                tool_name="execution.read_detail",
+                payload={
+                    "project_id": 10,
+                    "execution_type": "scenario",
+                    "execution_id": 220,
+                    "view": "step",
+                    "selector": {"step_ids": []},
+                },
+                current_user=self.user,
+            )
+
+        self.assertEqual(raised.exception.status_code, 422)
+
+    @patch("app.services.agent_platform_tool_service.ExecutionRecordService.get_detail")
+    def test_execution_read_detail_supports_summary_steps_and_single_step_views(
+        self, get_detail
+    ):
+        get_detail.return_value = run_220_shape()
+        payloads = {
+            "summary": {"view": "summary"},
+            "steps": {"view": "steps", "limit": 2},
+            "step": {"view": "step", "selector": {"step_ids": ["STEP-2"]}},
+        }
+
+        for expected_view, options in payloads.items():
+            with self.subTest(view=expected_view):
+                result = self.backend.execute(
+                    tool_name="execution.read_detail",
+                    payload={
+                        "project_id": 10,
+                        "execution_type": "scenario",
+                        "execution_id": 220,
+                        **options,
+                    },
+                    current_user=self.user,
+                )
+                diagnostic = result["diagnostic"]
+                self.assertEqual(diagnostic["view"], expected_view)
+                self.assertEqual(diagnostic["resource_ref"], "scenario:220")
+
+        self.assertEqual(
+            result["diagnostic"]["data"]["step"]["step_id"], "STEP-2"
+        )
+
+    def test_execution_read_detail_schema_exposes_progressive_read_fields(self):
+        schema = ToolRegistry().get("execution.read_detail").input_schema
+
+        for field in ("view", "selector", "include", "cursor", "limit", "max_chars"):
+            self.assertIn(field, schema["properties"])
+        self.assertEqual(schema["properties"]["max_chars"]["maximum"], 24000)
 
     @patch("app.services.agent_platform_tool_service.TestPlanService.list_plans")
     def test_plan_query_returns_fact_snapshot(self, list_plans):

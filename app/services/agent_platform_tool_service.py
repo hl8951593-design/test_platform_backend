@@ -23,6 +23,7 @@ from app.schemas.defect import (
     DefectStatusUpdateRequest,
     DefectUpdateRequest,
 )
+from app.schemas.execution_diagnostic import ExecutionDiagnosticQuery
 from app.schemas.test_plan import (
     TestPlanCreateRequest,
     TestPlanRead,
@@ -36,6 +37,7 @@ from app.schemas.visual_flow import (
 )
 from app.services.ai_browser_capture_service import AIBrowserCaptureService
 from app.services.defect_service import DefectService
+from app.services.execution_diagnostic_service import ExecutionDiagnosticService
 from app.services.execution_record_service import ExecutionRecordService
 from app.services.permission_service import PermissionService
 from app.services.test_plan_service import TestPlanService
@@ -214,6 +216,21 @@ class AgentPlatformToolBackend:
         project_id = _require_int(payload, "project_id")
         execution_type = _require_execution_type(payload, "execution_type")
         execution_id = _entity_id(payload, id_key="execution_id")
+        if payload.get("view") is not None:
+            query = _execution_diagnostic_query(payload)
+            diagnostic = ExecutionDiagnosticService(self.db).read(
+                project_id=project_id,
+                execution_type=execution_type,
+                execution_id=execution_id,
+                query=query,
+                current_user=current_user,
+            )
+            return {
+                "project_id": project_id,
+                "execution_type": execution_type,
+                "execution_id": execution_id,
+                "diagnostic": diagnostic.model_dump(mode="json"),
+            }
         detail = ExecutionRecordService(self.db).get_detail(
             project_id=project_id,
             execution_type=execution_type,
@@ -870,6 +887,18 @@ def _page_bounds(payload: dict[str, Any]) -> tuple[int, int]:
             detail="page must be >= 1 and page_size must be between 1 and 100",
         )
     return page, page_size
+
+
+def _execution_diagnostic_query(payload: dict[str, Any]) -> ExecutionDiagnosticQuery:
+    fields = ("view", "selector", "include", "cursor", "limit", "max_chars")
+    query_payload = {key: payload[key] for key in fields if key in payload}
+    try:
+        return ExecutionDiagnosticQuery.model_validate(query_payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=exc.errors(),
+        ) from exc
 
 
 def _detail_level(payload: dict[str, Any], *, allowed: set[str]) -> str:

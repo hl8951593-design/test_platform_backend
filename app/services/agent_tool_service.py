@@ -3115,6 +3115,46 @@ def _build_tool_specs() -> dict[str, ToolSpec]:
                 "execution_type": execution_type_schema,
                 "execution_id": {"type": "integer"},
                 "object_reference": entity_reference_schema,
+                "view": {
+                    "type": "string",
+                    "enum": ["summary", "failures", "steps", "step", "artifact", "full"],
+                },
+                "selector": {
+                    "type": "object",
+                    "properties": {
+                        "statuses": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 8,
+                        },
+                        "first_failure": {"type": "boolean"},
+                        "step_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 200,
+                        },
+                        "artifact_ref": {"type": "string", "maxLength": 128},
+                        "offset": {"type": "integer", "minimum": 0},
+                    },
+                },
+                "include": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "assertions",
+                            "response_summary",
+                            "bindings",
+                            "extractors",
+                            "retries",
+                            "upstream",
+                        ],
+                    },
+                    "maxItems": 8,
+                },
+                "cursor": {"type": "string", "maxLength": 512},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                "max_chars": {"type": "integer", "minimum": 1000, "maximum": 24000},
             },
         },
         "execution_diagnose_input": {

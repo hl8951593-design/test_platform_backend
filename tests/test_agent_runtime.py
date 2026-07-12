@@ -4455,11 +4455,19 @@ class AgentRuntimeTests(unittest.TestCase):
             AgentConversationRunner(self.db).run(run_id=current.run_id, user_id=self.owner.id)
 
         roles_and_content = [(message.role, message.content) for message in captured_messages]
+        system_context = "\n\n".join(
+            message.content for message in captured_messages if message.role == "system"
+        )
         self.assertIn(("user", "第一轮可见历史用户问题"), roles_and_content)
         self.assertIn(("assistant", "第一轮可见 assistant 回复"), roles_and_content)
         self.assertIn(("user", "第二轮只有用户历史可回放"), roles_and_content)
         self.assertNotIn(("assistant", "第二轮不可见 assistant 回复"), roles_and_content)
         self.assertNotIn(("user", "失败历史不应进入模型 prompt"), roles_and_content)
+        self.assertIn('"recent_run_states"', system_context)
+        self.assertIn(failed.run_id, system_context)
+        self.assertIn('"status": "failed"', system_context)
+        self.assertIn('"error_code": "history_contract_failure"', system_context)
+        self.assertIn('"error_message": "failed history"', system_context)
         self.assertEqual(roles_and_content[-1], ("user", "当前轮用户问题"))
         self.assertLess(
             roles_and_content.index(("user", "第一轮可见历史用户问题")),

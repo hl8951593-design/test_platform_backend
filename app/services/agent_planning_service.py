@@ -6,6 +6,7 @@ from typing import Any, Callable, Literal, Sequence
 
 from pydantic import BaseModel, Field, ValidationError
 
+from app.core.sensitive_data import mask_sensitive
 from app.schemas.ai import AIChatMessage, AIChatRequest
 from app.services.ai_service import AIService
 
@@ -368,7 +369,34 @@ def _safe_conversation_context(value: dict[str, Any] | None) -> dict[str, Any]:
     for key in ("active_artifact_action", "active_artifact_handles", "current_artifact_candidates"):
         if key in value:
             safe[key] = value[key]
+    recent_run_states = value.get("recent_run_states")
+    if isinstance(recent_run_states, list):
+        safe["recent_run_states"] = [
+            _safe_recent_run_state(item)
+            for item in recent_run_states[-12:]
+            if isinstance(item, dict)
+        ]
     return safe
+
+
+def _safe_recent_run_state(value: dict[str, Any]) -> dict[str, Any]:
+    allowed_fields = (
+        "run_id",
+        "status",
+        "user_intent",
+        "error_code",
+        "error_message",
+        "last_event_sequence",
+        "current_iteration",
+        "current_step_index",
+        "completed_at",
+    )
+    state = {field: value[field] for field in allowed_fields if value.get(field) is not None}
+    if "user_intent" in state:
+        state["user_intent"] = str(mask_sensitive(state["user_intent"]))[:800]
+    if "error_message" in state:
+        state["error_message"] = str(mask_sensitive(state["error_message"]))[:512]
+    return state
 
 
 def _compact_skill(item: dict[str, Any]) -> dict[str, Any]:

@@ -215,6 +215,49 @@ class AgentPlanningDecisionServiceTests(unittest.TestCase):
         self.assertEqual(len(ai_service.requests), 2)
         self.assertIn("invented.tool", raised.exception.details["last_error"]["unknown_tools"])
 
+    def test_planner_safe_context_keeps_terminal_run_state_without_assistant_prose(self):
+        ai_service = FakeAIService(response(planning_json()))
+        context = {
+            "schema_version": "conversation_working_context_v2",
+            "recent_run_states": [
+                {
+                    "run_id": "agent-run-failed-1",
+                    "status": "failed",
+                    "user_intent": "create defects from failed cases",
+                    "error_code": "agent_planning_failed",
+                    "error_message": "bounded planning failure",
+                    "last_event_sequence": 8,
+                }
+            ],
+            "recent_turns": [
+                {
+                    "run_id": "agent-run-completed-1",
+                    "user_intent": "analyze cases",
+                    "assistant_message": "private assistant prose must not enter planning",
+                }
+            ],
+            "active_artifact_handles": ARTIFACT_INDEX,
+        }
+
+        from app.services.agent_planning_service import AgentPlanningDecisionService
+
+        AgentPlanningDecisionService(ai_service=ai_service).decide(
+            intent="为什么上一轮失败",
+            conversation_context=context,
+            skill_index=SKILL_INDEX,
+            tool_index=TOOL_INDEX,
+            artifact_index=ARTIFACT_INDEX,
+            project_id=1,
+            permissions=("view_project", "view_test_case", "view_scenario", "execute_test"),
+        )
+
+        request_payload = json.loads(ai_service.requests[0].messages[-1].content)
+        safe_context = request_payload["conversation_context"]
+        self.assertIn("recent_run_states", safe_context)
+        self.assertEqual(safe_context["recent_run_states"], context["recent_run_states"])
+        self.assertNotIn("recent_turns", safe_context)
+        self.assertNotIn("private assistant prose", json.dumps(safe_context))
+
     def test_registered_future_skill_requires_no_keyword_router_branch(self):
         from app.services.agent_planning_service import AgentPlanningDecisionService
 

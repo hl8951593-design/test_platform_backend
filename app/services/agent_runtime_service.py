@@ -300,6 +300,9 @@ AGENT_HISTORY_CONTEXT_SUMMARY_CHARS = 360
 AGENT_HISTORY_CONTEXT_RECENT_USER_CHARS = 800
 AGENT_HISTORY_CONTEXT_RECENT_ASSISTANT_CHARS = 1200
 AGENT_HISTORY_CONTEXT_SOURCE_STATUS = "completed"
+AGENT_WORKING_CONTEXT_STATE_STATUSES = tuple(
+    sorted(RUN_TERMINAL_STATUSES | {"migration_blocked", "needs_human"})
+)
 AGENT_CONVERSATION_TOOL_ARTIFACT_MANIFEST_MAX_CALLS = 50
 AGENT_CONVERSATION_TOOL_ARTIFACT_CONTEXT_MAX_ITEMS = 12
 AGENT_HISTORY_CONTEXT_EXCLUDED_STATUSES = tuple(
@@ -5941,6 +5944,7 @@ class AgentConversationRunner:
         messages.append(AIChatMessage(role="system", content=_format_run_context(run)))
         working_context: dict[str, Any] | None = None
         previous_runs: list[AgentRun] = []
+        previous_state_runs: list[AgentRun] = []
         tool_artifact_manifests: list[dict[str, Any]] = []
         if run.conversation_id:
             previous_runs = list(
@@ -5957,10 +5961,24 @@ class AgentConversationRunner:
                 ).all()
             )
             previous_runs = list(reversed(previous_runs))
+            previous_state_runs = list(
+                self.db.scalars(
+                    select(AgentRun)
+                    .where(
+                        AgentRun.project_id == run.project_id,
+                        AgentRun.conversation_id == run.conversation_id,
+                        AgentRun.id < run.id,
+                        AgentRun.status.in_(AGENT_WORKING_CONTEXT_STATE_STATUSES),
+                    )
+                    .order_by(AgentRun.id.desc())
+                    .limit(AGENT_HISTORY_CONTEXT_MAX_RUNS)
+                ).all()
+            )
+            previous_state_runs = list(reversed(previous_state_runs))
             tool_artifact_manifests = self._conversation_tool_artifact_manifests(run)
             working_context = _conversation_working_context(
                 current_intent=run.intent,
-                previous_runs=previous_runs,
+                previous_runs=previous_state_runs,
                 tool_artifact_manifests=tool_artifact_manifests,
             )
         capability_plan_service = AgentCapabilityPlanService(self.db)
@@ -10209,10 +10227,11 @@ def _conversation_working_context(
             artifacts.append({"source_run_id": run.run_id, "artifact_class": "SUMMARY", **inferred})
         turns.append(turn)
     payload: dict[str, Any] = {
-        "schema_version": "conversation_working_context_v1",
+        "schema_version": "conversation_working_context_v2",
         "current_intent": current_intent,
         "current_intent_is_deictic_followup": _intent_is_deictic_followup(current_intent),
         "recent_turns": turns,
+        "recent_run_states": [_run_state_for_working_context(run) for run in recent_runs],
         "current_artifact_candidates": [
             *active_artifact_handles[-AGENT_CONVERSATION_TOOL_ARTIFACT_CONTEXT_MAX_ITEMS:],
             *artifacts[-3:],
@@ -10230,6 +10249,29 @@ def _conversation_working_context(
     if active_artifact_handles:
         payload["active_artifact_handles"] = active_artifact_handles
     return payload
+
+
+def _run_state_for_working_context(run: AgentRun) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "run_id": run.run_id,
+        "status": run.status,
+        "user_intent": _truncate_history_text(
+            run.intent,
+            AGENT_HISTORY_CONTEXT_RECENT_USER_CHARS,
+        ),
+        "last_event_sequence": run.last_event_sequence,
+        "current_iteration": run.current_iteration,
+        "current_step_index": run.current_step_index,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+    }
+    if run.error_code:
+        payload["error_code"] = run.error_code
+    if run.error_message:
+        payload["error_message"] = _truncate_history_text(
+            str(mask_sensitive(run.error_message)),
+            AGENT_ERROR_MESSAGE_MAX_CHARS,
+        )
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 def _format_conversation_working_context(payload: dict[str, Any]) -> str:

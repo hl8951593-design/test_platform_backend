@@ -3559,6 +3559,60 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotEqual(plan.primary_skill, "http-test-case-design")
         self.assertIn("planner:intent_defect_triage", plan.reason_codes)
 
+    def test_case_query_artifact_preserves_failed_cases_for_defect_triage(self):
+        failed_rows = [
+            {
+                "id": case_id,
+                "name": name,
+                "case_type": "http",
+                "object_ref": f"object-ref://test_case/http/snapshot/{case_id}",
+                "environment_id": 4 if case_id != 53 else None,
+                "last_execution_status": "failed",
+                "attention_reason": "last_execution_failed",
+                "private_request": "must not enter artifact summary",
+            }
+            for case_id, name in (
+                (8, "获取对应企业CT画像数"),
+                (10, "取消关注"),
+                (12, "商标信息接口"),
+                (53, "获取企业列表-缺少必填参数pageNum"),
+            )
+        ]
+        output = {
+            "project_id": 10,
+            "environment_id": 4,
+            "detail_level": "summary",
+            "http_total": 15,
+            "websocket_total": 0,
+            "case_status_summary": {
+                "total": 15,
+                "by_type": {"http": 15},
+                "by_status": {"passed": 11, "failed": 4},
+            },
+            "case_attention_rows": failed_rows,
+            "case_display_rows": failed_rows[:2],
+        }
+        call = SimpleNamespace(
+            tool_call_id="agent-tool-case-query",
+            run_id="agent-run-case-query",
+            tool_name="testcase.query_project_cases",
+            output_json_redacted=output,
+            output_hash="case-query-output-hash",
+        )
+        source_run = SimpleNamespace(conversation_id="agent-conv-case-query")
+
+        manifest = agent_runtime_service._tool_call_artifact_manifest(call, source_run)
+
+        self.assertIn("create_defect", manifest["available_followup_actions"])
+        summary = manifest["artifact_summary"]
+        self.assertEqual(summary["case_status_summary"]["by_status"]["failed"], 4)
+        self.assertEqual(summary["failed_case_count"], 4)
+        self.assertEqual([item["id"] for item in summary["failed_cases"]], [8, 10, 12, 53])
+        self.assertFalse(summary["failure_detail_available"])
+        encoded = json.dumps(summary, ensure_ascii=False)
+        self.assertNotIn("private_request", encoded)
+        self.assertNotIn("must not enter artifact summary", encoded)
+
     def test_context_manager_exposes_defect_create_and_case_evidence_tools(self):
         from app.services.agent_context_manager import AgentContextManager
         from app.services.agent_intent_action import AgentIntentAction

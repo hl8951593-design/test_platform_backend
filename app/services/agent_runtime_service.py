@@ -10719,6 +10719,7 @@ def _tool_call_artifact_manifest(call: AgentToolCall, source_run: AgentRun) -> d
         available_followup_actions = [
             "analyze_cases",
             "compose_scenario",
+            "create_defect",
             "update_assertions",
             "batch_update_assertions",
             "execute",
@@ -10949,7 +10950,63 @@ def _test_case_query_snapshot_artifact_summary(output: dict[str, Any]) -> dict[s
         execution_ready = output["case_result_policy"].get("execution_ready")
         if execution_ready is not None:
             summary["execution_ready"] = bool(execution_ready)
+    case_status_summary = output.get("case_status_summary")
+    if isinstance(case_status_summary, dict):
+        summary["case_status_summary"] = _safe_case_status_summary(case_status_summary)
+    attention_rows = output.get("case_attention_rows")
+    if isinstance(attention_rows, list):
+        failed_cases = sorted(
+            (
+                _failed_case_artifact_row(item)
+                for item in attention_rows
+                if isinstance(item, dict) and str(item.get("last_execution_status") or "") == "failed"
+            ),
+            key=lambda item: int(item["id"]) if isinstance(item.get("id"), int) else 2**63,
+        )
+        failed_cases = [item for item in failed_cases if item.get("id") is not None][:50]
+        status_failed_count = (
+            summary.get("case_status_summary", {}).get("by_status", {}).get("failed")
+            if isinstance(summary.get("case_status_summary"), dict)
+            else None
+        )
+        summary["failed_case_count"] = (
+            int(status_failed_count) if isinstance(status_failed_count, int) else len(failed_cases)
+        )
+        summary["failed_cases"] = failed_cases
+        summary["failure_detail_available"] = False
     return summary
+
+
+def _safe_case_status_summary(value: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    if isinstance(value.get("total"), int):
+        result["total"] = value["total"]
+    for key in ("by_type", "by_status"):
+        counts = value.get(key)
+        if isinstance(counts, dict):
+            result[key] = {
+                str(name): int(count)
+                for name, count in counts.items()
+                if isinstance(count, int) and not isinstance(count, bool)
+            }
+    return result
+
+
+def _failed_case_artifact_row(value: dict[str, Any]) -> dict[str, Any]:
+    allowed_fields = (
+        "id",
+        "name",
+        "case_type",
+        "object_ref",
+        "environment_id",
+        "last_execution_status",
+        "attention_reason",
+    )
+    return {
+        field: value[field]
+        for field in allowed_fields
+        if value.get(field) is not None
+    }
 
 
 def _tool_output_artifact_summary(output: Any) -> dict[str, Any]:

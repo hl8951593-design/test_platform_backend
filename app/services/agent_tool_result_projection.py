@@ -266,6 +266,16 @@ class ToolResultProjectionService:
             "snapshot": snapshot,
             list_key: projected_rows,
         }
+        if tool_name == "execution.query_records":
+            for key in (
+                "pagination_mode",
+                "returned",
+                "limit",
+                "has_more",
+                "next_cursor",
+            ):
+                if key in output:
+                    model_output[key] = output.get(key)
         if len(projected_rows) < len(rows):
             model_output[f"{list_key}_truncated"] = {
                 "returned": len(projected_rows),

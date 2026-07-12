@@ -37,6 +37,16 @@ class ExecutionRecordPage(BaseModel):
     page_size: int
 
 
+class ExecutionRecordCursorPage(BaseModel):
+    items: list[ExecutionRecordSummary] = Field(default_factory=list)
+    pagination_mode: Literal["cursor"] = "cursor"
+    returned: int
+    limit: int
+    has_more: bool
+    next_cursor: str | None = None
+    total: int | None = None
+
+
 class ExecutionRecordDetail(BaseModel):
     summary: ExecutionRecordSummary
     detail: dict[str, Any]

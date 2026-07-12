@@ -8,7 +8,14 @@ from app.core.async_response import public_execution_status
 from app.core.permissions import ProjectPermission
 from app.models.user import User
 from app.repositories.execution_record_repository import ExecutionRecordRepository
+from app.repositories.execution_diagnostic_repository import (
+    ExecutionCursor,
+    ExecutionDiagnosticRepository,
+    decode_cursor,
+    encode_cursor,
+)
 from app.schemas.execution_record import (
+    ExecutionRecordCursorPage,
     ExecutionRecordDetail,
     ExecutionRecordPage,
     ExecutionRecordSummary,
@@ -20,6 +27,7 @@ from app.services.permission_service import PermissionService
 class ExecutionRecordService:
     def __init__(self, db: Session):
         self.repository = ExecutionRecordRepository(db)
+        self.diagnostic_repository = ExecutionDiagnosticRepository(db)
         self.permission_service = PermissionService(db)
 
     def _require_view(self, current_user: User, project_id: int) -> None:
@@ -112,6 +120,97 @@ class ExecutionRecordService:
             total=total,
             page=page,
             page_size=page_size,
+        )
+
+    def list_records_cursor(
+        self,
+        *,
+        project_id: int,
+        current_user: User,
+        execution_type: ExecutionType | None,
+        status_filter: str | None,
+        environment_id: int | None,
+        trigger_user_id: int | None,
+        started_from: datetime | None,
+        started_to: datetime | None,
+        keyword: str | None,
+        cursor: str | None,
+        limit: int,
+        include_total: bool,
+    ) -> ExecutionRecordCursorPage:
+        self._require_view(current_user, project_id)
+        if started_from is not None and started_to is not None and started_from > started_to:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="started_from must be earlier than or equal to started_to",
+            )
+        if limit < 1 or limit > 200:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="limit must be between 1 and 200",
+            )
+        decoded_cursor = decode_cursor(cursor) if cursor is not None else None
+        query = {
+            "project_id": project_id,
+            "execution_type": execution_type,
+            "status_filter": status_filter,
+            "environment_id": environment_id,
+            "trigger_user_id": trigger_user_id,
+            "started_from": started_from,
+            "started_to": started_to,
+            "keyword": keyword,
+        }
+        rows = self.diagnostic_repository.list_records_cursor(
+            **query,
+            cursor=decoded_cursor,
+            limit=limit + 1,
+        )
+        has_more = len(rows) > limit
+        visible_rows = rows[:limit]
+        items = [self._index_summary(row) for row in visible_rows]
+        next_cursor = None
+        if has_more and visible_rows:
+            last = visible_rows[-1]
+            next_cursor = encode_cursor(
+                ExecutionCursor(
+                    started_at=last.started_at,
+                    execution_type=last.execution_type,
+                    execution_id=last.execution_id,
+                )
+            )
+        total = (
+            self.diagnostic_repository.count_records(**query)
+            if include_total
+            else None
+        )
+        return ExecutionRecordCursorPage(
+            items=items,
+            returned=len(items),
+            limit=limit,
+            has_more=has_more,
+            next_cursor=next_cursor,
+            total=total,
+        )
+
+    @staticmethod
+    def _index_summary(row: Any) -> ExecutionRecordSummary:
+        return ExecutionRecordSummary(
+            id=f"{row.execution_type}:{row.execution_id}",
+            execution_type=row.execution_type,
+            execution_id=row.execution_id,
+            project_id=row.project_id,
+            resource_id=row.resource_id,
+            resource_name=row.resource_name,
+            environment_id=row.environment_id,
+            scenario_run_id=None,
+            status=public_execution_status(row.status),
+            trigger_type=row.trigger_type,
+            trigger_user_id=row.trigger_user_id,
+            duration_ms=row.duration_ms,
+            error_message=None,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+            created_at=row.created_at,
         )
 
     @staticmethod

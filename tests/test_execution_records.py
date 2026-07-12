@@ -300,6 +300,10 @@ class ExecutionRecordOpenAPITests(unittest.TestCase):
             "keyword",
             "page",
             "page_size",
+            "pagination_mode",
+            "cursor",
+            "limit",
+            "include_total",
         }.issubset(parameters))
         self.assertEqual(
             detail_operation["parameters"][0]["name"],

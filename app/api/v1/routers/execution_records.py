@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
@@ -24,22 +25,34 @@ def list_execution_records(
     keyword: str | None = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
+    pagination_mode: Literal["page", "cursor"] = "page",
+    cursor: str | None = Query(default=None, max_length=512),
+    limit: int = Query(default=50, ge=1, le=200),
+    include_total: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = ExecutionRecordService(db).list_records(
-        project_id=project_id,
-        current_user=current_user,
-        execution_type=execution_type,
-        status_filter=status_filter,
-        environment_id=environment_id,
-        trigger_user_id=trigger_user_id,
-        started_from=started_from,
-        started_to=started_to,
-        keyword=keyword,
-        page=page,
-        page_size=page_size,
-    )
+    service = ExecutionRecordService(db)
+    common = {
+        "project_id": project_id,
+        "current_user": current_user,
+        "execution_type": execution_type,
+        "status_filter": status_filter,
+        "environment_id": environment_id,
+        "trigger_user_id": trigger_user_id,
+        "started_from": started_from,
+        "started_to": started_to,
+        "keyword": keyword,
+    }
+    if pagination_mode == "cursor":
+        result = service.list_records_cursor(
+            **common,
+            cursor=cursor,
+            limit=limit,
+            include_total=include_total,
+        )
+    else:
+        result = service.list_records(**common, page=page, page_size=page_size)
     return success(data=result)
 
 

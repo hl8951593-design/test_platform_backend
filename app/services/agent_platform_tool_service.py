@@ -154,20 +154,41 @@ class AgentPlatformToolBackend:
     def _execution_query_records(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         project_id = _require_int(payload, "project_id")
         execution_type = _optional_execution_type(payload, "execution_type")
-        page, page_size = _page_bounds(payload)
-        page_result = ExecutionRecordService(self.db).list_records(
-            project_id=project_id,
-            current_user=current_user,
-            execution_type=execution_type,
-            status_filter=_optional_str(payload, "status"),
-            environment_id=_optional_int(payload, "environment_id"),
-            trigger_user_id=_optional_int(payload, "trigger_user_id"),
-            started_from=_optional_datetime(payload, "started_from"),
-            started_to=_optional_datetime(payload, "started_to"),
-            keyword=_optional_str(payload, "keyword"),
-            page=page,
-            page_size=page_size,
-        )
+        pagination_mode = _optional_str(payload, "pagination_mode") or "page"
+        if pagination_mode not in {"page", "cursor"}:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="pagination_mode must be page or cursor",
+            )
+        common = {
+            "project_id": project_id,
+            "current_user": current_user,
+            "execution_type": execution_type,
+            "status_filter": _optional_str(payload, "status"),
+            "environment_id": _optional_int(payload, "environment_id"),
+            "trigger_user_id": _optional_int(payload, "trigger_user_id"),
+            "started_from": _optional_datetime(payload, "started_from"),
+            "started_to": _optional_datetime(payload, "started_to"),
+            "keyword": _optional_str(payload, "keyword"),
+        }
+        if pagination_mode == "cursor":
+            limit = _optional_int(payload, "limit") or 50
+            include_total = _optional_bool(payload, "include_total") or False
+            page_result = ExecutionRecordService(self.db).list_records_cursor(
+                **common,
+                cursor=_optional_str(payload, "cursor"),
+                limit=limit,
+                include_total=include_total,
+            )
+            page = None
+            page_size = None
+        else:
+            page, page_size = _page_bounds(payload)
+            page_result = ExecutionRecordService(self.db).list_records(
+                **common,
+                page=page,
+                page_size=page_size,
+            )
         normalized = normalize_response_data(page_result)
         rows = normalized.get("items") or []
         snapshot, references = _snapshot_and_references(
@@ -188,7 +209,7 @@ class AgentPlatformToolBackend:
             }
             for item in rows
         ]
-        return {
+        result = {
             "project_id": project_id,
             "filters": {
                 "execution_type": execution_type,
@@ -196,12 +217,8 @@ class AgentPlatformToolBackend:
                 "environment_id": _optional_int(payload, "environment_id"),
                 "trigger_user_id": _optional_int(payload, "trigger_user_id"),
                 "keyword": _optional_str(payload, "keyword"),
-                "page": page,
-                "page_size": page_size,
             },
             "total": normalized.get("total", 0),
-            "page": normalized.get("page", page),
-            "page_size": normalized.get("page_size", page_size),
             "execution_snapshot": snapshot,
             "object_reference_manifest": _object_reference_manifest(
                 object_family="execution",
@@ -211,6 +228,33 @@ class AgentPlatformToolBackend:
             ),
             "executions": executions,
         }
+        if pagination_mode == "cursor":
+            result.update(
+                {
+                    "pagination_mode": "cursor",
+                    "returned": normalized.get("returned", len(executions)),
+                    "limit": normalized.get("limit", limit),
+                    "has_more": normalized.get("has_more", False),
+                    "next_cursor": normalized.get("next_cursor"),
+                }
+            )
+            result["filters"].update(
+                {
+                    "cursor": _optional_str(payload, "cursor"),
+                    "limit": limit,
+                    "include_total": include_total,
+                    "pagination_mode": "cursor",
+                }
+            )
+        else:
+            result.update(
+                {
+                    "page": normalized.get("page", page),
+                    "page_size": normalized.get("page_size", page_size),
+                }
+            )
+            result["filters"].update({"page": page, "page_size": page_size})
+        return result
 
     def _execution_read_detail(self, payload: dict[str, Any], current_user: User) -> dict[str, Any]:
         project_id = _require_int(payload, "project_id")

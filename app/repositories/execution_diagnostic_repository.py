@@ -1,6 +1,14 @@
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from fastapi import HTTPException, status
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
@@ -99,6 +107,121 @@ class ExecutionDiagnosticRepository:
             or 0
         )
 
+    def list_records_cursor(
+        self,
+        *,
+        project_id: int,
+        execution_type: str | None,
+        status_filter: str | None,
+        environment_id: int | None,
+        trigger_user_id: int | None,
+        started_from: datetime | None,
+        started_to: datetime | None,
+        keyword: str | None,
+        cursor: ExecutionCursor | None,
+        limit: int,
+    ) -> list[ExecutionRecordIndex]:
+        filters = self._record_filters(
+            project_id=project_id,
+            execution_type=execution_type,
+            status_filter=status_filter,
+            environment_id=environment_id,
+            trigger_user_id=trigger_user_id,
+            started_from=started_from,
+            started_to=started_to,
+            keyword=keyword,
+        )
+        if cursor is not None:
+            filters.append(
+                or_(
+                    ExecutionRecordIndex.started_at < cursor.started_at,
+                    and_(
+                        ExecutionRecordIndex.started_at == cursor.started_at,
+                        ExecutionRecordIndex.execution_type > cursor.execution_type,
+                    ),
+                    and_(
+                        ExecutionRecordIndex.started_at == cursor.started_at,
+                        ExecutionRecordIndex.execution_type == cursor.execution_type,
+                        ExecutionRecordIndex.execution_id < cursor.execution_id,
+                    ),
+                )
+            )
+        return list(
+            self.db.scalars(
+                select(ExecutionRecordIndex)
+                .where(*filters)
+                .order_by(
+                    ExecutionRecordIndex.started_at.desc(),
+                    ExecutionRecordIndex.execution_type.asc(),
+                    ExecutionRecordIndex.execution_id.desc(),
+                )
+                .limit(limit)
+            ).all()
+        )
+
+    def count_records(
+        self,
+        *,
+        project_id: int,
+        execution_type: str | None,
+        status_filter: str | None,
+        environment_id: int | None,
+        trigger_user_id: int | None,
+        started_from: datetime | None,
+        started_to: datetime | None,
+        keyword: str | None,
+    ) -> int:
+        filters = self._record_filters(
+            project_id=project_id,
+            execution_type=execution_type,
+            status_filter=status_filter,
+            environment_id=environment_id,
+            trigger_user_id=trigger_user_id,
+            started_from=started_from,
+            started_to=started_to,
+            keyword=keyword,
+        )
+        return int(
+            self.db.scalar(
+                select(func.count()).select_from(ExecutionRecordIndex).where(*filters)
+            )
+            or 0
+        )
+
+    @staticmethod
+    def _record_filters(
+        *,
+        project_id: int,
+        execution_type: str | None,
+        status_filter: str | None,
+        environment_id: int | None,
+        trigger_user_id: int | None,
+        started_from: datetime | None,
+        started_to: datetime | None,
+        keyword: str | None,
+    ) -> list[Any]:
+        filters: list[Any] = [
+            ExecutionRecordIndex.project_id == project_id,
+            ExecutionRecordIndex.started_at.is_not(None),
+        ]
+        if execution_type is not None:
+            filters.append(ExecutionRecordIndex.execution_type == execution_type)
+        if status_filter is not None:
+            filters.append(ExecutionRecordIndex.status == status_filter)
+        if environment_id is not None:
+            filters.append(ExecutionRecordIndex.environment_id == environment_id)
+        if trigger_user_id is not None:
+            filters.append(ExecutionRecordIndex.trigger_user_id == trigger_user_id)
+        if started_from is not None:
+            filters.append(ExecutionRecordIndex.started_at >= started_from)
+        if started_to is not None:
+            filters.append(ExecutionRecordIndex.started_at <= started_to)
+        if keyword:
+            filters.append(
+                ExecutionRecordIndex.resource_name.ilike(f"%{keyword.strip()}%")
+            )
+        return filters
+
     def _dialect_name(self) -> str:
         bind = self.db.get_bind()
         return str(bind.dialect.name)
@@ -113,3 +236,56 @@ class ExecutionDiagnosticRepository:
                 if key not in {"id", "created_at"}:
                     setattr(existing, key, value)
         self.db.flush()
+
+
+@dataclass(frozen=True)
+class ExecutionCursor:
+    started_at: datetime
+    execution_type: str
+    execution_id: int
+
+
+def encode_cursor(value: ExecutionCursor) -> str:
+    started_at = value.started_at
+    if started_at.tzinfo is not None:
+        started_at = started_at.astimezone(UTC).replace(tzinfo=None)
+    payload = {
+        "v": 1,
+        "started_at": started_at.isoformat(),
+        "execution_type": value.execution_type,
+        "execution_id": value.execution_id,
+    }
+    encoded = json.dumps(payload, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(encoded).decode().rstrip("=")
+
+
+def decode_cursor(value: str) -> ExecutionCursor:
+    try:
+        if not isinstance(value, str) or not value or len(value) > 512:
+            raise ValueError("invalid cursor size")
+        padding = "=" * (-len(value) % 4)
+        decoded = base64.b64decode(
+            (value + padding).encode(), altchars=b"-_", validate=True
+        )
+        payload = json.loads(decoded)
+        if not isinstance(payload, dict) or payload.get("v") != 1:
+            raise ValueError("unsupported cursor version")
+        execution_type = payload.get("execution_type")
+        if execution_type not in {"http", "websocket", "scenario", "flow"}:
+            raise ValueError("invalid execution type")
+        execution_id = payload.get("execution_id")
+        if isinstance(execution_id, bool) or not isinstance(execution_id, int) or execution_id < 1:
+            raise ValueError("invalid execution id")
+        started_at = datetime.fromisoformat(str(payload.get("started_at") or ""))
+        if started_at.tzinfo is not None:
+            started_at = started_at.astimezone(UTC).replace(tzinfo=None)
+        return ExecutionCursor(
+            started_at=started_at,
+            execution_type=execution_type,
+            execution_id=execution_id,
+        )
+    except (ValueError, TypeError, json.JSONDecodeError, binascii.Error) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="invalid execution cursor",
+        ) from exc

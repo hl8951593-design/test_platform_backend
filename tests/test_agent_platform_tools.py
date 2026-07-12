@@ -8,7 +8,11 @@ from fastapi import HTTPException
 
 from app.core.permissions import ProjectPermission
 from app.schemas.defect import DefectRead
-from app.schemas.execution_record import ExecutionRecordPage, ExecutionRecordSummary
+from app.schemas.execution_record import (
+    ExecutionRecordCursorPage,
+    ExecutionRecordPage,
+    ExecutionRecordSummary,
+)
 from app.schemas.test_plan import TestPlanRead
 from app.services.agent_context_manager import AgentContextManager
 from app.services.agent_runtime_service import _tool_input_summary
@@ -267,6 +271,65 @@ class AgentPlatformToolTests(unittest.TestCase):
         self.assertEqual(result["executions"][0]["execution_id"], 41)
         self.assertTrue(result["executions"][0]["object_ref"].endswith("/41"))
         self.assertEqual(result["object_reference_manifest"]["query_tool"], "execution.query_records")
+
+    @patch("app.services.agent_platform_tool_service.ExecutionRecordService.list_records")
+    @patch(
+        "app.services.agent_platform_tool_service.ExecutionRecordService.list_records_cursor"
+    )
+    def test_execution_query_cursor_mode_skips_legacy_page_path(
+        self, list_records_cursor, list_records
+    ):
+        list_records_cursor.return_value = ExecutionRecordCursorPage(
+            items=[
+                ExecutionRecordSummary(
+                    id="scenario:220",
+                    execution_type="scenario",
+                    execution_id=220,
+                    project_id=10,
+                    resource_id=45,
+                    resource_name="enterprise flow",
+                    status="failed",
+                    trigger_type="agent_dry_run",
+                    trigger_user_id=1,
+                    created_at=datetime.now(UTC),
+                )
+            ],
+            returned=1,
+            limit=50,
+            has_more=True,
+            next_cursor="cursor-v1",
+            total=None,
+        )
+
+        result = self.backend.execute(
+            tool_name="execution.query_records",
+            payload={
+                "project_id": 10,
+                "pagination_mode": "cursor",
+                "limit": 50,
+                "include_total": False,
+            },
+            current_user=self.user,
+        )
+
+        list_records.assert_not_called()
+        list_records_cursor.assert_called_once()
+        self.assertEqual(result["pagination_mode"], "cursor")
+        self.assertEqual(result["next_cursor"], "cursor-v1")
+        self.assertNotIn("page", result)
+        model_output = ToolResultProjectionService().project_platform_query(
+            "execution.query_records", result
+        ).model_output
+        self.assertEqual(model_output["next_cursor"], "cursor-v1")
+        self.assertTrue(model_output["has_more"])
+
+    def test_execution_query_schema_exposes_cursor_mode(self):
+        properties = ToolRegistry().get("execution.query_records").input_schema[
+            "properties"
+        ]
+
+        for field in ("pagination_mode", "cursor", "limit", "include_total"):
+            self.assertIn(field, properties)
 
     @patch("app.services.agent_platform_tool_service.ExecutionRecordService.get_detail")
     def test_execution_read_detail_without_view_keeps_legacy_full_output(

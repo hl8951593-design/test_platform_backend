@@ -92,7 +92,9 @@ class ExecutionDiagnosticPersistence:
         summary = execution.get("summary")
         summary = summary if isinstance(summary, dict) else {}
         counts = canonical.counts
-        started_at = _datetime_value(summary.get("started_at"))
+        started_at = _datetime_value(
+            summary.get("started_at") or summary.get("created_at")
+        )
         finished_at = _datetime_value(summary.get("finished_at"))
         source_updated_at = _datetime_value(
             summary.get("updated_at")

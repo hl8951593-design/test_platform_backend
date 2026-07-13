@@ -25,6 +25,26 @@ type ApiEnvelope<T> = {
 
 SSE 接口 `GET /agents/runs/{run_id}/events` 返回 `text/event-stream`，不使用 `ApiEnvelope`。
 
+## 执行诊断卡片与 continuation
+
+前端应把执行记录查询和执行证据读取视为两层契约，不得把 ToolCall 成功直接渲染为“业务执行通过”。
+
+`execution.query_records.result_view` 的中文展示建议为：`records=执行记录`、`failure_clusters=失败聚类`、`metrics=执行指标`。聚类和指标必须显示查询时间范围与 `watermark`；聚类的 `sample_execution_refs` 是后续详情读取候选，不是完整失败清单。
+
+`execution.read_detail` 的视图中文展示建议为：`summary=执行摘要`、`failures=失败步骤`、`steps=步骤列表`、`step=步骤详情`、`artifact=证据分段`、`full=兼容诊断详情`。前端卡片至少渲染：
+
+- `resource_ref`、`view`、`diagnostic_complete`；
+- `data.counts`、`first_failure_step_id`、`failure_category`、`failure_signature`；
+- `omissions[]` 的 `section/reason/reference`；
+- `evidence_refs[]` 的 artifact 引用、大小和哈希；
+- `page.has_more/page.next_cursor` 与 `recommended_next_views`。
+
+当 `diagnostic_complete=false` 时不能显示“分析已覆盖全部证据”。`reason=budget_exceeded` 显示“内容超出本次预算”，`reason=artifact_externalized` 显示“证据已外置，可继续读取”，`reason=not_requested` 显示“本次未请求”，`reason=not_available` 显示“证据不可用”。
+
+artifact continuation 使用返回的 `data.next_offset` 作为下一次 `selector.offset`，单次 `selector.max_bytes` 不得超过 65,536。按钮应表达为“继续读取证据”，不要自动循环拉取整个大对象。跨项目、已删除、篡改或不属于当前执行的 artifact 均按错误态展示，不能降级为猜测内容。
+
+公共执行详情页面仍可使用 `/execution-records/{execution_type}/{execution_id}` 的完整兼容结构。Agent timeline 和 ToolCall 卡片应使用诊断 envelope；完整 ToolCall ledger 只用于审计/展开，不应整体回灌模型或默认渲染。
+
 ## 2. 前端建议封装
 
 | 文件 | 职责 |

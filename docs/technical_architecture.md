@@ -1233,3 +1233,28 @@ Capability Plan 是上述 LLM 决策的持久化安全边界。`read_only/determ
 Agent ledger 的递归脱敏同时识别 `Authorization`、`lingxi-auth`、`auth`、`authentication` 和 `x-auth-token` 等鉴权 header 名。Tool 输入、输出、事件和 Run 结果在持久化/回灌前均经过同一掩码边界；本轮已对历史 Agent ToolCall 中遗留的同类 header 做就地掩码，不删除审计记录或改变业务表。
 
 新增事件包括 `planner.llm_decision_started/completed/invalid/retrying/failed`、`planner.capability_activation_requested/accepted/rejected`、`planner.capability_plan_revised`、`planner.capability_call_rejected`、`model.capability_denial_observed` 和 `scenario.draft_validation_completed/failed`。REST、SSE envelope、AgentRun、ToolCall、Approval、worker、resume、cancel 和 EventStore 架构保持不变；本轮复用 `ai_agent_capability_plans` JSON 字段，无新增数据库迁移。
+# 可扩展执行诊断读模型
+
+执行诊断采用“权威执行表 + 可重建读模型”架构。原 HTTP、WebSocket、场景和 Flow 执行表仍是业务事实源；新增读模型只服务跨协议历史查询、语义失败证据、聚类和趋势，不接管执行状态机。
+
+核心表由 migration `0041_execution_diagnostic_read_models` 创建：
+
+| 表 | 作用 |
+| --- | --- |
+| `execution_record_index` | 跨协议轻量索引、游标分页、失败签名和 watermark 源 |
+| `execution_step_diagnostics` | 每个执行步骤一行的脱敏诊断详情与 artifact 引用 |
+| `execution_payload_artifacts` | 大字段的项目隔离 gzip+JSON、SHA-256 内容 |
+| `execution_metrics_hourly` | 可重复计算的小时维度汇总 |
+| `execution_metrics_daily` | 从小时表派生的日维度汇总 |
+
+投影写入遵循 caller-owned transaction：业务服务在已有 flush/commit 之前调用 `ExecutionDiagnosticPersistence`，投影层不自行 commit。重复事件和回填使用业务身份唯一键 upsert，因此可安全重放。投影失败随原事务回滚，不产生“业务成功但诊断半写入”的额外提交边界。
+
+大字段按 request、response、logs/messages、retry 独立判断。超过 `EXECUTION_ARTIFACT_INLINE_THRESHOLD_BYTES` 的段落在脱敏后压缩保存，步骤 JSON 只保留 `artifact_ref/raw_size_bytes/externalized`。分块读取默认 8 KiB、最大 64 KiB，每次解压后校验 SHA-256，并再次验证 project、execution_type 和 execution_id。
+
+模型侧采用 semantic projection，不做字符串前缀截断：首个失败、断言 expected/actual、HTTP 状态、业务码、错误类别和绑定证据优先。默认 12,000 字符、硬上限 24,000；超出预算的数据必须返回 omission、游标或 artifact continuation。完整 ToolCall ledger 和公共 REST 详情继续保留，但不会整体进入 LLM 上下文。
+
+`ExecutionMetricsScheduler` 是独立 daemon thread，每次 tick 创建自己的 `SessionLocal`，只读 `execution_record_index`，幂等重建最近变更的小时/日桶并独立提交；异常时回滚且只记录日志。它不调用执行服务、不改变运行状态，也不接触 worker、重试、审批或 SSE。
+
+场景步骤热路径默认启用 `EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED=true`。每次只 upsert 当前 running/completed/skipped 步骤，不再把增长中的 `step_results` JSON 重写回 run 行。读取层用共享的 `scenario_step_order` 规则将已落库步骤与场景快照生成的 pending 步骤合并，保持原顺序和公共详情契约。关闭开关会恢复旧写路径；关闭前必须先运行 `--restore-legacy-snapshots` 回填命令。
+
+读模型可通过 `scripts/backfill_execution_diagnostics.py` 分批重建，指标可通过 `scripts/rebuild_execution_metrics.py` 按项目和桶重建。两类命令均复用相同投影/聚合服务，避免在线和离线语义漂移。

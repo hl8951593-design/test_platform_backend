@@ -132,5 +132,64 @@ HTTP 和 WebSocket 执行没有独立 `started_at` 字段，统一接口使用�
 
 - 原 HTTP、WebSocket、场景和 Flow 执行接口保持不变。
 - 原执行详情接口继续可用，统一接口是新增只读入口。
-- 本功能不新增表或字段；当前全局 Alembic head 以 [文档索引与维护规范](README.md) 为准。
+- 公共执行详情仍读取原业务表；可重建诊断读模型由 Alembic `0041_execution_diagnostic_read_models` 管理。
 - 统一列表使用 SQL `UNION ALL` 在数据库内完成筛选、计数、排序和分页。
+
+## 大规模执行诊断与 Agent 渐进读取
+
+生产环境中的执行记录、场景步骤和响应正文可能达到万级或更大规模。公共 REST 完整详情仍保持原契约；Agent 不再把完整执行 JSON 直接放入模型上下文，而是通过统一诊断投影逐层读取。
+
+### 列表分页
+
+`GET /execution-records` 保留默认的 `pagination_mode=page`，其 `page/page_size/total` 返回结构不变。新客户端可显式使用 `pagination_mode=cursor`：
+
+| 参数 | 默认值 | 约束与语义 |
+| --- | --- | --- |
+| `cursor` | 空 | 上一页返回的不可解释游标，最大 512 字符 |
+| `limit` | `50` | 1 至 200 |
+| `include_total` | `false` | 仅为 `true` 时执行精确计数 |
+
+游标顺序固定为 `started_at DESC, execution_type ASC, execution_id DESC`。响应包含 `items/returned/limit/has_more/next_cursor/total`；默认不计数时 `total=null`。游标非法或过长返回 HTTP `422`。项目、状态、环境、触发用户、时间范围和关键字过滤在两种分页模式中保持一致。
+
+### Agent 查询视图
+
+`execution.query_records` 的 `result_view` 支持：
+
+- `records`：默认值，返回记录列表，可选择 page 或 cursor 分页；
+- `failure_clusters`：必须传 `started_from/started_to`，按稳定的 `failure_signature` 聚类，只返回计数、不同资源数、首末时间和最多 5 个代表执行引用；
+- `metrics`：必须传时间范围，返回小时或日级执行量与耗时汇总。跨度达到 7 天时使用日粒度。
+
+聚类和指标视图默认 `limit=20`，不返回原始请求、响应或步骤正文，并携带最新索引源时间 `watermark`。
+
+### 诊断详情视图
+
+`execution.read_detail` 支持 `summary/failures/steps/step/artifact/full`：
+
+| 视图 | 用途 |
+| --- | --- |
+| `summary` | 状态、步骤计数、首个失败步骤和失败签名 |
+| `failures` | 失败优先的有界步骤证据 |
+| `steps` | 有界步骤列表与 continuation |
+| `step` | 单一步骤；必须且只能传一个 `selector.step_ids` |
+| `artifact` | 按 `selector.artifact_ref/offset/max_bytes` 读取一段外置证据 |
+| `full` | 诊断投影的兼容视图，仍受模型预算约束，不等同于公共 REST 原始详情 |
+
+默认模型预算为 12,000 字符，硬上限 24,000。统一 envelope 字段为 `schema_version/projection_version/resource_ref/view/data/evidence_refs/omissions/page/diagnostic_complete/recommended_next_views`。任何未返回内容必须通过 `omissions`、`next_cursor` 或 `artifact_ref` 显式说明，禁止静默截断。
+
+外置证据先统一脱敏，再以确定性 JSON、gzip 和 SHA-256 保存。单段默认 8 KiB，最大 64 KiB；服务在每次读取时校验项目、执行身份、压缩内容和哈希。跨项目或跨执行引用按不存在处理。Agent 只能分块读取；只有通过 `report:view` 权限校验的公共完整详情兼容路径可以恢复完整 artifact。
+
+### 存储与迁移
+
+Alembic revision `0041_execution_diagnostic_read_models` 新增统一执行索引、步骤诊断、payload artifact、小时指标和日指标表。HTTP、WebSocket、场景和 Flow 在原事务内写投影，不增加提交点，也不改变 worker、重试、执行状态、审批或 SSE 语义。
+
+历史回填：
+
+```powershell
+.venv\Scripts\python.exe scripts/backfill_execution_diagnostics.py --project-id 1 --execution-type scenario --batch-size 500
+```
+
+场景回滚前恢复引用式旧快照：
+
+```powershell
+.venv\Scripts\python.exe scripts/backfill_execution_diagnostics.py --project-id 1 --execution-type scenario --batch-size 500 --restore-legacy-snapshots
+```

@@ -83,6 +83,7 @@
 - [后端日志与排查](logging.md)
 - [统一错误响应](api_errors.md)
 - [统一执行记录](api_execution_records.md)
+- [大规模执行诊断与 Agent 渐进读取](api_execution_records.md#大规模执行诊断与-agent-渐进读取)
 - [执行中心](api_execution_center.md)
 - [通知中心](api_notifications.md)
 - [工作台质量总览](api_dashboard.md)

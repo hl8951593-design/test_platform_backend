@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Sequence
 
 from pydantic import BaseModel, Field, ValidationError
@@ -29,9 +29,6 @@ SIDE_EFFECT_SCOPE: dict[str, str] = {
     "business_update": "persist",
 }
 
-CORE_CONTEXT_TOOLS = frozenset({"project.read_context", "tool_result.read_full"})
-
-
 class AgentPlanningDecision(BaseModel):
     goal: str = Field(min_length=1, max_length=1000)
     action: str = Field(min_length=1, max_length=64)
@@ -44,6 +41,29 @@ class AgentPlanningDecision(BaseModel):
     requested_effect_scope: AgentEffectScope
     confidence: float = Field(ge=0, le=1)
     reason_summary: str = Field(min_length=1, max_length=1000)
+
+
+@dataclass(frozen=True)
+class AgentToolSkillAlignment:
+    selected_skill_declared_tools: tuple[str, ...] = ()
+    aligned_tools: tuple[str, ...] = ()
+    supporting_skill_candidates_by_tool: dict[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
+    unbound_tools: tuple[str, ...] = ()
+
+    def model_view(self) -> dict[str, Any]:
+        return {
+            "selected_skill_declared_tools": list(
+                self.selected_skill_declared_tools
+            ),
+            "aligned_tools": list(self.aligned_tools),
+            "supporting_skill_candidates_by_tool": {
+                tool_name: list(skill_names)
+                for tool_name, skill_names in self.supporting_skill_candidates_by_tool.items()
+            },
+            "unbound_tools": list(self.unbound_tools),
+        }
 
 
 @dataclass(frozen=True)
@@ -63,6 +83,9 @@ class ValidatedAgentPlanningDecision:
     model_requested_effect_scope: str | None = None
     required_effect_scope: str | None = None
     effect_scope_normalized: bool = False
+    alignment: AgentToolSkillAlignment = field(
+        default_factory=AgentToolSkillAlignment
+    )
 
     def model_view(self) -> dict[str, Any]:
         return {
@@ -81,6 +104,7 @@ class ValidatedAgentPlanningDecision:
             "confidence": self.confidence,
             "reason_summary": self.reason_summary,
             "source": self.source,
+            "tool_skill_alignment": self.alignment.model_view(),
         }
 
 
@@ -200,24 +224,19 @@ class AgentPlanningDecisionService:
                 },
             )
 
-        declared_tools = set(CORE_CONTEXT_TOOLS)
+        alignment = derive_tool_skill_alignment(
+            selected_skills=selected_skills,
+            selected_tools=selected_tools,
+            skill_index=skill_index,
+        )
         owned_domains: set[str] = set()
         consumed_domains: set[str] = set()
         produced_domains: set[str] = set()
         for skill_name in selected_skills:
             skill = skills[skill_name]
-            declared_tools.update(_strings(skill.get("tool_names") or skill.get("tools")))
             owned_domains.update(_strings(skill.get("owns")))
             consumed_domains.update(_strings(skill.get("consumes")))
             produced_domains.update(_strings(skill.get("produces")))
-
-        undeclared_tools = sorted(set(selected_tools) - declared_tools)
-        if undeclared_tools:
-            raise AgentPlanningError(
-                "planner selected Tools not declared by the selected Skills",
-                code="planner_tool_not_declared_by_skill",
-                details={"undeclared_tools": undeclared_tools},
-            )
 
         if decision.target_domain and decision.target_domain not in owned_domains | produced_domains:
             raise AgentPlanningError(
@@ -285,6 +304,7 @@ class AgentPlanningDecisionService:
             model_requested_effect_scope=model_requested_effect_scope,
             required_effect_scope=required_effect_scope,
             effect_scope_normalized=effective_effect_scope != model_requested_effect_scope,
+            alignment=alignment,
         )
 
     def _request(
@@ -356,6 +376,51 @@ def _strings(values: Any) -> tuple[str, ...]:
 
 def _unique_non_empty(values: Any) -> tuple[str, ...]:
     return tuple(dict.fromkeys(_strings(values)))
+
+
+def derive_tool_skill_alignment(
+    *,
+    selected_skills: Sequence[str],
+    selected_tools: Sequence[str],
+    skill_index: Sequence[dict[str, Any]],
+) -> AgentToolSkillAlignment:
+    skills = _index_by(skill_index, "name")
+    declared_by_skill = {
+        skill_name: set(
+            _strings(skill.get("tool_names") or skill.get("tools"))
+        )
+        for skill_name, skill in skills.items()
+    }
+    selected_skill_names = set(_unique_non_empty(selected_skills))
+    selected_skill_declared_tools: set[str] = set()
+    for skill_name in selected_skill_names:
+        selected_skill_declared_tools.update(
+            declared_by_skill.get(skill_name, set())
+        )
+
+    selected_tool_names = set(_unique_non_empty(selected_tools))
+    aligned_tools = selected_tool_names & selected_skill_declared_tools
+    supporting_candidates: dict[str, tuple[str, ...]] = {}
+    unbound_tools: list[str] = []
+    for tool_name in sorted(selected_tool_names - aligned_tools):
+        declaring_skills = tuple(sorted(
+            skill_name
+            for skill_name, declared_tools in declared_by_skill.items()
+            if tool_name in declared_tools
+        ))
+        if declaring_skills:
+            supporting_candidates[tool_name] = declaring_skills
+        else:
+            unbound_tools.append(tool_name)
+
+    return AgentToolSkillAlignment(
+        selected_skill_declared_tools=tuple(
+            sorted(selected_skill_declared_tools)
+        ),
+        aligned_tools=tuple(sorted(aligned_tools)),
+        supporting_skill_candidates_by_tool=supporting_candidates,
+        unbound_tools=tuple(unbound_tools),
+    )
 
 
 def _bounded_error_text(exc: Exception) -> str:

@@ -215,6 +215,115 @@ class AgentPlanningDecisionServiceTests(unittest.TestCase):
         self.assertEqual(len(ai_service.requests), 2)
         self.assertIn("invented.tool", raised.exception.details["last_error"]["unknown_tools"])
 
+    def test_registered_tools_do_not_fail_when_selected_skill_does_not_declare_them(self):
+        from app.services.agent_planning_service import AgentPlanningDecisionService
+
+        skill_index = [
+            {
+                "name": "assertion-extractor-binding",
+                "owns": ["assertion"],
+                "consumes": ["test_case", "execution"],
+                "produces": ["assertion"],
+                "tool_names": [],
+            },
+            {
+                "name": "http-test-case-design",
+                "owns": ["test_case"],
+                "consumes": ["execution"],
+                "produces": ["test_case"],
+                "tool_names": [
+                    "testcase.update_assertions",
+                    "testcase.batch_update_assertions",
+                ],
+            },
+        ]
+        tool_index = [
+            {
+                "name": name,
+                "summary": "Update saved assertions after approval.",
+                "side_effect_class": "business_update",
+                "replay_policy": "require_revalidation",
+                "required_permissions": ["case:manage"],
+                "schema_hash": f"{name}-schema",
+            }
+            for name in (
+                "testcase.update_assertions",
+                "testcase.batch_update_assertions",
+            )
+        ]
+        decision_json = planning_json(
+            goal="Repair saved assertions.",
+            action="repair",
+            target_domain="assertion",
+            source_domains=["test_case", "execution"],
+            selected_skills=["assertion-extractor-binding"],
+            selected_tools=[item["name"] for item in tool_index],
+            selected_artifact_ids=[],
+            required_facts=["saved_case_assertions"],
+            requested_effect_scope="persist",
+        )
+
+        decision = AgentPlanningDecisionService(
+            ai_service=FakeAIService(response(decision_json), response(decision_json))
+        ).decide(
+            intent="修复断言",
+            conversation_context=None,
+            skill_index=skill_index,
+            tool_index=tool_index,
+            artifact_index=[],
+            project_id=1,
+            permissions=("case:manage",),
+        )
+
+        self.assertEqual(
+            decision.selected_tools,
+            (
+                "testcase.update_assertions",
+                "testcase.batch_update_assertions",
+            ),
+        )
+        self.assertEqual(decision.alignment.aligned_tools, ())
+        self.assertEqual(
+            decision.alignment.supporting_skill_candidates_by_tool,
+            {
+                "testcase.batch_update_assertions": ("http-test-case-design",),
+                "testcase.update_assertions": ("http-test-case-design",),
+            },
+        )
+        self.assertEqual(decision.alignment.unbound_tools, ())
+
+    def test_alignment_is_deterministic_and_reports_globally_unbound_registered_tools(self):
+        from app.services.agent_planning_service import derive_tool_skill_alignment
+
+        skill_index = [
+            {
+                "name": "http-test-case-design",
+                "tool_names": ["testcase.update_assertions"],
+            },
+            {
+                "name": "assertion-extractor-binding",
+                "tool_names": [],
+            },
+        ]
+
+        alignment = derive_tool_skill_alignment(
+            selected_skills=("assertion-extractor-binding",),
+            selected_tools=("future.repair", "testcase.update_assertions"),
+            skill_index=skill_index,
+        )
+
+        self.assertEqual(
+            alignment.model_view(),
+            {
+                "selected_skill_declared_tools": [],
+                "aligned_tools": [],
+                "supporting_skill_candidates_by_tool": {
+                    "testcase.update_assertions": ["http-test-case-design"],
+                },
+                "unbound_tools": ["future.repair"],
+            },
+        )
+
     def test_planner_safe_context_keeps_terminal_run_state_without_assistant_prose(self):
         ai_service = FakeAIService(response(planning_json()))
         context = {

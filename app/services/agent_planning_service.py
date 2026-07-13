@@ -146,6 +146,7 @@ class AgentPlanningDecisionService:
     ) -> ValidatedAgentPlanningDecision:
         last_error: AgentPlanningError | None = None
         for attempt in (1, 2):
+            parsed: AgentPlanningDecision | None = None
             request = self._request(
                 intent=intent,
                 conversation_context=conversation_context,
@@ -183,11 +184,23 @@ class AgentPlanningDecisionService:
                     permissions=permissions,
                 )
             except AgentPlanningError as exc:
-                last_error = exc
+                decision_summary = _planning_decision_summary(parsed)
+                last_error = (
+                    AgentPlanningError(
+                        str(exc),
+                        code=exc.code,
+                        details={**exc.details, **decision_summary},
+                    )
+                    if decision_summary
+                    else exc
+                )
                 if on_event is not None:
-                    on_event("invalid", exc.model_view())
+                    on_event("invalid", last_error.model_view())
                     if attempt == 1:
-                        on_event("retrying", {"next_attempt": 2, "reason_code": exc.code})
+                        on_event(
+                            "retrying",
+                            {"next_attempt": 2, "reason_code": last_error.code},
+                        )
         assert last_error is not None
         raise AgentPlanningFailed(last_error=last_error)
 
@@ -376,6 +389,22 @@ def _strings(values: Any) -> tuple[str, ...]:
 
 def _unique_non_empty(values: Any) -> tuple[str, ...]:
     return tuple(dict.fromkeys(_strings(values)))
+
+
+def _planning_decision_summary(
+    decision: AgentPlanningDecision | None,
+) -> dict[str, Any]:
+    if decision is None:
+        return {}
+    return {
+        "selected_skills": list(_unique_non_empty(decision.selected_skills)),
+        "selected_tools": list(_unique_non_empty(decision.selected_tools)),
+        "selected_artifact_id_count": len(
+            _unique_non_empty(decision.selected_artifact_ids)
+        ),
+        "target_domain": decision.target_domain,
+        "source_domains": list(_unique_non_empty(decision.source_domains)),
+    }
 
 
 def derive_tool_skill_alignment(

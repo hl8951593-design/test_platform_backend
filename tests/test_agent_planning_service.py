@@ -202,6 +202,63 @@ class AgentPlanningDecisionServiceTests(unittest.TestCase):
         self.assertEqual(events[0][1]["code"], "planner_response_incomplete")
         self.assertEqual(events[1][1]["next_attempt"], 2)
 
+    def test_invalid_decision_event_and_repair_include_bounded_selection_summary(self):
+        from app.services.agent_planning_service import AgentPlanningDecisionService
+
+        invalid = planning_json(
+            target_domain="defect",
+            selected_tools=["scenario.compose_draft"],
+        )
+        ai_service = FakeAIService(response(invalid), response(planning_json()))
+        events = []
+
+        AgentPlanningDecisionService(ai_service=ai_service).decide(
+            intent="build scenario",
+            conversation_context={"active_artifact_handles": ARTIFACT_INDEX},
+            skill_index=SKILL_INDEX,
+            tool_index=TOOL_INDEX,
+            artifact_index=ARTIFACT_INDEX,
+            project_id=1,
+            permissions=("view_project", "view_test_case", "view_scenario", "execute_test"),
+            on_event=lambda event_type, payload: events.append((event_type, payload)),
+        )
+
+        invalid_payload = events[0][1]
+        self.assertEqual(
+            invalid_payload["code"],
+            "planner_target_domain_incompatible",
+        )
+        self.assertEqual(
+            invalid_payload["selected_skills"],
+            ["scenario-composition"],
+        )
+        self.assertEqual(
+            invalid_payload["selected_tools"],
+            ["scenario.compose_draft"],
+        )
+        self.assertEqual(invalid_payload["selected_artifact_id_count"], 1)
+        self.assertEqual(invalid_payload["target_domain"], "defect")
+        self.assertEqual(
+            invalid_payload["source_domains"],
+            ["test_case", "environment"],
+        )
+
+        repair_payload = json.loads(ai_service.requests[1].messages[-1].content)
+        repair_error = repair_payload["validation_error"]
+        self.assertEqual(
+            repair_error["selected_skills"],
+            ["scenario-composition"],
+        )
+        self.assertEqual(
+            repair_error["selected_tools"],
+            ["scenario.compose_draft"],
+        )
+        self.assertEqual(repair_error["selected_artifact_id_count"], 1)
+        self.assertNotIn(
+            "selected_artifact_ids",
+            json.dumps(repair_error, ensure_ascii=False),
+        )
+
     def test_unknown_tool_is_never_silently_rewritten(self):
         from app.services.agent_planning_service import AgentPlanningFailed
 

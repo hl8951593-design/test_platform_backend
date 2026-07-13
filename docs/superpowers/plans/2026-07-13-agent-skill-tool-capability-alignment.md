@@ -455,7 +455,7 @@ Select-String -Path tests\test_agent_runtime.py -Pattern 'technical_architecture
 Then run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest
+.\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
 Expected: all tests PASS; existing documented skips remain unchanged.

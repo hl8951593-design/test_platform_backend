@@ -85,6 +85,88 @@ DEFECT_TOOL_INDEX = [
     },
 ]
 
+COMPOSITE_SKILL_INDEX = [
+    {
+        "name": "assertion-extractor-binding",
+        "description": "Extract and repair assertions from execution evidence.",
+        "owns": ["assertion"],
+        "consumes": ["test_case", "execution"],
+        "produces": ["assertion"],
+        "tool_names": [
+            "testcase.query_project_cases",
+            "testcase.update_assertions",
+            "testcase.batch_update_assertions",
+        ],
+    },
+    {
+        "name": "execution-diagnosis",
+        "description": "Inspect and diagnose test execution records.",
+        "owns": ["execution"],
+        "consumes": ["test_case"],
+        "produces": ["execution", "diagnosis"],
+        "tool_names": [
+            "execution.query_records",
+            "execution.read_detail",
+            "execution.diagnose",
+        ],
+    },
+    {
+        "name": "http-test-case-design",
+        "description": "Design, update, and execute saved HTTP test cases.",
+        "owns": ["test_case"],
+        "consumes": ["execution"],
+        "produces": ["test_case"],
+        "tool_names": [
+            "testcase.query_project_cases",
+            "testcase.update_assertions",
+            "testcase.batch_update_assertions",
+            "testcase.execute_saved",
+            "testcase.batch_execute",
+        ],
+    },
+]
+
+COMPOSITE_TOOL_NAMES = (
+    "testcase.query_project_cases",
+    "testcase.update_assertions",
+    "testcase.batch_update_assertions",
+    "testcase.execute_saved",
+    "testcase.batch_execute",
+    "execution.query_records",
+    "execution.read_detail",
+    "execution.diagnose",
+)
+
+COMPOSITE_TOOL_INDEX = [
+    {
+        "name": name,
+        "summary": "Frozen ToolSpec for the composite assertion repair flow.",
+        "side_effect_class": (
+            "business_update"
+            if name in {
+                "testcase.update_assertions",
+                "testcase.batch_update_assertions",
+            }
+            else "execution_record"
+            if name in {"testcase.execute_saved", "testcase.batch_execute"}
+            else "read_only"
+        ),
+        "replay_policy": "require_revalidation",
+        "required_permissions": [
+            "case:manage"
+            if name in {
+                "testcase.update_assertions",
+                "testcase.batch_update_assertions",
+            }
+            else "test:execute"
+            if name != "testcase.query_project_cases"
+            else "case:view"
+        ],
+        "schema_hash": f"{name}-schema",
+    }
+    for name in COMPOSITE_TOOL_NAMES
+]
+
 
 def planning_json(**overrides):
     payload = {
@@ -206,7 +288,7 @@ class AgentPlanningDecisionServiceTests(unittest.TestCase):
         from app.services.agent_planning_service import AgentPlanningDecisionService
 
         invalid = planning_json(
-            target_domain="defect",
+            confidence=0.1,
             selected_tools=["scenario.compose_draft"],
         )
         ai_service = FakeAIService(response(invalid), response(planning_json()))
@@ -226,7 +308,7 @@ class AgentPlanningDecisionServiceTests(unittest.TestCase):
         invalid_payload = events[0][1]
         self.assertEqual(
             invalid_payload["code"],
-            "planner_target_domain_incompatible",
+            "planner_confidence_too_low",
         )
         self.assertEqual(
             invalid_payload["selected_skills"],
@@ -237,7 +319,7 @@ class AgentPlanningDecisionServiceTests(unittest.TestCase):
             ["scenario.compose_draft"],
         )
         self.assertEqual(invalid_payload["selected_artifact_id_count"], 1)
-        self.assertEqual(invalid_payload["target_domain"], "defect")
+        self.assertEqual(invalid_payload["target_domain"], "scenario")
         self.assertEqual(
             invalid_payload["source_domains"],
             ["test_case", "environment"],
@@ -258,6 +340,141 @@ class AgentPlanningDecisionServiceTests(unittest.TestCase):
             "selected_artifact_ids",
             json.dumps(repair_error, ensure_ascii=False),
         )
+
+    def test_target_domain_owner_is_added_as_supporting_skill(self):
+        from app.services.agent_planning_service import AgentPlanningDecisionService
+
+        decision_json = planning_json(
+            goal="Analyze failed cases, repair assertions, and execute them again.",
+            action="repair_and_rerun",
+            target_domain="test_case",
+            source_domains=["test_case", "execution"],
+            selected_skills=[
+                "assertion-extractor-binding",
+                "execution-diagnosis",
+            ],
+            selected_tools=list(COMPOSITE_TOOL_NAMES),
+            selected_artifact_ids=[],
+            required_facts=["failed_case_ids", "execution_details"],
+            requested_effect_scope="persist",
+        )
+        decision = AgentPlanningDecisionService(
+            ai_service=FakeAIService(response(decision_json))
+        ).decide(
+            intent="先分析失败测试用例，分析后，修改断言重新执行",
+            conversation_context=None,
+            skill_index=COMPOSITE_SKILL_INDEX,
+            tool_index=COMPOSITE_TOOL_INDEX,
+            artifact_index=[],
+            project_id=1,
+            permissions=("case:view", "case:manage", "test:execute"),
+        )
+
+        self.assertEqual(
+            decision.model_selected_skills,
+            ("assertion-extractor-binding", "execution-diagnosis"),
+        )
+        self.assertEqual(
+            decision.selected_skills,
+            (
+                "assertion-extractor-binding",
+                "execution-diagnosis",
+                "http-test-case-design",
+            ),
+        )
+        self.assertEqual(
+            decision.domain_alignment.auto_added_supporting_skills,
+            ("http-test-case-design",),
+        )
+        self.assertTrue(decision.domain_alignment.target_aligned)
+        self.assertEqual(decision.selected_tools, COMPOSITE_TOOL_NAMES)
+
+    def test_domain_alignment_prefers_owner_and_reports_unbound_sources(self):
+        from app.services.agent_planning_service import derive_skill_domain_alignment
+
+        skill_index = [
+            *COMPOSITE_SKILL_INDEX,
+            {
+                "name": "a-test-case-producer",
+                "owns": ["draft"],
+                "consumes": ["execution"],
+                "produces": ["test_case"],
+                "tool_names": ["testcase.update_assertions"],
+            },
+        ]
+
+        alignment = derive_skill_domain_alignment(
+            model_selected_skills=("assertion-extractor-binding",),
+            selected_tools=("testcase.update_assertions",),
+            target_domain="test_case",
+            source_domains=("execution", "unknown_source"),
+            skill_index=skill_index,
+        )
+
+        self.assertEqual(
+            alignment.target_skill_candidates,
+            ("http-test-case-design", "a-test-case-producer"),
+        )
+        self.assertEqual(
+            alignment.auto_added_supporting_skills,
+            ("http-test-case-design",),
+        )
+        self.assertEqual(alignment.aligned_source_domains, ("execution",))
+        self.assertEqual(alignment.unbound_source_domains, ("unknown_source",))
+
+    def test_domain_alignment_candidate_order_uses_tool_overlap_then_source_coverage(self):
+        from app.services.agent_planning_service import derive_skill_domain_alignment
+
+        skill_index = [
+            {
+                "name": "owner-without-tool",
+                "owns": ["test_case"],
+                "consumes": [],
+                "produces": [],
+                "tool_names": [],
+            },
+            {
+                "name": "owner-with-tool-and-source",
+                "owns": ["test_case"],
+                "consumes": ["execution"],
+                "produces": [],
+                "tool_names": ["testcase.update_assertions"],
+            },
+        ]
+
+        alignment = derive_skill_domain_alignment(
+            model_selected_skills=(),
+            selected_tools=("testcase.update_assertions",),
+            target_domain="test_case",
+            source_domains=("execution",),
+            skill_index=skill_index,
+        )
+
+        self.assertEqual(
+            alignment.target_skill_candidates,
+            ("owner-with-tool-and-source", "owner-without-tool"),
+        )
+
+    def test_unbound_target_domain_is_diagnostic_not_fatal(self):
+        from app.services.agent_planning_service import AgentPlanningDecisionService
+
+        decision_json = planning_json(target_domain="future_domain")
+        decision = AgentPlanningDecisionService(
+            ai_service=FakeAIService(response(decision_json))
+        ).decide(
+            intent="build scenario",
+            conversation_context={"active_artifact_handles": ARTIFACT_INDEX},
+            skill_index=SKILL_INDEX,
+            tool_index=TOOL_INDEX,
+            artifact_index=ARTIFACT_INDEX,
+            project_id=1,
+            permissions=("view_project", "view_test_case", "view_scenario", "execute_test"),
+        )
+
+        self.assertEqual(decision.target_domain, "future_domain")
+        self.assertFalse(decision.domain_alignment.target_aligned)
+        self.assertEqual(decision.domain_alignment.target_skill_candidates, ())
+        self.assertEqual(decision.domain_alignment.auto_added_supporting_skills, ())
 
     def test_unknown_tool_is_never_silently_rewritten(self):
         from app.services.agent_planning_service import AgentPlanningFailed

@@ -67,6 +67,39 @@ class AgentToolSkillAlignment:
 
 
 @dataclass(frozen=True)
+class AgentSkillDomainAlignment:
+    model_selected_skills: tuple[str, ...] = ()
+    effective_selected_skills: tuple[str, ...] = ()
+    auto_added_supporting_skills: tuple[str, ...] = ()
+    target_domain: str | None = None
+    target_aligned: bool = True
+    target_skill_candidates: tuple[str, ...] = ()
+    aligned_source_domains: tuple[str, ...] = ()
+    source_skill_candidates_by_domain: dict[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
+    unbound_source_domains: tuple[str, ...] = ()
+
+    def model_view(self) -> dict[str, Any]:
+        return {
+            "model_selected_skills": list(self.model_selected_skills),
+            "effective_selected_skills": list(self.effective_selected_skills),
+            "auto_added_supporting_skills": list(
+                self.auto_added_supporting_skills
+            ),
+            "target_domain": self.target_domain,
+            "target_aligned": self.target_aligned,
+            "target_skill_candidates": list(self.target_skill_candidates),
+            "aligned_source_domains": list(self.aligned_source_domains),
+            "source_skill_candidates_by_domain": {
+                domain: list(candidates)
+                for domain, candidates in self.source_skill_candidates_by_domain.items()
+            },
+            "unbound_source_domains": list(self.unbound_source_domains),
+        }
+
+
+@dataclass(frozen=True)
 class ValidatedAgentPlanningDecision:
     goal: str
     action: str
@@ -79,12 +112,16 @@ class ValidatedAgentPlanningDecision:
     requested_effect_scope: str
     confidence: float
     reason_summary: str
+    model_selected_skills: tuple[str, ...] = ()
     source: str = "llm_planning"
     model_requested_effect_scope: str | None = None
     required_effect_scope: str | None = None
     effect_scope_normalized: bool = False
     alignment: AgentToolSkillAlignment = field(
         default_factory=AgentToolSkillAlignment
+    )
+    domain_alignment: AgentSkillDomainAlignment = field(
+        default_factory=AgentSkillDomainAlignment
     )
 
     def model_view(self) -> dict[str, Any]:
@@ -93,6 +130,9 @@ class ValidatedAgentPlanningDecision:
             "action": self.action,
             "target_domain": self.target_domain,
             "source_domains": list(self.source_domains),
+            "model_selected_skills": list(
+                self.model_selected_skills or self.selected_skills
+            ),
             "selected_skills": list(self.selected_skills),
             "selected_tools": list(self.selected_tools),
             "selected_artifact_ids": list(self.selected_artifact_ids),
@@ -105,6 +145,7 @@ class ValidatedAgentPlanningDecision:
             "reason_summary": self.reason_summary,
             "source": self.source,
             "tool_skill_alignment": self.alignment.model_view(),
+            "skill_domain_alignment": self.domain_alignment.model_view(),
         }
 
 
@@ -217,13 +258,13 @@ class AgentPlanningDecisionService:
         tools = _index_by(tool_index, "name")
         artifacts = _index_by(artifact_index, "artifact_id")
 
-        selected_skills = _unique_non_empty(decision.selected_skills)
+        model_selected_skills = _unique_non_empty(decision.selected_skills)
         selected_tools = _unique_non_empty(decision.selected_tools)
         selected_artifacts = _unique_non_empty(decision.selected_artifact_ids)
         source_domains = _unique_non_empty(decision.source_domains)
         required_facts = _unique_non_empty(decision.required_facts)
 
-        unknown_skills = sorted(set(selected_skills) - set(skills))
+        unknown_skills = sorted(set(model_selected_skills) - set(skills))
         unknown_tools = sorted(set(selected_tools) - set(tools))
         unknown_artifacts = sorted(set(selected_artifacts) - set(artifacts))
         if unknown_skills or unknown_tools or unknown_artifacts:
@@ -237,33 +278,20 @@ class AgentPlanningDecisionService:
                 },
             )
 
+        target_domain = str(decision.target_domain or "").strip() or None
+        domain_alignment = derive_skill_domain_alignment(
+            model_selected_skills=model_selected_skills,
+            selected_tools=selected_tools,
+            target_domain=target_domain,
+            source_domains=source_domains,
+            skill_index=skill_index,
+        )
+        selected_skills = domain_alignment.effective_selected_skills
         alignment = derive_tool_skill_alignment(
             selected_skills=selected_skills,
             selected_tools=selected_tools,
             skill_index=skill_index,
         )
-        owned_domains: set[str] = set()
-        consumed_domains: set[str] = set()
-        produced_domains: set[str] = set()
-        for skill_name in selected_skills:
-            skill = skills[skill_name]
-            owned_domains.update(_strings(skill.get("owns")))
-            consumed_domains.update(_strings(skill.get("consumes")))
-            produced_domains.update(_strings(skill.get("produces")))
-
-        if decision.target_domain and decision.target_domain not in owned_domains | produced_domains:
-            raise AgentPlanningError(
-                "planner target domain is incompatible with selected Skills",
-                code="planner_target_domain_incompatible",
-                details={"target_domain": decision.target_domain},
-            )
-        incompatible_sources = sorted(set(source_domains) - consumed_domains - owned_domains)
-        if incompatible_sources:
-            raise AgentPlanningError(
-                "planner source domains are incompatible with selected Skills",
-                code="planner_source_domain_incompatible",
-                details={"source_domains": incompatible_sources},
-            )
         if decision.confidence < self.minimum_confidence:
             raise AgentPlanningError(
                 "planner confidence is below the configured threshold",
@@ -305,7 +333,7 @@ class AgentPlanningDecisionService:
         return ValidatedAgentPlanningDecision(
             goal=decision.goal.strip(),
             action=decision.action.strip(),
-            target_domain=decision.target_domain,
+            target_domain=target_domain,
             source_domains=source_domains,
             selected_skills=selected_skills,
             selected_tools=selected_tools,
@@ -314,10 +342,12 @@ class AgentPlanningDecisionService:
             requested_effect_scope=effective_effect_scope,
             confidence=decision.confidence,
             reason_summary=decision.reason_summary.strip(),
+            model_selected_skills=model_selected_skills,
             model_requested_effect_scope=model_requested_effect_scope,
             required_effect_scope=required_effect_scope,
             effect_scope_normalized=effective_effect_scope != model_requested_effect_scope,
             alignment=alignment,
+            domain_alignment=domain_alignment,
         )
 
     def _request(
@@ -405,6 +435,125 @@ def _planning_decision_summary(
         "target_domain": decision.target_domain,
         "source_domains": list(_unique_non_empty(decision.source_domains)),
     }
+
+
+def derive_skill_domain_alignment(
+    *,
+    model_selected_skills: Sequence[str],
+    selected_tools: Sequence[str],
+    target_domain: str | None,
+    source_domains: Sequence[str],
+    skill_index: Sequence[dict[str, Any]],
+) -> AgentSkillDomainAlignment:
+    skills = _index_by(skill_index, "name")
+    model_skill_names = _unique_non_empty(model_selected_skills)
+    selected_tool_set = set(_unique_non_empty(selected_tools))
+    normalized_target = str(target_domain or "").strip() or None
+    normalized_sources = _unique_non_empty(source_domains)
+    source_domain_set = set(normalized_sources)
+
+    def skill_domains(skill: dict[str, Any]) -> tuple[set[str], set[str], set[str]]:
+        return (
+            set(_strings(skill.get("owns"))),
+            set(_strings(skill.get("consumes"))),
+            set(_strings(skill.get("produces"))),
+        )
+
+    target_candidates: tuple[str, ...] = ()
+    if normalized_target is not None:
+        candidates: list[tuple[tuple[Any, ...], str]] = []
+        for skill_name, skill in skills.items():
+            owns, consumes, produces = skill_domains(skill)
+            if normalized_target not in owns | produces:
+                continue
+            declared_tools = set(
+                _strings(skill.get("tool_names") or skill.get("tools"))
+            )
+            candidates.append(
+                (
+                    (
+                        0 if normalized_target in owns else 1,
+                        0 if normalized_target in produces else 1,
+                        -len(selected_tool_set & declared_tools),
+                        -len(source_domain_set & (owns | consumes)),
+                        skill_name,
+                    ),
+                    skill_name,
+                )
+            )
+        target_candidates = tuple(
+            skill_name for _, skill_name in sorted(candidates)
+        )
+
+    effective_skill_names = list(model_skill_names)
+    model_owned_or_produced: set[str] = set()
+    for skill_name in model_skill_names:
+        skill = skills.get(skill_name)
+        if skill is None:
+            continue
+        owns, _, produces = skill_domains(skill)
+        model_owned_or_produced.update(owns | produces)
+
+    auto_added: tuple[str, ...] = ()
+    if (
+        normalized_target is not None
+        and normalized_target not in model_owned_or_produced
+        and target_candidates
+    ):
+        supporting_skill = target_candidates[0]
+        if supporting_skill not in effective_skill_names:
+            effective_skill_names.append(supporting_skill)
+            auto_added = (supporting_skill,)
+
+    effective_owned: set[str] = set()
+    effective_consumed: set[str] = set()
+    effective_produced: set[str] = set()
+    for skill_name in effective_skill_names:
+        skill = skills.get(skill_name)
+        if skill is None:
+            continue
+        owns, consumes, produces = skill_domains(skill)
+        effective_owned.update(owns)
+        effective_consumed.update(consumes)
+        effective_produced.update(produces)
+
+    aligned_sources = tuple(
+        domain
+        for domain in normalized_sources
+        if domain in effective_owned | effective_consumed
+    )
+    unbound_sources = tuple(
+        domain
+        for domain in normalized_sources
+        if domain not in effective_owned | effective_consumed
+    )
+    source_candidates = {
+        domain: tuple(
+            sorted(
+                skill_name
+                for skill_name, skill in skills.items()
+                if domain
+                in set(_strings(skill.get("owns")))
+                | set(_strings(skill.get("consumes")))
+            )
+        )
+        for domain in normalized_sources
+    }
+
+    return AgentSkillDomainAlignment(
+        model_selected_skills=model_skill_names,
+        effective_selected_skills=tuple(effective_skill_names),
+        auto_added_supporting_skills=auto_added,
+        target_domain=normalized_target,
+        target_aligned=(
+            normalized_target is None
+            or normalized_target in effective_owned | effective_produced
+        ),
+        target_skill_candidates=target_candidates,
+        aligned_source_domains=aligned_sources,
+        source_skill_candidates_by_domain=source_candidates,
+        unbound_source_domains=unbound_sources,
+    )
 
 
 def derive_tool_skill_alignment(

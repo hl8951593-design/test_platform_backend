@@ -777,8 +777,8 @@ Run diagnostics 中的 `skill_plan.primary_skill` 表示目标领域主 Skill，
 | event_type | 中文显示名 | 前端处理 |
 | --- | --- | --- |
 | `planner.llm_decision_started` | 智能规划开始 | 普通运行诊断，不创建 Tool 卡片 |
-| `planner.llm_decision_completed` | 智能规划完成 | 可展示 selected Skills/Tools、effect scope 和 plan 摘要 |
-| `planner.llm_decision_invalid` | 规划校验未通过 | 展示结构化 code；不要展示 prompt 或推理链 |
+| `planner.llm_decision_completed` | 智能规划完成 | 可展示 selected Skills/Tools、effect scope、`tool_skill_alignment` 和 plan 摘要；alignment 仅是诊断，不代表授权或已执行 |
+| `planner.llm_decision_invalid` | 规划校验未通过 | 展示结构化 code；可使用 bounded selected Skills/Tools/target/source 摘要，不要展示 prompt、artifact 内容或推理链 |
 | `planner.llm_decision_retrying` | 正在修复规划 | 普通诊断；最多一次 |
 | `planner.llm_decision_failed` | 智能规划失败 | Run 最终错误码为 `agent_planning_failed` |
 | `planner.capability_activation_requested` | 请求扩展能力 | Runtime 控制事件，不是业务 ToolCall |
@@ -789,6 +789,17 @@ Run diagnostics 中的 `skill_plan.primary_skill` 表示目标领域主 Skill，
 | `model.capability_denial_observed` | 模型能力判断诊断 | 仅观测，不替换 assistant 文本、不重建计划 |
 | `scenario.draft_validation_completed` | 场景草稿校验通过 | payload 提供引用/模板/依赖统计，可允许后续保存入口 |
 | `scenario.draft_validation_failed` | 场景草稿校验失败 | 显示问题计数并引导修复；不得显示“可保存” |
+
+`planner.llm_decision_completed.payload.tool_skill_alignment` 为 additive 诊断对象：
+
+| 字段 | 类型 | 语义 |
+| --- | --- | --- |
+| `selected_skill_declared_tools` | `string[]` | 当前 selected Skills 在冻结 Skill manifest 中声明的全部工具 |
+| `aligned_tools` | `string[]` | 本次 selected Tools 中由当前 selected Skills 声明的工具 |
+| `supporting_skill_candidates_by_tool` | `Record<string,string[]>` | 未由当前 Skills 声明、但由其他冻结 Skill 声明的工具及候选 Skill |
+| `unbound_tools` | `string[]` | 已注册但没有任何冻结 Skill 声明的 selected Tools |
+
+该对象不改变前端 Tool 卡片、Approval 按钮或 Run 状态判断。Tool 是否可执行仍以 Capability Plan、ToolCall、权限和 Approval 事实为准。结构化规划已经解析但校验失败时，`planner.llm_decision_invalid` 可附加 `selected_skills`、`selected_tools`、`selected_artifact_id_count`、`target_domain` 和 `source_domains`；不会返回 artifact ID 列表、完整 prompt、Tool input 或 provider reasoning。
 
 `scenario.compose_draft` ToolResult 的 `draft.scenario_validation` 是新增 envelope，包含 `valid/referenced_case_count/unresolved_reference_count/dependency_edge_count/resolved_template_count/unresolved_template_count/extractor_count/binding_count/graph_errors/quality_issues/evidence_sources`。前端只有在 `valid=true` 时才能把 artifact 标为权威场景草稿；`scenario_draft_invalid` 是诊断 artifact，`available_followup_actions` 只有 `repair`。
 

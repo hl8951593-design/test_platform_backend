@@ -8056,6 +8056,228 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(approval.required_permissions_json, [ProjectPermission.CREATE_DEFECT.value])
         self.assertEqual(saved_count, 0)
 
+    def test_assertion_repair_planning_reaches_approval_with_skill_tool_alignment(self):
+        from app.core.permissions import ProjectPermission
+        from app.models.test_case import TestCase
+        from app.services.agent_planning_service import AgentPlanningDecisionService
+
+        conversation_id = "agent-conv-assertion-repair-alignment"
+        case_id = 8207
+        object_ref = f"object-ref://test_case/http/assertion-repair/{case_id}"
+        snapshot_id = "case-snapshot://assertion-repair"
+        original_assertions = [{"type": "status_code", "expected": 201}]
+        test_case = TestCase(
+            id=case_id,
+            project_id=10,
+            environment_id=None,
+            name="Assertion Repair Alignment Case",
+            description="case for assertion repair planning regression",
+            method="GET",
+            path="/assertion-repair",
+            headers={},
+            query_params={},
+            body=None,
+            assertions=original_assertions,
+            extractors=[],
+            created_by_id=self.owner.id,
+        )
+        self.db.add(test_case)
+        previous_run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="analyze failed assertions",
+            ),
+            current_user=self.owner,
+        )
+        query_call = ExecutionLedgerService(self.db).create_tool_call(
+            payload=AgentToolCallCreateRequest(
+                run_id=previous_run.run_id,
+                tool_name="testcase.query_project_cases",
+                input={
+                    "project_id": 10,
+                    "detail_level": "execution_ready",
+                    "test_case_ids": [case_id],
+                },
+                step_index=0,
+            ),
+            current_user=self.owner,
+            enqueue=False,
+        )
+        query_call.status = "succeeded"
+        query_call.execution_phase = "completed"
+        query_call.output_json_redacted = {
+            "detail_level": "execution_ready",
+            "case_result_policy": {"execution_ready": True},
+            "case_snapshot": {
+                "snapshot_id": snapshot_id,
+                "execution_ready": True,
+            },
+            "case_id_manifest": {
+                "snapshot_id": snapshot_id,
+                "http_test_case_ids": [case_id],
+                "http_assertion_update_ids": [case_id],
+                "websocket_test_case_ids": [],
+            },
+            "object_reference_manifest": {
+                "object_family": "test_case",
+                "snapshot_id": snapshot_id,
+                "http_test_case_ids": [case_id],
+                "http_assertion_update_ids": [case_id],
+                "object_references": [
+                    {
+                        "id": case_id,
+                        "object_ref": object_ref,
+                        "object_type": "http_test_case",
+                        "name": test_case.name,
+                    }
+                ],
+            },
+            "http_test_case_ids": [case_id],
+            "http_assertion_update_ids": [case_id],
+            "http_test_case_refs": [object_ref],
+            "object_references": [
+                {
+                    "id": case_id,
+                    "object_ref": object_ref,
+                    "object_type": "http_test_case",
+                    "name": test_case.name,
+                }
+            ],
+        }
+        previous_run.status = "completed"
+        previous_run.result_json = {"message": "Failure evidence is ready."}
+        previous_run.completed_at = datetime.now(UTC).replace(tzinfo=None)
+        self.db.commit()
+
+        planning_payload = {
+            "goal": "Repair assertions proven wrong by the previous failure analysis.",
+            "action": "repair",
+            "target_domain": "assertion",
+            "source_domains": ["test_case", "execution"],
+            "selected_skills": ["assertion-extractor-binding"],
+            "selected_tools": [
+                "testcase.query_project_cases",
+                "testcase.update_assertions",
+                "testcase.batch_update_assertions",
+            ],
+            "selected_artifact_ids": [],
+            "required_facts": [
+                "saved_case_assertions",
+                "latest_execution_failure",
+            ],
+            "requested_effect_scope": "persist",
+            "confidence": 0.98,
+            "reason_summary": (
+                "Use explicit case facts and approval-gated assertion patches."
+            ),
+        }
+
+        class PlanningAIService:
+            def chat(self, request):
+                return SimpleNamespace(
+                    content=json.dumps(planning_payload, ensure_ascii=False),
+                    finish_reason="stop",
+                )
+
+        current_run = AgentRuntimeService(self.db).create_run(
+            payload=AgentRunCreateRequest(
+                project_id=10,
+                conversation_id=conversation_id,
+                intent="修复断言",
+                max_iterations=1,
+            ),
+            current_user=self.owner,
+        )
+        tool_request = {
+            "tool_name": "testcase.update_assertions",
+            "input": {
+                "project_id": 10,
+                "object_reference": object_ref,
+                "case_snapshot_id": snapshot_id,
+                "assertions": [{"type": "status_code", "expected": 200}],
+            },
+            "reason": "Repair the saved assertion from explicit execution-ready facts.",
+            "evidence_refs": [],
+        }
+        stream_events = [
+            {
+                "type": "delta",
+                "content": (
+                    "```agent_tool_request\n"
+                    + json.dumps(tool_request, ensure_ascii=False)
+                    + "\n```"
+                ),
+            },
+            {"type": "done", "finish_reason": "stop", "model": "deepseek-test"},
+        ]
+        runner = AgentConversationRunner(
+            self.db,
+            planning_decision_service=AgentPlanningDecisionService(
+                ai_service=PlanningAIService()
+            ),
+        )
+
+        with patch.object(
+            agent_runtime_service.settings,
+            "AGENT_LLM_INTENT_DECISION_ENABLED",
+            True,
+        ), patch(
+            "app.services.agent_runtime_service.AIService.chat_stream",
+            return_value=iter(stream_events),
+        ):
+            blocked = runner.run(
+                run_id=current_run.run_id,
+                user_id=self.owner.id,
+            )
+
+        self.db.refresh(current_run)
+        self.db.refresh(test_case)
+        plan = self.db.scalar(
+            select(AgentCapabilityPlanRecord).where(
+                AgentCapabilityPlanRecord.capability_plan_id
+                == current_run.active_capability_plan_id
+            )
+        )
+        call = self.db.scalar(
+            select(AgentToolCall).where(
+                AgentToolCall.run_id == current_run.run_id,
+                AgentToolCall.tool_name == "testcase.update_assertions",
+            )
+        )
+        approval = self.db.scalar(
+            select(AgentApproval).where(
+                AgentApproval.run_id == current_run.run_id
+            )
+        )
+        queued = self.db.scalar(
+            select(AgentWorkerQueue).where(
+                AgentWorkerQueue.tool_call_id == call.tool_call_id
+            )
+        )
+
+        self.assertEqual(blocked.status, "needs_human")
+        self.assertNotEqual(current_run.error_code, "agent_planning_failed")
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            plan.intent_decision_json["tool_skill_alignment"]["aligned_tools"],
+            [
+                "testcase.batch_update_assertions",
+                "testcase.query_project_cases",
+                "testcase.update_assertions",
+            ],
+        )
+        self.assertEqual(call.status, "planned")
+        self.assertTrue(call.approval_required)
+        self.assertEqual(call.resolved_side_effect_class, "business_update")
+        self.assertEqual(approval.approval_status, "pending")
+        self.assertEqual(
+            approval.required_permissions_json,
+            [ProjectPermission.MANAGE_CASE.value],
+        )
+        self.assertEqual(test_case.assertions, original_assertions)
+        self.assertIsNone(queued)
+
     def test_agent_query_project_cases_returns_explicit_case_id_lists(self):
         from app.models.project import ProjectEnvironment
         from app.models.test_case import TestCase

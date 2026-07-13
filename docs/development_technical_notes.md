@@ -1629,3 +1629,11 @@ saved_scenario 执行 follow-up 架构修正：最新“保存场景 42 后执�
 Agent `scenario.compose_draft` 现为严格 `draft_only`：无论模型输入如何，均强制关闭 `execute_candidates/self_validate`，执行必须显式进入 `scenario.execute_dry_run`。候选草稿先按保存用例恢复真实 request/assertions/extractors，再把环境变量、dataset 和保存 extractor 分层解析；当前环境无法解析且没有证据来源的候选节点会被排除并记录原因。专用 ToolResult Planning View 将 source/candidate/grounded/omitted/excluded/validation/execution/persistence 和 authoritative summary 放在模型可见上下文前部，避免大草稿截断后最终回复沿用候选统计或推断遗漏原因。
 
 安全收口：敏感键识别补充 `lingxi-auth/auth/authentication/x-auth-token` 精确 header 名；历史 Agent ToolCall ledger 中 243 条输出和 5 条输入已就地递归掩码并验证剩余暴露计数为 0，不删除审计记录、不修改业务数据或原始审计 hash。
+
+## 2026-07-13 Agent Skill–Tool 能力对齐
+
+最新 Run `agent-run-26b5bea40a624d6e84fb710f231b010e` 在处理“修复断言”时，LLM 连续两次选择真实存在的 `testcase.update_assertions/testcase.batch_update_assertions`，但规划器在创建 Capability Plan 前以 `planner_tool_not_declared_by_skill` 终止。根因是语义最匹配的 `assertion-extractor-binding` 正文明确要求使用断言更新工具，冻结 frontmatter 的 `tool_names` 却为空；旧 fail-closed 校验错误地把 Skill 元数据完整性当成了 Tool 执行授权。该 Run 没有产生 ToolCall、Approval 或 WorkerQueue 记录，因此与业务 handler、审批和异步消费无关。
+
+本轮将 Skill `tools` 收口为规划/审计证据：已注册 Tool 不再仅因 selected Skill 漏声明而终止规划，`AgentPlanningDecisionService` 生成稳定的 `tool_skill_alignment`，记录已对齐工具、supporting Skill 候选和全局未绑定工具；未知 Tool、领域、置信度、权限和 side-effect 校验继续 fail-closed，Capability Plan、ToolRuntime、schema、对象引用、项目隔离、Approval 和异步 worker 不变。`assertion-extractor-binding` 已显式声明用例查询与 HTTP/WebSocket 断言更新工具，但继续禁止把 `ai_skill.run_draft` 用作保存用例断言；新 RuntimeSnapshot 创建前会校验所有显式 Skill Tool 声明均存在于 ToolRegistry。
+
+规划失败可观测性同步补强：已解析决策若在后端校验失败，`planner.llm_decision_invalid` 和唯一一次 bounded repair 会携带 selected Skills/Tools、artifact 数量及 target/source domain 摘要，不记录 artifact ID、prompt、Tool input 或推理链。新增端到端回归使用同会话 `execution_ready` 用例事实执行“修复断言”，确认 Capability Plan 正常落库、断言更新 ToolCall 停在 pending Approval、审批前业务断言不变且 WorkerQueue 不启动；无数据库迁移或 REST 形状变化。

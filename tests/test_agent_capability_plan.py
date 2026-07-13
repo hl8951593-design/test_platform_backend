@@ -1048,7 +1048,10 @@ class AgentCapabilityPlanTests(unittest.TestCase):
 
     def test_runner_persists_unified_llm_planning_decision_without_keyword_reroute(self):
         from app.services.agent_capability_plan_service import AgentCapabilityPlanService
-        from app.services.agent_planning_service import ValidatedAgentPlanningDecision
+        from app.services.agent_planning_service import (
+            AgentToolSkillAlignment,
+            ValidatedAgentPlanningDecision,
+        )
 
         planning_inputs = []
         native_catalogs = []
@@ -1068,6 +1071,16 @@ class AgentCapabilityPlanTests(unittest.TestCase):
                     requested_effect_scope="observe",
                     confidence=0.98,
                     reason_summary="The requested task is a defect query.",
+                    alignment=AgentToolSkillAlignment(
+                        selected_skill_declared_tools=(
+                            "defect.query_project_defects",
+                            "project.read_context",
+                        ),
+                        aligned_tools=(
+                            "defect.query_project_defects",
+                            "project.read_context",
+                        ),
+                    ),
                 )
 
         def fake_stream(_service, payload):
@@ -1104,6 +1117,21 @@ class AgentCapabilityPlanTests(unittest.TestCase):
             ["project.read_context", "defect.query_project_defects"],
         )
         self.assertEqual(plan.required_facts_json, ["project_context"])
+        self.assertEqual(
+            plan.intent_decision_json["tool_skill_alignment"],
+            {
+                "selected_skill_declared_tools": [
+                    "defect.query_project_defects",
+                    "project.read_context",
+                ],
+                "aligned_tools": [
+                    "defect.query_project_defects",
+                    "project.read_context",
+                ],
+                "supporting_skill_candidates_by_tool": {},
+                "unbound_tools": [],
+            },
+        )
         self.assertTrue(native_catalogs)
         event_types = [
             event.event_type

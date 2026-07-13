@@ -799,7 +799,25 @@ Run diagnostics 中的 `skill_plan.primary_skill` 表示目标领域主 Skill，
 | `supporting_skill_candidates_by_tool` | `Record<string,string[]>` | 未由当前 Skills 声明、但由其他冻结 Skill 声明的工具及候选 Skill |
 | `unbound_tools` | `string[]` | 已注册但没有任何冻结 Skill 声明的 selected Tools |
 
-该对象不改变前端 Tool 卡片、Approval 按钮或 Run 状态判断。Tool 是否可执行仍以 Capability Plan、ToolCall、权限和 Approval 事实为准。结构化规划已经解析但校验失败时，`planner.llm_decision_invalid` 可附加 `selected_skills`、`selected_tools`、`selected_artifact_id_count`、`target_domain` 和 `source_domains`；不会返回 artifact ID 列表、完整 prompt、Tool input 或 provider reasoning。
+同一 completed payload 和 Capability Plan `intent_decision_json` 还提供以下 additive Skill 领域字段：
+
+| 字段 | 类型 | 语义 |
+| --- | --- | --- |
+| `model_selected_skills` | `string[]` | LLM 原始选择，顺序保持不变 |
+| `selected_skills` | `string[]` | 实际进入模型上下文与 Capability Plan 的有效 Skill；可能比原始选择多一个 supporting Skill |
+| `skill_domain_alignment.model_selected_skills` | `string[]` | 与顶层原始选择相同，便于独立渲染诊断卡 |
+| `skill_domain_alignment.effective_selected_skills` | `string[]` | 与顶层有效选择相同 |
+| `skill_domain_alignment.auto_added_supporting_skills` | `string[]` | 后端从冻结 Skill 索引确定性补充的目标域 supporting Skill，当前最多一个 |
+| `skill_domain_alignment.target_domain` | `string \| null` | 模型给出的目标领域 |
+| `skill_domain_alignment.target_aligned` | `boolean` | 有效 Skill 是否通过 `owns/produces` 覆盖目标领域 |
+| `skill_domain_alignment.target_skill_candidates` | `string[]` | 按 owner、producer、Tool 重合、source 覆盖和名称稳定排序的候选 |
+| `skill_domain_alignment.aligned_source_domains` | `string[]` | 已被有效 Skill 的 `owns/consumes` 覆盖的来源领域 |
+| `skill_domain_alignment.source_skill_candidates_by_domain` | `Record<string,string[]>` | 每个来源领域在冻结索引中的候选 Skill |
+| `skill_domain_alignment.unbound_source_domains` | `string[]` | 暂未被有效 Skill 覆盖的来源领域诊断 |
+
+前端若需要解释规划，可把 `model_selected_skills` 标为“模型选择”，把 `auto_added_supporting_skills` 标为“系统补充领域上下文”；不要把后者渲染成 ToolCall、自动执行或额外授权。`target_aligned=false` 和 `unbound_source_domains` 也是普通诊断，不应单独改变 Run 终态。
+
+这些对象不改变前端 Tool 卡片、Approval 按钮或 Run 状态判断。领域闭包只补充 Skill 上下文，绝不增加 Tool；Tool 是否可执行仍以 Capability Plan、ToolCall、权限和 Approval 事实为准。结构化规划已经解析但校验失败时，`planner.llm_decision_invalid` 可附加模型原始 `selected_skills`、`selected_tools`、`selected_artifact_id_count`、`target_domain` 和 `source_domains`；不会返回 artifact ID 列表、完整 prompt、Tool input 或 provider reasoning。
 
 `scenario.compose_draft` ToolResult 的 `draft.scenario_validation` 是新增 envelope，包含 `valid/referenced_case_count/unresolved_reference_count/dependency_edge_count/resolved_template_count/unresolved_template_count/extractor_count/binding_count/graph_errors/quality_issues/evidence_sources`。前端只有在 `valid=true` 时才能把 artifact 标为权威场景草稿；`scenario_draft_invalid` 是诊断 artifact，`available_followup_actions` 只有 `repair`。
 

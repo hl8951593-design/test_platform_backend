@@ -1634,6 +1634,16 @@ Agent `scenario.compose_draft` 现为严格 `draft_only`：无论模型输入如
 
 最新 Run `agent-run-26b5bea40a624d6e84fb710f231b010e` 在处理“修复断言”时，LLM 连续两次选择真实存在的 `testcase.update_assertions/testcase.batch_update_assertions`，但规划器在创建 Capability Plan 前以 `planner_tool_not_declared_by_skill` 终止。根因是语义最匹配的 `assertion-extractor-binding` 正文明确要求使用断言更新工具，冻结 frontmatter 的 `tool_names` 却为空；旧 fail-closed 校验错误地把 Skill 元数据完整性当成了 Tool 执行授权。该 Run 没有产生 ToolCall、Approval 或 WorkerQueue 记录，因此与业务 handler、审批和异步消费无关。
 
-本轮将 Skill `tools` 收口为规划/审计证据：已注册 Tool 不再仅因 selected Skill 漏声明而终止规划，`AgentPlanningDecisionService` 生成稳定的 `tool_skill_alignment`，记录已对齐工具、supporting Skill 候选和全局未绑定工具；未知 Tool、领域、置信度、权限和 side-effect 校验继续 fail-closed，Capability Plan、ToolRuntime、schema、对象引用、项目隔离、Approval 和异步 worker 不变。`assertion-extractor-binding` 已显式声明用例查询与 HTTP/WebSocket 断言更新工具，但继续禁止把 `ai_skill.run_draft` 用作保存用例断言；新 RuntimeSnapshot 创建前会校验所有显式 Skill Tool 声明均存在于 ToolRegistry。
+本轮将 Skill `tools` 收口为规划/审计证据：已注册 Tool 不再仅因 selected Skill 漏声明而终止规划，`AgentPlanningDecisionService` 生成稳定的 `tool_skill_alignment`，记录已对齐工具、supporting Skill 候选和全局未绑定工具；未知 Skill/Tool/artifact、置信度、权限和 side-effect 校验继续 fail-closed，Capability Plan、ToolRuntime、schema、对象引用、项目隔离、Approval 和异步 worker 不变。Skill 领域不一致在后续架构增量中改为确定性 supporting Skill 闭包与诊断。`assertion-extractor-binding` 已显式声明用例查询与 HTTP/WebSocket 断言更新工具，但继续禁止把 `ai_skill.run_draft` 用作保存用例断言；新 RuntimeSnapshot 创建前会校验所有显式 Skill Tool 声明均存在于 ToolRegistry。
 
 规划失败可观测性同步补强：已解析决策若在后端校验失败，`planner.llm_decision_invalid` 和唯一一次 bounded repair 会携带 selected Skills/Tools、artifact 数量及 target/source domain 摘要，不记录 artifact ID、prompt、Tool input 或推理链。新增端到端回归使用同会话 `execution_ready` 用例事实执行“修复断言”，确认 Capability Plan 正常落库、断言更新 ToolCall 停在 pending Approval、审批前业务断言不变且 WorkerQueue 不启动；无数据库迁移或 REST 形状变化。
+
+## 2026-07-13 Agent 目标领域 Supporting Skill 闭包
+
+最新 Run `agent-run-8ec2a0ca6d544e18ac1bfd9d968dd0cf` 的意图是“先分析失败测试用例，分析后，修改断言重新执行”。LLM 两次都选择了正确的断言/执行 Skill 和 8 个已注册 Tool，但把 `target_domain` 设为 `test_case`；旧规划器要求 selected Skills 自身拥有目标域，因此连续返回 `planner_target_domain_incompatible`，没有创建 Capability Plan、ToolCall、Approval 或 WorkerQueue。冻结 RuntimeSnapshot 已包含全部新 Tool，说明根因不是工具缺失，而是后端把自身 Skill 领域图的完整复现责任转嫁给了 LLM。
+
+现在 `AgentPlanningDecisionService` 在注册引用校验后执行确定性最小领域闭包。`model_selected_skills` 保留模型原始选择；若这些 Skill 未覆盖目标域，只从同一 Run 的冻结 Skill 索引追加至多一个 owner/producer 到有效 `selected_skills`。候选按 owner、producer、所选 Tool 声明重合度、source domain 覆盖度和 Skill 名称排序。来源域只生成覆盖/候选/未绑定诊断，不递归追加 Skill；没有目标候选也不再触发 bounded repair。闭包结果通过 `skill_domain_alignment` 持久化到 Capability Plan，并由 `AgentContextManager` 加载全部有效 Skill 正文。
+
+该闭包不修改模型选择的 Tool、artifact、facts、action 或 effect scope，不授予权限，也不直接执行业务动作。未知注册引用、低置信度、未知 side-effect 和缺少权限仍在规划阶段 fail-closed；Capability Plan 成员校验、ToolRuntime schema、对象引用、项目隔离、Approval、幂等、异步 worker 和业务 handler 均保持原路径。端到端回归使用上述真实决策形态确认 `http-test-case-design` 被作为 supporting Skill 加入模型上下文，8 个 Tool 原样保留，断言更新仍停在 pending Approval，审批前用例断言不变且 WorkerQueue 不入队；无数据库迁移。
+
+真实 DeepSeek 只读验收直接复用该失败 Run 的冻结 snapshot `agent-snap-8ccefe4c77874b97b21a15ee1c5b50e8`（29 个 Skill、49 个 Tool、10 个 artifact handle），不启动 Runner。Provider 再次返回 `assertion-extractor-binding + execution-diagnosis`、同样 8 个 Tool 和 `target_domain=test_case`；本地校验生成有效 Skills `assertion-extractor-binding + execution-diagnosis + http-test-case-design`，`target_aligned=true` 且没有未绑定来源域。验收前后该 Run 的 Capability Plan、ToolCall、Approval 和 WorkerQueue 计数均保持 0，证明闭包仅发生在规划/上下文层。

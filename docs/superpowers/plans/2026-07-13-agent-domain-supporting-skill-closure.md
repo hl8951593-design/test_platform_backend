@@ -31,7 +31,7 @@
 - Consumes: frozen `skill_index`, model-selected Skills/Tools, `target_domain`, and `source_domains`.
 - Produces: `AgentSkillDomainAlignment`, `derive_skill_domain_alignment(*, model_selected_skills, selected_tools, target_domain, source_domains, skill_index)`, additive `ValidatedAgentPlanningDecision.model_selected_skills`, and effective `selected_skills`.
 
-- [ ] **Step 1: Write the failing latest-Run regression**
+- [x] **Step 1: Write the failing latest-Run regression**
 
 Add a test using the observed decision shape:
 
@@ -102,7 +102,7 @@ def test_target_domain_owner_is_added_as_supporting_skill(self):
 
 Define `latest_composite_planning_json()` and `latest_composite_tool_index()` in the test module with the eight observed Tool names and registered side-effect/permission metadata.
 
-- [ ] **Step 2: Run the exact test and verify RED**
+- [x] **Step 2: Run the exact test and verify RED**
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest tests.test_agent_planning_service.AgentPlanningDecisionServiceTests.test_target_domain_owner_is_added_as_supporting_skill
@@ -110,7 +110,7 @@ Define `latest_composite_planning_json()` and `latest_composite_tool_index()` in
 
 Expected: FAIL with `planner_target_domain_incompatible`.
 
-- [ ] **Step 3: Write failing deterministic and non-fatal domain tests**
+- [x] **Step 3: Write failing deterministic and non-fatal domain tests**
 
 Add tests proving:
 
@@ -130,7 +130,7 @@ assert alignment.unbound_source_domains == ("unknown_source",)
 
 Add an owner-versus-producer fixture where both candidates declare the same selected Tool; assert the owner is selected. Add an unbound target fixture; assert `target_aligned=False` without raising a planning error.
 
-- [ ] **Step 4: Implement `AgentSkillDomainAlignment` and closure**
+- [x] **Step 4: Implement `AgentSkillDomainAlignment` and closure**
 
 Add:
 
@@ -180,7 +180,7 @@ Append only the first target candidate when the model-selected Skills do not alr
 
 Add `model_selected_skills` and `domain_alignment` defaults to `ValidatedAgentPlanningDecision`; `model_view()` must expose `model_selected_skills` and `skill_domain_alignment` while preserving existing fields.
 
-- [ ] **Step 5: Run the complete planner suite**
+- [x] **Step 5: Run the complete planner suite**
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest tests.test_agent_planning_service
@@ -188,7 +188,7 @@ Add `model_selected_skills` and `domain_alignment` defaults to `ValidatedAgentPl
 
 Expected: PASS. Update the bounded invalid-decision test to use `planner_confidence_too_low` instead of a domain mismatch, preserving its selected Skill/Tool summary assertions.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 ```powershell
 git add -- app/services/agent_planning_service.py tests/test_agent_planning_service.py
@@ -208,7 +208,7 @@ git commit -m "fix: close agent target domains with supporting skills"
 - Consumes: `ValidatedAgentPlanningDecision.selected_skills`, `model_selected_skills`, and `domain_alignment`.
 - Produces: Capability Plan `intent_decision_json` with both model/effective Skill facts and `skill_plan_json` whose primary/supporting Skills match the actual model context.
 
-- [ ] **Step 1: Write failing context and persistence tests**
+- [x] **Step 1: Write failing context and persistence tests**
 
 Add a planning decision whose model Skills are assertion/execution and whose effective Skills append HTTP case design. Assert:
 
@@ -239,7 +239,7 @@ assert plan.skill_plan_json["supporting_skills"][-1] == "http-test-case-design"
 assert plan.intent_decision_json["skill_domain_alignment"]["target_aligned"] is True
 ```
 
-- [ ] **Step 2: Run focused tests and verify RED if propagation is incomplete**
+- [x] **Step 2: Run focused tests and verify RED if propagation is incomplete**
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest tests.test_agent_capability_plan.AgentCapabilityPlanTests.test_runner_persists_unified_llm_planning_decision_without_keyword_reroute tests.test_agent_runtime.AgentRuntimeTests.test_assertion_repair_planning_reaches_approval_with_skill_tool_alignment
@@ -247,11 +247,11 @@ assert plan.intent_decision_json["skill_domain_alignment"]["target_aligned"] is 
 
 Expected: FAIL until the fixtures and persisted alignment reflect model/effective Skill separation.
 
-- [ ] **Step 3: Implement the minimal propagation adjustment**
+- [x] **Step 3: Implement the minimal propagation adjustment**
 
 Keep `AgentContextManager.route_planning_decision()` reading effective `decision.selected_skills`. If no production adjustment is required, update only the test fixtures and persistence assertions; do not add duplicate routing logic.
 
-- [ ] **Step 4: Run Capability Plan and AgentRuntime suites**
+- [x] **Step 4: Run Capability Plan and AgentRuntime suites**
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest tests.test_agent_capability_plan tests.test_agent_runtime
@@ -259,7 +259,7 @@ Keep `AgentContextManager.route_planning_decision()` reading effective `decision
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```powershell
 git add -- tests/test_agent_capability_plan.py tests/test_agent_runtime.py app/services/agent_context_manager.py
@@ -282,11 +282,11 @@ Do not stage `app/services/agent_context_manager.py` if it requires no change.
 - Consumes: domain closure and effective Skill audit metadata.
 - Produces: documented additive event/Capability Plan fields and verified latest composite planning behavior.
 
-- [ ] **Step 1: Add the exact latest decision regression**
+- [x] **Step 1: Add the exact latest decision regression**
 
 Use intent `先分析失败测试用例，分析后，修改断言重新执行`, target `test_case`, model Skills assertion/execution, and the eight observed Tools. Assert the Runner creates a Capability Plan instead of `agent_planning_failed`, the effective Skill catalog contains `http-test-case-design`, and no business update executes without Approval.
 
-- [ ] **Step 2: Run the exact regression**
+- [x] **Step 2: Run the exact regression**
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest tests.test_agent_runtime.AgentRuntimeTests.test_latest_composite_assertion_repair_adds_test_case_supporting_skill
@@ -294,11 +294,11 @@ Use intent `先分析失败测试用例，分析后，修改断言重新执行`,
 
 Expected: PASS after Tasks 1–2.
 
-- [ ] **Step 3: Update architecture and frontend contracts**
+- [x] **Step 3: Update architecture and frontend contracts**
 
 Document `model_selected_skills`, effective `selected_skills`, `skill_domain_alignment`, deterministic target candidate ordering, source-domain diagnostics, and the invariant that closure never adds Tools or bypasses existing runtime safety.
 
-- [ ] **Step 4: Run focused and full verification**
+- [x] **Step 4: Run focused and full verification**
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest tests.test_agent_planning_service tests.test_agent_capability_plan tests.test_agent_runtime
@@ -307,13 +307,22 @@ Document `model_selected_skills`, effective `selected_skills`, `skill_domain_ali
 
 Expected: all tests PASS with existing documented skips only.
 
-- [ ] **Step 5: Run a read-only live planning acceptance**
+- [x] **Step 5: Run a read-only live planning acceptance**
 
 Use the latest failed Run's frozen Skill/Tool/artifact indexes and the real planning provider to request the same composite intent. Do not execute ToolCalls. Validate the returned decision locally and assert a Capability Plan-compatible result with no `planner_target_domain_incompatible`; record the model/effective Skill lists and target alignment.
 
-- [ ] **Step 6: Commit Task 3**
+- [x] **Step 6: Commit Task 3**
 
 ```powershell
 git add -- tests/test_agent_runtime.py docs/technical_architecture.md docs/api_agent_frontend_contract.md docs/development_technical_notes.md
 git commit -m "docs: document agent domain supporting skill closure"
 ```
+
+## Completion Evidence
+
+- Planner regression suite: PASS.
+- Capability Plan suite: 24 tests PASS.
+- AgentRuntime suite: PASS with the existing behavior-evaluation diagnostics.
+- Focused planner/Capability Plan/AgentRuntime verification: PASS.
+- Full `unittest discover -s tests`: PASS with existing documented skips only.
+- Live read-only DeepSeek acceptance on `agent-run-8ec2a0ca6d544e18ac1bfd9d968dd0cf`: model Skills remained assertion/execution, effective Skills appended `http-test-case-design`, all eight Tools remained unchanged, target alignment passed, and Capability Plan/ToolCall/Approval/WorkerQueue counts remained unchanged at zero.

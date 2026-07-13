@@ -1647,3 +1647,5 @@ Agent `scenario.compose_draft` 现为严格 `draft_only`：无论模型输入如
 该闭包不修改模型选择的 Tool、artifact、facts、action 或 effect scope，不授予权限，也不直接执行业务动作。未知注册引用、低置信度、未知 side-effect 和缺少权限仍在规划阶段 fail-closed；Capability Plan 成员校验、ToolRuntime schema、对象引用、项目隔离、Approval、幂等、异步 worker 和业务 handler 均保持原路径。端到端回归使用上述真实决策形态确认 `http-test-case-design` 被作为 supporting Skill 加入模型上下文，8 个 Tool 原样保留，断言更新仍停在 pending Approval，审批前用例断言不变且 WorkerQueue 不入队；无数据库迁移。
 
 真实 DeepSeek 只读验收直接复用该失败 Run 的冻结 snapshot `agent-snap-8ccefe4c77874b97b21a15ee1c5b50e8`（29 个 Skill、49 个 Tool、10 个 artifact handle），不启动 Runner。Provider 再次返回 `assertion-extractor-binding + execution-diagnosis`、同样 8 个 Tool 和 `target_domain=test_case`；本地校验生成有效 Skills `assertion-extractor-binding + execution-diagnosis + http-test-case-design`，`target_aligned=true` 且没有未绑定来源域。验收前后该 Run 的 Capability Plan、ToolCall、Approval 和 WorkerQueue 计数均保持 0，证明闭包仅发生在规划/上下文层。
+
+Capability Plan 恢复路径也同步支持完整 round-trip：`_validated_planning_decision_from_plan()` 会恢复模型/有效 Skill 集合、`skill_domain_alignment`、`tool_skill_alignment` 和 effect-scope 规范化审计；旧计划缺少新字段时以已持久化 `selected_skills` 构造兼容默认值。这样 active plan 的后续迭代不会丢失领域闭包解释，同时不重跑闭包或改变已冻结的 Tool 集合。

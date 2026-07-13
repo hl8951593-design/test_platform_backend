@@ -324,5 +324,5 @@ git commit -m "docs: document agent domain supporting skill closure"
 - Capability Plan suite: 24 tests PASS.
 - AgentRuntime suite: PASS with the existing behavior-evaluation diagnostics.
 - Focused planner/Capability Plan/AgentRuntime verification: PASS.
-- Full `unittest discover -s tests`: PASS with existing documented skips only.
+- Full `unittest discover -s tests`: 962 tests PASS, `skipped=3`.
 - Live read-only DeepSeek acceptance on `agent-run-8ec2a0ca6d544e18ac1bfd9d968dd0cf`: model Skills remained assertion/execution, effective Skills appended `http-test-case-design`, all eight Tools remained unchanged, target alignment passed, and Capability Plan/ToolCall/Approval/WorkerQueue counts remained unchanged at zero.

@@ -103,6 +103,8 @@ from app.services.agent_planning_service import (
     AgentPlanningDecisionService,
     AgentPlanningError,
     AgentPlanningFailed,
+    AgentSkillDomainAlignment,
+    AgentToolSkillAlignment,
     ValidatedAgentPlanningDecision,
 )
 from app.services.agent_memory_service import MemoryCandidate, MemoryManager
@@ -10527,20 +10529,107 @@ def _validated_intent_decision_from_plan(payload: dict[str, Any]) -> ValidatedAg
     )
 
 
+def _planning_string_tuple(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(str(item) for item in value if str(item))
+
+
+def _planning_string_tuple_mapping(value: Any) -> dict[str, tuple[str, ...]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): _planning_string_tuple(items)
+        for key, items in value.items()
+        if str(key)
+    }
+
+
 def _validated_planning_decision_from_plan(payload: dict[str, Any]) -> ValidatedAgentPlanningDecision:
+    selected_skills = _planning_string_tuple(payload.get("selected_skills"))
+    domain_payload = payload.get("skill_domain_alignment")
+    if not isinstance(domain_payload, dict):
+        domain_payload = {}
+    model_selected_skills = (
+        _planning_string_tuple(payload.get("model_selected_skills"))
+        or _planning_string_tuple(domain_payload.get("model_selected_skills"))
+        or selected_skills
+    )
+    tool_payload = payload.get("tool_skill_alignment")
+    if not isinstance(tool_payload, dict):
+        tool_payload = {}
+    target_domain = (
+        str(payload["target_domain"])
+        if payload.get("target_domain")
+        else None
+    )
     return ValidatedAgentPlanningDecision(
         goal=str(payload.get("goal") or "Continue the validated Agent plan."),
         action=str(payload.get("action") or "query"),
-        target_domain=(str(payload["target_domain"]) if payload.get("target_domain") else None),
-        source_domains=tuple(str(item) for item in (payload.get("source_domains") or ())),
-        selected_skills=tuple(str(item) for item in (payload.get("selected_skills") or ())),
-        selected_tools=tuple(str(item) for item in (payload.get("selected_tools") or ())),
-        selected_artifact_ids=tuple(str(item) for item in (payload.get("selected_artifact_ids") or ())),
-        required_facts=tuple(str(item) for item in (payload.get("required_facts") or ())),
+        target_domain=target_domain,
+        source_domains=_planning_string_tuple(payload.get("source_domains")),
+        selected_skills=selected_skills,
+        selected_tools=_planning_string_tuple(payload.get("selected_tools")),
+        selected_artifact_ids=_planning_string_tuple(
+            payload.get("selected_artifact_ids")
+        ),
+        required_facts=_planning_string_tuple(payload.get("required_facts")),
         requested_effect_scope=str(payload.get("requested_effect_scope") or "observe"),
         confidence=float(payload.get("confidence", 1.0)),
         reason_summary=str(payload.get("reason_summary") or "Persisted validated planning decision."),
+        model_selected_skills=model_selected_skills,
         source=str(payload.get("source") or "persisted_plan"),
+        model_requested_effect_scope=(
+            str(payload["model_requested_effect_scope"])
+            if payload.get("model_requested_effect_scope")
+            else None
+        ),
+        required_effect_scope=(
+            str(payload["required_effect_scope"])
+            if payload.get("required_effect_scope")
+            else None
+        ),
+        effect_scope_normalized=bool(payload.get("effect_scope_normalized", False)),
+        alignment=AgentToolSkillAlignment(
+            selected_skill_declared_tools=_planning_string_tuple(
+                tool_payload.get("selected_skill_declared_tools")
+            ),
+            aligned_tools=_planning_string_tuple(tool_payload.get("aligned_tools")),
+            supporting_skill_candidates_by_tool=_planning_string_tuple_mapping(
+                tool_payload.get("supporting_skill_candidates_by_tool")
+            ),
+            unbound_tools=_planning_string_tuple(tool_payload.get("unbound_tools")),
+        ),
+        domain_alignment=AgentSkillDomainAlignment(
+            model_selected_skills=model_selected_skills,
+            effective_selected_skills=(
+                _planning_string_tuple(
+                    domain_payload.get("effective_selected_skills")
+                )
+                or selected_skills
+            ),
+            auto_added_supporting_skills=_planning_string_tuple(
+                domain_payload.get("auto_added_supporting_skills")
+            ),
+            target_domain=(
+                str(domain_payload["target_domain"])
+                if domain_payload.get("target_domain")
+                else target_domain
+            ),
+            target_aligned=bool(domain_payload.get("target_aligned", True)),
+            target_skill_candidates=_planning_string_tuple(
+                domain_payload.get("target_skill_candidates")
+            ),
+            aligned_source_domains=_planning_string_tuple(
+                domain_payload.get("aligned_source_domains")
+            ),
+            source_skill_candidates_by_domain=_planning_string_tuple_mapping(
+                domain_payload.get("source_skill_candidates_by_domain")
+            ),
+            unbound_source_domains=_planning_string_tuple(
+                domain_payload.get("unbound_source_domains")
+            ),
+        ),
     )
 
 

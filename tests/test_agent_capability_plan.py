@@ -1168,6 +1168,85 @@ class AgentCapabilityPlanTests(unittest.TestCase):
         self.assertIn("planner.llm_decision_completed", event_types)
         self.assertNotIn("planner.intent_decision_fallback", event_types)
 
+    def test_persisted_planning_decision_round_trips_domain_and_tool_alignment(self):
+        from app.services.agent_planning_service import (
+            AgentSkillDomainAlignment,
+            AgentToolSkillAlignment,
+            ValidatedAgentPlanningDecision,
+        )
+        from app.services.agent_runtime_service import (
+            _validated_planning_decision_from_plan,
+        )
+
+        original = ValidatedAgentPlanningDecision(
+            goal="Repair assertions and rerun failed cases.",
+            action="repair_and_rerun",
+            target_domain="test_case",
+            source_domains=("test_case", "execution"),
+            selected_skills=(
+                "assertion-extractor-binding",
+                "execution-diagnosis",
+                "http-test-case-design",
+            ),
+            selected_tools=(
+                "testcase.update_assertions",
+                "testcase.execute_saved",
+            ),
+            selected_artifact_ids=(),
+            required_facts=("execution_details",),
+            requested_effect_scope="persist",
+            confidence=0.98,
+            reason_summary="Use execution evidence and approval-gated updates.",
+            model_selected_skills=(
+                "assertion-extractor-binding",
+                "execution-diagnosis",
+            ),
+            model_requested_effect_scope="execute",
+            required_effect_scope="persist",
+            effect_scope_normalized=True,
+            alignment=AgentToolSkillAlignment(
+                selected_skill_declared_tools=(
+                    "testcase.execute_saved",
+                    "testcase.update_assertions",
+                ),
+                aligned_tools=(
+                    "testcase.execute_saved",
+                    "testcase.update_assertions",
+                ),
+            ),
+            domain_alignment=AgentSkillDomainAlignment(
+                model_selected_skills=(
+                    "assertion-extractor-binding",
+                    "execution-diagnosis",
+                ),
+                effective_selected_skills=(
+                    "assertion-extractor-binding",
+                    "execution-diagnosis",
+                    "http-test-case-design",
+                ),
+                auto_added_supporting_skills=("http-test-case-design",),
+                target_domain="test_case",
+                target_aligned=True,
+                target_skill_candidates=("http-test-case-design",),
+                aligned_source_domains=("test_case", "execution"),
+                source_skill_candidates_by_domain={
+                    "test_case": (
+                        "assertion-extractor-binding",
+                        "execution-diagnosis",
+                        "http-test-case-design",
+                    ),
+                    "execution": (
+                        "assertion-extractor-binding",
+                        "http-test-case-design",
+                    ),
+                },
+            ),
+        )
+
+        restored = _validated_planning_decision_from_plan(original.model_view())
+
+        self.assertEqual(restored.model_view(), original.model_view())
+
     def test_planning_failure_has_controlled_run_error_without_keyword_fallback(self):
         from app.services.agent_planning_service import AgentPlanningError, AgentPlanningFailed
 

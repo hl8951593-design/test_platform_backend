@@ -245,3 +245,65 @@ Run:
 5. Invalid planning events identify selected Skills and Tools without exposing sensitive content.
 6. New Skill Tool declarations are checked against ToolRegistry.
 7. Existing asynchronous runtime and public contracts remain compatible.
+
+## 12. Domain Supporting Skill Closure
+
+The Tool-alignment phase fixed valid Tools being rejected because the semantic Skill omitted a Tool declaration. The next production Run exposed the corresponding domain problem: a composite goal may select the correct Skills and Tools while using a target domain owned by a supporting Skill that the model did not explicitly name.
+
+The observed decision selected `assertion-extractor-binding` and `execution-diagnosis`, selected the correct testcase and execution Tools, and set `target_domain=test_case`. Both selected Skills consume `test_case`, but neither owns or produces it. `http-test-case-design` is the registered owner. Rejecting this decision with `planner_target_domain_incompatible` makes the LLM responsible for reproducing the backend's exact Skill ownership graph and prevents Capability Plan creation before any safety boundary is reached.
+
+### 12.1 Model-selected and effective Skills
+
+The validated decision separates two facts:
+
+- `model_selected_skills`: the exact registered Skills returned by the planning model;
+- `selected_skills`: the effective ordered Skill list used to build the Capability Plan and model context after bounded supporting closure.
+
+The first model-selected Skill remains primary. Auto-added Skills are appended as supporting Skills and are recorded in `skill_domain_alignment.auto_added_supporting_skills`. Closure never removes or reorders model-selected Skills.
+
+### 12.2 Target-domain closure
+
+If `target_domain` is already owned or produced by a model-selected Skill, no Skill is added.
+
+Otherwise the backend derives target candidates from the same frozen Skill index:
+
+1. prefer Skills that `owns` the target domain over Skills that only `produces` it;
+2. within the same ownership class, prefer the Skill declaring more of the already selected Tools;
+3. then prefer the Skill covering more declared source domains through `owns` or `consumes`;
+4. use Skill name only as a deterministic final tie-breaker.
+
+At most one Skill is auto-added for the target domain. This is a metadata/context closure, not a business decision: the LLM's selected Tools, action, artifacts, facts, and effect scope remain unchanged.
+
+For the latest failure, `http-test-case-design` wins because it owns `test_case` and declares the selected testcase query, update, and execute Tools.
+
+### 12.3 Non-fatal domain alignment
+
+Domain metadata is planning evidence rather than authorization. After closure, the backend produces `skill_domain_alignment` with:
+
+- `model_selected_skills`;
+- `effective_selected_skills`;
+- `auto_added_supporting_skills`;
+- `target_domain`;
+- `target_aligned`;
+- `target_skill_candidates`;
+- `aligned_source_domains`;
+- `source_skill_candidates_by_domain`;
+- `unbound_source_domains`.
+
+An unbound target or source domain is observable but does not by itself terminate planning. Unknown Skill/Tool/artifact references, confidence, Tool effect class, permissions, Capability Plan membership, schema, object-reference freshness, project isolation, Approval, replay, lease, and WorkerQueue checks remain fail-closed.
+
+### 12.4 Context and audit flow
+
+`AgentContextManager.route_planning_decision()` consumes effective `selected_skills`, so the primary Skill body remains first and auto-added supporting Skill bodies are available for the execution loop. `planner.llm_decision_completed` and Capability Plan `intent_decision_json` preserve both model-selected and effective Skills plus domain alignment. Existing `skill_plan_json.primary_skill/supporting_skills/allowed_skills` reflects the effective context actually shown to the model.
+
+No database migration is required because the new fields are additive JSON metadata. Existing RuntimeSnapshot freezing remains authoritative.
+
+## 13. Domain Closure Acceptance Criteria
+
+1. The exact latest decision with `target_domain=test_case`, model Skills `assertion-extractor-binding/execution-diagnosis`, and testcase/execution Tools validates successfully.
+2. `http-test-case-design` is appended as the only auto-added supporting Skill.
+3. The model-selected Skill list remains separately auditable and unchanged.
+4. Source-domain mismatches and unbound domains produce deterministic diagnostics instead of `planner_target_domain_incompatible` or `planner_source_domain_incompatible`.
+5. Closure never adds a Tool, changes effect scope, grants permission, or bypasses Approval.
+6. Capability Plan and context messages load the effective supporting Skill.
+7. The latest composite intent reaches Tool planning rather than failing before Capability Plan creation.

@@ -8056,7 +8056,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(approval.required_permissions_json, [ProjectPermission.CREATE_DEFECT.value])
         self.assertEqual(saved_count, 0)
 
-    def test_assertion_repair_planning_reaches_approval_with_skill_tool_alignment(self):
+    def test_latest_composite_assertion_repair_adds_test_case_supporting_skill(self):
         from app.core.permissions import ProjectPermission
         from app.models.test_case import TestCase
         from app.services.agent_planning_service import AgentPlanningDecisionService
@@ -8151,15 +8151,23 @@ class AgentRuntimeTests(unittest.TestCase):
         self.db.commit()
 
         planning_payload = {
-            "goal": "Repair assertions proven wrong by the previous failure analysis.",
-            "action": "repair",
-            "target_domain": "assertion",
+            "goal": "Analyze failed cases, repair their assertions, and execute them again.",
+            "action": "repair_and_rerun",
+            "target_domain": "test_case",
             "source_domains": ["test_case", "execution"],
-            "selected_skills": ["assertion-extractor-binding"],
+            "selected_skills": [
+                "assertion-extractor-binding",
+                "execution-diagnosis",
+            ],
             "selected_tools": [
                 "testcase.query_project_cases",
                 "testcase.update_assertions",
                 "testcase.batch_update_assertions",
+                "testcase.execute_saved",
+                "testcase.batch_execute",
+                "execution.query_records",
+                "execution.read_detail",
+                "execution.diagnose",
             ],
             "selected_artifact_ids": [],
             "required_facts": [
@@ -8184,7 +8192,7 @@ class AgentRuntimeTests(unittest.TestCase):
             payload=AgentRunCreateRequest(
                 project_id=10,
                 conversation_id=conversation_id,
-                intent="修复断言",
+                intent="先分析失败测试用例，分析后，修改断言重新执行",
                 max_iterations=1,
             ),
             current_user=self.owner,
@@ -8211,6 +8219,12 @@ class AgentRuntimeTests(unittest.TestCase):
             },
             {"type": "done", "finish_reason": "stop", "model": "deepseek-test"},
         ]
+        model_payloads = []
+
+        def fake_stream(_service, payload):
+            model_payloads.append(payload)
+            yield from stream_events
+
         runner = AgentConversationRunner(
             self.db,
             planning_decision_service=AgentPlanningDecisionService(
@@ -8224,7 +8238,7 @@ class AgentRuntimeTests(unittest.TestCase):
             True,
         ), patch(
             "app.services.agent_runtime_service.AIService.chat_stream",
-            return_value=iter(stream_events),
+            new=fake_stream,
         ):
             blocked = runner.run(
                 run_id=current_run.run_id,
@@ -8260,9 +8274,46 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotEqual(current_run.error_code, "agent_planning_failed")
         self.assertIsNotNone(plan)
         self.assertEqual(
+            plan.intent_decision_json["model_selected_skills"],
+            ["assertion-extractor-binding", "execution-diagnosis"],
+        )
+        self.assertEqual(
+            plan.intent_decision_json["selected_skills"],
+            [
+                "assertion-extractor-binding",
+                "execution-diagnosis",
+                "http-test-case-design",
+            ],
+        )
+        self.assertEqual(
+            plan.intent_decision_json["skill_domain_alignment"][
+                "auto_added_supporting_skills"
+            ],
+            ["http-test-case-design"],
+        )
+        self.assertTrue(
+            plan.intent_decision_json["skill_domain_alignment"]["target_aligned"]
+        )
+        self.assertTrue(model_payloads)
+        self.assertTrue(
+            any(
+                "http-test-case-design" in message.content
+                for message in model_payloads[0].messages
+            )
+        )
+        self.assertEqual(
+            plan.skill_plan_json["supporting_skills"],
+            ["execution-diagnosis", "http-test-case-design"],
+        )
+        self.assertEqual(
             plan.intent_decision_json["tool_skill_alignment"]["aligned_tools"],
             [
+                "execution.diagnose",
+                "execution.query_records",
+                "execution.read_detail",
+                "testcase.batch_execute",
                 "testcase.batch_update_assertions",
+                "testcase.execute_saved",
                 "testcase.query_project_cases",
                 "testcase.update_assertions",
             ],

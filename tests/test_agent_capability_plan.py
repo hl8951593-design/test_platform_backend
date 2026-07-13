@@ -1049,6 +1049,7 @@ class AgentCapabilityPlanTests(unittest.TestCase):
     def test_runner_persists_unified_llm_planning_decision_without_keyword_reroute(self):
         from app.services.agent_capability_plan_service import AgentCapabilityPlanService
         from app.services.agent_planning_service import (
+            AgentSkillDomainAlignment,
             AgentToolSkillAlignment,
             ValidatedAgentPlanningDecision,
         )
@@ -1071,6 +1072,7 @@ class AgentCapabilityPlanTests(unittest.TestCase):
                     requested_effect_scope="observe",
                     confidence=0.98,
                     reason_summary="The requested task is a defect query.",
+                    model_selected_skills=("defect-triage",),
                     alignment=AgentToolSkillAlignment(
                         selected_skill_declared_tools=(
                             "defect.query_project_defects",
@@ -1080,6 +1082,13 @@ class AgentCapabilityPlanTests(unittest.TestCase):
                             "defect.query_project_defects",
                             "project.read_context",
                         ),
+                    ),
+                    domain_alignment=AgentSkillDomainAlignment(
+                        model_selected_skills=("defect-triage",),
+                        effective_selected_skills=("defect-triage",),
+                        target_domain="defect",
+                        target_aligned=True,
+                        target_skill_candidates=("defect-triage",),
                     ),
                 )
 
@@ -1111,7 +1120,25 @@ class AgentCapabilityPlanTests(unittest.TestCase):
         self.assertEqual(completed.status, "completed")
         self.assertEqual(len(planning_inputs), 1)
         plan = AgentCapabilityPlanService(self.db).get_active_plan(run=run)
+        self.assertEqual(
+            plan.intent_decision_json["model_selected_skills"],
+            ["defect-triage"],
+        )
         self.assertEqual(plan.intent_decision_json["selected_skills"], ["defect-triage"])
+        self.assertEqual(
+            plan.intent_decision_json["skill_domain_alignment"],
+            {
+                "model_selected_skills": ["defect-triage"],
+                "effective_selected_skills": ["defect-triage"],
+                "auto_added_supporting_skills": [],
+                "target_domain": "defect",
+                "target_aligned": True,
+                "target_skill_candidates": ["defect-triage"],
+                "aligned_source_domains": [],
+                "source_skill_candidates_by_domain": {},
+                "unbound_source_domains": [],
+            },
+        )
         self.assertEqual(
             plan.allowed_tools_json,
             ["project.read_context", "defect.query_project_defects"],

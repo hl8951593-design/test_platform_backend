@@ -1993,9 +1993,13 @@ class AgentRuntimeService:
 
     def _get_or_create_snapshot(self, *, project_id: int, current_user: User) -> AgentRuntimeSnapshot:
         registry_json = self.tool_registry.registry_json()
+        skill_registry = AgentSkillRegistry()
+        skill_registry.validate_tool_declarations({
+            spec.name for spec in self.tool_registry.list_specs()
+        })
         skill_manifests = {
             skill.name: skill.snapshot_manifest()
-            for skill in AgentSkillRegistry().list_skills()
+            for skill in skill_registry.list_skills()
         }
         runtime_hash = request_fingerprint({
             "tool_runtime_hash": self.tool_registry.runtime_hash(),

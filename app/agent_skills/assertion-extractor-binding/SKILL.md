@@ -11,6 +11,12 @@ consumes:
 produces:
   - assertion
   - extractor
+tools:
+  - testcase.query_project_cases
+  - testcase.update_assertions
+  - testcase.batch_update_assertions
+  - websocket_testcase.update_assertions
+  - websocket_testcase.batch_update_assertions
 triggers:
   - 断言
   - 提取器

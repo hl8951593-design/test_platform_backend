@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -286,6 +287,25 @@ class AgentSkillRegistry:
 
     def catalog(self) -> list[dict[str, str]]:
         return [skill.metadata() for skill in self.list_skills()]
+
+    def validate_tool_declarations(
+        self,
+        registered_tool_names: Iterable[str],
+    ) -> None:
+        registered = {
+            str(tool_name).strip()
+            for tool_name in registered_tool_names
+            if str(tool_name).strip()
+        }
+        unknown = {
+            skill.name: sorted(set(skill.tool_names) - registered)
+            for skill in self.list_skills()
+            if set(skill.tool_names) - registered
+        }
+        if unknown:
+            raise RuntimeError(
+                f"Agent Skill unknown Tool declarations: {unknown}"
+            )
 
     def private_list(self, skill_name: str, key: str) -> tuple[str, ...]:
         skill = self._skills.get(skill_name)

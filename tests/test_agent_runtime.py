@@ -14971,6 +14971,72 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("one explicit id at a time", prompt)
         self.assertIn("Do not re-query all cases with full detail after truncation", prompt)
 
+    def test_assertion_skill_declares_only_supported_query_and_patch_tools(self):
+        from app.services.agent_skill_registry import AgentSkillRegistry
+
+        skill = AgentSkillRegistry().get_skill("assertion-extractor-binding")
+
+        self.assertIsNotNone(skill)
+        self.assertEqual(
+            set(skill.tool_names),
+            {
+                "testcase.query_project_cases",
+                "testcase.update_assertions",
+                "testcase.batch_update_assertions",
+                "websocket_testcase.update_assertions",
+                "websocket_testcase.batch_update_assertions",
+            },
+        )
+        self.assertNotIn("ai_skill.run_draft", skill.tool_names)
+
+    def test_agent_skill_registry_rejects_unknown_declared_tools(self):
+        from app.services.agent_skill_registry import AgentSkillRegistry
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = Path(temp_dir) / "broken-skill"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                """---
+name: broken-skill
+description: Broken declaration fixture.
+tools:
+  - missing.tool
+---
+
+# Broken Skill
+""",
+                encoding="utf-8",
+            )
+            registry = AgentSkillRegistry(root=Path(temp_dir))
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Agent Skill unknown Tool declarations",
+            ):
+                registry.validate_tool_declarations({"project.read_context"})
+
+    def test_runtime_snapshot_validates_skill_tool_declarations_first(self):
+        from app.services.agent_skill_registry import AgentSkillRegistry
+        from app.services.agent_tool_service import ToolRegistry
+
+        service = AgentRuntimeService(self.db)
+        registered_tool_names = {
+            spec.name for spec in ToolRegistry().list_specs()
+        }
+
+        with patch.object(
+            AgentSkillRegistry,
+            "validate_tool_declarations",
+            autospec=True,
+        ) as validate:
+            service._get_or_create_snapshot(
+                project_id=10,
+                current_user=self.owner,
+            )
+
+        validate.assert_called_once()
+        self.assertEqual(validate.call_args.args[1], registered_tool_names)
+
     def test_required_tool_routing_uses_skill_private_hints(self):
         self.assertTrue(_intent_likely_requires_agent_tool("请读取当前项目上下文和真实用例"))
         self.assertTrue(_intent_likely_requires_agent_tool("把刚才的场景直接保存成正式场景，不要问我。"))

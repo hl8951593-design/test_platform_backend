@@ -20,16 +20,6 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     op.create_index(
-        "ix_test_case_executions_project_created_at",
-        "test_case_executions",
-        ["project_id", "created_at"],
-    )
-    op.create_index(
-        "ix_test_case_executions_case_created_at",
-        "test_case_executions",
-        ["test_case_id", "created_at"],
-    )
-    op.create_index(
         "ix_test_case_executions_project_status_created",
         "test_case_executions",
         ["project_id", "status", "created_at"],
@@ -128,5 +118,3 @@ def downgrade() -> None:
     op.drop_index("ix_test_case_executions_project_user_created", table_name="test_case_executions")
     op.drop_index("ix_test_case_executions_project_env_created", table_name="test_case_executions")
     op.drop_index("ix_test_case_executions_project_status_created", table_name="test_case_executions")
-    op.drop_index("ix_test_case_executions_case_created_at", table_name="test_case_executions")
-    op.drop_index("ix_test_case_executions_project_created_at", table_name="test_case_executions")

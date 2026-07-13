@@ -1,6 +1,7 @@
 import importlib
 import inspect
 import unittest
+from pathlib import Path
 
 from sqlalchemy import BigInteger
 
@@ -17,6 +18,27 @@ TABLE_NAMES = (
 
 
 class ExecutionDiagnosticMigrationTests(unittest.TestCase):
+    def test_execution_history_migration_does_not_recreate_0006_owned_indexes(self):
+        source = Path(
+            "migrations/versions/0032_execution_history_query_indexes.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn(
+            'op.create_index(\n        "ix_test_case_executions_project_created_at"',
+            source,
+        )
+        self.assertNotIn(
+            'op.create_index(\n        "ix_test_case_executions_case_created_at"',
+            source,
+        )
+        self.assertNotIn(
+            'op.drop_index("ix_test_case_executions_project_created_at"',
+            source,
+        )
+        self.assertNotIn(
+            'op.drop_index("ix_test_case_executions_case_created_at"',
+            source,
+        )
     def test_migration_is_additive_and_points_to_current_head(self):
         module = importlib.import_module(
             "migrations.versions.0041_execution_diagnostic_read_models"

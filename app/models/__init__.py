@@ -50,6 +50,7 @@ from app.models.scenario import (
     TestScenarioRunEvent,
     TestScenarioVersion,
 )
+from app.models.system_test_case import SystemCaseApiRelation, SystemTestCase
 from app.models.test_case import TestCase, TestCaseEnvironment, TestCaseExecution
 from app.models.test_plan import (
     TestPlan,
@@ -109,6 +110,8 @@ __all__ = [
     "TestScenarioVersion",
     "TestScenarioRun",
     "TestScenarioRunEvent",
+    "SystemCaseApiRelation",
+    "SystemTestCase",
     "TestCase",
     "TestCaseEnvironment",
     "TestCaseExecution",

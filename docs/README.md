@@ -93,6 +93,7 @@
 - [项目权限](api_project_permissions.md)
 - [环境配置](api_environment_configs.md)
 - [HTTP 测试用例](api_test_cases.md)
+- [系统测试用例](api_system_test_cases.md)
 - [WebSocket 测试用例](api_websocket_test_cases.md)
 - [场景组合与实时执行](api_scenarios.md)
 - [场景组合执行流程图谱](scenario_execution_graph.md)

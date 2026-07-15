@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1.routers import agents, ai, auth, browser_captures, dashboard, defects, environment_configs, execution_center, execution_records, media, notifications, projects, scenarios, test_cases, test_plans, test_reports, users, visual_flows, websocket_test_cases
+from app.api.v1.routers import agents, ai, auth, browser_captures, dashboard, defects, environment_configs, execution_center, execution_records, media, notifications, projects, scenarios, system_test_cases, test_cases, test_plans, test_reports, users, visual_flows, websocket_test_cases
 
 api_router = APIRouter()
 api_router.include_router(agents.router, prefix="/agents", tags=["AI Agents"])
@@ -14,6 +14,7 @@ api_router.include_router(browser_captures.router, prefix="/browser-captures", t
 api_router.include_router(notifications.router, prefix="/notifications", tags=["Notifications"])
 api_router.include_router(visual_flows.router, prefix="/flows", tags=["Visual flows"])
 api_router.include_router(websocket_test_cases.router, prefix="/websocket-test-cases", tags=["WebSocket test cases"])
+api_router.include_router(system_test_cases.router, tags=["系统测试用例"])
 api_router.include_router(ai.router, prefix="/ai", tags=["AI"])
 api_router.include_router(environment_configs.router, prefix="/environment-configs", tags=["环境配置"])
 api_router.include_router(auth.router, prefix="/auth", tags=["认证"])

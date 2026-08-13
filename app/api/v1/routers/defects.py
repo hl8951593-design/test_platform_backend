@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user, get_db
 from app.core.response import success
+from app.core.project_cache import invalidate_project_list_cache
 from app.models.user import User
 from app.schemas.defect import (
     DefectCreateRequest,
@@ -53,6 +54,7 @@ def create_defect(
         payload=payload,
         current_user=current_user,
     )
+    invalidate_project_list_cache()
     return success(data=DefectRead.model_validate(defect), message="缺陷创建成功")
 
 
@@ -85,6 +87,7 @@ def update_defect(
         payload=payload,
         current_user=current_user,
     )
+    invalidate_project_list_cache()
     return success(data=DefectRead.model_validate(defect), message="缺陷更新成功")
 
 
@@ -100,6 +103,7 @@ def delete_defect(
         defect_id=defect_id,
         current_user=current_user,
     )
+    invalidate_project_list_cache()
     return success(message="缺陷删除成功")
 
 
@@ -117,4 +121,5 @@ def transition_defect_status(
         payload=payload,
         current_user=current_user,
     )
+    invalidate_project_list_cache()
     return success(data=DefectRead.model_validate(defect), message="缺陷状态已更新")

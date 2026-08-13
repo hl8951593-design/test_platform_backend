@@ -81,7 +81,12 @@ class PermissionService:
         user_id: int,
         permission_codes: set[str],
     ) -> ProjectMember:
-        self.require_can_grant_member_permissions(operator, project_id)
+        project = self.require_can_grant_member_permissions(operator, project_id)
+        if user_id == project.created_by_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="项目创建者已经拥有全部项目权限",
+            )
         invalid_permissions = permission_codes - NORMAL_TESTER_GRANTABLE_PERMISSIONS
         if invalid_permissions:
             raise HTTPException(
@@ -89,11 +94,21 @@ class PermissionService:
                 detail=f"无效权限编码: {', '.join(sorted(invalid_permissions))}",
             )
 
-        member = self.project_repository.get_member(project_id=project_id, user_id=user_id)
+        member = self.project_repository.get_member(
+            project_id=project_id,
+            user_id=user_id,
+            include_inactive=True,
+        )
         if member is None:
             member = self.project_repository.add_member(
                 project_id=project_id,
                 user_id=user_id,
+                added_by_id=operator.id,
+            )
+        elif not member.is_active:
+            member = self.project_repository.set_member_active(
+                member=member,
+                is_active=True,
                 added_by_id=operator.id,
             )
         self.project_repository.replace_member_permissions(

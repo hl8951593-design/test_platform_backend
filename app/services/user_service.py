@@ -10,6 +10,7 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
+from app.core.config import settings
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import LoginRequest, RefreshTokenRequest, RegisterRequest
 from app.schemas.user import TokenRead, UserRead
@@ -64,6 +65,7 @@ class UserService:
         return TokenRead(
             access_token=create_access_token(user.id),
             refresh_token=create_refresh_token(user.id),
+            platform_web_url=settings.PLATFORM_WEB_BASE_URL.rstrip("/"),
             user=UserRead.model_validate(user),
         )
 
@@ -90,5 +92,6 @@ class UserService:
         return TokenRead(
             access_token=create_access_token(user.id),
             refresh_token=create_refresh_token(user.id),
+            platform_web_url=settings.PLATFORM_WEB_BASE_URL.rstrip("/"),
             user=UserRead.model_validate(user),
         )

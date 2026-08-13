@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -65,6 +66,38 @@ def mask_sensitive(value: Any) -> Any:
     return value
 
 
+def redact_sensitive_data(value: Any, *, key_hint: str | None = None) -> Any:
+    """Redact captured/runtime payloads before they are written to storage."""
+    if isinstance(value, dict):
+        return {
+            key: "***" if _is_sensitive_key(key) else redact_sensitive_data(item, key_hint=str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_sensitive_data(item, key_hint=key_hint) for item in value]
+    if isinstance(value, str):
+        normalized_hint = (key_hint or "").lower().replace("-", "_")
+        if normalized_hint in {"url", "source_url"}:
+            return _redact_url_query(value)
+        if normalized_hint in {"body", "raw_body", "request_body", "response_body"}:
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return value
+            return json.dumps(redact_sensitive_data(parsed), ensure_ascii=False, separators=(",", ":"))
+    return value
+
+
+def redact_query_string(value: str) -> str:
+    """Mask sensitive query values before URLs are written to logs."""
+    if not value:
+        return ""
+    return urlencode([
+        (key, "***" if _is_sensitive_key(key) else item)
+        for key, item in parse_qsl(value, keep_blank_values=True)
+    ])
+
+
 def request_fingerprint(payload: Any) -> str:
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -95,6 +128,20 @@ def verify_webhook_signature(*, timestamp: str, body: bytes, signature: str) -> 
 def _is_sensitive_key(key: object) -> bool:
     normalized = str(key).lower().replace("-", "_")
     return normalized in SENSITIVE_EXACT_KEYS or any(item in normalized for item in SENSITIVE_KEYS)
+
+
+def _redact_url_query(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if not parsed.query:
+        return value
+    redacted_query = urlencode([
+        (key, "***" if _is_sensitive_key(key) else item)
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+    ])
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, redacted_query, parsed.fragment))
 
 
 def _key() -> bytes:

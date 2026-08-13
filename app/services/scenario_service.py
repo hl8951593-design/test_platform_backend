@@ -10,9 +10,9 @@ from datetime import datetime
 from typing import Any, Callable
 
 from fastapi import HTTPException, status
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, defer
+from sqlalchemy.orm import Session, defer, load_only
 
 from app.core.config import settings
 from app.core.permissions import ProjectPermission
@@ -22,6 +22,7 @@ from app.core.sensitive_data import (
     mask_sensitive,
     request_fingerprint,
 )
+from app.models.database_connection import DatabaseActionExecution, ProjectDatabaseConnection
 from app.models.project import ProjectEnvironment
 from app.db.session import SessionLocal
 from app.models.scenario import (
@@ -42,9 +43,18 @@ from app.schemas.scenario import (
     ScenarioScriptExecuteUnsavedRequest,
     ScenarioUpdateRequest,
 )
+from app.schemas.database_connection import (
+    DatabaseActionConfig,
+    ScenarioDatabaseExecuteUnsavedRead,
+    ScenarioDatabaseExecuteUnsavedRequest,
+)
 from app.schemas.test_case import TestCaseRequestConfig
 from app.schemas.websocket_test_case import WebSocketTestCaseConfig
 from app.services.permission_service import PermissionService
+from app.services.database_action_service import (
+    DatabaseActionExecutor,
+    validate_database_action,
+)
 from app.services.execution_diagnostic_persistence import (
     ExecutionDiagnosticPersistence,
 )
@@ -61,6 +71,7 @@ class ScenarioService:
         self.permission_service = PermissionService(db)
         self.diagnostic_persistence = ExecutionDiagnosticPersistence(db)
         self.scenario_step_assembler = ScenarioStepResultAssembler(db)
+        self.database_action_executor = DatabaseActionExecutor(db)
 
     def list_scenarios(self, *, project_id: int, current_user: User, keyword: str | None,
                        page: int, page_size: int) -> dict[str, Any]:
@@ -69,12 +80,42 @@ class ScenarioService:
         if keyword:
             filters.append(or_(TestScenario.name.contains(keyword), TestScenario.description.contains(keyword)))
         total = self.db.scalar(select(func.count()).select_from(TestScenario).where(*filters)) or 0
-        scenarios = list(self.db.scalars(
-            select(TestScenario).where(*filters).order_by(TestScenario.updated_at.desc(), TestScenario.id.desc())
-            .offset((page - 1) * page_size).limit(page_size)
-        ).all())
+        rows = self.db.execute(
+            select(
+                TestScenario,
+                TestScenarioVersion,
+                ProjectEnvironment.name.label("environment_name"),
+            )
+            .outerjoin(
+                TestScenarioVersion,
+                and_(
+                    TestScenarioVersion.scenario_id == TestScenario.id,
+                    TestScenarioVersion.version == TestScenario.current_version,
+                ),
+            )
+            .outerjoin(
+                ProjectEnvironment,
+                and_(
+                    ProjectEnvironment.id == TestScenario.environment_id,
+                    ProjectEnvironment.project_id == TestScenario.project_id,
+                    ProjectEnvironment.is_deleted.is_(False),
+                ),
+            )
+            .where(*filters)
+            .order_by(TestScenario.updated_at.desc(), TestScenario.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        ).all()
         return {
-            "items": [self._detail(item) for item in scenarios],
+            "items": [
+                self._detail(
+                    scenario,
+                    version=version,
+                    environment_name=environment_name,
+                    dependencies_loaded=True,
+                )
+                for scenario, version, environment_name in rows
+            ],
             "total": total,
             "page": page,
             "page_size": page_size,
@@ -205,6 +246,40 @@ class ScenarioService:
             duration_ms=max(0, int((time.perf_counter() - started_at) * 1000)),
             outputs=outputs,
             error_message=error_message,
+        )
+
+    def execute_unsaved_database_action(
+        self,
+        *,
+        project_id: int,
+        payload: ScenarioDatabaseExecuteUnsavedRequest,
+        current_user: User,
+    ) -> ScenarioDatabaseExecuteUnsavedRead:
+        self._get_environment(project_id, payload.environment_id)
+        rendered = self._render(
+            payload.config.model_dump(mode="python"), payload.input_values
+        )
+        for field in ("sql", "collection", "operation", "connection_key"):
+            value = getattr(payload.config, field, None)
+            if value is not None:
+                rendered[field] = value
+        result = self.database_action_executor.execute(
+            project_id=project_id,
+            environment_id=payload.environment_id,
+            scenario_run_id=None,
+            step_id=f"DATABASE-DEBUG-{uuid.uuid4().hex[:12]}",
+            kind=payload.kind,
+            raw_config=rendered,
+            current_user=current_user,
+        )
+        return ScenarioDatabaseExecuteUnsavedRead(
+            status="passed" if result.status == "passed" else "failed",
+            duration_ms=result.duration_ms,
+            output=result.stored_output,
+            assertion_results=result.assertion_results,
+            extracted_variables=result.extracted_variables,
+            attempt_history=result.attempt_history,
+            error_message=result.error_message,
         )
 
     def validate_unsaved_scenario(
@@ -374,7 +449,7 @@ class ScenarioService:
             scenario_id=scenario.id,
             scenario_version_id=version.id,
             project_id=project_id,
-            status="queued" if datasets else "passed",
+            status="queued" if datasets else "skipped",
             idempotency_key=idempotency_key,
             request_hash=fingerprint,
             triggered_by_id=current_user.id,
@@ -522,13 +597,67 @@ class ScenarioService:
         ) or 0
         items = list(self.db.scalars(
             select(TestScenarioRun)
-            .options(defer(TestScenarioRun.scenario_snapshot))
+            .options(load_only(
+                TestScenarioRun.id,
+                TestScenarioRun.execution_id,
+                TestScenarioRun.scenario_id,
+                TestScenarioRun.project_id,
+                TestScenarioRun.environment_id,
+                TestScenarioRun.dataset_id,
+                TestScenarioRun.dataset_name,
+                TestScenarioRun.record_id,
+                TestScenarioRun.record_name,
+                TestScenarioRun.status,
+                TestScenarioRun.trigger_type,
+                TestScenarioRun.current_step_id,
+                TestScenarioRun.current_step_index,
+                TestScenarioRun.last_event_sequence,
+                TestScenarioRun.started_at,
+                TestScenarioRun.finished_at,
+                TestScenarioRun.duration_ms,
+                TestScenarioRun.created_at,
+            ))
             .where(*filters)
             .order_by(TestScenarioRun.started_at.desc(), TestScenarioRun.id.desc())
             .offset((page - 1) * page_size)
             .limit(page_size)
         ).all())
-        return {"items": items, "total": total, "page": page, "page_size": page_size}
+        summaries = []
+        for item in items:
+            duration_ms = item.duration_ms
+            if item.status in {"queued", "running"}:
+                duration_ms = max(
+                    int((datetime.utcnow() - item.started_at).total_seconds() * 1000),
+                    0,
+                )
+            summaries.append({
+                "id": item.id,
+                "execution_id": item.execution_id,
+                "scenario_id": item.scenario_id,
+                "project_id": item.project_id,
+                "environment_id": item.environment_id,
+                "dataset_id": item.dataset_id,
+                "dataset_name": item.dataset_name,
+                "record_id": item.record_id,
+                "record_name": item.record_name,
+                "status": item.status,
+                "trigger_type": item.trigger_type,
+                "variables_snapshot": {},
+                "step_results": [],
+                "current_step_id": item.current_step_id,
+                "current_step_index": item.current_step_index,
+                "last_event_sequence": item.last_event_sequence,
+                "started_at": item.started_at,
+                "finished_at": item.finished_at,
+                "duration_ms": duration_ms,
+                "created_at": item.created_at,
+            })
+        return {
+            "items": summaries,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
 
     def get_run(self, *, project_id: int, run_id: int, current_user: User) -> TestScenarioRun:
         self._require_view(current_user, project_id)
@@ -591,6 +720,11 @@ class ScenarioService:
         self.db.execute(
             update(WebSocketTestCaseExecution)
             .where(WebSocketTestCaseExecution.scenario_run_id == run.id)
+            .values(scenario_run_id=None)
+        )
+        self.db.execute(
+            update(DatabaseActionExecution)
+            .where(DatabaseActionExecution.scenario_run_id == run.id)
             .values(scenario_run_id=None)
         )
         self.db.execute(
@@ -972,9 +1106,13 @@ class ScenarioService:
         error_message = None
         status_value = "passed"
         output = None
+        runtime_output = None
         assertion_results: list[dict[str, Any]] = []
         extracted_variables: list[dict[str, Any]] = []
         resolved_bindings: list[dict[str, Any]] = []
+        attempt_history: list[dict[str, Any]] = []
+        request_snapshot = None
+        response_snapshot = None
         raw_config = copy.deepcopy(step.get("config") or {})
         scenario_context = raw_config.pop("_scenario_context", {}) or {}
         try:
@@ -984,10 +1122,24 @@ class ScenarioService:
             config = self._render(raw_config, variables)
             if step["kind"] == "condition":
                 config["expression"] = raw_config["expression"]
+            if step["kind"] in {"database_query", "database_execute"}:
+                for field in ("sql", "collection", "operation", "connection_key"):
+                    if field in raw_config:
+                        config[field] = raw_config[field]
+                if remaining is not None:
+                    remaining_ms = max(100, int(remaining * 1000))
+                    configured_timeout = config.get("timeout_ms")
+                    config["timeout_ms"] = min(
+                        300000,
+                        remaining_ms,
+                        configured_timeout if isinstance(configured_timeout, int) else remaining_ms,
+                    )
+            binding_raw_config = self._binding_config(step, raw_config)
+            binding_rendered_config = self._render(binding_raw_config, variables)
             resolved_bindings = self._resolved_bindings(
                 step=step,
-                raw_config=raw_config,
-                rendered_config=config,
+                raw_config=binding_raw_config,
+                rendered_config=binding_rendered_config,
                 scenario_context=scenario_context,
                 variables=variables,
                 variable_sources=variable_sources,
@@ -1046,6 +1198,48 @@ class ScenarioService:
                         "source_extraction_id": f"action:{step['id']}:{name}",
                         "masked": self._trace_masked(config, name),
                     }
+            elif step["kind"] in {"database_query", "database_execute"}:
+                database_result = self.database_action_executor.execute(
+                    project_id=project_id,
+                    environment_id=environment_id,
+                    scenario_run_id=scenario_run_id,
+                    step_id=str(step["id"]),
+                    kind=str(step["kind"]),
+                    raw_config=config,
+                    current_user=current_user,
+                )
+                execution_id = database_result.execution_id
+                status_value = database_result.status
+                output = database_result.stored_output
+                runtime_output = database_result.runtime_output
+                assertion_results = database_result.assertion_results
+                context_extraction_names = {
+                    str(item.get("name"))
+                    for item in scenario_context.get("extractions", [])
+                    if isinstance(item, dict) and item.get("name")
+                }
+                extracted_variables.extend(
+                    item
+                    for item in database_result.extracted_variables
+                    if str(item.get("name")) not in context_extraction_names
+                )
+                attempt_history = database_result.attempt_history
+                error_message = database_result.error_message
+                request_snapshot = database_result.request_snapshot
+                response_snapshot = database_result.stored_output
+                extractor_configs = {
+                    str(item.get("name")): item
+                    for item in config.get("extractors", [])
+                    if isinstance(item, dict)
+                }
+                for name, value in database_result.extracted_values.items():
+                    variables[name] = copy.deepcopy(value)
+                    extractor_config = extractor_configs.get(name, {})
+                    variable_sources[name] = {
+                        "source_step_id": step["id"],
+                        "source_extraction_id": f"database:{step['id']}:{name}",
+                        "masked": bool(extractor_config.get("masked", False)),
+                    }
             elif step["kind"] == "api_case":
                 data = copy.deepcopy(step["case_snapshot"])
                 data["environment_id"] = environment_id
@@ -1059,12 +1253,15 @@ class ScenarioService:
                         TestCase.id == step["reference_id"],
                     )
                 )
+                runtime_response_sink: dict[str, Any] = {}
                 execution = TestCaseService(self.db)._execute(  # noqa: SLF001
                     project_id=project_id, test_case_id=existing_case_id, payload=payload,
                     current_user=current_user, scenario_run_id=scenario_run_id, timeout_seconds=remaining,
+                    runtime_response_sink=runtime_response_sink,
                 )
                 execution_id, status_value = execution.id, execution.status
                 output = execution.response_snapshot
+                runtime_output = runtime_response_sink.get("response_snapshot")
                 error_message = execution.error_message
             else:
                 data = copy.deepcopy(step["case_snapshot"])
@@ -1093,13 +1290,13 @@ class ScenarioService:
         if execution is not None:
             assertion_results = getattr(execution, "assertion_results", None) or []
         if status_value == "passed":
-            extracted_variables = self._extract_step_variables(
+            extracted_variables.extend(self._extract_step_variables(
                 step=step,
-                output=output,
+                output=runtime_output if runtime_output is not None else output,
                 scenario_context=scenario_context,
                 variables=variables,
                 variable_sources=variable_sources,
-            )
+            ))
             if step["kind"] in {"random", "fixed_value"}:
                 name = str(config["output"])
                 extracted_variables.append({
@@ -1137,7 +1334,7 @@ class ScenarioService:
             "attempt_history": (
                 copy.deepcopy(getattr(execution, "attempt_history", None) or [])
                 if execution is not None
-                else []
+                else attempt_history
             ),
             "execution_id": execution_id, "output": output, "error_message": error_message,
             "request_snapshot": (
@@ -1145,17 +1342,22 @@ class ScenarioService:
                 if execution is not None and step["kind"] == "api_case"
                 else copy.deepcopy(getattr(execution, "session_snapshot", None))
                 if execution is not None and step["kind"] == "websocket_case"
-                else None
+                else copy.deepcopy(request_snapshot)
             ),
             "response_snapshot": (
                 copy.deepcopy(getattr(execution, "response_snapshot", None))
                 if execution is not None
-                else None
+                else copy.deepcopy(response_snapshot)
             ),
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(), "duration_ms": int((finished_at - started_at).total_seconds() * 1000),
         }
-        variables[f"step_{variable_step_index or step_index}"] = output
+        variables[f"step_{variable_step_index or step_index}"] = copy.deepcopy(
+            runtime_output
+            if step["kind"] in {"database_query", "database_execute"}
+            and runtime_output is not None
+            else output
+        )
         return result
 
     def _hydrate_step_result_snapshots(
@@ -1163,6 +1365,51 @@ class ScenarioService:
         run: TestScenarioRun,
         step_results: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        http_execution_ids: set[int] = set()
+        websocket_execution_ids: set[int] = set()
+        for source in step_results:
+            if not source.get("execution_id") or (
+                source.get("request_snapshot") is not None
+                and source.get("response_snapshot") is not None
+            ):
+                continue
+            try:
+                execution_key = int(source["execution_id"])
+            except (TypeError, ValueError):
+                continue
+            kind = source.get("kind")
+            if kind != "websocket_case":
+                http_execution_ids.add(execution_key)
+            if kind == "websocket_case" or kind not in {
+                "api_case",
+                "delay",
+                "condition",
+            }:
+                websocket_execution_ids.add(execution_key)
+        http_executions = {
+            execution.id: execution
+            for execution in (
+                self.db.scalars(
+                    select(TestCaseExecution).where(
+                        TestCaseExecution.id.in_(http_execution_ids)
+                    )
+                ).all()
+                if http_execution_ids
+                else []
+            )
+        }
+        websocket_executions = {
+            execution.id: execution
+            for execution in (
+                self.db.scalars(
+                    select(WebSocketTestCaseExecution).where(
+                        WebSocketTestCaseExecution.id.in_(websocket_execution_ids)
+                    )
+                ).all()
+                if websocket_execution_ids
+                else []
+            )
+        }
         hydrated: list[dict[str, Any]] = []
         for source in step_results:
             result = copy.deepcopy(source)
@@ -1183,11 +1430,11 @@ class ScenarioService:
 
             execution: TestCaseExecution | WebSocketTestCaseExecution | None = None
             if kind == "websocket_case":
-                execution = self.db.get(WebSocketTestCaseExecution, execution_key)
+                execution = websocket_executions.get(execution_key)
             else:
-                execution = self.db.get(TestCaseExecution, execution_key)
+                execution = http_executions.get(execution_key)
                 if execution is None and kind not in {"api_case", "delay", "condition"}:
-                    execution = self.db.get(WebSocketTestCaseExecution, execution_key)
+                    execution = websocket_executions.get(execution_key)
 
             if (
                 execution is None
@@ -1346,8 +1593,7 @@ class ScenarioService:
 
         def walk(value: Any, root: str, parts: list[str]) -> None:
             if isinstance(value, str):
-                match = re.fullmatch(r"\{\{\s*([^{}]+?)\s*\}\}", value)
-                if match:
+                for match in re.finditer(r"\{\{\s*([^{}]+?)\s*\}\}", value):
                     bindings.append((root, ".".join(parts), match.group(1).strip()))
             elif isinstance(value, dict):
                 for key, item in value.items():
@@ -1412,6 +1658,19 @@ class ScenarioService:
     @staticmethod
     def _execution_steps(definition: dict[str, Any]) -> list[dict[str, Any]]:
         return ordered_scenario_steps(definition)
+
+    def _ensure_definition_trace_metadata(
+        self, definition: dict[str, Any]
+    ) -> None:
+        """Persist trace metadata on the definition rather than flattened copies."""
+        steps: list[dict[str, Any]] = []
+        for node in definition.get("nodes") or []:
+            steps.extend(node.get("before_actions") or [])
+            test_case = node.get("test_case")
+            if isinstance(test_case, dict):
+                steps.append(test_case)
+            steps.extend(node.get("after_actions") or [])
+        self._ensure_trace_metadata(steps)
 
     @classmethod
     def _test_case_steps(cls, definition: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1836,20 +2095,73 @@ class ScenarioService:
 
     def _validated_definition(self, project_id: int, payload: ScenarioPayload) -> dict:
         self._get_environment(project_id, payload.environment_id)
+        http_case_ids = {
+            node.test_case.reference_id
+            for node in payload.nodes
+            if node.test_case.kind == "api_case"
+        }
+        websocket_case_ids = {
+            node.test_case.reference_id
+            for node in payload.nodes
+            if node.test_case.kind == "websocket_case"
+        }
+        http_cases = {
+            item.id: item
+            for item in (
+                self.db.scalars(
+                    select(TestCase).where(
+                        TestCase.id.in_(http_case_ids),
+                        TestCase.project_id == project_id,
+                    )
+                ).all()
+                if http_case_ids
+                else []
+            )
+        }
+        websocket_cases = {
+            item.id: item
+            for item in (
+                self.db.scalars(
+                    select(WebSocketTestCase).where(
+                        WebSocketTestCase.id.in_(websocket_case_ids),
+                        WebSocketTestCase.project_id == project_id,
+                    )
+                ).all()
+                if websocket_case_ids
+                else []
+            )
+        }
+        has_database_actions = any(
+            action.kind in {"database_query", "database_execute"}
+            for node in payload.nodes
+            for action in [*node.before_actions, *node.after_actions]
+        )
+        database_connections = (
+            self.db.scalars(
+                select(ProjectDatabaseConnection).where(
+                    ProjectDatabaseConnection.project_id == project_id,
+                    ProjectDatabaseConnection.environment_id == payload.environment_id,
+                    ProjectDatabaseConnection.is_deleted.is_(False),
+                )
+            ).all()
+            if has_database_actions
+            else []
+        )
+        database_connections_by_id = {
+            connection.id: connection for connection in database_connections
+        }
+        database_connections_by_key = {
+            connection.connection_key: connection
+            for connection in database_connections
+        }
         nodes = []
         for node_item in payload.nodes:
             node = node_item.model_dump()
             test_case_item = node_item.test_case
             if test_case_item.kind == "api_case":
-                asset = self.db.scalar(select(TestCase).where(
-                    TestCase.id == test_case_item.reference_id,
-                    TestCase.project_id == project_id,
-                ))
+                asset = http_cases.get(test_case_item.reference_id)
             else:
-                asset = self.db.scalar(select(WebSocketTestCase).where(
-                    WebSocketTestCase.id == test_case_item.reference_id,
-                    WebSocketTestCase.project_id == project_id,
-                ))
+                asset = websocket_cases.get(test_case_item.reference_id)
             if asset is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -1864,6 +2176,55 @@ class ScenarioService:
                 ),
             })
             for action in [*node["before_actions"], *node["after_actions"]]:
+                if action.get("kind") in {"database_query", "database_execute"}:
+                    database_config_payload = copy.deepcopy(action.get("config") or {})
+                    database_config_payload.pop("_scenario_context", None)
+                    database_config = DatabaseActionConfig.model_validate(
+                        database_config_payload
+                    )
+                    connection_by_key = None
+                    if database_config.connection_key:
+                        connection_by_key = database_connections_by_key.get(
+                            database_config.connection_key
+                        )
+                    connection_by_id = None
+                    if database_config.connection_id is not None:
+                        connection_by_id = database_connections_by_id.get(
+                            database_config.connection_id
+                        )
+                    if (
+                        connection_by_key is not None
+                        and connection_by_id is not None
+                        and connection_by_key.id != connection_by_id.id
+                    ):
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"数据库动作连接 ID 与连接键不一致: {action.get('id')}",
+                        )
+                    connection = connection_by_key or connection_by_id
+                    if connection is None:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"数据库动作引用连接不存在: {action.get('id')}",
+                        )
+                    try:
+                        validate_database_action(
+                            connection, str(action["kind"]), database_config
+                        )
+                    except ValueError as exc:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"数据库动作配置无效 {action.get('id')}: {exc}",
+                        ) from exc
+                    action["config"]["connection_id"] = connection.id
+                    action["config"]["connection_key"] = connection.connection_key
+                    action["connection_snapshot"] = {
+                        "id": connection.id,
+                        "connection_key": connection.connection_key,
+                        "name": connection.name,
+                        "provider": connection.provider,
+                        "database_name": connection.database_name,
+                    }
                 action.pop("reference_id", None)
                 action.pop("method", None)
                 action.pop("path", None)
@@ -1872,7 +2233,7 @@ class ScenarioService:
             "nodes": nodes,
             "datasets": [item.model_dump() for item in payload.datasets],
         }
-        self._ensure_trace_metadata(self._execution_steps(definition))
+        self._ensure_definition_trace_metadata(definition)
         self._validate_request_overrides(definition)
         return encrypt_sensitive(definition)
 
@@ -2136,7 +2497,9 @@ class ScenarioService:
                         target_path,
                     )
 
-            for target, target_path, variable_name in self._template_bindings(config):
+            for target, target_path, variable_name in self._template_bindings(
+                self._binding_config(step, config)
+            ):
                 if (target, target_path) in bound_targets:
                     continue
                 source = extraction_sources.get(variable_name)
@@ -2186,6 +2549,19 @@ class ScenarioService:
             context["extractions"] = extractions
 
     @staticmethod
+    def _binding_config(
+        step: dict[str, Any], config: dict[str, Any]
+    ) -> dict[str, Any]:
+        effective: dict[str, Any] = {}
+        if step.get("kind") in {"api_case", "websocket_case"}:
+            snapshot = step.get("case_snapshot")
+            if isinstance(snapshot, dict):
+                effective = copy.deepcopy(snapshot)
+        effective.update(copy.deepcopy(config))
+        effective.pop("_scenario_context", None)
+        return effective
+
+    @staticmethod
     def _trace_id(prefix: str, *parts: Any) -> str:
         raw = "|".join("" if item is None else str(item) for item in parts)
         return f"{prefix}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
@@ -2201,20 +2577,34 @@ class ScenarioService:
                 snapshot[name] = "***"
         return mask_sensitive(snapshot)
 
-    def _detail(self, scenario: TestScenario) -> dict[str, Any]:
-        version = self._get_version(scenario)
+    def _detail(
+        self,
+        scenario: TestScenario,
+        *,
+        version: TestScenarioVersion | None = None,
+        environment_name: str | None = None,
+        dependencies_loaded: bool = False,
+    ) -> dict[str, Any]:
+        if dependencies_loaded:
+            if version is None:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="场景版本不存在",
+                )
+        else:
+            version = self._get_version(scenario)
+            environment_name = self.db.scalar(
+                select(ProjectEnvironment.name).where(
+                    ProjectEnvironment.id == scenario.environment_id,
+                    ProjectEnvironment.project_id == scenario.project_id,
+                    ProjectEnvironment.is_deleted.is_(False),
+                )
+            )
         definition = decrypt_sensitive(copy.deepcopy(version.definition))
         self._normalize_definition_datasets(definition)
         public_nodes = copy.deepcopy(definition["nodes"])
         for node in public_nodes:
             node["test_case"].pop("case_snapshot", None)
-        environment_name = self.db.scalar(
-            select(ProjectEnvironment.name).where(
-                ProjectEnvironment.id == scenario.environment_id,
-                ProjectEnvironment.project_id == scenario.project_id,
-                ProjectEnvironment.is_deleted.is_(False),
-            )
-        )
         return {
             "id": scenario.id, "project_id": scenario.project_id, "environment_id": scenario.environment_id,
             "environment_name": environment_name,

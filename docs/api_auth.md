@@ -23,6 +23,8 @@ http://127.0.0.1:8000/api/v1
 参数校验、认证和业务错误统一返回 `{code,message,data}`。详细规则见
 [统一错误响应契约](api_errors.md)。
 
+所有受保护接口都会在解析 JWT 后再次检查用户当前 `is_active` 状态。账号被停用后，旧 access token 和 refresh token 均不可继续访问业务接口。
+
 ## 用户注册
 
 ### 基本信息
@@ -97,7 +99,7 @@ Content-Type: application/json
 | 接口 | `/auth/login` |
 | 方法 | `POST` |
 | Content-Type | `application/json` |
-| 说明 | 使用账号和密码登录，成功后返回 access token、refresh token 和用户信息 |
+| 说明 | 使用账号和密码登录，成功后返回 access token、refresh token、Web 平台基地址和用户信息 |
 
 ### 请求参数
 
@@ -129,6 +131,7 @@ Content-Type: application/json
     "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
     "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
     "token_type": "bearer",
+    "platform_web_url": "http://127.0.0.1:5174",
     "user": {
       "id": 1,
       "username": "测试用户",
@@ -150,6 +153,8 @@ Content-Type: application/json
 ```http
 Authorization: Bearer <access_token>
 ```
+
+Chrome 插件使用 `platform_web_url` 拼接平台返回的 UI 用例相对路径，从保存结果直接打开 Web 用例详情。部署时必须通过 `PLATFORM_WEB_BASE_URL` 配置真实 Web 入口；不要从 API 域名或端口猜测生产地址。
 
 示例：
 
@@ -179,6 +184,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 ```text
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 REFRESH_TOKEN_EXPIRE_DAYS=7
+PLATFORM_WEB_BASE_URL=http://127.0.0.1:5174
 ```
 
 ## 刷新访问令牌
@@ -220,6 +226,7 @@ Content-Type: application/json
     "access_token": "new-access-token",
     "refresh_token": "new-refresh-token",
     "token_type": "bearer",
+    "platform_web_url": "http://127.0.0.1:5174",
     "user": {
       "id": 1,
       "username": "测试用户",

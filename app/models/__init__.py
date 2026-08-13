@@ -27,6 +27,21 @@ from app.models.agent import (
     ProjectMemory,
 )
 from app.models.defect import Defect
+from app.models.desktop_device import (
+    DesktopDevice,
+    DesktopDeviceCredential,
+    DesktopDeviceProjectBinding,
+)
+from app.models.database_connection import (
+    DatabaseActionExecution,
+    ProjectDatabaseConnection,
+)
+from app.models.dashboard import (
+    DashboardAIAnalysisJob,
+    DashboardAssetDailySnapshot,
+    DashboardAssetEvent,
+    DashboardRegressionRun,
+)
 from app.models.execution_diagnostic import (
     ExecutionMetricDaily,
     ExecutionMetricHourly,
@@ -52,6 +67,15 @@ from app.models.scenario import (
 )
 from app.models.system_test_case import SystemCaseApiRelation, SystemTestCase
 from app.models.test_case import TestCase, TestCaseEnvironment, TestCaseExecution
+from app.models.ui_test_case import UiTestCase, UiTestCaseVersion
+from app.models.ui_execution import (
+    UiExecution,
+    UiExecutionCommand,
+    UiExecutionEvent,
+    UiRuntimePatch,
+    UiStepExecution,
+)
+from app.models.ui_execution_artifact import ExecutionArtifactUploadSession
 from app.models.test_plan import (
     TestPlan,
     TestPlanEnvironment,
@@ -59,6 +83,7 @@ from app.models.test_plan import (
     TestPlanScenario,
     TestPlanWebhookEvent,
 )
+from app.models.test_report import TestReportDeletion, TestReportExport
 from app.models.user import User
 from app.models.websocket_test_case import WebSocketTestCase, WebSocketTestCaseEnvironment, WebSocketTestCaseExecution
 from app.models.visual_flow import VisualFlow, VisualFlowExecution, VisualFlowNodeExecution, VisualFlowVersion
@@ -93,6 +118,15 @@ __all__ = [
     "BrowserCapture",
     "BrowserCaptureEntry",
     "Defect",
+    "DesktopDevice",
+    "DesktopDeviceCredential",
+    "DesktopDeviceProjectBinding",
+    "DatabaseActionExecution",
+    "ProjectDatabaseConnection",
+    "DashboardAIAnalysisJob",
+    "DashboardAssetDailySnapshot",
+    "DashboardAssetEvent",
+    "DashboardRegressionRun",
     "ExecutionMetricDaily",
     "ExecutionMetricHourly",
     "ExecutionPayloadArtifact",
@@ -115,11 +149,21 @@ __all__ = [
     "TestCase",
     "TestCaseEnvironment",
     "TestCaseExecution",
+    "UiTestCase",
+    "UiTestCaseVersion",
+    "UiExecution",
+    "UiExecutionCommand",
+    "UiExecutionEvent",
+    "UiRuntimePatch",
+    "UiStepExecution",
+    "ExecutionArtifactUploadSession",
     "TestPlan",
     "TestPlanEnvironment",
     "TestPlanScenario",
     "TestPlanRun",
     "TestPlanWebhookEvent",
+    "TestReportDeletion",
+    "TestReportExport",
     "User",
     "WebSocketTestCase",
     "WebSocketTestCaseEnvironment",
@@ -130,3 +174,4 @@ __all__ = [
     "VisualFlowNodeExecution",
 ]
 from app.models.browser_capture import BrowserCapture, BrowserCaptureEntry
+from app.models import dashboard_asset_events as _dashboard_asset_events  # noqa: F401, E402

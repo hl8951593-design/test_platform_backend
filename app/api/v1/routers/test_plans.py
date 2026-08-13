@@ -8,7 +8,11 @@ from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user, get_db
 from app.core.config import settings
-from app.core.execution_worker import execution_worker
+from app.core.execution_worker import ExecutionReservation, execution_worker
+from app.core.project_cache import (
+    invalidate_project_list_cache,
+    invalidate_project_list_cache_on_completion,
+)
 from app.core.response import success
 from app.core.sensitive_data import verify_webhook_signature
 from app.db.session import SessionLocal
@@ -62,12 +66,30 @@ def _execute_plan_run_background(run_id: int) -> None:
             logger.exception("Test plan run %s failed in background execution", run_id)
 
 
-def _submit_plan_run(run_id: int) -> None:
-    if not execution_worker.submit(_execute_plan_run_background, run_id):
+def _reserve_plan_runs(count: int) -> ExecutionReservation | None:
+    if count == 0:
+        return None
+    reservation = execution_worker.reserve(count)
+    if reservation is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="执行队列已满，请稍后重试",
         )
+    return reservation
+
+
+def _submit_plan_run(run_id: int, reservation: ExecutionReservation | None = None) -> None:
+    future = (
+        reservation.submit_future(_execute_plan_run_background, run_id)
+        if reservation is not None
+        else execution_worker.submit_future(_execute_plan_run_background, run_id)
+    )
+    if future is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="执行队列已满，请稍后重试",
+        )
+    invalidate_project_list_cache_on_completion(future)
 
 
 @router.get("", summary="查询测试计划列表")
@@ -88,6 +110,7 @@ def list_plans(
 def create_plan(project_id: int, payload: TestPlanCreateRequest, db: Session = Depends(get_db),
                 current_user: User = Depends(get_current_user)):
     plan = TestPlanService(db).create_plan(project_id=project_id, payload=payload, current_user=current_user)
+    invalidate_project_list_cache()
     return success(data=_plan_data(plan), message="测试计划创建成功")
 
 
@@ -96,6 +119,7 @@ def import_plans(project_id: int, payload: TestPlanImportRequest | list[TestPlan
                  current_user: User = Depends(get_current_user)):
     payloads = payload.plans if isinstance(payload, TestPlanImportRequest) else payload
     plans = TestPlanService(db).import_plans(project_id=project_id, payloads=payloads, current_user=current_user)
+    invalidate_project_list_cache()
     return success(data=[_plan_data(plan) for plan in plans], message="测试计划导入成功")
 
 
@@ -130,12 +154,14 @@ def get_plan(project_id: int, plan_id: int, db: Session = Depends(get_db), curre
 def update_plan(project_id: int, plan_id: int, payload: TestPlanUpdateRequest, db: Session = Depends(get_db),
                 current_user: User = Depends(get_current_user)):
     plan = TestPlanService(db).update_plan(project_id=project_id, plan_id=plan_id, payload=payload, current_user=current_user)
+    invalidate_project_list_cache()
     return success(data=_plan_data(plan), message="测试计划更新成功")
 
 
 @router.delete("/{plan_id}", summary="删除测试计划")
 def delete_plan(project_id: int, plan_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     TestPlanService(db).delete_plan(project_id=project_id, plan_id=plan_id, current_user=current_user)
+    invalidate_project_list_cache()
     return success(message="测试计划删除成功")
 
 
@@ -173,28 +199,50 @@ async def trigger_webhook(
         signature=x_webhook_signature,
     ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook signature")
-    runs = TestPlanService(db).create_webhook_runs(
+    body_hash = hashlib.sha256(body).hexdigest()
+    service = TestPlanService(db)
+    capacity = service.webhook_run_capacity(
         project_id=project_id,
         event=event,
         idempotency_key=idempotency_key,
-        body_hash=hashlib.sha256(body).hexdigest(),
+        body_hash=body_hash,
     )
-    for run in runs:
-        if run.status == "pending":
-            _submit_plan_run(run.id)
+    invalidate_project_list_cache()
+    reservation = _reserve_plan_runs(capacity)
+    try:
+        runs = service.create_webhook_runs(
+            project_id=project_id,
+            event=event,
+            idempotency_key=idempotency_key,
+            body_hash=body_hash,
+        )
+        for run in runs:
+            if run.status == "pending":
+                _submit_plan_run(run.id, reservation)
+        if runs:
+            invalidate_project_list_cache()
+    finally:
+        if reservation is not None:
+            reservation.release_unused()
     return success(data={"runs": [_run_data(run) for run in runs]}, message="Webhook accepted")
 
 
 @router.post("/{plan_id}/execute", status_code=status.HTTP_202_ACCEPTED, summary="手动执行测试计划")
 def execute_plan(project_id: int, plan_id: int, payload: TestPlanExecuteRequest,
                  db: Session = Depends(get_db),
-                 current_user: User = Depends(get_current_user)):
-    run = TestPlanService(db).create_plan_run(
-        project_id=project_id, plan_id=plan_id, environment_id=payload.environment_id,
-        idempotency_key=payload.idempotency_key, current_user=current_user,
-    )
-    if run.status == "pending":
-        _submit_plan_run(run.id)
+    current_user: User = Depends(get_current_user)):
+    reservation = _reserve_plan_runs(1)
+    assert reservation is not None
+    try:
+        run = TestPlanService(db).create_plan_run(
+            project_id=project_id, plan_id=plan_id, environment_id=payload.environment_id,
+            idempotency_key=payload.idempotency_key, current_user=current_user,
+        )
+        if run.status == "pending":
+            _submit_plan_run(run.id, reservation)
+        invalidate_project_list_cache()
+    finally:
+        reservation.release_unused()
     return success(data=_run_data(run, include_results=True), message="测试计划执行已受理")
 
 
@@ -209,6 +257,7 @@ def list_runs(project_id: int, page: int = Query(default=1, ge=1), page_size: in
 @run_router.delete("", summary="清空项目测试计划执行历史")
 def clear_runs(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     count = TestPlanService(db).clear_runs(project_id=project_id, current_user=current_user)
+    invalidate_project_list_cache()
     return success(data={"deleted_count": count}, message="测试计划执行历史已清空")
 
 
@@ -221,4 +270,5 @@ def get_run(project_id: int, run_id: int, db: Session = Depends(get_db), current
 @run_router.delete("/{run_id}", summary="删除测试计划运行记录")
 def delete_run(project_id: int, run_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     TestPlanService(db).delete_run(project_id=project_id, run_id=run_id, current_user=current_user)
+    invalidate_project_list_cache()
     return success(message="测试计划运行记录已删除")

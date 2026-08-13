@@ -10,6 +10,8 @@ import app.models  # noqa: F401
 from app.core.permissions import ProjectPermission
 from app.db.base import Base
 from app.models.defect import Defect
+from app.models.browser_capture import BrowserCapture, BrowserCaptureEntry
+from app.models.execution_diagnostic import ExecutionMetricHourly, ExecutionRecordIndex
 from app.models.project import Project, ProjectEnvironment, ProjectEnvironmentVariable
 from app.models.scenario import (
     TestScenario,
@@ -20,6 +22,7 @@ from app.models.scenario import (
 )
 from app.models.test_case import TestCase, TestCaseExecution
 from app.models.test_plan import TestPlan, TestPlanEnvironment, TestPlanRun
+from app.models.system_test_case import SystemCaseApiRelation, SystemTestCase
 from app.models.user import User
 from app.models.visual_flow import (
     VisualFlow,
@@ -231,6 +234,65 @@ class PhysicalDeletionTests(unittest.TestCase):
             created_by_id=self.user.id,
         )
         self.db.add(test_case)
+        self.db.flush()
+        capture = BrowserCapture(
+            project_id=self.project.id,
+            environment_id=environment_id,
+            name="Capture",
+            created_by_id=self.user.id,
+        )
+        self.db.add(capture)
+        self.db.flush()
+        capture_entry = BrowserCaptureEntry(
+            capture_id=capture.id,
+            project_id=self.project.id,
+            client_entry_id="entry-1",
+            protocol="http",
+            fingerprint="fingerprint",
+            name="GET /health",
+            method="GET",
+            path="/health",
+            source_url="https://example.com/health",
+            request_data={},
+            response_data={},
+            draft_data={},
+            captured_at=datetime.utcnow(),
+        )
+        system_case = SystemTestCase(
+            project_id=self.project.id,
+            case_code="SYS-1",
+            title="Health",
+            business_module="platform",
+            test_objective="verify health",
+            created_by_id=self.user.id,
+        )
+        self.db.add_all([capture_entry, system_case])
+        self.db.flush()
+        relation = SystemCaseApiRelation(
+            project_id=self.project.id,
+            system_case_id=system_case.id,
+            api_case_id=test_case.id,
+            relation_type="covered_by",
+        )
+        diagnostic = ExecutionRecordIndex(
+            project_id=self.project.id,
+            execution_type="http",
+            execution_id=1,
+            object_ref="http:1",
+            status="passed",
+            trigger_type="manual",
+            trigger_user_id=self.user.id,
+            projection_version="test",
+        )
+        metric = ExecutionMetricHourly(
+            project_id=self.project.id,
+            execution_type="http",
+            time_bucket=datetime.utcnow(),
+            execution_count=1,
+            duration_sum_ms=10,
+            duration_max_ms=10,
+        )
+        self.db.add_all([relation, diagnostic, metric])
         defect = Defect(
             project_id=self.project.id,
             title="Defect",
@@ -248,6 +310,8 @@ class PhysicalDeletionTests(unittest.TestCase):
         ))
         self.db.commit()
         project_id, test_case_id, defect_id = self.project.id, test_case.id, defect.id
+        capture_id, capture_entry_id = capture.id, capture_entry.id
+        system_case_id, diagnostic_id, metric_id = system_case.id, diagnostic.id, metric.id
 
         ProjectRepository(self.db).delete_project(self.project)
 
@@ -255,8 +319,13 @@ class PhysicalDeletionTests(unittest.TestCase):
         self.assertIsNone(self.db.get(ProjectEnvironment, environment_id))
         self.assertIsNone(self.db.get(TestCase, test_case_id))
         self.assertIsNone(self.db.get(Defect, defect_id))
+        self.assertIsNone(self.db.get(BrowserCapture, capture_id))
+        self.assertIsNone(self.db.get(BrowserCaptureEntry, capture_entry_id))
+        self.assertIsNone(self.db.get(SystemTestCase, system_case_id))
+        self.assertIsNone(self.db.get(ExecutionRecordIndex, diagnostic_id))
+        self.assertIsNone(self.db.get(ExecutionMetricHourly, metric_id))
 
-    def test_plan_run_delete_physically_removes_history(self):
+    def test_plan_run_delete_hides_history_but_retains_audit_evidence(self):
         run = TestPlanRun(
             project_id=self.project.id,
             plan_name="Deleted plan",
@@ -294,8 +363,11 @@ class PhysicalDeletionTests(unittest.TestCase):
             current_user=self.user,
         )
 
-        self.assertIsNone(self.db.get(TestPlanRun, run_id))
-        self.assertIsNone(self.db.get(TestScenarioRun, scenario_run_id).plan_run_id)
+        retained_run = self.db.get(TestPlanRun, run_id)
+        self.assertIsNotNone(retained_run)
+        self.assertTrue(retained_run.is_deleted)
+        self.assertIsNotNone(retained_run.deleted_at)
+        self.assertEqual(self.db.get(TestScenarioRun, scenario_run_id).plan_run_id, run_id)
 
     def test_scenario_run_delete_removes_events_and_detaches_case_executions(self):
         execution = TestScenarioExecution(

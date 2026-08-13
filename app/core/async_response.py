@@ -4,13 +4,22 @@ from app.core.response import normalize_response_data
 
 
 DEFAULT_EXECUTION_POLL_AFTER_MS = 1000
-INTERNAL_PENDING_STATUSES = {"queued", "pending"}
+INTERNAL_PENDING_STATUSES = {"queued", "pending", "claimed", "launching"}
+PUBLIC_STATUS_ALIASES = {
+    "waiting_user": "paused",
+    "assisted": "passed",
+    "lost": "failed",
+    "success": "passed",
+    "completed": "passed",
+    "error": "failed",
+    "timeout": "failed",
+}
 
 
 def public_execution_status(status: str | None) -> str | None:
     if status in INTERNAL_PENDING_STATUSES:
         return "running"
-    return status
+    return PUBLIC_STATUS_ALIASES.get(status, status)
 
 
 def execution_started_payload(

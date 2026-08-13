@@ -260,7 +260,17 @@ class ExecutionDiagnosticRepository:
         if execution_type is not None:
             filters.append(ExecutionRecordIndex.execution_type == execution_type)
         if status_filter is not None:
-            filters.append(ExecutionRecordIndex.status == status_filter)
+            public_statuses = {
+                "running": ("running", "queued", "pending", "claimed", "launching"),
+                "paused": ("paused", "waiting_user"),
+                "passed": ("passed", "success", "completed", "assisted"),
+                "failed": ("failed", "error", "timeout", "lost"),
+            }
+            filters.append(
+                ExecutionRecordIndex.status.in_(public_statuses[status_filter])
+                if status_filter in public_statuses
+                else ExecutionRecordIndex.status == status_filter
+            )
         if environment_id is not None:
             filters.append(ExecutionRecordIndex.environment_id == environment_id)
         if trigger_user_id is not None:
@@ -324,7 +334,7 @@ def decode_cursor(value: str) -> ExecutionCursor:
         if not isinstance(payload, dict) or payload.get("v") != 1:
             raise ValueError("unsupported cursor version")
         execution_type = payload.get("execution_type")
-        if execution_type not in {"http", "websocket", "scenario", "flow"}:
+        if execution_type not in {"http", "websocket", "scenario", "flow", "ui"}:
             raise ValueError("invalid execution type")
         execution_id = payload.get("execution_id")
         if isinstance(execution_id, bool) or not isinstance(execution_id, int) or execution_id < 1:

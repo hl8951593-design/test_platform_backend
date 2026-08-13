@@ -5,7 +5,9 @@ from unittest.mock import MagicMock
 from fastapi import HTTPException
 
 from app.models.scenario import TestScenarioRun, TestScenarioRunEvent
+from app.models.execution_diagnostic import ExecutionPayloadArtifact
 from app.models.test_case import TestCaseExecution
+from app.models.ui_execution import UiExecution, UiExecutionCommand, UiRuntimePatch, UiStepExecution
 from app.models.user import User
 from app.models.visual_flow import VisualFlowExecution, VisualFlowNodeExecution
 from app.models.websocket_test_case import WebSocketTestCaseExecution
@@ -262,6 +264,111 @@ class ExecutionRecordServiceTests(unittest.TestCase):
 
         self.assertEqual(result.summary.duration_ms, 250)
         self.assertEqual(result.detail["node_executions"][0]["node_id"], "api-1")
+
+    def test_ui_detail_includes_steps_audit_commands_and_artifacts(self):
+        service = build_service()
+        execution = UiExecution(
+            id=41,
+            public_id="ui_exec_41",
+            project_id=3,
+            environment_id=5,
+            ui_test_case_id=8,
+            ui_test_case_version_id=9,
+            trigger_user_id=9,
+            trigger_type="manual",
+            source="platform_task",
+            client_request_id="request-41",
+            request_hash="a" * 64,
+            status="assisted",
+            delivery_status="complete",
+            case_snapshot_json={"case": {"name": "Login"}},
+            runtime_policy_json={},
+            required_secret_refs_json=[],
+            total_steps=1,
+            passed_steps=1,
+            failed_steps=0,
+            skipped_steps=0,
+            assisted=True,
+            duration_ms=250,
+            created_at=NOW,
+            started_at=NOW,
+            finished_at=NOW + timedelta(milliseconds=250),
+        )
+        execution.step_executions = [
+            UiStepExecution(
+                id=1,
+                step_id="step_1",
+                attempt=1,
+                step_index=0,
+                name="Open login",
+                kind="action",
+                operation="navigate",
+                status="passed",
+                result_summary_json={},
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        ]
+        execution.runtime_patches = [
+            UiRuntimePatch(
+                id=1,
+                step_id="step_1",
+                patch_type="timeout",
+                scope="current_run",
+                before_json={"timeout_ms": 1000},
+                after_json={"timeout_ms": 2000},
+                reason="slow CI",
+                created_at=NOW,
+            )
+        ]
+        execution.commands = [
+            UiExecutionCommand(
+                id=1,
+                public_id="ui_cmd_1",
+                command_type="resume",
+                status="acknowledged",
+                payload_json={},
+                issued_by_id=9,
+                created_at=NOW,
+            )
+        ]
+        artifact = ExecutionPayloadArtifact(
+            id=1,
+            artifact_ref="ui_artifact_1",
+            project_id=3,
+            execution_type="ui",
+            execution_id=41,
+            step_id="step_1",
+            section="screenshot",
+            storage_backend="minio",
+            storage_locator="bucket/key.png",
+            content_type="image/png",
+            encoding="identity",
+            content=None,
+            raw_size_bytes=3,
+            stored_size_bytes=3,
+            sha256="b" * 64,
+            redaction_version="desktop-v1",
+            retention_tier="standard",
+            metadata_json={"original_filename": "step.png"},
+            created_at=NOW,
+        )
+        service.repository.get_ui.return_value = (execution, "Login")
+        service.repository.list_ui_artifacts.return_value = [artifact]
+
+        result = service.get_detail(
+            project_id=3,
+            execution_type="ui",
+            execution_id=41,
+            current_user=self.user,
+        )
+
+        self.assertEqual(result.summary.status, "passed")
+        self.assertEqual(result.detail["steps"][0]["step_id"], "step_1")
+        self.assertEqual(result.detail["runtime_patches"][0]["patch_type"], "timeout")
+        self.assertEqual(result.detail["commands"][0]["command_type"], "resume")
+        self.assertEqual(result.detail["artifacts"][0]["artifact_ref"], "ui_artifact_1")
+        self.assertEqual(result.detail["artifacts"][0]["metadata"]["original_filename"], "step.png")
 
     def test_missing_detail_returns_404(self):
         service = build_service()

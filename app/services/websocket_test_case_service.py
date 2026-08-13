@@ -386,6 +386,23 @@ class WebSocketTestCaseService:
         self.repository.db.refresh(execution)
         return execution
 
+    def validate_saved_case_batch(
+        self,
+        *,
+        project_id: int,
+        test_case_ids: list[int],
+        environment_id: int | None,
+        current_user: User,
+    ) -> None:
+        self._require(current_user, project_id, ProjectPermission.EXECUTE_TEST.value)
+        for test_case_id in test_case_ids:
+            case = self._get_case(project_id, test_case_id)
+            payload = self._saved_case_payload(
+                case,
+                environment_id=environment_id or case.environment_id,
+            )
+            self._load_environment_context(project_id, payload.environment_id)
+
     def _stage_execution_diagnostic(
         self, execution: WebSocketTestCaseExecution
     ) -> None:

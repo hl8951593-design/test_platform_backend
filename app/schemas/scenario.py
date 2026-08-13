@@ -27,6 +27,8 @@ class ScenarioExecutableRequest(BaseModel):
         "random",
         "fixed_value",
         "script",
+        "database_query",
+        "database_execute",
     ]
     reference_id: int | None = Field(default=None, validation_alias=AliasChoices("reference_id", "referenceId"))
     name: str = Field(min_length=1, max_length=200)
@@ -111,6 +113,17 @@ class ScenarioExecutableRequest(BaseModel):
                     raise ValueError(f"脚本 {field} 必须是合法变量名数组")
                 if len(values) != len(set(values)):
                     raise ValueError(f"脚本 {field} 不能包含重复变量")
+        if self.kind in {"database_query", "database_execute"}:
+            from app.schemas.database_connection import DatabaseActionConfig
+
+            database_config_payload = dict(self.config)
+            database_config_payload.pop("_scenario_context", None)
+            database_config = DatabaseActionConfig.model_validate(database_config_payload)
+            if (
+                self.kind == "database_execute"
+                and database_config.retry_policy.max_attempts != 1
+            ):
+                raise ValueError("数据库写操作禁止自动重试")
         return self
 
     @staticmethod
@@ -124,7 +137,15 @@ class ScenarioTestCaseRequest(ScenarioExecutableRequest):
 
 
 class ScenarioActionRequest(ScenarioExecutableRequest):
-    kind: Literal["condition", "delay", "random", "fixed_value", "script"]
+    kind: Literal[
+        "condition",
+        "delay",
+        "random",
+        "fixed_value",
+        "script",
+        "database_query",
+        "database_execute",
+    ]
 
 
 class ScenarioScriptExecuteUnsavedRequest(BaseModel):

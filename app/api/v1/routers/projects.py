@@ -14,6 +14,7 @@ from app.schemas.project import (
     ProjectEnvironmentVariableUpsertRequest,
     ProjectEnvironmentUpdateRequest,
     ProjectMemberGrantRequest,
+    ProjectMemberUpdateRequest,
     ProjectUpdateRequest,
 )
 from app.services.project_service import ProjectService
@@ -41,6 +42,7 @@ def create_project(
 
 @router.get("", summary="查询当前用户可见项目列表")
 def list_projects(
+    refresh: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -51,6 +53,8 @@ def list_projects(
         visible_projects = service.list_visible_projects(current_user)
         return success(data=service.build_project_reads(visible_projects))
 
+    if refresh:
+        return build_response()
     return read_response_cache.get_or_set(cache_key, build_response)
 
 
@@ -63,6 +67,19 @@ def get_project(
     service = ProjectService(db)
     project = service.get_visible_project(project_id, current_user)
     return success(data=service.build_project_read(project))
+
+
+@router.get("/{project_id}/testing-overview", summary="查询项目测试总览")
+def get_project_testing_overview(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    overview = ProjectService(db).build_testing_overview(
+        project_id=project_id,
+        current_user=current_user,
+    )
+    return success(data=overview)
 
 
 @router.put("/{project_id}", summary="更新项目")
@@ -108,6 +125,53 @@ def grant_normal_tester_permissions(
     )
     read_response_cache.clear_prefix(("projects",))
     return success(data=member, message="项目成员权限已更新")
+
+
+@router.get("/{project_id}/members", summary="查询项目成员")
+def list_project_members(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    members = ProjectService(db).list_members(
+        project_id=project_id,
+        current_user=current_user,
+    )
+    return success(data=members)
+
+
+@router.put("/{project_id}/members/{user_id}", summary="更新项目成员权限")
+def update_project_member(
+    project_id: int,
+    user_id: int,
+    payload: ProjectMemberUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    member = ProjectService(db).update_member_permissions(
+        project_id=project_id,
+        user_id=user_id,
+        permission_codes=payload.permission_codes,
+        current_user=current_user,
+    )
+    read_response_cache.clear_prefix(("projects",))
+    return success(data=member, message="项目成员权限已更新")
+
+
+@router.delete("/{project_id}/members/{user_id}", summary="移除项目成员")
+def remove_project_member(
+    project_id: int,
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ProjectService(db).remove_member(
+        project_id=project_id,
+        user_id=user_id,
+        current_user=current_user,
+    )
+    read_response_cache.clear_prefix(("projects",))
+    return success(message="项目成员已移除")
 
 
 @router.get("/{project_id}/environments", summary="查询项目环境列表")

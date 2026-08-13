@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.permissions import ProjectPermission
 from app.models.scenario import TestScenarioRun, TestScenarioRunEvent
+from app.models.ui_execution import UiExecution
 from app.models.user import User
 from app.repositories.execution_record_repository import ExecutionRecordRepository
 from app.schemas.execution_center import (
@@ -23,18 +24,25 @@ from app.schemas.execution_center import (
     ExecutionCenterWorkerRead,
 )
 from app.services.permission_service import PermissionService
+from app.repositories.desktop_device_repository import DesktopDeviceRepository
+from app.services.desktop_presence_service import desktop_presence_service
 
 
 class ExecutionCenterService:
-    ACTIVE_STATUSES = {"queued", "running", "retrying", "paused"}
-    FAILED_STATUSES = {"failed", "error", "timeout"}
-    TERMINAL_STATUSES = {"passed", "failed", "cancelled", "timeout", "error", "success", "completed"}
+    ACTIVE_STATUSES = {"queued", "claimed", "launching", "running", "retrying", "paused", "waiting_user"}
+    FAILED_STATUSES = {"failed", "error", "timeout", "lost"}
+    TERMINAL_STATUSES = {"passed", "assisted", "failed", "cancelled", "lost", "timeout", "error", "success", "completed"}
     STATUS_ALIASES = {
         "pending": "queued",
         "success": "passed",
         "completed": "passed",
         "timeout": "failed",
         "error": "failed",
+        "claimed": "running",
+        "launching": "running",
+        "waiting_user": "paused",
+        "assisted": "passed",
+        "lost": "failed",
     }
     TRIGGER_LABELS = {
         "plan": "测试计划",
@@ -48,6 +56,7 @@ class ExecutionCenterService:
     def __init__(self, db: Session):
         self.db = db
         self.repository = ExecutionRecordRepository(db)
+        self.desktop_repository = DesktopDeviceRepository(db)
         self.permission_service = PermissionService(db)
 
     def overview(
@@ -70,8 +79,14 @@ class ExecutionCenterService:
             for row in rows
             if row.get("duration_ms") is not None and self._normalize_status(row.get("status")) in {"passed", "failed", "cancelled"}
         ]
-        worker_total = max(int(settings.EXECUTION_WORKER_MAX_WORKERS), 1)
-        worker_online = worker_total
+        server_worker_total = max(int(settings.EXECUTION_WORKER_MAX_WORKERS), 1)
+        now = datetime.now()
+        desktop_devices = self.desktop_repository.list_for_project(project_id)
+        desktop_online = sum(
+            1 for device in desktop_devices if self._desktop_device_online(device, now)
+        )
+        worker_total = server_worker_total + len(desktop_devices)
+        worker_online = server_worker_total + desktop_online
         worker_health_rate = round(worker_online / worker_total * 100)
         diagnosis_count = failed_blocking_count
 
@@ -125,7 +140,8 @@ class ExecutionCenterService:
         active_items = [
             self._queue_item(row)
             for row in self._record_rows(project_id=project_id, environment_id=None, page_size=1000)
-            if self._normalize_status(row.get("status")) in {"running", "retrying"}
+            if row.get("execution_type") != "ui"
+            and self._normalize_status(row.get("status")) in {"running", "retrying"}
         ]
         now = datetime.now()
         worker_total = max(int(settings.EXECUTION_WORKER_MAX_WORKERS), 1)
@@ -143,9 +159,72 @@ class ExecutionCenterService:
                     heartbeat_at=now,
                     heartbeat_text="实时派生",
                     capabilities=["http", "websocket", "scenario", "flow"],
+                    worker_kind="server",
+                    online=True,
+                )
+            )
+        desktop_devices = self.desktop_repository.list_for_project(project_id)
+        active_ui_by_device: dict[int, UiExecution] = {}
+        device_ids = [device.id for device in desktop_devices]
+        if device_ids:
+            active_ui_executions = self.db.scalars(
+                select(UiExecution)
+                .where(
+                    UiExecution.assigned_device_id.in_(device_ids),
+                    UiExecution.status.in_(
+                        ("claimed", "launching", "running", "paused", "waiting_user")
+                    ),
+                )
+                .order_by(
+                    UiExecution.assigned_device_id.asc(),
+                    UiExecution.updated_at.desc(),
+                    UiExecution.id.desc(),
+                )
+            ).all()
+            for execution in active_ui_executions:
+                if execution.assigned_device_id is not None:
+                    active_ui_by_device.setdefault(
+                        execution.assigned_device_id, execution
+                    )
+        for device in desktop_devices:
+            online = self._desktop_device_online(device, now)
+            active_execution = active_ui_by_device.get(device.id)
+            runtime_state = device.runtime_state_json or {}
+            capabilities = device.capabilities_json or {}
+            browsers = capabilities.get("browsers") or []
+            workers.append(
+                ExecutionCenterWorkerRead(
+                    id=device.public_id,
+                    state=("offline" if not online else "busy" if active_execution else "idle"),
+                    load=min(max(int(runtime_state.get("current_load") or 0), 0), 100),
+                    current_job_id=(
+                        f"ui:{active_execution.id}" if active_execution is not None else None
+                    ),
+                    current_job_name=(
+                        str((active_execution.case_snapshot_json or {}).get("case", {}).get("name") or "UI execution")
+                        if active_execution is not None
+                        else None
+                    ),
+                    heartbeat_at=device.last_heartbeat_at or device.registered_at,
+                    heartbeat_text="Desktop heartbeat" if online else "Desktop offline",
+                    capabilities=["ui", *[str(item) for item in browsers]],
+                    worker_kind="desktop",
+                    device_id=device.public_id,
+                    online=online,
                 )
             )
         return ExecutionCenterWorkerPageRead(items=workers)
+
+    @staticmethod
+    def _desktop_device_online(device: Any, now: datetime) -> bool:
+        redis_online = desktop_presence_service.is_online(device.public_id)
+        if redis_online is not None:
+            return bool(redis_online)
+        return bool(
+            device.last_heartbeat_at
+            and (now - device.last_heartbeat_at).total_seconds()
+            < settings.DESKTOP_DEVICE_OFFLINE_AFTER_SECONDS
+        )
 
     def logs(
         self,
@@ -157,7 +236,12 @@ class ExecutionCenterService:
     ) -> ExecutionCenterLogPageRead:
         self._require_view(current_user, project_id)
         rows = self.db.execute(
-            select(TestScenarioRunEvent, TestScenarioRun)
+            select(
+                TestScenarioRunEvent,
+                TestScenarioRun.id.label("run_id"),
+                TestScenarioRun.created_at.label("run_created_at"),
+                TestScenarioRun.started_at.label("run_started_at"),
+            )
             .join(TestScenarioRun, TestScenarioRun.id == TestScenarioRunEvent.run_id)
             .where(
                 TestScenarioRun.project_id == project_id,
@@ -167,16 +251,16 @@ class ExecutionCenterService:
             .limit(limit)
         ).all()
         items: list[ExecutionCenterLogItemRead] = []
-        for event, run in rows:
-            created_at = event.occurred_at or run.created_at or run.started_at
+        for event, run_id, run_created_at, run_started_at in rows:
+            created_at = event.occurred_at or run_created_at or run_started_at
             items.append(
                 ExecutionCenterLogItemRead(
                     sequence=event.id,
                     time=created_at.strftime("%H:%M:%S"),
                     level=self._event_level(event.event),
                     message=self._event_message(event),
-                    run_id=self._run_id(run.id),
-                    worker_id=self._worker_for_execution(run.id, 0),
+                    run_id=self._run_id(run_id),
+                    worker_id=self._worker_for_execution(run_id, 0),
                     created_at=created_at,
                 )
             )
@@ -236,6 +320,11 @@ class ExecutionCenterService:
         trigger_type = self._trigger_type(row)
         progress = self._progress(status_value)
         eta_seconds = 0 if status_value in self.TERMINAL_STATUSES else 300
+        worker_id = None
+        if row["execution_type"] == "ui":
+            worker_id = row.get("worker_id")
+        elif status_value in {"running", "retrying"}:
+            worker_id = self._worker_for_execution(execution_id, 0)
         return ExecutionCenterQueueItemRead(
             id=self._run_id(execution_id),
             execution_type=row["execution_type"],
@@ -245,7 +334,7 @@ class ExecutionCenterService:
             trigger_type=trigger_type,
             priority=self._priority(status_value),
             status=status_value,
-            worker_id=self._worker_for_execution(execution_id, 0) if status_value in {"running", "retrying"} else None,
+            worker_id=worker_id,
             progress=progress,
             eta_seconds=eta_seconds,
             eta_text=self._eta_text(eta_seconds, status_value),

@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -23,19 +24,105 @@ class ProjectStatsRead(BaseModel):
     api_case_count: int = 0
     http_test_case_count: int = 0
     websocket_test_case_count: int = 0
+    system_test_case_count: int = 0
     test_case_count: int = 0
     scenario_count: int = 0
     plan_count: int = 0
+    flow_count: int = 0
     run_count: int = 0
+    passed_execution_count: int = 0
+    failed_execution_count: int = 0
     pass_rate: int = 0
+    api_execution_coverage_rate: int = 0
+    api_success_coverage_rate: int = 0
+    # Compatibility aliases. New clients should use the explicit API coverage names above.
     coverage_rate: int = 0
     automation_rate: int = 0
+    open_defect_count: int = 0
+    total_defect_count: int = 0
+    # Compatibility alias for total_defect_count.
     defect_count: int = 0
     last_run_at: datetime | None = None
     last_execution_status: str | None = None
     risk_score: int = 0
+    risk_level: Literal["low", "medium", "high"] = "low"
     ai_recommendations: list[str] = Field(default_factory=list)
     team_activity: list[str] = Field(default_factory=list)
+    recommendations: list["ProjectRecommendationRead"] = Field(default_factory=list)
+    activities: list["ProjectActivityRead"] = Field(default_factory=list)
+
+
+class ProjectRecommendationRead(BaseModel):
+    id: str
+    type: Literal["coverage", "failure", "defect", "automation"]
+    title: str
+    description: str
+    severity: Literal["low", "medium", "high"]
+    action_type: str | None = None
+    action_target_id: int | None = None
+
+
+class ProjectActivityRead(BaseModel):
+    id: str
+    type: Literal[
+        "project_updated",
+        "case_created",
+        "case_executed",
+        "scenario_executed",
+        "plan_executed",
+        "flow_executed",
+        "defect_created",
+    ]
+    title: str
+    description: str | None = None
+    operator_id: int | None = None
+    operator_name: str | None = None
+    resource_type: str | None = None
+    resource_id: int | None = None
+    resource_name: str | None = None
+    occurred_at: datetime
+
+
+class ProjectTestingCountsRead(BaseModel):
+    http_test_cases: int = 0
+    websocket_test_cases: int = 0
+    system_test_cases: int = 0
+    api_test_cases: int = 0
+    scenarios: int = 0
+    plans: int = 0
+    flows: int = 0
+    total_executions: int = 0
+    passed_executions: int = 0
+    failed_executions: int = 0
+    open_defects: int = 0
+    total_defects: int = 0
+
+
+class ProjectTestingQualityRead(BaseModel):
+    pass_rate: int = 0
+    api_execution_coverage_rate: int = 0
+    api_success_coverage_rate: int = 0
+    risk_score: int = 0
+    risk_level: Literal["low", "medium", "high"] = "low"
+
+
+class ProjectLatestExecutionRead(BaseModel):
+    id: int
+    resource_type: Literal["http_case", "websocket_case", "scenario", "plan", "flow"]
+    resource_id: int | None = None
+    resource_name: str
+    status: str
+    executed_at: datetime
+
+
+class ProjectTestingOverviewRead(BaseModel):
+    project_id: int
+    generated_at: datetime
+    counts: ProjectTestingCountsRead
+    quality: ProjectTestingQualityRead
+    latest_execution: ProjectLatestExecutionRead | None = None
+    recommendations: list[ProjectRecommendationRead] = Field(default_factory=list)
+    activities: list[ProjectActivityRead] = Field(default_factory=list)
 
 
 class ProjectRead(BaseModel):
@@ -75,6 +162,10 @@ class ProjectMemberGrantRequest(BaseModel):
     permission_codes: set[str] = Field(default_factory=set, description="授予的项目内功能权限编码")
 
 
+class ProjectMemberUpdateRequest(BaseModel):
+    permission_codes: set[str] = Field(default_factory=set, description="Complete replacement permission set")
+
+
 class ProjectMemberRead(BaseModel):
     id: int
     project_id: int
@@ -85,6 +176,24 @@ class ProjectMemberRead(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class ProjectMemberDetailRead(BaseModel):
+    # Member-management routes are keyed by user_id, so id is the stable user identity.
+    id: int
+    membership_id: int | None = None
+    project_id: int
+    user_id: int
+    username: str
+    display_name: str
+    avatar_url: str | None = None
+    role: Literal["owner", "tester", "viewer"]
+    permission_codes: list[str] = Field(default_factory=list)
+    is_active: bool
+    added_by_id: int
+    added_by_name: str
+    created_at: datetime
+    updated_at: datetime
 
 
 class ProjectEnvironmentCreateRequest(BaseModel):

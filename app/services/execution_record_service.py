@@ -397,3 +397,60 @@ class ExecutionRecordService:
             for node in self.repository.list_flow_nodes(execution.id)
         ]
         return ExecutionRecordDetail(summary=summary, detail=detail)
+
+    def _get_ui_detail(self, *, project_id: int, execution_id: int):
+        row = self.repository.get_ui(project_id=project_id, execution_id=execution_id)
+        if row is None:
+            return None
+        execution, resource_name = row
+        summary = self._summary({
+            "execution_type": "ui",
+            "execution_id": execution.id,
+            "project_id": execution.project_id,
+            "resource_id": execution.ui_test_case_id,
+            "resource_name": resource_name,
+            "environment_id": execution.environment_id,
+            "scenario_run_id": None,
+            "status": execution.status,
+            "scenario_trigger": execution.trigger_type,
+            "trigger_user_id": execution.trigger_user_id,
+            "duration_ms": execution.duration_ms,
+            "error_message": execution.error_message,
+            "started_at": execution.started_at or execution.created_at,
+            "finished_at": execution.finished_at,
+            "created_at": execution.created_at,
+        })
+        detail = self._column_values(execution)
+        detail["status"] = public_execution_status(detail.get("status"))
+        detail["steps"] = [
+            self._column_values(item)
+            for item in sorted(
+                execution.step_executions,
+                key=lambda row: (row.step_index, row.attempt, row.id),
+            )
+        ]
+        detail["runtime_patches"] = [
+            self._column_values(item)
+            for item in sorted(execution.runtime_patches, key=lambda row: row.id)
+        ]
+        detail["commands"] = [
+            self._column_values(item)
+            for item in sorted(execution.commands, key=lambda row: row.id)
+        ]
+        detail["artifacts"] = [
+            {
+                "artifact_ref": item.artifact_ref,
+                "step_id": item.step_id,
+                "section": item.section,
+                "content_type": item.content_type,
+                "size_bytes": item.raw_size_bytes,
+                "sha256": item.sha256,
+                "metadata": item.metadata_json or {},
+                "created_at": item.created_at,
+            }
+            for item in self.repository.list_ui_artifacts(
+                project_id=project_id,
+                execution_id=execution_id,
+            )
+        ]
+        return ExecutionRecordDetail(summary=summary, detail=detail)

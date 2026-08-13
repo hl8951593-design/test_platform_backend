@@ -3,6 +3,7 @@ from sqlalchemy import insert, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.permissions import ProjectPermission
+from app.core.sensitive_data import redact_sensitive_data
 from app.models.browser_capture import BrowserCapture, BrowserCaptureEntry
 from app.models.project import ProjectEnvironment
 from app.models.user import User
@@ -112,7 +113,7 @@ class BrowserCaptureService:
         )).all()}
         new_values = []
         for entry_payload in payload.entries:
-            values = entry_payload.model_dump()
+            values = redact_sensitive_data(entry_payload.model_dump())
             entry = existing.get(entry_payload.client_entry_id)
             if entry is None:
                 new_values.append({
@@ -136,13 +137,23 @@ class BrowserCaptureService:
 
     def update_entry(self, *, project_id: int, capture_id: int, entry_id: int, payload: BrowserCaptureEntryUpdateRequest, current_user: User):
         entry = self.get_entry(project_id=project_id, capture_id=capture_id, entry_id=entry_id, current_user=current_user, manage=True)
-        for key, value in payload.model_dump(exclude_unset=True).items():
+        for key, value in redact_sensitive_data(payload.model_dump(exclude_unset=True)).items():
             setattr(entry, key, value)
         self.db.commit()
         self.db.refresh(entry)
         return entry
 
     def import_entries(self, *, project_id: int, capture_id: int, payload: BrowserCaptureImportRequest, current_user: User):
+        if payload.create_environment_variables:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="create_environment_variables 尚未实现，不能静默忽略",
+            )
+        if payload.scenario_draft_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="scenario_draft_id 尚未接入导入流程，不能静默忽略",
+            )
         self._require_import(project_id, current_user)
         self.permission_service.require_project_permission(
             current_user, project_id, ProjectPermission.MANAGE_CASE.value

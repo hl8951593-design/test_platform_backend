@@ -11,7 +11,8 @@ http://127.0.0.1:8000/api/v1
 - 执行中心接口是页面聚合读模型，复用统一执行记录、场景运行事件和当前执行工作池配置。
 - 不新增执行总表，不复制历史执行数据，不改变 HTTP、WebSocket、场景和 Flow 的执行链路。
 - 查询权限为项目 `report:view`；管理员和项目创建者自动具备该权限。
-- 当前后端没有独立持久化业务 Worker heartbeat 表，`/workers` 的 Worker 总数来自执行工作池配置，忙碌状态由运行中/重试中执行记录派生。
+- `/workers` 同时投影服务端执行工作池和项目绑定的真实 Desktop 设备。服务端 Worker 由工作池配置/活动记录派生；Desktop 在线状态优先读取 Redis presence，Redis 不可用时回退 MySQL heartbeat 时间。
+- Desktop 活动执行按本页全部设备一次批量读取；队列中的 UI worker public ID 由统一执行投影直接提供，不按设备或队列项追加查询。
 - 重试、停止、暂停和恢复等控制类接口需要可靠调度器/持久化队列承接，当前文档只声明已实现的读接口。
 
 ## 执行中心总览
@@ -110,7 +111,7 @@ http://127.0.0.1:8000/api/v1
 | 接口 | `/execution-center/workers?project_id={project_id}` |
 | 方法 | `GET` |
 | 权限 | `report:view` |
-| 说明 | 返回当前执行工作池派生的 Worker 视图 |
+| 说明 | 返回服务端工作池与项目 Desktop 设备的统一 Worker 视图 |
 
 Worker 状态：
 
@@ -118,6 +119,9 @@ Worker 状态：
 | --- | --- |
 | `idle` | 空闲 |
 | `busy` | 忙碌 |
+| `offline` | Desktop 心跳超过离线阈值 |
+
+每项返回 `worker_kind=server|desktop`、`online` 和可选 `device_id`。Desktop 忙碌任务从 `ui_executions.assigned_device_id` 及活动状态派生，`current_job_id` 使用统一 `ui:{internal_id}`；capabilities 包含 `ui` 和设备上报的浏览器渠道。overview 的 `worker_total/worker_online/worker_health_rate` 同样计入项目 Desktop 设备。
 
 ## 实时日志
 
@@ -127,6 +131,8 @@ Worker 状态：
 | 方法 | `GET` |
 | 权限 | `report:view` |
 | 说明 | 当前读取场景运行事件表，使用事件表主键作为全局递增 `sequence` |
+
+日志查询只读取事件字段及 run ID/时间，不加载 `scenario_snapshot`、`variables_snapshot` 或 `step_results`；消息、游标、排序和 worker 映射契约不变。
 
 响应字段：
 

@@ -77,6 +77,7 @@ flowchart TD
     P -->|"condition"| T["受限表达式计算 variables / steps"]
     P -->|"random / fixed_value"| T1["生成类型化值并写入 output 变量"]
     P -->|"script"| T2["受限子进程执行声明的 inputs / outputs"]
+    P -->|"database_query / database_execute"| T3["解析当前环境连接<br/>执行参数化 SQL 或结构化 MongoDB 操作"]
 
     Q --> U["最终成功后提取响应变量"]
     R --> U
@@ -84,6 +85,7 @@ flowchart TD
     T --> U
     T1 --> U
     T2 --> U
+    T3 --> U
     U --> V["保存 request/session、response、assertions、extractions"]
     V --> W{"步骤通过?"}
 

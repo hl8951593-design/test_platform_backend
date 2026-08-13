@@ -1,6 +1,7 @@
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
-from sqlalchemy import case, func, literal, select, union_all
+from fastapi import HTTPException, status
+from sqlalchemy import case, func, literal, or_, select, union_all
 from sqlalchemy.orm import Session
 
 from app.models.defect import Defect
@@ -8,9 +9,13 @@ from app.models.scenario import TestScenario, TestScenarioRun
 from app.models.test_case import TestCase, TestCaseExecution
 from app.models.test_plan import TestPlan, TestPlanRun
 from app.models.user import User
+from app.models.visual_flow import VisualFlow, VisualFlowExecution
 from app.models.websocket_test_case import WebSocketTestCase, WebSocketTestCaseExecution
 from app.schemas.dashboard import (
     DashboardAIRecommendation,
+    DashboardAction,
+    DashboardActivityFeedItem,
+    DashboardActivityFeedResponse,
     DashboardActivityItem,
     DashboardAutomationEfficiencyItem,
     DashboardDefectPrediction,
@@ -19,6 +24,10 @@ from app.schemas.dashboard import (
     DashboardHero,
     DashboardKPI,
     DashboardKPIBreakdown,
+    DashboardInsightDetailResponse,
+    DashboardInsightItem,
+    DashboardInsightMetric,
+    DashboardInsightSummary,
     DashboardRiskMatrixItem,
     DashboardScope,
     QualityOverview,
@@ -139,6 +148,8 @@ class DashboardService:
                 failed_count=failed_count,
                 open_defect_count=open_defect_count,
                 pass_rate=pass_rate,
+                execution_rows=activity_rows,
+                open_defects=recent_open_defects,
             ),
             activity_feed=self._activity_feed(execution_rows=activity_rows, open_defects=recent_open_defects),
         )
@@ -172,6 +183,11 @@ class DashboardService:
                 TestPlanRun.project_id == project_id,
                 TestPlanRun.is_deleted.is_(False),
                 self._env_filter(TestPlanRun, environment_id),
+            ),
+            self._max_time_select(
+                VisualFlowExecution.started_at,
+                VisualFlowExecution.project_id == project_id,
+                self._env_filter(VisualFlowExecution, environment_id),
             ),
             self._max_time_select(Defect.updated_at, Defect.project_id == project_id),
         ]
@@ -258,6 +274,7 @@ class DashboardService:
                 environment_id=environment_id,
                 started_from=started_from,
                 started_to=started_to,
+                extra_filters=[TestCaseExecution.scenario_run_id.is_(None)],
             ),
             self._status_source_select(
                 WebSocketTestCaseExecution,
@@ -267,6 +284,7 @@ class DashboardService:
                 environment_id=environment_id,
                 started_from=started_from,
                 started_to=started_to,
+                extra_filters=[WebSocketTestCaseExecution.scenario_run_id.is_(None)],
             ),
             self._status_source_select(
                 TestScenarioRun,
@@ -276,6 +294,7 @@ class DashboardService:
                 environment_id=environment_id,
                 started_from=started_from,
                 started_to=started_to,
+                extra_filters=[TestScenarioRun.plan_run_id.is_(None)],
             ),
             self._status_source_select(
                 TestPlanRun,
@@ -286,6 +305,15 @@ class DashboardService:
                 started_from=started_from,
                 started_to=started_to,
                 extra_filters=[TestPlanRun.is_deleted.is_(False)],
+            ),
+            self._status_source_select(
+                VisualFlowExecution,
+                VisualFlowExecution.status,
+                VisualFlowExecution.started_at,
+                project_id=project_id,
+                environment_id=environment_id,
+                started_from=started_from,
+                started_to=started_to,
             ),
         ]
         statuses = union_all(*status_sources).subquery()
@@ -378,7 +406,87 @@ class DashboardService:
         environment_id: int | None,
         started_from: datetime,
         started_to: datetime,
+        limit: int = 8,
     ) -> list[dict]:
+        activity = union_all(
+            *self._activity_sources(
+                project_id=project_id,
+                environment_id=environment_id,
+                started_from=started_from,
+                started_to=started_to,
+                include_defects=False,
+            )
+        ).subquery()
+        rows = self.db.execute(
+            select(activity).order_by(activity.c.occurred_at.desc(), activity.c.row_id.desc()).limit(limit)
+        ).all()
+        return [self._activity_row_from_union(row._mapping) for row in rows]
+
+    def activity_feed(
+        self,
+        *,
+        project_id: int,
+        current_user: User,
+        environment_id: int | None = None,
+        resource_type: str | None = None,
+        status_value: str | None = None,
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> DashboardActivityFeedResponse:
+        self.permission_service.require_project_access(current_user, project_id)
+        started_to = date_to or datetime.now()
+        started_from = date_from or (started_to - timedelta(days=29))
+        if started_to < started_from:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="date_to 不能早于 date_from",
+            )
+        activity = union_all(
+            *self._activity_sources(
+                project_id=project_id,
+                environment_id=environment_id,
+                started_from=started_from,
+                started_to=started_to,
+                include_defects=True,
+            )
+        ).subquery()
+        statement = select(activity)
+        raw_type = self._raw_activity_type(resource_type)
+        if raw_type == "__execution__":
+            statement = statement.where(activity.c.type != "defect")
+        elif raw_type == "__none__":
+            statement = statement.where(literal(False))
+        elif raw_type is not None:
+            statement = statement.where(activity.c.type == raw_type)
+        if status_value:
+            normalized_statuses = self._raw_activity_statuses(status_value)
+            statement = statement.where(func.lower(activity.c.status).in_(normalized_statuses))
+        filtered = statement.subquery()
+        total = int(self.db.scalar(select(func.count()).select_from(filtered)) or 0)
+        rows = self.db.execute(
+            select(filtered)
+            .order_by(filtered.c.occurred_at.desc(), filtered.c.row_id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        ).all()
+        return DashboardActivityFeedResponse(
+            page=page,
+            page_size=page_size,
+            total=total,
+            items=[self._public_activity_item(row._mapping) for row in rows],
+        )
+
+    def _activity_sources(
+        self,
+        *,
+        project_id: int,
+        environment_id: int | None,
+        started_from: datetime,
+        started_to: datetime,
+        include_defects: bool,
+    ) -> list:
         sources = [
             self._activity_source_select(
                 "http",
@@ -393,6 +501,7 @@ class DashboardService:
                 environment_id=environment_id,
                 started_from=started_from,
                 started_to=started_to,
+                extra_filters=[TestCaseExecution.scenario_run_id.is_(None)],
             ),
             self._activity_source_select(
                 "websocket",
@@ -407,6 +516,7 @@ class DashboardService:
                 environment_id=environment_id,
                 started_from=started_from,
                 started_to=started_to,
+                extra_filters=[WebSocketTestCaseExecution.scenario_run_id.is_(None)],
             ),
             self._activity_source_select(
                 "scenario",
@@ -421,6 +531,7 @@ class DashboardService:
                 environment_id=environment_id,
                 started_from=started_from,
                 started_to=started_to,
+                extra_filters=[TestScenarioRun.plan_run_id.is_(None)],
             ),
             self._activity_source_select(
                 "plan",
@@ -437,12 +548,37 @@ class DashboardService:
                 started_to=started_to,
                 extra_filters=[TestPlanRun.is_deleted.is_(False)],
             ),
+            self._activity_source_select(
+                "flow",
+                VisualFlowExecution,
+                VisualFlowExecution.started_at,
+                ref_column=VisualFlowExecution.flow_id,
+                detail_column=literal(None),
+                name_column=VisualFlow.name,
+                join_target=VisualFlow,
+                join_condition=VisualFlow.id == VisualFlowExecution.flow_id,
+                project_id=project_id,
+                environment_id=environment_id,
+                started_from=started_from,
+                started_to=started_to,
+            ),
         ]
-        activity = union_all(*sources).subquery()
-        rows = self.db.execute(
-            select(activity).order_by(activity.c.occurred_at.desc()).limit(8)
-        ).all()
-        return [self._activity_row_from_union(row._mapping) for row in rows]
+        if include_defects:
+            sources.append(
+                self._activity_source_select(
+                    "defect",
+                    Defect,
+                    Defect.updated_at,
+                    ref_column=Defect.id,
+                    detail_column=literal(None),
+                    name_column=Defect.title,
+                    project_id=project_id,
+                    environment_id=None,
+                    started_from=started_from,
+                    started_to=started_to,
+                )
+            )
+        return sources
 
     def _activity_source_select(
         self,
@@ -500,16 +636,280 @@ class DashboardService:
         elif source_type == "scenario":
             name = row["name"] or f"场景 {ref_id}"
             detail = f"场景执行状态：{self._activity_status_label(row['status'])}"
+        elif source_type == "flow":
+            name = row["name"] or f"Flow {ref_id}"
+            detail = f"Flow 执行状态：{self._activity_status_label(row['status'])}"
+        elif source_type == "defect":
+            name = row["name"] or f"缺陷 {ref_id}"
+            detail = f"缺陷状态：{row['status']}"
         else:
             name = row["name"] or f"计划 {ref_id}"
             detail = f"计划目标 {row['passed_count'] or 0}/{row['target_count'] or 0} 通过"
+        resource_type = self._resource_type(source_type)
+        is_failure = str(row["status"] or "").strip().lower() in self.FAILED_STATUSES
+        if source_type == "defect":
+            action = DashboardAction(
+                code="view_defect",
+                label="查看缺陷",
+                resource_type="defect",
+                resource_id=ref_id,
+            )
+            event_type = "defect.updated"
+            run_id = None
+            title = f"缺陷更新：{name}"
+        else:
+            action = DashboardAction(
+                code="view_failure_analysis" if is_failure else "view_execution",
+                label="查看失败分析" if is_failure else "查看执行详情",
+                resource_type="execution",
+                resource_id=row["row_id"],
+                params={"execution_type": source_type},
+            )
+            event_type = f"execution.{self._public_activity_status(row['status']) or 'unknown'}"
+            run_id = row["row_id"]
+            title = f"{name} 执行{self._activity_status_label(row['status'])}"
         return {
-            "type": source_type,
+            "id": f"activity-{source_type}-{row['row_id']}",
+            "event_type": event_type,
+            "type": resource_type,
+            "resource_id": ref_id,
+            "run_id": run_id,
             "name": name,
             "status": row["status"],
             "occurred_at": row["occurred_at"],
+            "title": title,
             "detail": detail,
+            "action": action,
         }
+
+    @staticmethod
+    def _resource_type(source_type: str) -> str:
+        return {
+            "http": "http_test_case",
+            "websocket": "websocket_test_case",
+            "scenario": "scenario",
+            "flow": "flow",
+            "plan": "test_plan",
+            "defect": "defect",
+        }[source_type]
+
+    @staticmethod
+    def _raw_activity_type(resource_type: str | None) -> str | None:
+        if resource_type is None:
+            return None
+        normalized = resource_type.strip().lower()
+        mapping = {
+            "http_test_case": "http",
+            "websocket_test_case": "websocket",
+            "scenario": "scenario",
+            "flow": "flow",
+            "test_plan": "plan",
+            "defect": "defect",
+            "execution": "__execution__",
+            "system_test_case": "__none__",
+        }
+        if normalized not in mapping:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="不支持的 resource_type",
+            )
+        return mapping[normalized]
+
+    def _public_activity_item(self, row) -> DashboardActivityFeedItem:
+        mapped = self._activity_row_from_union(row)
+        return DashboardActivityFeedItem(
+            id=mapped["id"],
+            event_type=mapped["event_type"],
+            occurred_at=mapped["occurred_at"],
+            resource_type=mapped["type"],
+            resource_id=mapped["resource_id"],
+            resource_name=mapped["name"],
+            run_id=mapped["run_id"],
+            status=(None if mapped["type"] == "defect" else self._public_activity_status(mapped["status"])),
+            title=mapped["title"],
+            detail=mapped["detail"],
+            action=mapped["action"],
+        )
+
+    @staticmethod
+    def _public_activity_status(value: str | None) -> str | None:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"passed", "success", "completed"}:
+            return "passed"
+        if normalized in {"failed", "failure", "error"}:
+            return "failed"
+        if normalized in {"queued", "pending"}:
+            return "queued"
+        if normalized in {"running", "cancelled", "timeout"}:
+            return normalized
+        return None
+
+    @staticmethod
+    def _raw_activity_statuses(value: str) -> tuple[str, ...]:
+        normalized = value.strip().lower()
+        mapping = {
+            "queued": ("queued", "pending"),
+            "running": ("running",),
+            "passed": ("passed", "success", "completed"),
+            "failed": ("failed", "failure", "error"),
+            "cancelled": ("cancelled",),
+            "timeout": ("timeout",),
+        }
+        if normalized not in mapping:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="不支持的 status",
+            )
+        return mapping[normalized]
+
+    def insight_detail(
+        self,
+        *,
+        insight_type: str,
+        project_id: int,
+        current_user: User,
+        environment_id: int | None,
+        range_value: str,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> DashboardInsightDetailResponse:
+        allowed = {
+            "risk-analysis",
+            "automation-efficiency",
+            "health-profile",
+            "defect-prediction",
+        }
+        if insight_type not in allowed:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="洞察类型不存在")
+        overview = self.quality_overview(
+            project_id=project_id,
+            current_user=current_user,
+            environment_id=environment_id,
+            range_value=range_value,
+            version=None,
+        )
+        generated_at = datetime.now()
+        if insight_type == "defect-prediction":
+            return DashboardInsightDetailResponse(
+                insight_type="defect-prediction",
+                available=False,
+                generated_at=generated_at,
+                summary=DashboardInsightSummary(
+                    title="缺陷预测暂不可用",
+                    description="当前系统尚未部署经过历史数据校准和效果验证的缺陷预测模型。",
+                ),
+            )
+
+        if insight_type == "health-profile":
+            dimensions = overview.health_profile.dimensions
+            return DashboardInsightDetailResponse(
+                insight_type="health-profile",
+                available=True,
+                generated_at=generated_at,
+                summary=DashboardInsightSummary(
+                    title="质量健康画像",
+                    description="基于当前筛选范围内的执行、缺陷与自动化资产事实计算。",
+                    score=overview.health_profile.score,
+                    level=self._score_level(overview.health_profile.score),
+                ),
+                metrics=[
+                    DashboardInsightMetric(
+                        key=f"health_{index}",
+                        label=dimension.label,
+                        value=dimension.value,
+                        unit="percent",
+                    )
+                    for index, dimension in enumerate(dimensions, start=1)
+                ],
+            )
+
+        if insight_type == "automation-efficiency":
+            items = overview.automation_efficiency
+            average = round(sum(item.percent for item in items) / len(items), 2) if items else 0.0
+            return DashboardInsightDetailResponse(
+                insight_type="automation-efficiency",
+                available=True,
+                generated_at=generated_at,
+                summary=DashboardInsightSummary(
+                    title="自动化效率",
+                    description="覆盖率只使用已保存的接口用例与场景编排资产计算。",
+                    score=average,
+                    level=self._score_level(average),
+                ),
+                metrics=[
+                    DashboardInsightMetric(
+                        key=f"automation_{index}",
+                        label=item.label,
+                        value=item.percent,
+                        unit="percent",
+                    )
+                    for index, item in enumerate(items, start=1)
+                ],
+            )
+
+        range_start = self._range_start(reference_time=generated_at, range_value=range_value)
+        activity = union_all(
+            *self._activity_sources(
+                project_id=project_id,
+                environment_id=environment_id,
+                started_from=range_start,
+                started_to=generated_at,
+                include_defects=True,
+            )
+        ).subquery()
+        risk_condition = or_(
+            activity.c.type == "defect",
+            func.lower(activity.c.status).in_(tuple(self.FAILED_STATUSES)),
+        )
+        high_count = int(
+            self.db.scalar(select(func.count()).select_from(activity).where(risk_condition)) or 0
+        )
+        risk_rows = self.db.execute(
+            select(activity)
+            .where(risk_condition)
+            .order_by(activity.c.occurred_at.desc(), activity.c.row_id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        ).all()
+        paged = [self._public_activity_item(row._mapping) for row in risk_rows]
+        score = max(0.0, 100.0 - high_count * 8)
+        return DashboardInsightDetailResponse(
+            insight_type="risk-analysis",
+            available=True,
+            generated_at=generated_at,
+            summary=DashboardInsightSummary(
+                title="质量风险明细",
+                description="风险项来自失败执行和当前缺陷，不包含推测性事件。",
+                score=score,
+                level="high" if high_count >= 5 else "medium" if high_count else "low",
+            ),
+            metrics=[
+                DashboardInsightMetric(key="risk_count", label="风险项", value=high_count),
+            ],
+            items=[
+                DashboardInsightItem(
+                    id=item.id,
+                    title=item.title,
+                    description=item.detail,
+                    level="high" if item.resource_type == "defect" else "medium",
+                    resource_type=item.resource_type,
+                    resource_id=item.resource_id,
+                    action=item.action,
+                )
+                for item in paged
+            ],
+            page=page,
+            page_size=page_size,
+            total=high_count,
+        )
+
+    @staticmethod
+    def _score_level(score: float) -> str:
+        if score < 60:
+            return "high"
+        if score < 80:
+            return "medium"
+        return "low"
 
     def _execution_rows(
         self,
@@ -691,8 +1091,8 @@ class DashboardService:
         total_cases = http_total + websocket_total
         scenario_percent = self._automation_percent(http_total, websocket_total, scenario_total)
         return [
-            DashboardAutomationEfficiencyItem(label="接口自动化", percent=100 if total_cases else 0, saved_hours=total_cases * 2),
-            DashboardAutomationEfficiencyItem(label="场景编排", percent=scenario_percent, saved_hours=scenario_total * 4),
+            DashboardAutomationEfficiencyItem(label="接口自动化", percent=100 if total_cases else 0, saved_hours=0),
+            DashboardAutomationEfficiencyItem(label="场景编排", percent=scenario_percent, saved_hours=0),
         ]
 
     def _automation_percent(self, http_total: int, websocket_total: int, scenario_total: int) -> int:
@@ -702,59 +1102,97 @@ class DashboardService:
         return min(100, int(round(scenario_total * 100 / total_cases)))
 
     def _defect_predictions(self, *, open_defect_count: int, failed_count: int) -> list[DashboardDefectPrediction]:
-        probability = min(95, failed_count * 20 + open_defect_count * 12)
-        impact = "high" if probability >= 70 else "medium" if probability >= 30 else "low"
-        reason = "失败执行和未关闭缺陷集中在当前范围内" if probability else "当前暂无明显缺陷风险"
-        return [DashboardDefectPrediction(module="企业核心链路", probability=probability, impact=impact, reason=reason)]
+        # No calibrated prediction model is currently available. Returning no
+        # prediction is more honest than presenting a hand-written coefficient
+        # as a probability.
+        return []
 
-    def _ai_recommendations(self, *, failed_count: int, open_defect_count: int, pass_rate: float) -> list[DashboardAIRecommendation]:
+    def _ai_recommendations(
+        self,
+        *,
+        failed_count: int,
+        open_defect_count: int,
+        pass_rate: float,
+        execution_rows: list[dict],
+        open_defects: list[Defect],
+    ) -> list[DashboardAIRecommendation]:
         if failed_count:
+            failed_row = next(
+                (
+                    row for row in execution_rows
+                    if str(row.get("status") or "").strip().lower() in self.FAILED_STATUSES
+                ),
+                None,
+            )
             return [
                 DashboardAIRecommendation(
+                    id="quality-failed-executions",
+                    type="failure_analysis",
                     priority="P0",
                     title="优先处理失败链路",
                     summary=f"当前范围内有 {failed_count} 次失败执行，建议先查看失败聚类和最近运行快照。",
-                    action="查看失败分析",
+                    recommendation="从最近失败执行开始核对请求、响应、断言与环境快照，再决定是否发起定向回归。",
+                    confidence_score=95,
+                    risk_level="high",
+                    action=failed_row.get("action") if failed_row else None,
                 )
             ]
         if open_defect_count:
+            defect = open_defects[0] if open_defects else None
             return [
                 DashboardAIRecommendation(
+                    id="quality-open-defects",
+                    type="defect_follow_up",
                     priority="P1",
                     title="推进缺陷关闭",
                     summary=f"当前仍有 {open_defect_count} 个待处理缺陷。",
-                    action="查看缺陷",
+                    recommendation="优先核对高紧急度缺陷的最新状态与关联执行证据。",
+                    confidence_score=100,
+                    risk_level="medium",
+                    action=(
+                        DashboardAction(
+                            code="view_defect",
+                            label="查看缺陷",
+                            resource_type="defect",
+                            resource_id=defect.id,
+                        )
+                        if defect else None
+                    ),
                 )
             ]
         return [
             DashboardAIRecommendation(
+                id="quality-stable-regression",
+                type="regression",
                 priority="P2",
                 title="保持稳定回归",
                 summary=f"当前通过率 {pass_rate}%，建议继续维持核心场景每日回归。",
-                action="查看报告",
+                recommendation="保持现有回归节奏，并在资产或环境变化后执行增量回归。",
+                confidence_score=90,
+                risk_level="low",
+                action=None,
             )
         ]
 
     def _activity_feed(self, *, execution_rows: list[dict], open_defects: list[Defect]) -> list[DashboardActivityItem]:
-        items = [
-            DashboardActivityItem(
-                occurred_at=row["occurred_at"] or datetime.now(),
-                type=row["type"],
-                name=row["name"],
-                status=row["status"],
-                title=f"{row['name']} 执行{self._activity_status_label(row['status'])}",
-                detail=row["detail"],
-            )
-            for row in execution_rows[:5]
-        ]
+        items = [DashboardActivityItem(**row) for row in execution_rows[:5]]
         items.extend([
             DashboardActivityItem(
+                id=f"activity-defect-{defect.id}",
                 occurred_at=defect.updated_at or defect.created_at,
+                event_type="defect.updated",
                 type="defect",
+                resource_id=defect.id,
                 name=defect.title,
                 status=defect.status,
                 title=f"缺陷待处理：{defect.title}",
                 detail=f"状态 {defect.status}，紧急程度 {defect.urgency}",
+                action=DashboardAction(
+                    code="view_defect",
+                    label="查看缺陷",
+                    resource_type="defect",
+                    resource_id=defect.id,
+                ),
             )
             for defect in open_defects[:3]
         ])

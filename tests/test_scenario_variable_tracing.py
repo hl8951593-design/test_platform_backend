@@ -143,7 +143,7 @@ class ScenarioVariableTracingTests(unittest.TestCase):
             assertion_results=[],
             error_message="Execution failed",
         )
-        self.db.get.return_value = execution
+        self.db.scalars.return_value.all.return_value = [execution]
 
         results = self.service._hydrate_step_result_snapshots(
             run, run.step_results
@@ -158,6 +158,7 @@ class ScenarioVariableTracingTests(unittest.TestCase):
             results[0]["assertion_results"],
             [{"name": "业务断言", "status": "failed"}],
         )
+        self.db.scalars.assert_called_once()
 
     def test_resolved_binding_is_the_final_request_value(self):
         self.variables["companyId"] = 9527
@@ -301,6 +302,61 @@ class ScenarioVariableTracingTests(unittest.TestCase):
         )
         self.assertEqual(snapshot["sessionValue"], "***")
 
+    def test_http_step_extracts_from_runtime_response_without_persisting_secret(self):
+        step = self.api_step(
+            "STEP-1",
+            "Login",
+            {
+                "_scenario_context": {
+                    "extractions": [{
+                        "id": "VAR-TOKEN",
+                        "name": "access_token",
+                        "path": "data.access_token",
+                        "masked": True,
+                    }]
+                }
+            },
+        )
+        stored_response = {"json": {"data": {"access_token": "***"}}}
+        execution = SimpleNamespace(
+            id=304,
+            status="passed",
+            request_snapshot={"method": "POST", "url": "https://api.example.com/login"},
+            response_snapshot=stored_response,
+            assertion_results=[],
+            attempt_history=[],
+            error_message=None,
+        )
+
+        def execute(**kwargs):
+            kwargs["runtime_response_sink"]["response_snapshot"] = {
+                "json": {"data": {"access_token": "real-secret"}}
+            }
+            return execution
+
+        with patch(
+            "app.services.scenario_service.TestCaseService._execute",
+            side_effect=execute,
+        ):
+            result = self.service._execute_step(
+                project_id=1,
+                environment_id=2,
+                step=step,
+                step_index=1,
+                variables=self.variables,
+                previous_results=[],
+                current_user=self.user,
+                scenario_run_id=9,
+                deadline=None,
+                variable_sources=self.variable_sources,
+            )
+
+        self.assertEqual(self.variables["access_token"], "real-secret")
+        self.assertEqual(result["extracted_variables"][0]["value"], "***")
+        self.assertEqual(result["output"], stored_response)
+        self.assertEqual(result["response_snapshot"], stored_response)
+        self.assertEqual(self.variables["step_1"], stored_response)
+
     def test_failed_extraction_is_returned_with_error(self):
         step = self.api_step(
             "STEP-1",
@@ -358,6 +414,133 @@ class ScenarioVariableTracingTests(unittest.TestCase):
         self.assertTrue(first_id.startswith("BIND-AUTO-"))
         self.assertEqual(bindings[0]["source_step_id"], "STEP-1")
         self.assertEqual(bindings[0]["source_extraction_id"], "VAR-1")
+
+    def test_trace_metadata_discovers_template_from_saved_case_snapshot(self):
+        source = self.api_step(
+            "STEP-1",
+            "Create company",
+            {
+                "_scenario_context": {
+                    "extractions": [{
+                        "id": "VAR-1",
+                        "name": "companyId",
+                        "path": "data.id",
+                    }]
+                }
+            },
+        )
+        target = self.api_step("STEP-2", "Get company detail", {})
+        target["case_snapshot"]["path"] = "/companies/{{companyId}}"
+
+        self.service._ensure_trace_metadata([source, target])
+
+        bindings = target["config"]["_scenario_context"]["bindings"]
+        self.assertEqual(len(bindings), 1)
+        self.assertEqual(bindings[0]["name"], "companyId")
+        self.assertEqual(bindings[0]["source_step_id"], "STEP-1")
+        self.assertEqual(bindings[0]["target"], "path")
+        self.assertEqual(bindings[0]["target_path"], "")
+
+    def test_definition_trace_metadata_is_persisted_on_scenario_nodes(self):
+        source = self.api_step(
+            "STEP-1",
+            "Create company",
+            {
+                "_scenario_context": {
+                    "extractions": [{
+                        "id": "VAR-1",
+                        "name": "companyId",
+                        "path": "data.id",
+                    }]
+                }
+            },
+        )
+        target = self.api_step("STEP-2", "Get company detail", {})
+        target["case_snapshot"]["path"] = "/companies/{{companyId}}"
+        definition = {
+            "nodes": [
+                {
+                    "id": "NODE-1",
+                    "before_actions": [],
+                    "test_case": source,
+                    "after_actions": [],
+                },
+                {
+                    "id": "NODE-2",
+                    "before_actions": [],
+                    "test_case": target,
+                    "after_actions": [],
+                },
+            ],
+            "datasets": [],
+        }
+
+        self.service._ensure_definition_trace_metadata(definition)
+
+        stored_bindings = definition["nodes"][1]["test_case"]["config"][
+            "_scenario_context"
+        ]["bindings"]
+        self.assertEqual(len(stored_bindings), 1)
+        self.assertEqual(stored_bindings[0]["name"], "companyId")
+
+    def test_saved_case_snapshot_binding_records_the_final_request_value(self):
+        self.variables["companyId"] = 9527
+        self.variable_sources["companyId"] = {
+            "source_step_id": "STEP-1",
+            "source_extraction_id": "VAR-1",
+            "masked": False,
+        }
+        source = self.api_step(
+            "STEP-1",
+            "Create company",
+            {
+                "_scenario_context": {
+                    "extractions": [{
+                        "id": "VAR-1",
+                        "name": "companyId",
+                        "path": "data.id",
+                    }]
+                }
+            },
+        )
+        target = self.api_step("STEP-2", "Get company detail", {})
+        target["case_snapshot"]["path"] = "/companies/{{companyId}}"
+        self.service._ensure_trace_metadata([source, target])
+        captured = {}
+
+        def execute(**kwargs):
+            captured["path"] = kwargs["payload"].path
+            return SimpleNamespace(
+                id=305,
+                status="passed",
+                response_snapshot={"json": {"ok": True}},
+                assertion_results=[],
+                attempt_history=[],
+                error_message=None,
+            )
+
+        with patch(
+            "app.services.scenario_service.TestCaseService._execute",
+            side_effect=execute,
+        ):
+            result = self.service._execute_step(
+                project_id=1,
+                environment_id=2,
+                step=target,
+                step_index=2,
+                variables=self.variables,
+                previous_results=[],
+                current_user=self.user,
+                scenario_run_id=9,
+                deadline=None,
+                variable_sources=self.variable_sources,
+            )
+
+        self.assertEqual(captured["path"], "/companies/9527")
+        self.assertEqual(
+            result["resolved_bindings"][0]["value"], "/companies/9527"
+        )
+        self.assertEqual(result["resolved_bindings"][0]["target"], "path")
 
 
 if __name__ == "__main__":

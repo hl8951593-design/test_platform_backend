@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 
 from app.core.config import settings
 from app.core.logging import reset_request_id, set_request_id
+from app.core.sensitive_data import redact_query_string
 
 
 logger = logging.getLogger("app.request")
@@ -42,7 +43,7 @@ def _log_request(request: Request, status_code: int, duration_ms: int) -> None:
         "request_completed method=%s path=%s query=%s status=%s duration_ms=%s client=%s",
         request.method,
         request.url.path,
-        str(request.url.query or ""),
+        redact_query_string(str(request.url.query or "")),
         status_code,
         duration_ms,
         request.client.host if request.client else "-",

@@ -2,7 +2,7 @@
 
 场景将 HTTP/WebSocket 基础用例、等待和条件步骤编排为可版本化的业务流程。基础路径为
 `/api/v1`，接口使用 Bearer Token。除 SSE 事件流外，成功响应统一使用
-`{code, message, data}`，包括 HTTP 202 异步启动响应。
+`{code, message, data}`，包括 HTTP `202 Accepted` 异步启动响应。
 
 ## 接口
 
@@ -10,14 +10,16 @@
 | --- | --- | --- | --- |
 | GET/POST | `/scenarios?project_id={id}` | `scenario:view` / `scenario:manage` | 分页查询、创建场景 |
 | GET/PUT/DELETE | `/scenarios/{scenario_id}?project_id={id}` | `scenario:view` / `scenario:manage` | 详情、更新、删除；被测试计划引用时拒绝删除 |
-| POST | `/scenarios/{scenario_id}/execute?project_id={id}` | `test:execute` | 异步启动场景，返回 HTTP 202 |
+| POST | `/scenarios/{scenario_id}/execute?project_id={id}` | `test:execute` | 异步启动场景，返回 HTTP `202 Accepted` |
 | GET | `/scenario-runs?project_id={id}&scenario_id={id}` | `scenario:view` | 分页查询运行，`page_size` 最大 200 |
 | GET/DELETE | `/scenario-runs/{run_id}?project_id={id}` | `scenario:view` / `scenario:manage` | 运行和步骤详情、删除调试记录 |
 | GET | `/scenario-runs/{run_id}/events?project_id={id}` | `scenario:view` | SSE 实时事件和历史重放 |
+| POST | `/scenarios/actions/database/execute-unsaved?project_id={id}` | `database:execute` | 调试未保存数据库动作；写操作另需 `database:write` |
 
 请求字段同时接受 snake_case 和文档注明的 camelCase 别名；响应统一使用 snake_case。
 列表响应结构为 `{items, total, page, page_size}`，`page_size` 最大为 200。
 场景列表、详情、创建和更新响应包含 `environment_id` 与 `environment_name`，前端可直接展示环境名称。
+场景列表在同一分页查询中关联当前版本和环境名称，返回的 `nodes/datasets`、排序和缺失版本错误语义不变；保存/更新校验会按项目批量读取 HTTP、WebSocket 用例和环境数据库连接，节点数增加不会再产生逐节点 SQL。
 
 ## 场景定义与版本
 
@@ -109,7 +111,8 @@
 
 `nodes[]` 是唯一编排结构。每个节点必须且只能包含一个 `test_case`，主用例仅允许
 `api_case` 或 `websocket_case`；`before_actions[]` 和 `after_actions[]` 允许
-`condition`、`delay`、`random`、`fixed_value`、`script`。后端拒绝旧的
+`condition`、`delay`、`random`、`fixed_value`、`script`、`database_query`、
+`database_execute`。后端拒绝旧的
 `steps`、`execution_phase`、`executionPhase` 和 `phase`。
 
 - 节点按数组顺序执行，节点内部固定为 `before_actions -> test_case -> after_actions`。
@@ -122,6 +125,11 @@
 `javascript`。脚本在独立受限子进程执行，只暴露声明的 `inputs`，只回收声明的 `outputs`，
 并限制语言、语法、超时、输入输出大小及子进程资源。随机和固定值使用 `config.output` 写入变量，
 脚本使用 `config.outputs`。
+
+数据库动作通过当前场景环境中的 `connection_id` 或稳定 `connection_key` 解析 MySQL、PostgreSQL
+或 MongoDB 连接；支持参数化查询/写入、数据库断言、结果取值和只读查询重试。连接密码不进入
+场景版本，写动作需要连接级 `allow_writes` 和独立权限。完整字段与安全限制见
+[数据库连接与场景数据库动作](api_database_connections.md)。
 
 ### 未保存脚本动作调试
 
@@ -275,8 +283,10 @@ value 也可以包含 `{{variable}}` 模板。
 
 ## 状态与审计
 
-execution 和场景运行状态包括 `queued`、`running`、`passed`、`failed`、`timeout`；
+execution 和场景运行状态包括 `queued`、`running`、`passed`、`failed`、`timeout`、`skipped`；
 步骤包括 `pending`、`running`、`passed`、`failed`、`timeout`、`skipped`。
+
+如果启用的数据集没有任何启用 record，父 execution 直接以 `skipped` 终止，不能计为通过。手工执行会在创建 execution 前预留工作池容量；队列已满返回 `503` 且不写入执行记录。
 关联链如下：
 
 ```text
@@ -318,7 +328,7 @@ record。运行详情中的最终请求仍按实际请求字段执行脱敏。
 
 ## 实时执行
 
-`POST /scenarios/{scenario_id}/execute?project_id={id}` 现在返回 HTTP `202`。
+`POST /scenarios/{scenario_id}/execute?project_id={id}` 现在返回 HTTP `202 Accepted`。
 响应不再等待场景执行结束，而是直接返回 `execution_id`、场景版本以及每个数据集
 record 对应的 `run_id`、`events_url` 和 `detail_url`。同一个 `idempotency_key` 会返回原
 execution 和 run，不会重复启动任务。
@@ -373,6 +383,10 @@ X-Accel-Buffering: no
 `GET /scenario-runs/{run_id}` 在执行期间仍可查询，并返回 `current_step_id`、
 `current_step_index`、`last_event_sequence` 以及包含 pending/running 状态的
 `step_results`。完整请求、响应、断言、变量提取和绑定信息仍以该详情接口为准。
+运行列表是轻量查询；启用归一化步骤存储时，列表项的 `step_results=[]` 只表示尚未读取完整
+步骤详情，不代表运行包含 0 个步骤；`variables_snapshot={}` 同理。列表 SQL 不读取
+`scenario_snapshot`、`variables_snapshot` 或 `step_results`，避免大型场景历史排序时把诊断大字段
+带入数据库 sort buffer。前端应在展开记录时请求详情接口后再展示步骤统计和变量。
 事件、详情和变量追踪字段分别见 [运行事件契约](scenario-run-events-contract.md)、
 [运行详情契约](scenario-run-detail-contract.md) 和
 [变量追踪契约](scenario-variable-tracing-contract.md)。

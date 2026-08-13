@@ -1,8 +1,11 @@
 from fastapi import APIRouter
 
-from app.api.v1.routers import agents, ai, auth, browser_captures, dashboard, defects, environment_configs, execution_center, execution_records, media, notifications, projects, scenarios, system_test_cases, test_cases, test_plans, test_reports, users, visual_flows, websocket_test_cases
+from app.api.v1.routers import agents, ai, auth, browser_captures, dashboard, database_connections, defects, desktop_devices, environment_configs, execution_center, execution_records, media, notifications, projects, scenarios, system_test_cases, test_cases, test_plans, test_reports, ui_executions, ui_test_cases, users, visual_flows, websocket_test_cases
 
 api_router = APIRouter()
+api_router.include_router(desktop_devices.router, prefix="/desktop", tags=["TestAuto Desktop"])
+api_router.include_router(ui_test_cases.router, prefix="/ui-test-cases", tags=["UI test cases"])
+api_router.include_router(ui_executions.router, prefix="/ui-executions", tags=["UI executions"])
 api_router.include_router(agents.router, prefix="/agents", tags=["AI Agents"])
 api_router.include_router(test_reports.router, prefix="/reports", tags=["Test reports"])
 api_router.include_router(execution_records.router, prefix="/execution-records", tags=["Execution records"])
@@ -17,6 +20,7 @@ api_router.include_router(websocket_test_cases.router, prefix="/websocket-test-c
 api_router.include_router(system_test_cases.router, tags=["系统测试用例"])
 api_router.include_router(ai.router, prefix="/ai", tags=["AI"])
 api_router.include_router(environment_configs.router, prefix="/environment-configs", tags=["环境配置"])
+api_router.include_router(database_connections.router, tags=["数据库连接"])
 api_router.include_router(auth.router, prefix="/auth", tags=["认证"])
 api_router.include_router(projects.router, prefix="/projects", tags=["项目权限"])
 api_router.include_router(test_cases.router, prefix="/test-cases", tags=["测试用例"])

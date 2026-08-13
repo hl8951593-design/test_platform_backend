@@ -1,26 +1,37 @@
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import app.models  # noqa: F401
-from app.api.v1.routers import environment_configs, projects
+from app.api.v1.routers import defects, environment_configs, projects
+from app.core.read_response_cache import read_response_cache
 from app.db.base import Base
 from app.models.defect import Defect
 from app.models.project import Project, ProjectEnvironment, ProjectEnvironmentVariable, ProjectMember
-from app.models.scenario import TestScenario
+from app.models.scenario import TestScenario, TestScenarioRun
+from app.models.system_test_case import SystemTestCase
 from app.models.test_case import TestCase, TestCaseExecution
-from app.models.test_plan import TestPlan
+from app.models.test_plan import TestPlan, TestPlanRun
 from app.models.user import User
+from app.models.visual_flow import VisualFlow
 from app.models.websocket_test_case import WebSocketTestCase
-from app.schemas.project import ProjectCreateRequest, ProjectEnvironmentCreateRequest
+from app.schemas.project import (
+    ProjectCreateRequest,
+    ProjectEnvironmentCreateRequest,
+    ProjectMemberGrantRequest,
+    ProjectMemberUpdateRequest,
+)
+from app.schemas.defect import DefectCreateRequest
 from app.repositories.project_repository import ProjectRepository
 from app.services.project_service import ProjectService
 
 
 class ProjectPageContractTests(unittest.TestCase):
     def setUp(self):
+        read_response_cache.clear_all()
         engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(engine)
         self.db = sessionmaker(bind=engine)()
@@ -134,6 +145,7 @@ class ProjectPageContractTests(unittest.TestCase):
 
     def tearDown(self):
         self.db.close()
+        read_response_cache.clear_all()
 
     def test_project_list_returns_members_and_stats_for_frontend_cards(self):
         response = projects.list_projects(db=self.db, current_user=self.owner)
@@ -175,6 +187,209 @@ class ProjectPageContractTests(unittest.TestCase):
 
         self.assertEqual(response["code"], 0)
         self.assertEqual(response["data"][0]["stats"]["api_case_count"], 2)
+
+    def test_project_list_refresh_bypasses_the_cached_stats_snapshot(self):
+        initial = projects.list_projects(db=self.db, current_user=self.owner)
+        self.assertEqual(initial["data"][0]["stats"]["api_case_count"], 2)
+
+        self.db.add(TestCase(
+            project_id=self.project.id,
+            environment_id=self.environment.id,
+            name="新接口",
+            method="GET",
+            path="/api/new",
+            body_type="json",
+            created_by_id=self.owner.id,
+        ))
+        self.db.commit()
+
+        cached = projects.list_projects(db=self.db, current_user=self.owner)
+        refreshed = projects.list_projects(refresh=True, db=self.db, current_user=self.owner)
+
+        self.assertEqual(cached["data"][0]["stats"]["api_case_count"], 2)
+        self.assertEqual(refreshed["data"][0]["stats"]["api_case_count"], 3)
+
+    def test_defect_mutation_invalidates_cached_project_aggregate(self):
+        initial = projects.list_projects(db=self.db, current_user=self.owner)
+        self.assertEqual(initial["data"][0]["stats"]["open_defect_count"], 1)
+
+        defects.create_defect(
+            project_id=self.project.id,
+            payload=DefectCreateRequest(
+                title="新增待处理缺陷",
+                bug_type="functional",
+                urgency="high",
+                status="new",
+                content_html="<p>new defect</p>",
+            ),
+            db=self.db,
+            current_user=self.owner,
+        )
+
+        updated = projects.list_projects(db=self.db, current_user=self.owner)
+        self.assertEqual(updated["data"][0]["stats"]["open_defect_count"], 2)
+
+    def test_project_stats_count_root_runs_instead_of_nested_execution_rows(self):
+        plan = self.db.query(TestPlan).filter_by(project_id=self.project.id).one()
+        scenario = self.db.query(TestScenario).filter_by(project_id=self.project.id).one()
+        test_case = self.db.query(TestCase).filter_by(project_id=self.project.id).one()
+        plan_run = TestPlanRun(
+            plan_id=plan.id,
+            project_id=self.project.id,
+            plan_name=plan.name,
+            plan_version=1,
+            environment_id=self.environment.id,
+            status="passed",
+            trigger="manual",
+            plan_snapshot={},
+            target_results=[],
+            operator_id=self.owner.id,
+            started_at=datetime.utcnow(),
+        )
+        self.db.add(plan_run)
+        self.db.flush()
+        scenario_run = TestScenarioRun(
+            plan_run_id=plan_run.id,
+            scenario_id=scenario.id,
+            project_id=self.project.id,
+            environment_id=self.environment.id,
+            status="passed",
+            scenario_snapshot={},
+            variables_snapshot={},
+            step_results=[],
+            triggered_by_id=self.owner.id,
+            started_at=datetime.utcnow(),
+        )
+        self.db.add(scenario_run)
+        self.db.flush()
+        self.db.add(TestCaseExecution(
+            project_id=self.project.id,
+            test_case_id=test_case.id,
+            environment_id=self.environment.id,
+            scenario_run_id=scenario_run.id,
+            executed_by_id=self.owner.id,
+            status="passed",
+            request_snapshot={},
+        ))
+        self.db.commit()
+
+        stats = projects.list_projects(db=self.db, current_user=self.owner)["data"][0]["stats"]
+
+        self.assertEqual(stats["run_count"], 2)
+        self.assertEqual(stats["pass_rate"], 100)
+        self.assertEqual(stats["coverage_rate"], 50)
+        self.assertEqual(stats["automation_rate"], 50)
+
+    def test_testing_overview_uses_explicit_quality_semantics_and_real_resources(self):
+        http_case = self.db.query(TestCase).filter_by(project_id=self.project.id).one()
+        self.db.add_all([
+            SystemTestCase(
+                project_id=self.project.id,
+                case_code="SYS-001",
+                title="企业查询系统链路",
+                business_module="企业查询",
+                test_objective="验证企业查询主链路",
+                priority="P1",
+                status="ready",
+                tags=[],
+                created_by_id=self.owner.id,
+            ),
+            VisualFlow(
+                project_id=self.project.id,
+                name="企业查询流程",
+                status="draft",
+                created_by_id=self.owner.id,
+                updated_by_id=self.owner.id,
+            ),
+            Defect(
+                project_id=self.project.id,
+                title="已关闭历史缺陷",
+                bug_type="functional",
+                urgency="low",
+                status="closed",
+                content_html="<p>closed</p>",
+                reporter_id=self.owner.id,
+            ),
+            TestCaseExecution(
+                project_id=self.project.id,
+                test_case_id=http_case.id,
+                environment_id=self.environment.id,
+                executed_by_id=self.owner.id,
+                status="failed",
+                request_snapshot={},
+                created_at=datetime(2030, 1, 1, 12, 0, 0),
+            ),
+        ])
+        self.db.commit()
+
+        response = projects.get_project_testing_overview(
+            project_id=self.project.id,
+            db=self.db,
+            current_user=self.owner,
+        )
+
+        overview = response["data"]
+        self.assertEqual(overview["counts"]["http_test_cases"], 1)
+        self.assertEqual(overview["counts"]["websocket_test_cases"], 1)
+        self.assertEqual(overview["counts"]["system_test_cases"], 1)
+        self.assertEqual(overview["counts"]["flows"], 1)
+        self.assertEqual(overview["counts"]["total_executions"], 2)
+        self.assertEqual(overview["counts"]["passed_executions"], 1)
+        self.assertEqual(overview["counts"]["failed_executions"], 1)
+        self.assertEqual(overview["counts"]["open_defects"], 1)
+        self.assertEqual(overview["counts"]["total_defects"], 2)
+        self.assertEqual(overview["quality"]["api_execution_coverage_rate"], 50)
+        self.assertEqual(overview["quality"]["api_success_coverage_rate"], 50)
+        self.assertEqual(overview["latest_execution"]["resource_type"], "http_case")
+        self.assertEqual(overview["latest_execution"]["resource_name"], http_case.name)
+        self.assertTrue(all(isinstance(item, dict) for item in overview["recommendations"]))
+        self.assertTrue(all(item["occurred_at"] for item in overview["activities"]))
+
+    def test_member_management_preserves_implicit_owner_and_reactivates_removed_member(self):
+        listed = projects.list_project_members(
+            project_id=self.project.id,
+            db=self.db,
+            current_user=self.owner,
+        )["data"]
+        self.assertEqual([item["role"] for item in listed], ["owner", "viewer"])
+        membership_id = listed[1]["membership_id"]
+
+        updated = projects.update_project_member(
+            project_id=self.project.id,
+            user_id=self.member.id,
+            payload=ProjectMemberUpdateRequest(permission_codes={"test:execute", "report:view"}),
+            db=self.db,
+            current_user=self.owner,
+        )["data"]
+        self.assertEqual(updated["id"], self.member.id)
+        self.assertEqual(updated["role"], "tester")
+
+        projects.remove_project_member(
+            project_id=self.project.id,
+            user_id=self.member.id,
+            db=self.db,
+            current_user=self.owner,
+        )
+        self.assertEqual(
+            len(projects.list_project_members(
+                project_id=self.project.id,
+                db=self.db,
+                current_user=self.owner,
+            )["data"]),
+            1,
+        )
+
+        reactivated = projects.grant_normal_tester_permissions(
+            project_id=self.project.id,
+            payload=ProjectMemberGrantRequest(
+                user_id=self.member.id,
+                permission_codes={"project:view"},
+            ),
+            db=self.db,
+            current_user=self.owner,
+        )["data"]
+        self.assertEqual(reactivated["id"], membership_id)
+        self.assertTrue(reactivated["is_active"])
 
     def test_create_project_returns_frontend_shape_with_default_stats(self):
         response = projects.create_project(

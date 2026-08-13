@@ -36,11 +36,12 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         user_id = payload.get("sub")
         if user_id is None:
             raise credentials_exception
-    except InvalidTokenError as exc:
+        user_id = int(user_id)
+    except (InvalidTokenError, TypeError, ValueError) as exc:
         raise credentials_exception from exc
 
-    user = UserRepository(db).get_by_id(int(user_id))
-    if user is None:
+    user = UserRepository(db).get_by_id(user_id)
+    if user is None or not user.is_active:
         raise credentials_exception
     return user
 

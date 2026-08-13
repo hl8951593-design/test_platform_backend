@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.async_response import public_execution_status
 from app.schemas.retry import RetryPolicyConfig
@@ -54,8 +54,14 @@ class UnsavedTestCaseExecuteRequest(TestCaseRequestConfig):
 
 
 class BatchExecuteRequest(BaseModel):
-    test_case_ids: list[int] = Field(min_length=1, description="按该列表顺序批量执行")
+    test_case_ids: list[int] = Field(min_length=1, max_length=100, description="按该列表顺序批量执行")
     environment_id: int | None = Field(default=None, description="批量执行时覆盖用例绑定环境")
+
+    @model_validator(mode="after")
+    def validate_unique_case_ids(self):
+        if len(self.test_case_ids) != len(set(self.test_case_ids)):
+            raise ValueError("test_case_ids 不能重复")
+        return self
 
 
 class TestCaseRead(BaseModel):

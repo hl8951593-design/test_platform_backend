@@ -1,12 +1,13 @@
-from concurrent.futures import Future, TimeoutError as FutureTimeoutError
-
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user, get_db
-from app.core.async_response import public_execution_status
-from app.core.config import settings
-from app.core.execution_worker import execution_worker
+from app.core.async_response import execution_started_payload, public_execution_status
+from app.core.execution_worker import ExecutionReservation, execution_worker
+from app.core.project_cache import (
+    invalidate_project_list_cache,
+    invalidate_project_list_cache_on_completion,
+)
 from app.core.response import success
 from app.models.user import User
 from app.schemas.visual_flow import FlowCreateRequest, FlowDefinition, FlowExecuteUnsavedRequest, FlowExecutionRead, FlowSummaryRead, FlowUpdateRequest
@@ -15,29 +16,32 @@ from app.services.visual_flow_service import VisualFlowService
 router = APIRouter()
 
 
-def _submit_flow_execution(execution_id: int) -> Future[None]:
-    future = execution_worker.submit_future(
-        VisualFlowService.execute_queued_execution,
-        execution_id,
+def _reserve_flow_execution() -> ExecutionReservation:
+    reservation = execution_worker.reserve(1)
+    if reservation is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="执行队列已满，请稍后重试",
+        )
+    return reservation
+
+
+def _submit_flow_execution(execution_id: int, reservation: ExecutionReservation | None = None):
+    future = (
+        reservation.submit_future(VisualFlowService.execute_queued_execution, execution_id)
+        if reservation is not None
+        else execution_worker.submit_future(
+            VisualFlowService.execute_queued_execution,
+            execution_id,
+        )
     )
     if future is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="执行队列已满，请稍后重试",
         )
+    invalidate_project_list_cache_on_completion(future)
     return future
-
-
-def _wait_for_flow_execution(db: Session, execution) -> None:
-    future = _submit_flow_execution(execution.id)
-    try:
-        future.result(timeout=settings.EXECUTION_REQUEST_WAIT_TIMEOUT_SECONDS)
-    except FutureTimeoutError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Flow 执行超时，请稍后在执行中心查看结果",
-        ) from exc
-    db.refresh(execution)
 
 
 @router.get("")
@@ -67,6 +71,7 @@ def list_flows(
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_flow(project_id: int, payload: FlowCreateRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     item = VisualFlowService(db).create_flow(project_id=project_id, payload=payload, current_user=current_user)
+    invalidate_project_list_cache()
     return success(data=item, message="Flow created")
 
 
@@ -79,6 +84,7 @@ def get_flow(project_id: int, flow_id: int, db: Session = Depends(get_db), curre
 @router.put("/{flow_id}")
 def update_flow(project_id: int, flow_id: int, payload: FlowUpdateRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     item = VisualFlowService(db).update_flow(project_id=project_id, flow_id=flow_id, payload=payload, current_user=current_user)
+    invalidate_project_list_cache()
     return success(data=item, message="Flow updated")
 
 
@@ -94,6 +100,7 @@ def delete_flow(
         flow_id=flow_id,
         current_user=current_user,
     )
+    invalidate_project_list_cache()
     return success(message="Flow deleted")
 
 
@@ -108,7 +115,7 @@ def _execution_response(execution, flow_version, node_executions):
 
 @router.post(
     "/{flow_id}/execute",
-    status_code=status.HTTP_200_OK,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="异步执行已保存可视化流程",
 )
 def execute_saved_flow(
@@ -116,15 +123,24 @@ def execute_saved_flow(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     db: Session = Depends(get_db), current_user: User = Depends(get_current_user),
 ):
-    result = VisualFlowService(db).enqueue_saved(
-        project_id=project_id, flow_id=flow_id, environment_id=environment_id,
-        idempotency_key=idempotency_key, current_user=current_user,
-    )
-    _wait_for_flow_execution(db, result[0])
-    node_executions = VisualFlowService(db).repository.list_node_executions(result[0].id)
+    reservation = _reserve_flow_execution()
+    try:
+        result = VisualFlowService(db).enqueue_saved(
+            project_id=project_id, flow_id=flow_id, environment_id=environment_id,
+            idempotency_key=idempotency_key, current_user=current_user,
+        )
+        _submit_flow_execution(result[0].id, reservation)
+        invalidate_project_list_cache()
+    finally:
+        reservation.release_unused()
     return success(
-        data=_execution_response(result[0], result[1], node_executions),
-        message="Flow execution completed",
+        data=execution_started_payload(
+            _execution_response(result[0], result[1], []),
+            execution_type="flow",
+            execution_id=result[0].id,
+            project_id=project_id,
+        ),
+        message="Flow execution accepted",
     )
 
 
@@ -140,4 +156,5 @@ def execute_unsaved_flow(
         environment_id=environment_id,
         idempotency_key=idempotency_key, current_user=current_user,
     )
+    invalidate_project_list_cache()
     return success(data=_execution_response(*result), message="Unsaved flow execution completed")

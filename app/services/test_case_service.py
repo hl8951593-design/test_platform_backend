@@ -10,8 +10,10 @@ import httpx
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
+from app.core.outbound_http import validate_outbound_http_url
 from app.core.permissions import ProjectPermission
-from app.core.sensitive_data import mask_sensitive
+from app.core.sensitive_data import mask_sensitive, redact_sensitive_data
 from app.core.variable_renderer import render_variables
 from app.db.session import SessionLocal
 from app.models.test_case import TestCase, TestCaseExecution
@@ -375,6 +377,7 @@ class TestCaseService:
         trigger_tool_name: str | None = None,
         timeout_seconds: float | None = None,
         queued_execution_id: int | None = None,
+        runtime_response_sink: dict[str, Any] | None = None,
     ) -> TestCaseExecution:
         environment, variables = self._load_environment_context(
             project_id=project_id,
@@ -516,6 +519,11 @@ class TestCaseService:
             break
 
         duration_ms = int((time.perf_counter() - started_at) * 1000)
+        if runtime_response_sink is not None:
+            runtime_response_sink["response_snapshot"] = copy.deepcopy(response_snapshot)
+        stored_response_snapshot = redact_sensitive_data(response_snapshot)
+        stored_assertion_results = redact_sensitive_data(assertion_results)
+        stored_attempt_history = redact_sensitive_data(attempt_history)
         if queued_execution_id is not None:
             execution = self.db.get(TestCaseExecution, queued_execution_id)
             if execution is None:
@@ -525,9 +533,9 @@ class TestCaseService:
                 )
             execution.status = status_value
             execution.request_snapshot = mask_sensitive(request_snapshot)
-            execution.response_snapshot = response_snapshot
-            execution.assertion_results = assertion_results
-            execution.attempt_history = attempt_history
+            execution.response_snapshot = stored_response_snapshot
+            execution.assertion_results = stored_assertion_results
+            execution.attempt_history = stored_attempt_history
             execution.error_message = error_message
             execution.duration_ms = duration_ms
             if test_case_id is not None:
@@ -552,9 +560,9 @@ class TestCaseService:
             trigger_tool_name=trigger_tool_name,
             status=status_value,
             request_snapshot=mask_sensitive(request_snapshot),
-            response_snapshot=response_snapshot,
-            assertion_results=assertion_results,
-            attempt_history=attempt_history,
+            response_snapshot=stored_response_snapshot,
+            assertion_results=stored_assertion_results,
+            attempt_history=stored_attempt_history,
             error_message=error_message,
             duration_ms=duration_ms,
             commit=False,
@@ -563,6 +571,28 @@ class TestCaseService:
         self.db.commit()
         self.db.refresh(execution)
         return execution
+
+    def validate_saved_case_batch(
+        self,
+        *,
+        project_id: int,
+        test_case_ids: list[int],
+        environment_id: int | None,
+        current_user: User,
+    ) -> None:
+        self.permission_service.require_project_permission(
+            current_user,
+            project_id,
+            ProjectPermission.EXECUTE_TEST.value,
+        )
+        for test_case_id in test_case_ids:
+            test_case = self._get_case_or_404(project_id=project_id, test_case_id=test_case_id)
+            selected_environment_id = environment_id or test_case.environment_id
+            payload = self._saved_case_payload(test_case, environment_id=selected_environment_id)
+            self._load_environment_context(
+                project_id=project_id,
+                environment_id=payload.environment_id,
+            )
 
     def _create_execution_record(self, **values) -> TestCaseExecution:
         try:
@@ -742,21 +772,38 @@ class TestCaseService:
             if generated_content_type:
                 headers.setdefault("Content-Type", generated_content_type)
 
-        response = httpx.request(
+        validate_outbound_http_url(request_snapshot["url"])
+        max_bytes = settings.EXECUTION_RESPONSE_MAX_BYTES
+        body_bytes = bytearray()
+        body_truncated = False
+        with httpx.stream(
             request_snapshot["method"],
             request_snapshot["url"],
             content=data,
             headers=headers,
             timeout=max(min(timeout_seconds or 20, 20), 0.1),
-            follow_redirects=True,
-        )
-
-        raw_body = response.text
+            follow_redirects=False,
+        ) as response:
+            for chunk in response.iter_bytes():
+                remaining = max_bytes - len(body_bytes)
+                if remaining <= 0:
+                    body_truncated = True
+                    break
+                body_bytes.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    body_truncated = True
+                    break
+            encoding = response.encoding or "utf-8"
+            raw_body = bytes(body_bytes).decode(encoding, errors="replace")
+            status_code = response.status_code
+            response_headers = dict(response.headers.items())
         return {
-            "status_code": response.status_code,
-            "headers": dict(response.headers.items()),
+            "status_code": status_code,
+            "headers": response_headers,
             "body": raw_body,
             "json": self._safe_json(raw_body),
+            "body_bytes_read": len(body_bytes),
+            "body_truncated": body_truncated,
         }
 
     def _encode_body(self, *, body_type: str, body: Any) -> tuple[bytes | None, str | None]:

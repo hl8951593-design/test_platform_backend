@@ -1,22 +1,24 @@
 import unittest
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 import app.models  # noqa: F401
 from app.api.v1.routers import execution_center
 from app.db.base import Base
 from app.models.project import Project, ProjectEnvironment
+from app.models.desktop_device import DesktopDevice, DesktopDeviceProjectBinding
 from app.models.scenario import TestScenario, TestScenarioRun, TestScenarioRunEvent
 from app.models.user import User
 
 
 class ExecutionCenterContractTests(unittest.TestCase):
     def setUp(self):
-        engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(engine)
-        self.db = sessionmaker(bind=engine)()
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        self.db = sessionmaker(bind=self.engine)()
 
         self.owner = User(
             username="owner",
@@ -90,6 +92,7 @@ class ExecutionCenterContractTests(unittest.TestCase):
 
     def tearDown(self):
         self.db.close()
+        self.engine.dispose()
 
     def _run(
         self,
@@ -195,6 +198,93 @@ class ExecutionCenterContractTests(unittest.TestCase):
         )["data"]["items"]
         self.assertEqual(retries[0]["run_id"], f"RUN-{self.retrying.id}")
         self.assertEqual(retries[0]["status"], "retrying")
+
+    def test_logs_query_does_not_load_large_run_artifacts(self):
+        statements = []
+
+        def record_statement(_conn, _cursor, statement, _params, _context, _many):
+            statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", record_statement)
+        try:
+            logs = execution_center.list_execution_center_logs(
+                project_id=self.project.id,
+                after_sequence=0,
+                limit=100,
+                db=self.db,
+                current_user=self.owner,
+            )["data"]
+        finally:
+            event.remove(self.engine, "before_cursor_execute", record_statement)
+
+        self.assertEqual(logs["items"][0]["run_id"], f"RUN-{self.running.id}")
+        log_query = next(
+            statement.lower()
+            for statement in statements
+            if "test_scenario_run_events" in statement.lower()
+        )
+        for large_column in (
+            "scenario_snapshot",
+            "variables_snapshot",
+            "step_results",
+        ):
+            self.assertNotIn(large_column, log_query)
+
+    def test_desktop_device_is_projected_as_execution_worker(self):
+        device = DesktopDevice(
+            public_id="desktop-qa-01",
+            owner_id=self.owner.id,
+            installation_id_hash="a" * 64,
+            name="Desktop QA 01",
+            registration_status="active",
+            accepting_jobs=True,
+            concurrency_limit=1,
+            desktop_version="0.3.0-dev",
+            os_name="Windows",
+            os_version="11",
+            architecture="x64",
+            supported_protocols_json={"dsl": ["ui-case-v1"]},
+            capabilities_json={"browsers": ["chromium"]},
+            runtime_state_json={"current_load": 0},
+            last_heartbeat_at=datetime.now(),
+        )
+        self.db.add(device)
+        self.db.flush()
+        self.db.add(
+            DesktopDeviceProjectBinding(
+                device_id=device.id,
+                project_id=self.project.id,
+                enabled=True,
+                accepting_jobs=True,
+                concurrency_limit=1,
+                created_by_id=self.owner.id,
+            )
+        )
+        self.db.commit()
+
+        with patch(
+            "app.services.execution_center_service.desktop_presence_service.is_online",
+            return_value=True,
+        ):
+            workers = execution_center.list_execution_center_workers(
+                project_id=self.project.id,
+                db=self.db,
+                current_user=self.owner,
+            )["data"]["items"]
+            overview = execution_center.get_execution_center_overview(
+                project_id=self.project.id,
+                environment_id=None,
+                db=self.db,
+                current_user=self.owner,
+            )["data"]
+
+        desktop = next(item for item in workers if item["id"] == "desktop-qa-01")
+        self.assertEqual(desktop["worker_kind"], "desktop")
+        self.assertEqual(desktop["state"], "idle")
+        self.assertTrue(desktop["online"])
+        self.assertIn("ui", desktop["capabilities"])
+        self.assertEqual(overview["worker_total"], len(workers))
+        self.assertEqual(overview["worker_online"], len(workers))
 
 
 if __name__ == "__main__":

@@ -174,12 +174,50 @@ class VisualFlowRepository:
     def get_http_case(self, *, project_id: int, case_id: int) -> TestCase | None:
         return self.db.scalar(select(TestCase).where(TestCase.id == case_id, TestCase.project_id == project_id))
 
+    def list_http_cases(
+        self, *, project_id: int, case_ids: set[int]
+    ) -> list[TestCase]:
+        if not case_ids:
+            return []
+        return list(
+            self.db.scalars(
+                select(TestCase).where(
+                    TestCase.project_id == project_id,
+                    TestCase.id.in_(case_ids),
+                )
+            ).all()
+        )
+
     def get_websocket_case(self, *, project_id: int, case_id: int) -> WebSocketTestCase | None:
         return self.db.scalar(
             select(WebSocketTestCase).where(
                 WebSocketTestCase.id == case_id,
                 WebSocketTestCase.project_id == project_id,
             )
+        )
+
+    def list_websocket_cases(
+        self, *, project_id: int, case_ids: set[int]
+    ) -> list[WebSocketTestCase]:
+        if not case_ids:
+            return []
+        return list(
+            self.db.scalars(
+                select(WebSocketTestCase).where(
+                    WebSocketTestCase.project_id == project_id,
+                    WebSocketTestCase.id.in_(case_ids),
+                )
+            ).all()
+        )
+
+    def list_environments(self, *, project_id: int) -> list[ProjectEnvironment]:
+        return list(
+            self.db.scalars(
+                select(ProjectEnvironment).where(
+                    ProjectEnvironment.project_id == project_id,
+                    ProjectEnvironment.is_deleted.is_(False),
+                )
+            ).all()
         )
 
     def get_execution_by_idempotency_key(

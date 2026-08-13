@@ -56,6 +56,9 @@ class ExecutionCenterWorkerRead(BaseModel):
     heartbeat_at: datetime
     heartbeat_text: str
     capabilities: list[str] = Field(default_factory=list)
+    worker_kind: str = "server"
+    device_id: str | None = None
+    online: bool = True
 
 
 class ExecutionCenterWorkerPageRead(BaseModel):

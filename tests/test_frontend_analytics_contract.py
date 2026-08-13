@@ -70,7 +70,7 @@ class FrontendAnalyticsContractTests(unittest.TestCase):
         self.db.add(self.scenario)
         self.db.flush()
 
-        now = datetime(2026, 7, 8, 15, 30, 0)
+        now = datetime.now().replace(microsecond=0)
         self.db.add_all([
             TestCaseExecution(
                 project_id=self.project.id,
@@ -154,6 +154,8 @@ class FrontendAnalyticsContractTests(unittest.TestCase):
         self.assertEqual(response["code"], 0)
         data = response["data"]
         self.assertIn("generated_at", data)
+        self.assertEqual(data["generated_by"], "rules")
+        self.assertEqual(data["scope"]["range"], "7d")
         self.assertIn("summary", data)
         self.assertIn("pass_rate", data["summary"])
         self.assertIn("failure_cluster_count", data["summary"])
@@ -164,8 +166,10 @@ class FrontendAnalyticsContractTests(unittest.TestCase):
         self.assertEqual(data["failure_clusters"][0]["priority"], "P0")
         self.assertTrue(data["slow_tests"])
         self.assertIn("duration_ms", data["slow_tests"][0])
-        self.assertTrue(data["stability_heatmap"])
-        self.assertTrue(data["ai_recommendations"])
+        self.assertTrue(data["stability_heatmap"]["labels"])
+        self.assertTrue(data["stability_heatmap"]["rows"])
+        self.assertTrue(data["recommendations"])
+        self.assertIn("action", data["recommendations"][0])
 
     def test_dashboard_quality_overview_matches_frontend_shape(self):
         response = dashboard.get_quality_overview(
@@ -189,7 +193,8 @@ class FrontendAnalyticsContractTests(unittest.TestCase):
         self.assertTrue(data["risk_matrix"])
         self.assertTrue(data["automation_efficiency"])
         self.assertTrue(data["health_profile"]["dimensions"])
-        self.assertTrue(data["defect_predictions"])
+        self.assertEqual(data["defect_predictions"], [])
+        self.assertTrue(all(item["saved_hours"] == 0 for item in data["automation_efficiency"]))
         self.assertTrue(data["ai_recommendations"])
         self.assertTrue(data["activity_feed"])
 

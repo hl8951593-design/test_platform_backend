@@ -128,7 +128,7 @@ class BrowserCapturePluginContractTests(unittest.TestCase):
         self.assertEqual(entry.name, "POST /api/orders")
         self.assertEqual(entry.path, "/api/orders")
         self.assertEqual(entry.source_url, "https://test.example.com/api/orders?page=1")
-        self.assertEqual(entry.request_data["headers"]["Authorization"], "Bearer secret-token")
+        self.assertEqual(entry.request_data["headers"]["Authorization"], "***")
         self.assertEqual(entry.request_data["query_params"], {"page": "1"})
         self.assertEqual(entry.response_data["status_code"], 200)
         self.assertEqual(entry.draft_data["duration_ms"], 128)
@@ -160,7 +160,6 @@ class BrowserCapturePluginContractTests(unittest.TestCase):
             payload=BrowserCaptureImportRequest(
                 entry_ids=[entry.id],
                 environment_id=self.environment.id,
-                create_environment_variables=True,
                 create_scenario=False,
             ),
             current_user=self.owner,
@@ -187,6 +186,27 @@ class BrowserCapturePluginContractTests(unittest.TestCase):
         )
         self.assertEqual(duplicate["duplicate_count"], 1)
         self.assertEqual(duplicate["results"][0]["status"], "duplicate")
+
+    def test_import_rejects_options_that_are_not_implemented(self):
+        capture = self._create_capture()
+        entry = self.capture_service.upsert_entries(
+            project_id=self.project.id,
+            capture_id=capture.id,
+            payload=BrowserCaptureEntryBatchRequest(entries=[self._plugin_http_entry()]),
+            current_user=self.owner,
+        )[0]
+
+        with self.assertRaisesRegex(Exception, "create_environment_variables 尚未实现"):
+            self.capture_service.import_entries(
+                project_id=self.project.id,
+                capture_id=capture.id,
+                payload=BrowserCaptureImportRequest(
+                    entry_ids=[entry.id],
+                    environment_id=self.environment.id,
+                    create_environment_variables=True,
+                ),
+                current_user=self.owner,
+            )
 
     def test_local_analyze_masks_sensitive_values_and_returns_structured_defaults(self):
         captured_prompts = []

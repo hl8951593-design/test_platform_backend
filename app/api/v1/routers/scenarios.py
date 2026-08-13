@@ -7,7 +7,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user, get_db
-from app.core.execution_worker import execution_worker
+from app.core.execution_worker import ExecutionReservation, execution_worker
+from app.core.project_cache import (
+    invalidate_project_list_cache,
+    invalidate_project_list_cache_on_completion,
+)
 from app.core.response import success
 from app.db.session import SessionLocal
 from app.models.scenario import (
@@ -26,6 +30,10 @@ from app.schemas.scenario import (
     ScenarioScriptExecuteUnsavedRequest,
     ScenarioUpdateRequest,
 )
+from app.schemas.database_connection import (
+    ScenarioDatabaseExecuteUnsavedRead,
+    ScenarioDatabaseExecuteUnsavedRequest,
+)
 from app.services.scenario_service import ScenarioService
 
 router = APIRouter()
@@ -33,12 +41,28 @@ run_router = APIRouter()
 actions_router = APIRouter()
 
 
-def _submit_scenario_execution(execution_id: str) -> None:
-    if not execution_worker.submit(ScenarioService.execute_queued_execution, execution_id):
+def _reserve_scenario_execution() -> ExecutionReservation:
+    reservation = execution_worker.reserve(1)
+    if reservation is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="执行队列已满，请稍后重试",
         )
+    return reservation
+
+
+def _submit_scenario_execution(execution_id: str, reservation: ExecutionReservation | None = None) -> None:
+    future = (
+        reservation.submit_future(ScenarioService.execute_queued_execution, execution_id)
+        if reservation is not None
+        else execution_worker.submit_future(ScenarioService.execute_queued_execution, execution_id)
+    )
+    if future is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="执行队列已满，请稍后重试",
+        )
+    invalidate_project_list_cache_on_completion(future)
 
 
 @router.get("", summary="查询项目场景列表")
@@ -71,6 +95,7 @@ def create_scenario(
     item = ScenarioService(db).create_scenario(
         project_id=project_id, payload=payload, current_user=current_user
     )
+    invalidate_project_list_cache()
     return success(data=ScenarioRead.model_validate(item), message="场景创建成功")
 
 
@@ -101,6 +126,7 @@ def update_scenario(
         payload=payload,
         current_user=current_user,
     )
+    invalidate_project_list_cache()
     return success(data=ScenarioRead.model_validate(item), message="场景更新成功")
 
 
@@ -114,6 +140,7 @@ def delete_scenario(
     ScenarioService(db).delete_scenario(
         project_id=project_id, scenario_id=scenario_id, current_user=current_user
     )
+    invalidate_project_list_cache()
     return success(message="场景删除成功")
 
 
@@ -129,6 +156,22 @@ def _execute_unsaved_script_action(
         current_user=current_user,
     )
     return success(data=ScenarioScriptExecuteUnsavedRead.model_validate(result), message="ok")
+
+
+def _execute_unsaved_database_action(
+    project_id: int,
+    payload: ScenarioDatabaseExecuteUnsavedRequest,
+    db: Session,
+    current_user: User,
+):
+    result = ScenarioService(db).execute_unsaved_database_action(
+        project_id=project_id,
+        payload=payload,
+        current_user=current_user,
+    )
+    return success(
+        data=ScenarioDatabaseExecuteUnsavedRead.model_validate(result), message="ok"
+    )
 
 
 @router.post("/actions/script/execute-unsaved", summary="调试未保存脚本动作")
@@ -151,6 +194,16 @@ def execute_unsave_script_action(
     return _execute_unsaved_script_action(project_id, payload, db, current_user)
 
 
+@router.post("/actions/database/execute-unsaved", summary="调试未保存数据库动作")
+def execute_unsaved_database_action(
+    project_id: int,
+    payload: ScenarioDatabaseExecuteUnsavedRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return _execute_unsaved_database_action(project_id, payload, db, current_user)
+
+
 @router.post(
     "/{scenario_id}/execute",
     status_code=status.HTTP_202_ACCEPTED,
@@ -163,16 +216,21 @@ def execute_scenario(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    execution = ScenarioService(db).enqueue_scenario(
-        project_id=project_id,
-        scenario_id=scenario_id,
-        environment_id=payload.environment_id,
-        dataset_ids=payload.dataset_ids,
-        idempotency_key=payload.idempotency_key,
-        current_user=current_user,
-    )
-    if execution["status"] == "queued":
-        _submit_scenario_execution(execution["execution_id"])
+    reservation = _reserve_scenario_execution()
+    try:
+        execution = ScenarioService(db).enqueue_scenario(
+            project_id=project_id,
+            scenario_id=scenario_id,
+            environment_id=payload.environment_id,
+            dataset_ids=payload.dataset_ids,
+            idempotency_key=payload.idempotency_key,
+            current_user=current_user,
+        )
+        if execution["status"] == "queued":
+            _submit_scenario_execution(execution["execution_id"], reservation)
+        invalidate_project_list_cache()
+    finally:
+        reservation.release_unused()
     return success(
         data=ScenarioExecutionQueuedRead.model_validate(execution),
         message="场景执行请求已受理",
@@ -187,6 +245,16 @@ def execute_unsaved_script_action_legacy(
     current_user: User = Depends(get_current_user),
 ):
     return _execute_unsaved_script_action(project_id, payload, db, current_user)
+
+
+@actions_router.post("/database/execute-unsaved", summary="调试未保存数据库动作")
+def execute_unsaved_database_action_legacy(
+    project_id: int,
+    payload: ScenarioDatabaseExecuteUnsavedRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return _execute_unsaved_database_action(project_id, payload, db, current_user)
 
 
 @run_router.get("", summary="查询场景调试历史")
@@ -231,6 +299,7 @@ def delete_scenario_run(
     ScenarioService(db).delete_run(
         project_id=project_id, run_id=run_id, current_user=current_user
     )
+    invalidate_project_list_cache()
     return success(message="场景运行记录已删除")
 
 

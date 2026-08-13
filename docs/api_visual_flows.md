@@ -10,7 +10,7 @@ The visual flow module persists versioned DAG definitions and executes HTTP, Web
 | POST | `/api/v1/flows?project_id={project_id}` | `flow:manage` |
 | GET | `/api/v1/flows/{flow_id}?project_id={project_id}` | `flow:view` |
 | PUT | `/api/v1/flows/{flow_id}?project_id={project_id}` | `flow:manage` |
-| POST | `/api/v1/flows/{flow_id}/execute?project_id={project_id}` | `test:execute`，后端内部提交工作池执行，接口等待完成并返回原执行记录结构 |
+| POST | `/api/v1/flows/{flow_id}/execute?project_id={project_id}` | `test:execute`，HTTP `202`；预留容量后立即返回执行 ID 和轮询地址 |
 | POST | `/api/v1/flows/execute-unsaved?project_id={project_id}` | `test:execute`，当前仍为同步调试入口 |
 
 Flow 列表支持 `keyword`、`status`、`page` 和 `page_size`：
@@ -35,9 +35,9 @@ Execution endpoints accept an optional `environment_id` query parameter and `Ide
 
 Condition expressions use a restricted Python/CEL-like subset over `outputs` and `variables`. Function calls and arbitrary code execution are rejected.
 
-Saved Flow execution now runs through the shared execution worker internally: the API creates a
-`visual_flow_executions` record, submits it to the worker, waits for completion, and returns the original
-execution response shape with the final status. Queue state remains a backend scheduling detail. Unsaved Flow
+Saved Flow execution runs through the shared execution worker. Capacity is reserved before the
+`visual_flow_executions` row is created, so queue rejection returns `503` without a stranded queued row. The API
+returns `202` with `execution_id`, `polling_url` and `poll_after_ms` and does not wait for completion. Unsaved Flow
 execution remains a synchronous debugging path until task payload persistence is introduced.
 
 ## Node-local case editing

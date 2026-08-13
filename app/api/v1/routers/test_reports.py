@@ -8,7 +8,12 @@ from sqlalchemy.orm import Session
 from app.api.v1.deps import get_current_user, get_db
 from app.core.response import success
 from app.models.user import User
-from app.schemas.test_report import ReportSourceType
+from app.schemas.test_report import (
+    ReportRange,
+    ReportSourceType,
+    SupplementCaseDraftRequest,
+    TestReportExportCreate,
+)
 from app.services.test_report_service import TestReportService
 
 router = APIRouter()
@@ -66,7 +71,7 @@ def get_test_report_trends(
 def get_report_intelligence_overview(
     project_id: int,
     environment_id: int | None = None,
-    range_value: Annotated[str, Query(alias="range")] = "7d",
+    range_value: Annotated[ReportRange, Query(alias="range")] = "7d",
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -77,6 +82,26 @@ def get_report_intelligence_overview(
         current_user=current_user,
     )
     return success(data=overview)
+
+
+@router.get(
+    "/exports/{export_id}/download",
+    summary="Download a one-time HTML test report export",
+    response_class=HTMLResponse,
+)
+def download_one_time_test_report_export(
+    export_id: str,
+    token: str = Query(min_length=16),
+    db: Session = Depends(get_db),
+):
+    content, filename = TestReportService(db).consume_export(
+        export_id=export_id,
+        token=token,
+    )
+    return HTMLResponse(
+        content=content,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/{source_type}/{source_id}", summary="Get a structured test report")
@@ -94,6 +119,85 @@ def get_test_report(
         current_user=current_user,
     )
     return success(data=report)
+
+
+@router.delete("/{source_type}/{source_id}", summary="Delete a test report from the report center")
+def delete_test_report(
+    project_id: int,
+    source_type: ReportSourceType,
+    source_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    TestReportService(db).delete_report(
+        project_id=project_id,
+        source_type=source_type,
+        source_id=source_id,
+        current_user=current_user,
+    )
+    return success(message="测试报告已删除")
+
+
+@router.get(
+    "/{source_type}/{source_id}/items/{item_id}",
+    summary="Get a redacted test report item detail",
+)
+def get_test_report_item(
+    project_id: int,
+    source_type: ReportSourceType,
+    source_id: int,
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = TestReportService(db).get_report_item(
+        project_id=project_id,
+        source_type=source_type,
+        source_id=source_id,
+        item_id=item_id,
+        current_user=current_user,
+    )
+    return success(data=item)
+
+
+@router.post(
+    "/{source_type}/{source_id}/exports",
+    summary="Create a one-time test report export",
+)
+def create_test_report_export(
+    source_type: ReportSourceType,
+    source_id: int,
+    payload: TestReportExportCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report_export = TestReportService(db).create_export(
+        project_id=payload.project_id,
+        source_type=source_type,
+        source_id=source_id,
+        current_user=current_user,
+    )
+    return success(data=report_export)
+
+
+@router.post(
+    "/{source_type}/{source_id}/supplement-case-drafts",
+    summary="Generate deterministic supplement case drafts from report gaps",
+)
+def generate_supplement_case_drafts(
+    source_type: ReportSourceType,
+    source_id: int,
+    payload: SupplementCaseDraftRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    drafts = TestReportService(db).generate_supplement_case_drafts(
+        source_type=source_type,
+        source_id=source_id,
+        payload=payload,
+        current_user=current_user,
+    )
+    return success(data=drafts)
 
 
 @router.get(

@@ -97,6 +97,30 @@ class ExecutionDiagnosticMigrationTests(unittest.TestCase):
         self.assertTrue(settings.EXECUTION_METRICS_SCHEDULER_ENABLED)
         self.assertEqual(settings.EXECUTION_METRICS_SCHEDULER_INTERVAL_SECONDS, 60)
 
+    def test_ui_artifact_delivery_migration_extends_current_desktop_head(self):
+        module = importlib.import_module(
+            "migrations.versions.0049_ui_execution_artifact_delivery"
+        )
+
+        self.assertEqual(module.down_revision, "0048_ui_execution_runtime")
+        upgrade_source = inspect.getsource(module.upgrade)
+        self.assertIn("execution_artifact_upload_sessions", upgrade_source)
+        self.assertIn("metadata_json", upgrade_source)
+        self.assertNotIn("drop_table", upgrade_source)
+        self.assertNotIn("drop_column", upgrade_source)
+
+    def test_ui_patch_request_migration_links_applied_patch_to_command(self):
+        module = importlib.import_module(
+            "migrations.versions.0050_ui_execution_patch_requests"
+        )
+
+        self.assertEqual(module.down_revision, "0049_ui_execution_artifact_delivery")
+        upgrade_source = inspect.getsource(module.upgrade)
+        self.assertIn("request_command_id", upgrade_source)
+        self.assertIn("fk_ui_runtime_patches_request_command", upgrade_source)
+        self.assertIn("uq_ui_runtime_patches_request_command", upgrade_source)
+        self.assertNotIn("drop_table", upgrade_source)
+
 
 if __name__ == "__main__":
     unittest.main()

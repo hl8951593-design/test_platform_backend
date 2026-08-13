@@ -1,0 +1,197 @@
+{
+  "schema_version": "testauto-desktop-contract-fixture-v1",
+  "device_register_response": {
+    "device": {
+      "device_id": "dev_contract_qa_1",
+      "owner_id": 1,
+      "name": "DESKTOP-CONTRACT-QA",
+      "registration_status": "active",
+      "online": false,
+      "accepting_jobs": true,
+      "concurrency_limit": 1,
+      "desktop_version": "0.3.0-dev",
+      "os_name": "Windows",
+      "os_version": "11",
+      "architecture": "x86_64",
+      "supported_protocols": {
+        "dsl": ["ui-case-v1"],
+        "ipc": ["desktop-ipc-v1"]
+      },
+      "capabilities": {
+        "browsers": ["chromium"],
+        "headed": true
+      },
+      "runtime_state": {},
+      "last_heartbeat_at": null,
+      "registered_at": "2026-07-17T00:00:00Z",
+      "revoked_at": null,
+      "project_bindings": []
+    },
+    "credential": {
+      "access_token": "fixture-device-access-token",
+      "refresh_token": "fixture-device-refresh-token-with-contract-length-0001",
+      "token_type": "bearer",
+      "access_expires_in": 900,
+      "refresh_expires_at": "2099-01-01T00:00:00Z"
+    }
+  },
+  "available_executions_response": {
+    "items": [
+      {
+        "execution_id": "ui_exec_contract_1",
+        "project_id": 7,
+        "case_id": "ui_case_contract_1",
+        "case_name": "Contract login",
+        "case_version": 3,
+        "case_checksum": "contract-checksum",
+        "environment_id": 3,
+        "status": "queued",
+        "expected_status": "queued",
+        "delivery_status": "pending",
+        "attention_reason": null,
+        "current_step": 0,
+        "total_steps": 1,
+        "passed_steps": 0,
+        "failed_steps": 0,
+        "skipped_steps": 0,
+        "requested_device_id": null,
+        "assigned_device": null,
+        "source": "platform_task",
+        "assisted": false,
+        "duration_ms": null,
+        "created_at": "2026-07-17T00:00:00Z",
+        "updated_at": "2026-07-17T00:00:00Z"
+      }
+    ],
+    "total": 1
+  },
+  "claim_response": {
+    "execution_id": "ui_exec_contract_1",
+    "internal_execution_id": 101,
+    "status": "claimed",
+    "last_client_sequence": 7,
+    "lease": {
+      "lease_id": "lease_contract_1",
+      "version": 2,
+      "expires_at": "2099-01-01T00:00:00Z",
+      "renew_after_seconds": 15
+    },
+    "snapshot": {
+      "case_id": "ui_case_contract_1",
+      "version": 3,
+      "schema_version": "ui-case-v1",
+      "checksum": "contract-checksum",
+      "dsl": {
+        "schema_version": "ui-case-v1",
+        "steps": [
+          {
+            "step_id": "step_open_login",
+            "type": "action",
+            "action": "navigate",
+            "url": "https://example.test/login"
+          }
+        ]
+      },
+      "environment": {
+        "id": 3,
+        "name": "Contract",
+        "base_url": "https://example.test",
+        "variables": {}
+      },
+      "required_secret_refs": ["secret.qa_password"],
+      "runtime_policy": {
+        "trace": "retain-on-failure",
+        "screenshot": "only-on-failure"
+      }
+    }
+  },
+  "control_messages": [
+    {
+      "schema_version": "desktop-control-v1",
+      "type": "execution.available",
+      "message_id": "msg_execution_contract_1",
+      "device_id": "dev_contract_qa_1",
+      "execution_id": "ui_exec_contract_1",
+      "server_time": "2026-07-17T00:00:01Z",
+      "authoritative_transport": "rest"
+    },
+    {
+      "schema_version": "desktop-control-v1",
+      "type": "command.available",
+      "message_id": "msg_command_contract_1",
+      "device_id": "dev_contract_qa_1",
+      "execution_id": "ui_exec_contract_1",
+      "command_id": "ui_cmd_contract_1",
+      "server_time": "2026-07-17T00:00:02Z",
+      "authoritative_transport": "rest"
+    }
+  ],
+  "patch_command": {
+    "command_id": "ui_cmd_patch_contract_1",
+    "command_type": "patch",
+    "status": "delivered",
+    "payload": {
+      "schema_version": "ui-runtime-patch-request-v1",
+      "step_id": "step_open_login",
+      "patch_type": "locator",
+      "scope": "current_run",
+      "before": {
+        "locator_by": "css",
+        "locator_value": "#login-button"
+      },
+      "after": {
+        "locator_by": "role",
+        "locator_value": "button: 登录"
+      },
+      "reason": "operator corrected the locator"
+    },
+    "ack": null,
+    "created_at": "2026-07-17T00:00:02Z",
+    "delivered_at": "2026-07-17T00:00:03Z",
+    "acknowledged_at": null,
+    "expires_at": "2099-01-01T00:00:00Z"
+  },
+  "runtime_patch_response": {
+    "patch_id": 501,
+    "command_id": "ui_cmd_patch_contract_1",
+    "step_id": "step_open_login",
+    "patch_type": "locator",
+    "scope": "current_run",
+    "before": {
+      "locator_by": "css",
+      "locator_value": "#login-button"
+    },
+    "after": {
+      "locator_by": "role",
+      "locator_value": "button: 登录"
+    },
+    "reason": "operator corrected the locator",
+    "created_at": "2026-07-17T00:00:04Z",
+    "idempotent_replay": false
+  },
+  "artifact_presign_response": {
+    "artifact_ref": "ui_art_contract_1",
+    "upload_id": "ui_upload_contract_1",
+    "url": "https://objects.example.test/testauto/ui_art_contract_1",
+    "method": "PUT",
+    "required_headers": {
+      "Content-Type": "image/png",
+      "x-amz-meta-sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "expires_at": "2099-01-01T00:00:00Z",
+    "max_size_bytes": 3,
+    "idempotent_replay": false
+  },
+  "artifact_finalize_response": {
+    "artifact_ref": "ui_art_contract_1",
+    "step_id": "step_open_login",
+    "section": "screenshot",
+    "content_type": "image/png",
+    "size_bytes": 3,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "original_filename": "step.png",
+    "etag": "contract-etag",
+    "created_at": "2026-07-17T00:00:03Z",
+    "idempotent_replay": false
+  }
+}

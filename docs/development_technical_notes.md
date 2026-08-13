@@ -6,12 +6,80 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 最近更新日期 | 2026-07-12 |
-| 当前开发基线 | 3.0.536-agent-native-tool-wire-fix |
+| 最近更新日期 | 2026-07-18 |
+| 当前开发基线 | 3.0.541-self-test-e2e-failure-repair |
 | 当前阶段 | 场景组合、P1 统一执行/报告、缺陷媒体、AI Skill Runtime 与 Harness Loop Agent 后端已实现；Agent Run 已接入对话生成 runner、planner-first 静默模型规划与合并补发 delta、服务端 conversation history、多轮上下文、长历史预算压缩、Phase 0 Agent 基线指标、Phase 1 Agent Context Budget、Phase 2 Tool Catalog/Contract 分层、Phase 2 Tool Result Projection 模型视图/Ledger 视图分离、Phase 3 Artifact Native 场景保存、Capability Resolver 工具目录裁决、Artifact Scope/Context Requirements/Action Graph 联动、Artifact-aware 保存 follow-up 路由、场景执行 follow-up 路由、scenario.compose_draft Agent-facing 入参归一化与结构化草稿 requirement 兼容修复、Phase 4 Deterministic Tool Input Repair、Phase 5 Skill Router 单主 Skill 选择、Phase 6 场景创建状态机、软件测试领域通用问答、Codex-style Agent SkillRegistry、48 个平台 ToolSpec（新增执行记录、测试计划、可视化流程和缺陷四领域共 19 个工具，保留原有 29 个工具）、29 个内置平台能力 Skill、Skill frontmatter triggers、Skill 私有 routing/guard hints、Skill 私有 prompt resources、Skill 正文模型注入硬上限、Skill 私有 classifier prompt 模型注入硬上限、Skill 私有 classifier 失败/非法响应/结果 reason 日志有界摘要、Skill 声明式 unsupported capability guard、ToolSpec 私有 backend_handler / required_context_requirements / tool_result_repair_guidance、Capabilities/ToolSpec 公私字段机器契约覆盖、RuntimeSnapshot 工具 manifest/hash 机器契约覆盖、RuntimeSnapshot item identity 机器契约覆盖、模型初始工具提示机器契约覆盖、模型初始 Skill catalog 提示机器契约覆盖、ContextBuild metadata 机器契约覆盖、ContextBuild token window 机器契约覆盖、ContextBuild item identity 机器契约覆盖、LoopObservation item identity 机器契约覆盖、Memory audit event item identity 机器契约覆盖、Memory feedback result item identity 机器契约覆盖、conversation history 模型上下文机器契约覆盖、history compaction envelope 机器契约覆盖、Transcript/Export compaction 索引机器契约覆盖、Run Event Snapshot compaction 索引机器契约覆盖、ContextCompaction item id 机器契约覆盖、Checkpoint compaction freshness 引用机器契约覆盖、前端只读 Skill catalog 元数据、模型驱动工具闭环、模型工具请求 reason/decision_reason 事件有界摘要、模型输出 content_preview 事件有界摘要、工具请求型 model.completed 内容有界预览、工具请求模型上下文有界摘要、ToolResultPolicy 通用工具结果质量闭环、工具结果模型回灌硬上限、工具结果聚合模型上下文总预算、工具请求格式自修复与本地挽救、工具请求修复上下文硬上限、工具请求解析/修复错误事件有界摘要、required follow-up 修复失败错误事件有界摘要、工具请求规划文本全程隐藏、复杂工具结果最终回复预算、审批后恢复生成、项目 Memory 对话上下文与模型注入硬上限、Agent 模型健康/live stream 探测、Conversation Smoke 端到端诊断、Run Summary 聚合接口、Conversation Transcript 聚合接口、Run Action State 聚合接口、Conversation Export 聚合接口、Agent Run Event Snapshot 非流式事件快照接口、文件 SQLite/MySQL 后台 runner 启动边界、取消感知的对话 runner 和 unsupported capability guard、陈旧 active run 自动终止兜底、Agent Run 失败错误消息/日志有界摘要、Agent stream retry/interruption 错误事件有界摘要、ToolCall 失败错误消息有界摘要、Outbox 发布失败 last_error 有界摘要、真实 DeepSeek/MySQL 普通用户端到端诊断脚本、Agent Launch Audit 前端联调/上线准备聚合审计接口、Agent Backend Completion Audit 后端功能完成度聚合审计接口、行为评测 CASES/ASSERTIONS 单一来源、来源追溯、断言覆盖映射、未声明断言治理、已登记断言未覆盖治理、安全运行 runbook、assertion_coverage/runbook 来源追溯、Model call trace/Tool diagnostic chain 期望 case 单一来源、行为评测可选诊断按 assertion 生效、缺 schema 历史报告 schema mismatch 标记、最新历史报告安全摘要、summary 计数与 results 一致性、当前 CASES 覆盖/重复状态、重复 case 阻断诊断 complete、schema mismatch 阻断诊断 complete、报告不可用稳定合同、报告不可用真实 schema 为空、报告 schema 匹配状态、历史报告完整 model_call_trace 覆盖状态、历史报告 tool_diagnostic_chain 覆盖状态、历史报告 JSON/Markdown artifact pair 覆盖状态、历史报告完整 SSE high-cursor replay 证据判定、completion audit 行为评测报告字段契约、latest_report_fields 字段清单单一来源、行为评测生成端严格汇总/畸形 evaluation 报告、case 异常 artifact、部分 result Markdown 占位渲染、evaluate_case 诊断自恢复、finite score 校验、标准 JSON artifact 写盘/读取与安全 artifact 展示、ToolCall dispatch trace、effect 后 EventStore 写入失败 dispatch trace 恢复状态、Runbook dispatch trace 白名单摘要、行为评测 ToolCall 诊断链断言、行为评测 Markdown ToolCall 诊断链摘要、行为评测 model_call_trace 可读摘要、Agent loop runtime trace/model call 可观测性、prompt cache 友好的稳定工具清单序列化、worker heartbeat 终态门禁、worker claim ledger 状态门禁、worker claim queue/run 归属门禁、worker claim 缺 run context 门禁、worker active lease queue/run 归属门禁、ToolExecutor queue context 归属门禁、approval resume failed queue reason 门禁、approval resume no-progress 事件门禁、worker claim 终态门禁、ToolExecutor 执行入口状态门禁、failed_retryable resume 重排状态清理和 stale blocking id 清理、执行前终态 ToolCall obsolete 门禁、orphan lease recovery 终态门禁、effectful 工具取消后 uncertain/reconcile 终态门禁、终态 run 残留 uncertain ToolCall reconcile action 入口、终态 migration block 创建/解决保持 run 终态、completed run 残留恢复上下文时开放 Runbook 入口、terminal migration block Runbook 详情语义、terminal migration block resolve response 终态保留元数据、terminal migration block Action State 详情语义、Action State 主操作显式优先级、resume resource ids 稳定去重、Action State resource ids 稳定排序、Action State 机器契约覆盖、Run Summary blocking ids 稳定去重、Resume early return 响应形状稳定、AgentRun item identity 机器契约覆盖、MigrationBlock item identity 机器契约覆盖、Approval mutation log item identity 机器契约覆盖，以及 planner-first 主循环合并补发性能/安全边界 |
-| 数据库迁移 | 最新 head 为 `0040_agent_capability_plans`；新增 `ai_agent_capability_plans`，并为 AgentRun/AgentToolCall 增加计划关联字段；`alembic_version.version_num` 保持 `VARCHAR(128)` |
+| 数据库迁移 | 最新 head 为 `0051_test_report_deletions`；`0047` 新增 UI 用例/不可变版本，`0048` 新增 UI 运行协议，`0049` 新增产物上传会话与统一产物元数据，`0050` 关联平台修补请求与最终 runtime patch，`0051` 新增报告中心删除标记 |
 | 当前主要协议 | HTTP、WebSocket |
 | 当前主要执行方式 | 已保存 HTTP/WebSocket 用例、批量用例和已保存 Flow 内部通过共享执行工作池运行，但对前端保持原最终结果返回；场景、测试计划和 AI Skill Run 使用异步受理/事件查询；通知中心、工作台质量总览和报告智能大盘以已有缺陷/执行/报告事实派生读模型；未保存调试、WebSocket 长连接调试和媒体上传仍为同步边界 |
+
+2026-07-18 TestAuto Desktop 完整执行队列增量：`GET /ui-executions` 增加 `environment_id` 筛选，并在摘要中返回 `project_name/environment_name`；PyQt6 执行队列合并用户管理列表与设备 `/available`，支持真实分页、动态环境筛选、facets、详情/事件/产物读取、可信取消命令和 Outbox 产物手工重试结果。未定向执行创建后会筛选项目内 active、接单且兼容 `ui-case-v1 + desktop-ipc-v1` 的全部设备，经本地连接与 Redis pub/sub 扇出 `execution.available`；Redis 仍不是任务真相源，心跳/重连继续以 REST available 恢复并由 claim 原子仲裁。本机 Memurai 7.2.5 跨 Hub 扇出通过；后端 Desktop/UI runtime 定向 `51` 项通过，Desktop 默认 `87 passed, 4 skipped`。
+
+2026-07-18 报告与项目删除增量：新增 `DELETE /reports/{source_type}/{source_id}` 和
+`report:delete` 权限。迁移 `0051_test_report_deletions` 以项目、来源类型和来源 ID 唯一记录报告中心删除
+标记；删除报告会撤销对应一次性导出，但保留计划运行、Flow 执行、节点和诊断审计，活动执行返回 409。
+项目物理清理补齐 `test_report_exports/test_report_deletions`，前端报告详情与项目卡片均提供二次确认删除入口。
+
+2026-07-17 TestAuto Desktop 设备队列恢复增量：新增设备鉴权
+`GET /ui-executions/available?limit=20`，按项目绑定、接单开关、requested/assigned 设备、Desktop/DSL/IPC
+兼容性和设备/绑定并发上限筛选 queued/assigned 执行；响应在执行摘要上增加 `expected_status`。WSS、heartbeat
+和重连只触发该 REST 权威读取，claim 继续承担最终原子仲裁。后端权威 Desktop fixture 与 PyQt6 Adapter 已共同消费
+available 响应；UI runtime 与 fixture 定向 `19` 项、完整仓库 `1063` 项通过（`skipped=3`），Desktop 默认
+`69 passed, 2 skipped`，启用真实浏览器后 `71 passed`。
+
+2026-07-17 TestAuto Desktop 平台修补增量：新增用户态
+`POST /ui-executions/{execution_id}/patch-requests`，只允许 `paused/waiting_user`，以
+`client_request_id` 幂等并使用可选 `before` 做 CAS。后端基于冻结用例快照和历史已应用修补计算当前步骤，重新校验
+`ui-case-v1` 后通过既有命令链投递；Desktop 通过权威 lease renew 获取 `command_type=patch`，写入带
+`command_id` 的 runtime patch 后才能确认成功。迁移 `0050_ui_execution_patch_requests` 为命令与最终修补建立可空唯一
+外键，保留 Desktop 本地无命令修补兼容性。真实 MySQL single head/current 已升级到 `0050`；相关专项 `55` 项、
+完整仓库 `1063` 项通过（`skipped=3`）。
+
+2026-07-16 TestAuto Desktop 阶段 C 增量：新增 `ui_test_cases` 与 `ui_test_case_versions`，实现
+`ui-case-v1` 白名单校验、当前 Desktop 扁平 DSL 与目标嵌套 DSL 归一化、用例 CRUD/分页/软删除、不可变版本、
+`base_version` 乐观并发和 checksum 幂等；环境归属、导航 host、上传别名、步骤/大小/未知字段均由后端强制校验。
+新增 `ui_executions` 及步骤、事件、运行时修补、命令四张运行时基础表；当前开放 `202` 执行创建，以
+`project + user + client_request_id` 幂等，固化不含密钥值的用例/环境快照，可选向有效项目设备发送轻量
+`execution.available`。UI 运行创建、活动状态、步骤、终态与产物同步写入统一执行/诊断投影，现有页码与 cursor 查询支持
+`execution_type=ui`。claim/lease/events/complete、专用 UI 执行列表和产物接口仍未开放。真实 MySQL 已升级并核验
+single head/current、7 张新增表、外键与核心索引；UI 专项 `14` 项、Desktop/统一执行/诊断/物理删除聚焦回归
+`57` 项通过；完整仓库 `1039` 项通过（`skipped=3`）。
+
+2026-07-16 TestAuto Desktop 设备控制面增量：新增 `desktop_devices`、`desktop_device_credentials` 和
+`desktop_device_project_bindings`，以用户身份管理设备、以独立 `desktop_device_access` JWT 执行 heartbeat/WSS；
+设备 refresh token 使用不透明随机 secret、后端只保存哈希并在每次刷新时原子轮换。新增 runtime policy、注册/重新注册、
+列表/详情/更新/撤销、项目 opt-in 绑定和降频心跳 REST 接口；Redis TTL 保存在线态，Redis pub/sub 支持多进程 WSS
+通知，Redis 不可用时注册和 REST 不阻塞并退化到 MySQL 心跳快照。WSS 当前实现 `control.ready/ping/pong/resync`
+基础协议，REST 始终是权威状态源。迁移 `0046_desktop_devices`，新增 `redis>=5,<7` 依赖。设备专项 `13` 项、设备与关联边界
+聚焦回归 `40` 项、完整仓库 `1025` 项均通过（`skipped=3`）；真实 MySQL 已完成 upgrade、current、表、索引和
+外键核验。
+
+2026-07-16 场景数据库动作增量：新增环境级 MySQL、PostgreSQL、MongoDB 连接管理、连接测试、
+加密凭据、目标网络门禁和 `database:view/manage/execute/write` 权限；场景前后置动作新增
+`database_query` / `database_execute`，支持参数化 SQL、结构化 MongoDB 操作、断言、类型保真取值、
+查询重试、行数/超时上限和写连接显式 opt-in。目标数据库与平台 Session 分离，每次动作写入脱敏
+`database_action_executions` 审计。未保存数据库动作调试为同步单步边界；正式整场执行继续沿用既有
+异步受理与 execution worker。迁移 `0045_database_test_actions`，依赖 `psycopg`、`pymongo`、
+`sqlparse`。
+
+3.0.537 增量：项目管理读模型补齐 `GET /projects/{id}/testing-overview`，统一统计 HTTP/WebSocket/系统用例、场景、计划、流程、根执行成功/失败和未关闭/全部缺陷；新增语义明确的 API 执行覆盖率、API 成功覆盖率、风险等级、真实最近执行、结构化规则建议和项目活动，旧统计字段保留为兼容别名。补齐成员查询、权限完整替换和移除接口，保持创建者隐式所有权，普通成员删除采用停用并支持重新激活。场景、计划、流程、缺陷写入和异步执行完成统一失效项目列表缓存。前端详情并行读取项目详情与测试总览，成员弹窗接入真实接口，高风险/最近活跃筛选生效，移除无契约的批量导入入口。新增后端项目页契约与前端 API/页面回归；无数据库迁移。
+
+3.0.538 增量：测试报告详情从数据库原始结构收敛为统一轻量展示契约，计划目标和 Flow 节点补齐名称、
+方法、路径、计数、耗时、断言、错误与风险标志；原始请求/响应改由单条明细接口按需读取并统一脱敏。
+列表补齐执行人与环境，Flow 新执行保存来源名称/版本快照。规则洞察删除无失败占位聚类，拆分执行失败、
+慢执行和未关闭缺陷风险，补齐趋势日期、慢用例执行身份、热力图坐标和结构化建议动作。新增规则化补充
+用例草稿接口；HTML 支持 Bearer Blob 下载以及基于 `0043_test_report_contracts` 的短时一次性下载凭证。
+
+2026-07-15 平台自举式非 Agent 回归增量：以项目 `10` 和环境 `13` 建立 310 条保存用例、36 条可维护流程
+和统一总回归计划，覆盖 OpenAPI 的 125 条非 Agent 路径、164 个 operation。新增 33 步动态故障修复
+主链，覆盖创建失败用例、绑定含前后置动作的子场景、失败证据、缺陷、断言修复、场景版本刷新、
+修复重跑、测试计划、结构化/HTML 报告、报告钻取、缺陷关闭和资源清理。独立场景 `114` 运行 `331`
+完成 64/64 步；百级场景 `108` v3 编排 304 个用例节点和 43 个动作，运行 `335` 完成 347/347 步，
+耗时 1,040,456 ms。保存版本记录 34 个提取和 394 条绑定。
+回归暴露大响应诊断证据超过 MySQL `BLOB` 上限的问题，`0044_execution_artifact_mediumblob` 将 artifact
+内容列扩为 `MEDIUMBLOB`，未改变脱敏、压缩、哈希、权限和分块读取语义。
+大流程历史列表另外暴露 MySQL sort buffer 问题；场景运行列表改为只投影轻量摘要，不再选择
+`scenario_snapshot`、`variables_snapshot` 和 `step_results`，完整步骤只在详情接口按需组装。
 
 3.0.533 增量：Agent 平台业务工具覆盖从 29 个扩展到 48 个 ToolSpec。新增 `execution.query_records/read_detail/diagnose`；`plan.query_project_plans/create_saved/update_saved/set_enabled/execute_saved/query_runs/read_run`；`flow.query_project_flows/validate_graph/create_saved/update_saved/execute_saved`；`defect.query_project_defects/create_saved/update_saved/transition_status`。实现集中在独立 `AgentPlatformToolBackend`，原 `AgentToolBackend` 的 29 个 handler 与工具名保持不变；查询工具返回 fresh snapshot、`object_reference_manifest` 和 `object_ref`，保存/执行/状态变更工具继续经过权限、审批和对象引用 preflight。测试计划与 Flow 执行只创建 queued run/execution 并提交共享执行工作池，不在 Agent Tool worker 内同步等待。四个领域的 Skill、Planner 路由和查询结果 Model View 同步补齐；`execution.diagnose` 支持 HTTP、WebSocket、场景和 Flow 统一执行详情。新增 9 个回归覆盖注册表兼容、handler、路由、快照/引用、异步提交、Flow 校验和 projection；Agent/Skill 626 项回归 OK（skipped=3），完整仓库 787 项回归 OK（skipped=3），无数据库迁移或既有 REST 路由形状变化。
 
@@ -331,7 +399,7 @@ ToolCall 失败终态的错误消息也已收口：`ToolExecutor.execute_tool_ca
 | 可视化测试流程 | 联调中 | 版本化 DAG、HTTP/WebSocket 节点、条件、延迟、数据绑定和执行 | [流程接口文档](api_visual_flows.md) |
 | 场景组合与实时运行 | 联调中 | nodes 绑定动作、版本快照、dataset record 独立运行、请求覆盖、受限脚本、异步启动和持久化 SSE | [场景接口文档](api_scenarios.md)、[执行图谱](scenario_execution_graph.md) |
 | 执行记录 | 联调中 | 已统一查询 HTTP、WebSocket、场景和 Flow 历史，支持筛选、分页及协议专属详情 | [统一执行记录接口](api_execution_records.md) |
-| 测试报告 | 联调中 | 测试计划与 Flow 支持报告历史、结构化指标、明细、HTML 下载和按日趋势 | [测试报告接口](api_test_reports.md) |
+| 测试报告 | 已实现 | 测试计划与 Flow 报告历史、统一轻量明细、单条脱敏详情、规则洞察、一次性 HTML 下载和按日趋势 | [测试报告接口](api_test_reports.md) |
 | 缺陷跟踪与媒体 | 已实现 | 项目缺陷 CRUD、富文本清洗、状态流转、MinIO 图片附件、权限和删除清理 | [缺陷跟踪接口文档](api_defects.md)、[媒体存储接口文档](api_media.md) |
 | 浏览器接口采集 | 联调中 | Chrome 插件采集批次、HTTP/WebSocket 草稿幂等同步与结构化 AI | [浏览器采集接口文档](api_browser_captures.md) |
 | 接口定义与导入 | 待规划 | 独立接口资产、OpenAPI 导入、从接口生成用例 | 本文档开发计划 |
@@ -357,12 +425,21 @@ ToolCall 失败终态的错误消息也已收口：`ToolExecutor.execute_tool_ca
 ### 2.2 当前主要缺口
 
 - 统一执行记录查询已实现，尚缺前端执行中心联调、归档和聚合统计。
-- 测试报告、HTML 导出和按日趋势已实现，尚缺前端联调、PDF 和长期归档。
+- 测试报告轻量详情、单条脱敏明细、规则洞察、HTML 导出和趋势已实现；前端仍需切换一次性下载/Blob 下载并接入明细懒加载，PDF 和长期归档尚未实现。
 - 场景手工执行已支持应用内后台任务和实时进度，但缺少独立 Worker、启动恢复扫描、取消、重试和并发控制。
-- 可视化 Flow 执行仍为同步执行，尚未复用场景实时运行协议。
+- 已保存 HTTP、WebSocket 和 Flow 已统一返回 `202`，并在写执行记录前预留有界工作池容量；仍缺少独立 Worker、进程重启恢复和跨实例队列。
 - HTTP 用例、WebSocket 用例和流程缺少完整的删除、归档、复制和分页检索能力。
 - 已形成统一的 `unittest discover` 回归套件，但尚未接入 CI 门禁和真实 MySQL/SSE 集成环境。
 - WebSocket 长连接调试会话保存在单进程内存中，多 Worker 或多实例部署需要会话路由方案。
+
+### 2.3 非 Agent 业务逻辑加固（2026-07-15）
+
+- 项目物理删除补齐浏览器采集、系统用例关系和执行诊断/指标表，数据库提交后再清理对象存储。
+- 已保存 HTTP/WebSocket/Flow 与场景执行在持久化前预留队列容量，批量执行最多 100 个唯一 ID 并整批预留，API 立即返回 `202`。
+- HTTP 执行默认阻断私网/回环目标、禁止自动重定向并限制响应体；执行快照与浏览器采集入库前二次脱敏。
+- 空 record 场景终态改为 `skipped`；公共 `running` 筛选覆盖内部 queued/pending；停用账号旧 token 立即失效。
+- 项目统计改为根执行口径，覆盖率按已有终态执行的唯一用例计算，自动化率按已有通过执行的唯一用例计算；看板不再伪造节省工时和缺陷概率。
+- 测试计划运行历史删除改为软删除并保留计划到场景运行的审计关联。
 
 ## 3. 用户与认证模块
 
@@ -494,7 +571,7 @@ ToolCall 失败终态的错误消息也已收口：`ToolExecutor.execute_tool_ca
 
 项目管理模块用于组织测试资源。项目下应包含环境、接口定义、测试用例、测试流程、执行记录和报告。
 
-当前已实现项目创建、项目列表、项目详情访问控制、项目更新、项目软删除、项目普通测试人员授权，以及项目环境管理。
+当前已实现项目创建、项目列表、项目详情访问控制、项目更新、项目软删除、测试总览、项目成员查询/授权/移除，以及项目环境管理。
 
 项目归项目创建者所有。项目创建者可以修改、编辑、删除自己创建的项目；管理员可以管理所有项目。
 
@@ -502,7 +579,7 @@ ToolCall 失败终态的错误消息也已收口：`ToolExecutor.execute_tool_ca
 
 | 类型 | 文件 | 说明 |
 | --- | --- | --- |
-| API Router | `app/api/v1/routers/projects.py` | 项目创建、查询、成员授权、权限编码查询 |
+| API Router | `app/api/v1/routers/projects.py` | 项目创建、查询、测试总览、成员管理、权限编码查询 |
 | API Router | `app/api/v1/routers/users.py` | 管理员权限设置 |
 | 依赖注入 | `app/api/v1/deps.py` | 当前用户、管理员校验、项目权限依赖 |
 | Model | `app/models/project.py` | 项目、项目成员、项目成员权限 |
@@ -980,7 +1057,7 @@ P0 完成条件：
 | 统一执行记录接口 | 已实现：统一返回执行类型、项目、环境、执行人、状态、耗时、开始时间和错误摘要 | 已可分页筛选四类执行记录 |
 | 执行详情 | 已实现：保留协议专属响应，同时提供统一摘要 | 已可查看请求/会话快照、响应、断言、attempt、场景事件和节点日志 |
 | 测试报告 | 已实现：基于测试计划运行或 Flow 执行即时生成 | 已包含通过率、失败原因、耗时、record/步骤或节点明细 |
-| 报告导出 | 已实现 HTML；后续扩展 PDF | 用户可下载并离线查看完整 HTML 报告 |
+| 报告导出 | 已实现 Bearer Blob 与短时一次性 HTML；后续扩展 PDF | 用户可下载不含原始敏感快照的离线 HTML 报告，凭证成功消费一次后失效 |
 | 历史趋势 | 已实现：按项目、来源、环境和日期聚合，窗口最长 366 天 | 已返回执行数、通过率、失败数和平均耗时 |
 
 P1 完成条件：
@@ -1649,3 +1726,13 @@ Agent `scenario.compose_draft` 现为严格 `draft_only`：无论模型输入如
 真实 DeepSeek 只读验收直接复用该失败 Run 的冻结 snapshot `agent-snap-8ccefe4c77874b97b21a15ee1c5b50e8`（29 个 Skill、49 个 Tool、10 个 artifact handle），不启动 Runner。Provider 再次返回 `assertion-extractor-binding + execution-diagnosis`、同样 8 个 Tool 和 `target_domain=test_case`；本地校验生成有效 Skills `assertion-extractor-binding + execution-diagnosis + http-test-case-design`，`target_aligned=true` 且没有未绑定来源域。验收前后该 Run 的 Capability Plan、ToolCall、Approval 和 WorkerQueue 计数均保持 0，证明闭包仅发生在规划/上下文层。
 
 Capability Plan 恢复路径也同步支持完整 round-trip：`_validated_planning_decision_from_plan()` 会恢复模型/有效 Skill 集合、`skill_domain_alignment`、`tool_skill_alignment` 和 effect-scope 规范化审计；旧计划缺少新字段时以已持久化 `selected_skills` 构造兼容默认值。这样 active plan 的后续迭代不会丢失领域闭包解释，同时不重跑闭包或改变已冻结的 Tool 集合。
+
+## 2026-07-15 工作台业务接口补全
+
+新增项目资产趋势、分页活动明细、异步 AI 分析、统一回归父任务和洞察详情接口，并为现有质量总览活动和建议补齐资源 ID、运行 ID 与结构化动作。趋势使用每日快照和生命周期事实，迁移前历史显式标为不完整；缺陷预测没有校准模型时返回不可用。AI 分析复用现有 Provider 但不进入 Agent Runtime，回归父任务只编排现有 HTTP/WebSocket/场景/Flow/测试计划执行服务。迁移 head 更新为 `0042_dashboard_workbench_contracts`。
+
+## 2026-07-17 非 Agent 业务接口与数据库性能筛查
+
+按需求排除 Agent 路由后盘点 209 个业务接口，结合 14,295 条请求日志、真实 MySQL SQL 计数、执行计划、表/索引结构和静态循环查询扫描定位性能根因。已把场景列表的版本/环境 `2N` 查询、场景与 Flow 校验的逐节点查询、执行中心日志的大 JSON 加载、Desktop Worker/队列逐项查询、UI 高频轮询重复 count、Desktop token 三段鉴权，以及 Dashboard GET 写入当天快照改为固定批量或轻量投影；公共路由、响应字段、权限、分页、排序、幂等、状态机和迁移均不变。
+
+真实 MySQL 复测：20 条场景列表从 44 SQL/约 2.7 秒降至 2 SQL/约 138 毫秒；100 条执行日志从 3 SQL/约 784 毫秒降至 1 SQL/约 51 毫秒；Dashboard 7 天趋势为 5 SQL/约 145 毫秒且无写事务；UI 列表/available 仓储层分别为 2/1 SQL；304 节点场景校验由至少 305 SQL 降至 2 SQL/约 714 毫秒。数据库未发现当前热点缺少必要左前缀索引；`execution-center/logs` 服务端计划约 0.6 毫秒，瓶颈是大字段传输/解码，因此未新增索引或 migration。完整筛查与残余风险见 `docs/non_agent_performance_screening_2026-07-17.md`。

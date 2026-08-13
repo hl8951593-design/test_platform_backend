@@ -11,6 +11,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.mysql import MEDIUMBLOB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -18,6 +19,7 @@ from app.db.base import Base
 
 BIGINT_PK = BigInteger().with_variant(Integer, "sqlite")
 BIGINT_VALUE = BigInteger().with_variant(Integer, "sqlite")
+ARTIFACT_BINARY = LargeBinary().with_variant(MEDIUMBLOB, "mysql")
 
 
 class ExecutionRecordIndex(Base):
@@ -186,12 +188,13 @@ class ExecutionPayloadArtifact(Base):
     storage_locator: Mapped[str] = mapped_column(String(255), nullable=False)
     content_type: Mapped[str] = mapped_column(String(128), nullable=False)
     encoding: Mapped[str] = mapped_column(String(32), nullable=False)
-    content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    content: Mapped[bytes | None] = mapped_column(ARTIFACT_BINARY, nullable=True)
     raw_size_bytes: Mapped[int] = mapped_column(BIGINT_VALUE, nullable=False)
     stored_size_bytes: Mapped[int] = mapped_column(BIGINT_VALUE, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     redaction_version: Mapped[str] = mapped_column(String(64), nullable=False)
     retention_tier: Mapped[str] = mapped_column(String(32), nullable=False)
+    metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )

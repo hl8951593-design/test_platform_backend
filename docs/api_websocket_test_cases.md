@@ -20,9 +20,11 @@ WebSocket 测试用例与 HTTP 测试用例完全独立：使用 `/api/v1/websoc
 | POST | `/websocket-test-cases?project_id={project_id}` | `case:manage` | 新增用例 |
 | PUT | `/websocket-test-cases/{id}?project_id={project_id}` | `case:manage` | 更新用例 |
 | DELETE | `/websocket-test-cases/{id}?project_id={project_id}` | `case:manage` | 删除用例 |
-| POST | `/websocket-test-cases/{id}/execute?project_id={project_id}` | `test:execute` | 后端内部提交工作池执行，接口等待完成并返回原执行记录结构 |
+| POST | `/websocket-test-cases/{id}/execute?project_id={project_id}` | `test:execute` | HTTP `202`；预留容量后提交工作池，立即返回执行 ID 和轮询地址 |
 | POST | `/websocket-test-cases/execute-unsaved?project_id={project_id}` | `test:execute` | 执行未保存用例；当前仍为同步调试入口 |
-| POST | `/websocket-test-cases/batch-execute?project_id={project_id}` | `test:execute` | 后端内部并发提交工作池执行，接口等待本批次完成并返回原执行记录列表 |
+| POST | `/websocket-test-cases/batch-execute?project_id={project_id}` | `test:execute` | HTTP `202`；最多 100 个唯一 ID，整批容量和全部用例/环境校验通过后才写执行记录 |
+
+队列无容量时返回 `503`，不会留下部分 `queued` 记录。已保存执行不再占用 API 请求线程等待 WebSocket 会话结束；客户端使用响应中的 `polling_url` 查询终态。
 
 删除时保留历史执行记录并将 `websocket_test_case_id` 置空。已保存的场景版本仍按完整快照执行；如果可视化流程版本仍引用该用例，接口返回 `409 Conflict`，并在 `detail.flows` 中返回流程名称。
 

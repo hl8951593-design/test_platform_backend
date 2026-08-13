@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.async_response import public_execution_status
 from app.schemas.retry import RetryPolicyConfig
@@ -55,8 +55,14 @@ class UnsavedWebSocketTestCaseExecuteRequest(WebSocketTestCaseConfig):
 
 
 class WebSocketBatchExecuteRequest(BaseModel):
-    websocket_test_case_ids: list[int] = Field(min_length=1)
+    websocket_test_case_ids: list[int] = Field(min_length=1, max_length=100)
     environment_id: int | None = None
+
+    @model_validator(mode="after")
+    def validate_unique_case_ids(self):
+        if len(self.websocket_test_case_ids) != len(set(self.websocket_test_case_ids)):
+            raise ValueError("websocket_test_case_ids 不能重复")
+        return self
 
 
 class WebSocketDebugSessionCreateRequest(BaseModel):

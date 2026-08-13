@@ -81,8 +81,8 @@ POST /api/v1/test-plans/8/execute?project_id=1
 }
 ```
 
-环境必须属于当前项目、未删除，并且存在于计划的 `environment_ids`。接口创建 `pending`
-运行后立即返回 HTTP `202`；客户端通过运行历史接口查询 `pending`、`running`、
+环境必须属于当前项目、未删除，并且存在于计划的 `environment_ids`。接口先预留工作池容量，再创建 `pending`
+运行并立即返回 HTTP `202`；队列已满时返回 `503` 且不创建运行。客户端通过运行历史接口查询 `pending`、`running`、
 `passed`、`failed` 或 `timeout` 状态。
 
 幂等键作用域为项目且不自动过期。同键相同请求返回原运行；同键不同计划版本、环境、触发类型

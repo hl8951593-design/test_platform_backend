@@ -9,6 +9,27 @@ from app.models.project import (
     ProjectMemberPermission,
 )
 from app.models.defect import Defect
+from app.models.database_connection import (
+    DatabaseActionExecution,
+    ProjectDatabaseConnection,
+)
+from app.models.desktop_device import DesktopDeviceProjectBinding
+from app.models.ui_execution import UiExecution
+from app.models.ui_test_case import UiTestCase, UiTestCaseVersion
+from app.models.dashboard import (
+    DashboardAIAnalysisJob,
+    DashboardAssetDailySnapshot,
+    DashboardAssetEvent,
+    DashboardRegressionRun,
+)
+from app.models.browser_capture import BrowserCapture, BrowserCaptureEntry
+from app.models.execution_diagnostic import (
+    ExecutionMetricDaily,
+    ExecutionMetricHourly,
+    ExecutionPayloadArtifact,
+    ExecutionRecordIndex,
+    ExecutionStepDiagnostic,
+)
 from app.models.media import MediaObject
 from app.models.notification import NotificationReadState
 from app.models.scenario import (
@@ -27,6 +48,8 @@ from app.models.test_plan import (
     TestPlanScenario,
     TestPlanWebhookEvent,
 )
+from app.models.test_report import TestReportDeletion, TestReportExport
+from app.models.system_test_case import SystemCaseApiRelation, SystemTestCase
 from app.models.visual_flow import (
     VisualFlow,
     VisualFlowExecution,
@@ -84,6 +107,9 @@ class ProjectRepository:
 
     def delete_project(self, project: Project) -> None:
         project_id = project.id
+        ui_case_ids = list(self.db.scalars(
+            select(UiTestCase.id).where(UiTestCase.project_id == project_id)
+        ).all())
         flow_ids = list(self.db.scalars(
             select(VisualFlow.id).where(VisualFlow.project_id == project_id)
         ).all())
@@ -99,6 +125,51 @@ class ProjectRepository:
         member_ids = list(self.db.scalars(
             select(ProjectMember.id).where(ProjectMember.project_id == project_id)
         ).all())
+
+        # Diagnostic projections do not have database foreign keys by design,
+        # so project removal must purge them explicitly.
+        self.db.execute(
+            delete(DatabaseActionExecution).where(
+                DatabaseActionExecution.project_id == project_id
+            )
+        )
+        self.db.execute(delete(ExecutionStepDiagnostic).where(ExecutionStepDiagnostic.project_id == project_id))
+        self.db.execute(delete(ExecutionPayloadArtifact).where(ExecutionPayloadArtifact.project_id == project_id))
+        self.db.execute(delete(ExecutionRecordIndex).where(ExecutionRecordIndex.project_id == project_id))
+        self.db.execute(delete(ExecutionMetricHourly).where(ExecutionMetricHourly.project_id == project_id))
+        self.db.execute(delete(ExecutionMetricDaily).where(ExecutionMetricDaily.project_id == project_id))
+        self.db.execute(delete(TestReportExport).where(TestReportExport.project_id == project_id))
+        self.db.execute(delete(TestReportDeletion).where(TestReportDeletion.project_id == project_id))
+        self.db.execute(delete(DashboardRegressionRun).where(DashboardRegressionRun.project_id == project_id))
+        self.db.execute(delete(DashboardAIAnalysisJob).where(DashboardAIAnalysisJob.project_id == project_id))
+        self.db.execute(delete(DashboardAssetEvent).where(DashboardAssetEvent.project_id == project_id))
+        self.db.execute(
+            delete(DashboardAssetDailySnapshot).where(
+                DashboardAssetDailySnapshot.project_id == project_id
+            )
+        )
+
+        # UI runs retain immutable snapshots during normal case soft-deletion.
+        # A physical project purge removes runs first, then breaks the case/current
+        # version cycle before deleting versioned case assets.
+        self.db.execute(delete(UiExecution).where(UiExecution.project_id == project_id))
+        if ui_case_ids:
+            self.db.execute(
+                update(UiTestCase)
+                .where(UiTestCase.id.in_(ui_case_ids))
+                .values(current_version_id=None)
+            )
+            self.db.execute(
+                update(UiTestCaseVersion)
+                .where(UiTestCaseVersion.ui_test_case_id.in_(ui_case_ids))
+                .values(based_on_version_id=None)
+            )
+            self.db.execute(
+                delete(UiTestCaseVersion).where(
+                    UiTestCaseVersion.ui_test_case_id.in_(ui_case_ids)
+                )
+            )
+        self.db.execute(delete(UiTestCase).where(UiTestCase.project_id == project_id))
 
         if flow_execution_ids:
             self.db.execute(
@@ -149,6 +220,10 @@ class ProjectRepository:
                 )
             )
         self.db.execute(delete(TestScenario).where(TestScenario.project_id == project_id))
+        self.db.execute(delete(BrowserCaptureEntry).where(BrowserCaptureEntry.project_id == project_id))
+        self.db.execute(delete(BrowserCapture).where(BrowserCapture.project_id == project_id))
+        self.db.execute(delete(SystemCaseApiRelation).where(SystemCaseApiRelation.project_id == project_id))
+        self.db.execute(delete(SystemTestCase).where(SystemTestCase.project_id == project_id))
         self.db.execute(delete(TestCaseEnvironment).where(TestCaseEnvironment.project_id == project_id))
         self.db.execute(
             delete(WebSocketTestCaseEnvironment).where(
@@ -162,6 +237,11 @@ class ProjectRepository:
         self.db.execute(delete(MediaObject).where(MediaObject.project_id == project_id))
         self.db.execute(delete(NotificationReadState).where(NotificationReadState.project_id == project_id))
         self.db.execute(delete(Defect).where(Defect.project_id == project_id))
+        self.db.execute(
+            delete(DesktopDeviceProjectBinding).where(
+                DesktopDeviceProjectBinding.project_id == project_id
+            )
+        )
 
         if environment_ids:
             self.db.execute(
@@ -169,6 +249,11 @@ class ProjectRepository:
                     ProjectEnvironmentVariable.environment_id.in_(environment_ids)
                 )
             )
+        self.db.execute(
+            delete(ProjectDatabaseConnection).where(
+                ProjectDatabaseConnection.project_id == project_id
+            )
+        )
         self.db.execute(
             delete(ProjectEnvironment).where(ProjectEnvironment.project_id == project_id)
         )
@@ -182,17 +267,61 @@ class ProjectRepository:
         self.db.delete(project)
         self.db.commit()
 
-    def get_member(self, *, project_id: int, user_id: int) -> ProjectMember | None:
-        statement = select(ProjectMember).where(
-            ProjectMember.project_id == project_id,
-            ProjectMember.user_id == user_id,
-            ProjectMember.is_active.is_(True),
+    def get_member(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        include_inactive: bool = False,
+    ) -> ProjectMember | None:
+        statement = (
+            select(ProjectMember)
+            .options(
+                joinedload(ProjectMember.user),
+                joinedload(ProjectMember.added_by),
+                selectinload(ProjectMember.permissions),
+            )
+            .where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.user_id == user_id,
+            )
         )
+        if not include_inactive:
+            statement = statement.where(ProjectMember.is_active.is_(True))
         return self.db.scalar(statement)
+
+    def list_members(self, *, project_id: int, include_inactive: bool = False) -> list[ProjectMember]:
+        statement = (
+            select(ProjectMember)
+            .options(
+                joinedload(ProjectMember.user),
+                joinedload(ProjectMember.added_by),
+                selectinload(ProjectMember.permissions),
+            )
+            .where(ProjectMember.project_id == project_id)
+            .order_by(ProjectMember.id.asc())
+        )
+        if not include_inactive:
+            statement = statement.where(ProjectMember.is_active.is_(True))
+        return list(self.db.scalars(statement).all())
 
     def add_member(self, *, project_id: int, user_id: int, added_by_id: int) -> ProjectMember:
         member = ProjectMember(project_id=project_id, user_id=user_id, added_by_id=added_by_id)
         self.db.add(member)
+        self.db.commit()
+        self.db.refresh(member)
+        return member
+
+    def set_member_active(
+        self,
+        *,
+        member: ProjectMember,
+        is_active: bool,
+        added_by_id: int | None = None,
+    ) -> ProjectMember:
+        member.is_active = is_active
+        if added_by_id is not None:
+            member.added_by_id = added_by_id
         self.db.commit()
         self.db.refresh(member)
         return member
@@ -363,6 +492,24 @@ class ProjectRepository:
             .values(environment_id=None)
         )
         self.db.execute(
+            update(UiTestCase)
+            .where(UiTestCase.default_environment_id == environment_id)
+            .values(default_environment_id=None)
+        )
+        self.db.execute(
+            update(UiExecution)
+            .where(UiExecution.environment_id == environment_id)
+            .values(environment_id=None)
+        )
+        self.db.execute(
+            update(ExecutionRecordIndex)
+            .where(
+                ExecutionRecordIndex.project_id == environment.project_id,
+                ExecutionRecordIndex.environment_id == environment_id,
+            )
+            .values(environment_id=None)
+        )
+        self.db.execute(
             delete(TestCaseEnvironment).where(
                 TestCaseEnvironment.environment_id == environment_id
             )
@@ -380,6 +527,16 @@ class ProjectRepository:
         self.db.execute(
             delete(ProjectEnvironmentVariable).where(
                 ProjectEnvironmentVariable.environment_id == environment_id
+            )
+        )
+        self.db.execute(
+            delete(DatabaseActionExecution).where(
+                DatabaseActionExecution.environment_id == environment_id
+            )
+        )
+        self.db.execute(
+            delete(ProjectDatabaseConnection).where(
+                ProjectDatabaseConnection.environment_id == environment_id
             )
         )
         self.db.delete(environment)

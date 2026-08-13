@@ -7,11 +7,11 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 最近核对日期 | 2026-07-12 |
-| 开发基线 | `3.0.536-agent-native-tool-wire-fix` |
-| Alembic head | `0040_agent_capability_plans` |
+| 最近核对日期 | 2026-07-17 |
+| 开发基线 | `3.0.540-self-test-full-mega-flow` |
+| Alembic head | `0050_ui_execution_patch_requests` |
 | 回归命令 | `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v` |
-| 最近完整回归 | `3.0.536-agent-native-tool-wire-fix` 已执行 `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q`，879 个用例 OK（skipped=3）；其中 Agent Runtime、结构化意图、Capability Plan、原生 Tool Calling、DeepSeek thinking 多轮回传、AI 传输层与平台工具回归全部通过；迁移链单 head 为 `0040_agent_capability_plans` |
+| 最近完整回归 | 2026-07-17 后端 `unittest discover` 共 `1063` 项通过，`skipped=3`；UI runtime 与后端权威 Desktop fixture 定向 `19` 项通过；真实 MySQL 已升级并确认 single head/current 为 `0050_ui_execution_patch_requests` |
 
 数字基线只能在实际执行命令后更新。数据库结构以 Alembic migration 和当前模型共同为准，
 不能只修改模型而遗漏迁移。
@@ -22,6 +22,8 @@
 真实 MySQL 复测约 0.75 秒。新增索引迁移为
 `0038_non_agent_query_performance_indexes`，HTTP 响应字段、排序、权限、幂等语义和既有异步执行架构均未改变。
 专项 40 项、非 Agent 161 项、完整 796 项测试均通过，完整回归 `skipped=3`。
+
+2026-07-17 完成第二轮非 Agent 全项目性能筛查：排除 Agent 后盘点 209 个业务路由和对应 MySQL 查询，修复场景列表/校验、Flow 校验、执行中心日志/Worker/队列、Dashboard 趋势、UI 轮询和 Desktop 鉴权中的查询放大与 GET 写事务。真实 MySQL 复测中场景列表由 44 条 SQL 降至 2 条，执行日志由 3 条降至 1 条，304 节点场景校验由至少 305 条降至 2 条；未改变公共 API、权限、排序、分页、幂等、状态机或 migration head。完整证据见 [非 Agent 业务接口与数据库性能筛查](non_agent_performance_screening_2026-07-17.md)。
 
 ## 文档收敛规则
 
@@ -53,19 +55,27 @@
 | 文档 | 权威范围 |
 | --- | --- |
 | [技术架构](technical_architecture.md) | 分层、模块关系、执行模型、基础设施和演进边界 |
+| [TestAuto Desktop 目标架构](testauto_desktop_technical_architecture.md) | PyQt6 桌面端、Playwright 浏览器管理、交互执行、平台目标契约与分阶段验收 |
+| [TestAuto Desktop 后端接口开发计划](testauto_desktop_backend_api_development_plan.md) | Desktop 设备、UI 用例版本、claim/lease、事件、产物、统一执行接入与阶段 A–F 验收（代码闭环已完成） |
+| [TestAuto Desktop 设备控制面 API](api_desktop_devices.md) | 已实现的设备注册、独立凭据、项目绑定、runtime policy、heartbeat 与 WSS Control |
+| [TestAuto Desktop UI 用例 API](api_ui_test_cases.md) | 已实现的 `ui-case-v1` 校验、用例 CRUD、不可变版本和乐观并发 |
+| [TestAuto Desktop UI 执行 API](api_ui_executions.md) | 已实现的 `202` 创建、claim/lease、事件、SSE、本地导入、修补、命令、complete、产物和统一执行投影 |
 | [场景执行图谱](scenario_execution_graph.md) | 场景触发、dataset record 展开、步骤执行、变量链路、状态和持久化关系 |
 | [场景数据驱动契约](scenario-data-driven-contract.md) | record 展开、请求覆盖与兼容读取规则 |
 | [场景运行事件契约](scenario-run-events-contract.md) | SSE 顺序、重连、事件类型与校准边界 |
 | [场景运行详情契约](scenario-run-detail-contract.md) | run 身份、步骤结果、快照和运行中字段 |
 | [场景变量追踪契约](scenario-variable-tracing-contract.md) | 变量来源、动作写入、绑定与脱敏 |
+| [数据库连接与场景数据库动作](api_database_connections.md) | MySQL、PostgreSQL、MongoDB 连接、执行、断言、取值和安全边界 |
 | [开发进度与计划](development_technical_notes.md) | 当前完成度、风险、优先级、迁移基线和验收计划 |
 | [后端日志与排查](logging.md) | request_id、请求日志、执行队列和 AI JSON 修复日志定位 |
 | [统一错误响应](api_errors.md) | HTTP 错误 envelope、字段定位、500 request ID 和 OpenAPI 契约 |
-| [统一执行记录](api_execution_records.md) | HTTP、WebSocket、场景和 Flow 执行历史的公共列表与详情契约 |
+| [统一执行记录](api_execution_records.md) | HTTP、WebSocket、场景、Flow 和 UI 执行历史的公共列表与详情契约 |
 | [执行中心](api_execution_center.md) | 执行中心页面总览、队列、Worker、日志、失败诊断和重试池读接口 |
 | [通知中心](api_notifications.md) | 顶栏通知列表、未读筛选和已读状态持久化契约 |
-| [工作台质量总览](api_dashboard.md) | 首页质量大盘、风险矩阵、自动化效率、AI 建议和热路径聚合性能边界 |
+| [工作台接口](api_dashboard.md) | 质量总览、资产趋势、活动明细、异步 AI、统一回归、洞察钻取和快照边界 |
 | [测试报告](api_test_reports.md) | 测试计划、Flow 报告历史、结构化指标、HTML 导出和 AI 报告大盘 |
+| [平台自举式全量回归](platform_self_test_regression.md) | 非 Agent OpenAPI 全接口契约、业务生命周期流程、总回归计划、外部依赖门禁和重建方式 |
+| [非 Agent 业务接口与数据库性能筛查](non_agent_performance_screening_2026-07-17.md) | 2026-07-17 路由、日志、SQL、索引筛查，优化前后真实 MySQL 证据和残余风险 |
 | [缺陷跟踪](api_defects.md) | 项目缺陷 CRUD、富文本清洗、状态流转和权限契约 |
 | [媒体存储](api_media.md) | MinIO 图片上传、附件绑定、临时访问地址和清理契约 |
 | [Agent 前端接口契约](api_agent_frontend_contract.md) | Harness Loop Agent 前端接入接口、SSE、字段契约和限制 |
@@ -80,6 +90,7 @@
 ## 接口文档
 
 - [认证](api_auth.md)
+- [TestAuto Desktop 设备控制面](api_desktop_devices.md)
 - [后端日志与排查](logging.md)
 - [统一错误响应](api_errors.md)
 - [统一执行记录](api_execution_records.md)
@@ -91,7 +102,9 @@
 - [缺陷跟踪](api_defects.md)
 - [媒体存储](api_media.md)
 - [项目权限](api_project_permissions.md)
+- [项目管理](api_projects.md)
 - [环境配置](api_environment_configs.md)
+- [数据库连接与场景数据库动作](api_database_connections.md)
 - [HTTP 测试用例](api_test_cases.md)
 - [系统测试用例](api_system_test_cases.md)
 - [WebSocket 测试用例](api_websocket_test_cases.md)

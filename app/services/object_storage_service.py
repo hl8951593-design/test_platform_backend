@@ -1,5 +1,5 @@
 from functools import cached_property
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import boto3
 from botocore.config import Config
@@ -52,12 +52,62 @@ class ObjectStorageService:
         except (BotoCoreError, ClientError) as exc:
             raise self._unavailable() from exc
 
-    def presigned_get_url(self, *, bucket: str, object_key: str) -> str:
+    def presigned_put_url(
+        self,
+        *,
+        bucket: str,
+        object_key: str,
+        content_type: str,
+        sha256: str,
+        expires_in: int,
+    ) -> tuple[str, dict[str, str]]:
+        required_headers = {
+            "Content-Type": content_type,
+            "x-amz-meta-sha256": sha256,
+        }
+        try:
+            url = self.public_client.generate_presigned_url(
+                "put_object",
+                Params={
+                    "Bucket": bucket,
+                    "Key": object_key,
+                    "ContentType": content_type,
+                    "Metadata": {"sha256": sha256},
+                },
+                ExpiresIn=expires_in,
+                HttpMethod="PUT",
+            )
+            return url, required_headers
+        except (BotoCoreError, ClientError) as exc:
+            raise self._unavailable() from exc
+
+    def head(self, *, bucket: str, object_key: str) -> dict[str, Any]:
+        try:
+            response = self.client.head_object(Bucket=bucket, Key=object_key)
+            return {
+                "size_bytes": int(response.get("ContentLength") or 0),
+                "content_type": str(response.get("ContentType") or ""),
+                "metadata": {
+                    str(key).lower(): str(value)
+                    for key, value in (response.get("Metadata") or {}).items()
+                },
+                "etag": str(response.get("ETag") or "").strip('"') or None,
+            }
+        except (BotoCoreError, ClientError) as exc:
+            raise self._unavailable() from exc
+
+    def presigned_get_url(
+        self,
+        *,
+        bucket: str,
+        object_key: str,
+        expires_in: int | None = None,
+    ) -> str:
         try:
             return self.public_client.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": bucket, "Key": object_key},
-                ExpiresIn=settings.MEDIA_PRESIGNED_URL_EXPIRE_SECONDS,
+                ExpiresIn=expires_in or settings.MEDIA_PRESIGNED_URL_EXPIRE_SECONDS,
             )
         except (BotoCoreError, ClientError) as exc:
             raise self._unavailable() from exc

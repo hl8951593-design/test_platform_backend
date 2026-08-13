@@ -4,6 +4,10 @@
 `step_results`。运行身份必须同时包含 dataset 与 record 的 ID/name；同一 dataset 的不同 record
 不能合并审计。
 
+`GET /api/v1/scenario-runs` 是轻量历史列表。启用归一化步骤存储时，列表项的原始
+`step_results` 可以为空；这表示“步骤详情尚未加载”，不能解释为该运行有 0 个步骤。调用方应在
+用户展开记录时请求上述详情接口，再依据组装后的 `step_results` 展示通过数和总步骤数。
+
 ## 归一化步骤存储与兼容组装
 
 `GET /api/v1/scenario-runs/{run_id}` 的返回结构不变。默认配置 `EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED=true` 时，运行热路径不再反复覆盖 `test_scenario_runs.step_results`；每个 running/completed/skipped/timeout 步骤写入 `execution_step_diagnostics` 的独立行。

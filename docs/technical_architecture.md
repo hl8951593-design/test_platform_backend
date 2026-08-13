@@ -1,7 +1,7 @@
 ﻿# 自动化测试平台后端技术架构文档
 
 状态：当前实现
-最后核验：2026-07-12
+最后核验：2026-07-16
 
 文档入口、权威范围和维护要求见 [文档索引与维护规范](README.md)。
 
@@ -18,6 +18,7 @@ AI 能力、Skill Runtime 和 DeepSeek 接入见 [AI 能力接口文档](api_ai.
 [AI 开发记录](development_ai_notes.md)。
 
 场景组合与实时事件接口见 [场景组合接口文档](api_scenarios.md)。
+数据库连接、执行与安全边界见 [数据库连接与场景数据库动作](api_database_connections.md)。
 
 缺陷跟踪接口见 [缺陷跟踪接口文档](api_defects.md)。
 
@@ -32,13 +33,35 @@ MinIO 图片附件接口和部署配置见 [媒体存储接口文档](api_media.
 后置动作逐项尝试，失败仍如实计入运行终态。旧 `steps/execution_phase` 只允许通过
 `0020_scenario_nodes` 一次性迁移，运行时没有兼容分支。
 
+数据库能力采用“平台配置/审计库与目标业务库分离”的执行边界。环境级
+`project_database_connections` 保存结构化 MySQL、PostgreSQL、MongoDB 连接和加密凭据；
+场景数据库动作按当前环境解析稳定连接键，通过短生命周期 SQLAlchemy `NullPool` 或 PyMongo
+客户端访问目标库，并把脱敏请求、结果、断言、尝试历史写入 `database_action_executions`。
+关系型 SQL 与 MongoDB 操作均先经过类型、单语句、操作符、网络目标、权限和连接写开关校验；
+目标库事务不复用平台 ORM Session。数据库动作当前作为场景执行器内同步步骤，受单步超时、
+场景 deadline、查询重试上限和返回行数上限约束，整场手工执行仍由既有 `202 + execution worker`
+异步受理。迁移为 `0045_database_test_actions`。
+
 ## 1. 项目定位
 
 平台业务 ToolRegistry 当前包含 48 个 ToolSpec，原有 29 个工具名、handler 和调用链保持不变；新增的 19 个工具按执行记录、测试计划、可视化流程和缺陷四个领域落在独立 `AgentPlatformToolBackend`，再由 `AgentToolBackend` 统一委派，避免在旧 handler 上增加按领域分支。四个领域的 query 工具返回本次查询的 snapshot、`object_reference_manifest` 和对象级 `object_ref`；后续更新、启停、执行或状态流转由 `ObjectReferenceGuardRule` 校验同一会话最新事实快照并再次校验项目归属。Flow 保存还会按节点 `kind` 分别把 `api_case` 和 `websocket_case` 的 `referenceId/reference_id` 绑定到最新用例快照，避免两种协议 ID 混用。只读执行详情按 Skill 约束先 query，再由 `ExecutionRecordService` 校验项目归属。测试计划和 Flow 执行工具只创建 queued run/execution 并提交共享 `execution_worker`，立即返回可查询身份，不在 Agent Tool worker 中嵌套同步执行。query 结果进入下一轮模型前由 `ToolResultProjectionService` 生成有界 Planning View，完整脱敏结果仍留在 ToolCall Ledger View。
 
 新增工具集合为：执行记录 `execution.query_records/read_detail/diagnose`；测试计划 `plan.query_project_plans/create_saved/update_saved/set_enabled/execute_saved/query_runs/read_run`；可视化流程 `flow.query_project_flows/validate_graph/create_saved/update_saved/execute_saved`；缺陷 `defect.query_project_defects/create_saved/update_saved/transition_status`。其中 read/query/validate 是安全读取或确定性计算；create/update/enable/execute/transition 仍按 `business_update + require_revalidation` 进入权限与审批链。`execution.diagnose` 先通过统一执行详情读取真实 HTTP、WebSocket、场景或 Flow 记录，再把脱敏后的 draft/execution 数据交给现有 AI 诊断服务，不允许模型用自然语言中的 ID 绕过查询快照。
 
-非 Agent 业务读写路径保持“服务层语义不变、持久化边界减负”的优化原则：场景运行列表只延迟加载未进入列表响应的 `scenario_snapshot`；测试计划统计使用条件聚合与标量子查询；浏览器采集批量写入使用 executemany 并在提交后一次回读恢复输入顺序；报告智能总览使用无 count 的内部比较周期查询，慢用例仅投影展示所需字段。`0038_non_agent_query_performance_indexes` 为场景运行项目时间排序与采集条目批次顺序补齐索引。上述调整不改变路由、响应模型、权限、幂等策略、SSE、执行工作池或任何异步受理流程。
+非 Agent 业务读写路径保持“服务层语义不变、持久化边界减负”的优化原则：场景运行列表只投影身份、状态、进度和时间字段，`scenario_snapshot`、`variables_snapshot` 与 `step_results` 均不进入列表排序查询；列表使用空详情占位，完整步骤和变量在单条详情中按需组装。测试计划统计使用条件聚合与标量子查询；浏览器采集批量写入使用 executemany 并在提交后一次回读恢复输入顺序；报告智能总览使用无 count 的内部比较周期查询，慢用例仅投影展示所需字段。`0038_non_agent_query_performance_indexes` 为场景运行项目时间排序与采集条目批次顺序补齐索引。上述调整不改变路由、响应模型、权限、幂等策略、SSE、执行工作池或任何异步受理流程。
+
+第二轮性能收口继续使用相同边界：场景列表一次关联当前版本/环境，场景与 Flow 定义校验批量读取引用资产；执行中心日志只投影事件及 run 身份/时间，Desktop Worker 和 UI worker 映射按页批量读取；UI 列表用窗口总数与条件聚合减少轮询 SQL，设备鉴权一次联结 credential/device/owner。Dashboard 趋势 GET 使用实时计数构造当天内存点，只有 `DashboardAssetSnapshotScheduler` 持久化每日快照。当前热点未发现缺少必要索引，故本轮没有新增 migration；完整证据见 `docs/non_agent_performance_screening_2026-07-17.md`。
+
+测试报告采用“不可变执行事实 -> 轻量报告投影 -> 单条敏感明细”的读取边界。列表和详情从
+`TestPlanRun/VisualFlowExecution` 及子执行聚合，详情首页只暴露统一的计划目标或 Flow 节点展示字段；
+请求、响应、断言和 attempt 仅由单条明细接口按项目权限懒加载，并通过统一敏感数据组件递归脱敏。
+Flow 新执行在既有 `context_snapshot` 中保存 `sourceName/sourceVersion`，计划继续使用
+`plan_name/plan_version/plan_snapshot`，因此报告不依赖当前源资产是否仍存在。HTML 导出复用同一轻量投影；
+浏览器新窗口下载由 `test_report_exports` 保存短时随机凭证摘要和一次性消费状态，凭证不承担报告归档，
+迁移为 `0043_test_report_contracts`。报告删除使用 `0051_test_report_deletions` 墓碑从报告读模型中排除
+指定计划/Flow 报告并撤销其导出凭证，不删除执行事实、节点或诊断审计；运行中报告禁止删除。规则洞察明确
+标记 `generated_by=rules`，失败聚类、慢执行和未关闭
+缺陷保持独立统计语义。
 
 系统测试用例是独立于 HTTP 执行用例的项目级业务资产：`system_test_cases` 保存业务模块、测试目标、优先级、状态、AI 标记和标签；`system_case_api_relations` 保存它与现有 HTTP `test_cases` 的关联。所有接口必须先校验项目权限，并在 SQL 条件中带上 `project_id`。API 候选只从同项目 HTTP 用例投影 method/path/environment/last execution status/assertion count；保存关系时再次校验每个 `apiCaseId` 归属，避免前端或模型传入跨项目 ID。
 
@@ -62,7 +85,7 @@ MinIO 图片附件接口和部署配置见 [媒体存储接口文档](api_media.
 | 对象存储 | MinIO（S3 兼容） | 私有保存缺陷截图等二进制媒体，MySQL 只保存对象键和元数据 |
 | HTTP 执行引擎 | httpx | 执行接口测试步骤 |
 | AI Provider | DeepSeek OpenAI 兼容接口 | 通过 `AIService` 统一调用，业务能力由 AI Skill Runtime 与 Harness Loop Agent 承载；Agent 使用 `/api/v1/agents/model-health` 做配置与 live stream 探测，使用 `/api/v1/agents/launch-audit` 聚合前端联调/上线准备状态，并使用 `/api/v1/agents/backend-completion-audit` 聚合后端仓库拥有的 Agent 功能完成度，不暴露 API key |
-| 异步任务 | FastAPI BackgroundTasks（当前）/ 独立 Worker（演进目标） | 当前场景手工执行在响应后继续运行；生产可靠性阶段迁移到独立 Worker |
+| 异步任务 | 进程内有界 `execution_worker`（当前）/ 独立 Worker（演进目标） | 已保存 HTTP、WebSocket、场景和 Flow 先原子预留容量，再返回 `202 + execution id`；生产可靠性阶段迁移到独立 Worker |
 | 实时事件 | SSE + MySQL 持久化事件表 | 支持鉴权请求头、Last-Event-ID 重放、心跳、终态关闭和出站 item_id envelope |
 | 测试报告 | 自研 | 基于执行记录生成平台内置报告 |
 | 配置管理 | pydantic-settings + .env | 管理环境配置 |
@@ -604,10 +627,13 @@ Redis 可用于：
 - 成员与权限
 
 项目管理页的 `GET /projects` 是页面级读模型：路由先读取当前用户可见项目，再由
-`ProjectService.build_project_reads()` 批量装配 owner、members 和 stats。stats 聚合 HTTP/WebSocket 用例、
-场景、计划、缺陷和四类执行记录；列表接口不能对每个项目逐个调用单项目 `_build_project_stats()`，否则会形成
+`ProjectService.build_project_reads()` 批量装配 owner、members 和 stats。stats 聚合 HTTP/WebSocket/系统用例、
+场景、计划、可视化流程、未关闭/全部缺陷和五类根执行记录；列表接口不能对每个项目逐个调用单项目 `_build_project_stats()`，否则会形成
 `项目数 * 十余条统计 SQL` 的 N+1 查询。成员查询依赖 `0036_project_list_query_indexes` 补齐
-`project_members(project_id,is_active,id)` 索引；单项目详情、创建和更新仍可复用单项目装配路径。
+`project_members(project_id,is_active,id)` 索引。`GET /projects/{id}/testing-overview` 在同一统计口径上补充真实最近
+执行、结构化建议和活动；旧 `coverage_rate/automation_rate/defect_count` 只作为兼容别名，新调用使用明确的
+API 执行覆盖、成功覆盖和未关闭/全部缺陷字段。创建者所有权不落 `project_members` 行，成员管理读模型以
+`user_id` 作为稳定 ID、以可空 `membership_id` 表达关系记录。异步执行在入队和完成时清理项目列表短缓存。
 
 ### 4.3 环境管理
 
@@ -897,8 +923,9 @@ GET /notifications
 
 数据库不保存 MinIO 凭据，也不保存会过期的预签名 URL。对象键使用随机 UUID，原始文件名
 仅作为展示元数据。当前仅接受 PNG、JPEG、GIF 和 WebP；SVG 因可嵌入脚本不进入首版白名单。
-删除单个媒体、缺陷或项目时同步删除对象。MinIO 和 MySQL 不具备跨系统原子事务，因此删除
-中存储不可用时接口返回 `503` 并保留数据库记录，便于重试；后续可增加 outbox 和孤儿对象巡检。
+删除单个媒体或缺陷时同步删除对象。删除整个项目时先在单个数据库事务中物理清理项目资源，
+提交后再尽力删除已收集的 MinIO 对象，避免外键失败导致仍存活项目丢失附件。对象清理失败会记日志；
+MinIO 与 MySQL 不具备跨系统原子事务，后续仍需 outbox 和孤儿对象巡检处理项目删除后的残留对象。
 
 ## 5. 自研测试报告设计
 
@@ -1253,12 +1280,54 @@ Agent ledger 的递归脱敏同时识别 `Authorization`、`lingxi-auth`、`auth
 
 投影写入遵循 caller-owned transaction：业务服务在已有 flush/commit 之前调用 `ExecutionDiagnosticPersistence`，投影层不自行 commit。重复事件和回填使用业务身份唯一键 upsert，因此可安全重放。投影失败随原事务回滚，不产生“业务成功但诊断半写入”的额外提交边界。
 
-大字段按 request、response、logs/messages、retry 独立判断。超过 `EXECUTION_ARTIFACT_INLINE_THRESHOLD_BYTES` 的段落在脱敏后压缩保存，步骤 JSON 只保留 `artifact_ref/raw_size_bytes/externalized`。分块读取默认 8 KiB、最大 64 KiB，每次解压后校验 SHA-256，并再次验证 project、execution_type 和 execution_id。
+大字段按 request、response、logs/messages、retry 独立判断。超过 `EXECUTION_ARTIFACT_INLINE_THRESHOLD_BYTES` 的段落在脱敏后压缩保存，步骤 JSON 只保留 `artifact_ref/raw_size_bytes/externalized`。MySQL 使用 migration `0044_execution_artifact_mediumblob` 将 artifact 内容保存为 `MEDIUMBLOB`，避免较大的压缩响应触发 `BLOB` 64 KiB 写入上限；SQLite 仍使用标准 `BLOB`。分块读取默认 8 KiB、最大 64 KiB，每次解压后校验 SHA-256，并再次验证 project、execution_type 和 execution_id。
 
 模型侧采用 semantic projection，不做字符串前缀截断：首个失败、断言 expected/actual、HTTP 状态、业务码、错误类别和绑定证据优先。默认 12,000 字符、硬上限 24,000；超出预算的数据必须返回 omission、游标或 artifact continuation。完整 ToolCall ledger 和公共 REST 详情继续保留，但不会整体进入 LLM 上下文。
 
 `ExecutionMetricsScheduler` 是独立 daemon thread，每次 tick 创建自己的 `SessionLocal`，只读 `execution_record_index`，幂等重建最近变更的小时/日桶并独立提交；异常时回滚且只记录日志。它不调用执行服务、不改变运行状态，也不接触 worker、重试、审批或 SSE。
 
+## 工作台事实投影与异步编排
+
+工作台采用“业务事实表 + 可持久化读模型 + 现有执行服务”架构。HTTP/WebSocket/系统用例、场景、缺陷和各类执行表仍是权威业务事实；`dashboard_asset_daily_snapshots` 与 `dashboard_asset_events` 只负责趋势历史，不能替代资源表或执行表。`DashboardAssetSnapshotScheduler` 为项目与有效环境持久化当天快照；趋势 GET 使用同口径实时计数构造内存中的当天点，不在读取事务中 INSERT/UPDATE/commit。迁移前缺失的历史通过 `historical_data_complete=false` 暴露，不用当前 `created_at` 反推删除历史。
+
+`dashboard_ai_analysis_jobs` 通过共享有界执行队列异步运行。后端先按项目、环境、时间和 focus 读取真实活动证据，再调用既有 AI Provider；模型只生成文本分析，资源身份、证据与结构化动作由后端重建。本链路不经过 Agent Runtime、Skill、ToolCall 或 Approval。
+
+`dashboard_regression_runs` 是统一父任务，不是新的测试执行引擎。创建时固化请求指纹和目标快照；worker 逐项调用现有 HTTP、WebSocket、场景、Flow、测试计划服务，并把子执行 ID 和终态汇总到父任务。系统用例通过真实 API 关系展开，不产生虚构执行。权限、环境归属、用例快照、断言、诊断投影和幂等仍由各子服务负责。
+
 场景步骤热路径默认启用 `EXECUTION_NORMALIZED_SCENARIO_STEPS_ENABLED=true`。每次只 upsert 当前 running/completed/skipped 步骤，不再把增长中的 `step_results` JSON 重写回 run 行。读取层用共享的 `scenario_step_order` 规则将已落库步骤与场景快照生成的 pending 步骤合并，保持原顺序和公共详情契约。关闭开关会恢复旧写路径；关闭前必须先运行 `--restore-legacy-snapshots` 回填命令。
 
 读模型可通过 `scripts/backfill_execution_diagnostics.py` 分批重建，指标可通过 `scripts/rebuild_execution_metrics.py` 按项目和桶重建。两类命令均复用相同投影/聚合服务，避免在线和离线语义漂移。
+
+## TestAuto Desktop 设备控制面
+
+Desktop 是用户桌面上的 PyQt6 浏览器执行端，平台后端不直接操作浏览器，也不要求 Desktop 开放入站端口。第一批后端
+控制面由 migration `0046_desktop_devices` 建立三层数据：`desktop_devices` 保存用户所属的安装实例和脱敏能力摘要，
+`desktop_device_credentials` 保存可独立撤销、单次轮换的设备 refresh secret 哈希，
+`desktop_device_project_bindings` 以显式 opt-in 方式决定设备可参与哪些项目。内部主键使用 BIGINT，外部接口只暴露
+`dev_` public ID；installation ID 是客户端生成的随机值，服务端按 owner 做 HMAC 后存储，不使用硬件指纹。
+
+用户 access token 只负责设备注册和管理；heartbeat 与 WSS Control 必须使用 `type=desktop_device_access` 的短期设备
+JWT。设备 refresh token 是 `credential_id.random_secret` 不透明值，轮换时以旧哈希为条件执行原子 UPDATE，防止旧 token
+重复消费。重新注册相同 installation 会保留 public device ID、撤销旧 credential 并签发新凭据；撤销设备同时关闭接单、
+撤销全部 credential 并删除在线 presence。
+
+在线态采用 Redis 短 TTL，能力和运行摘要变化或达到持久化间隔后才刷新 MySQL `last_heartbeat_at`，避免每次 ping 写热行。
+Redis 不可用不会阻塞 API 进程启动、注册和设备管理，读取在线态会退化到 MySQL 快照；生产运行仍必须配置 Redis。
+`DesktopControlHub` 保存当前进程 WSS 连接，并通过 Redis pub/sub 把通知 fan-out 到其他 Uvicorn worker。WSS 只承载
+`control.ready/ping/pong/resync` 和后续轻量 `*.available` 通知，断线重连后以 REST 列表/详情重新校准，内存连接和
+pub/sub 消息都不是业务权威事实。
+
+阶段 C 由 migration `0047_ui_test_cases` 与 `0048_ui_execution_runtime` 扩展控制面。`ui_test_cases` 保存项目级
+用例身份和可变元数据，`ui_test_case_versions` 只允许追加规范化的 `ui-case-v1` DSL、checksum 和密钥引用；
+`current_version_id` 只指向当前不可变版本。保存新版本先按 canonical JSON 比较 checksum，再校验 `base_version`，
+从而让网络重试保持幂等、真实并发编辑保持 409 冲突。绝对导航 URL 受环境 host 约束，本机上传路径和任意代码执行
+不会进入平台资产。
+
+执行创建使用 `202 + ui_exec_ public_id`，事务内固化 case/version/environment 快照并写入
+`execution_record_index(execution_type=ui)`；`project + trigger_user + client_request_id` 唯一约束和请求哈希共同防止
+重复任务。环境 secret 只保存引用名，快照只含公开变量。指定有效项目设备后 WSS 只通知 `execution.available`，不携带 DSL
+或密钥，REST 仍是权威。`0048` 建立 step/event/patch/command 基础表，`0049` 补齐预签名产物交付；`0050` 在
+`ui_runtime_patches.request_command_id` 上建立可空唯一外键，使平台用户通过 `202 patch-requests` 发起的修补命令能追溯到
+Desktop 最终应用的 runtime patch。平台请求只允许 `paused/waiting_user`，服务端按冻结快照和已应用修补计算当前 before、
+重新校验候选 `ui-case-v1` 步骤；Desktop 上报时必须带原命令 ID，内容不一致即拒绝。未带命令 ID 的 Desktop 本地修补保持兼容。
+平台后端始终不接管 Playwright、浏览器 Profile 或本地缓存，完整边界见 `docs/testauto_desktop_backend_api_development_plan.md`。

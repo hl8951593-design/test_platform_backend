@@ -2,10 +2,14 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import String, cast, func, literal, select, union_all
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models.scenario import TestScenario, TestScenarioRun, TestScenarioRunEvent
+from app.models.desktop_device import DesktopDevice
 from app.models.test_case import TestCase, TestCaseExecution
+from app.models.ui_execution import UiExecution
+from app.models.execution_diagnostic import ExecutionPayloadArtifact
+from app.models.ui_test_case import UiTestCase
 from app.models.visual_flow import VisualFlow, VisualFlowExecution, VisualFlowNodeExecution
 from app.models.websocket_test_case import WebSocketTestCase, WebSocketTestCaseExecution
 
@@ -36,6 +40,7 @@ class ExecutionRecordRepository:
             TestCaseExecution.created_at.label("started_at"),
             cast(None, TestCaseExecution.created_at.type).label("finished_at"),
             TestCaseExecution.created_at.label("created_at"),
+            cast(None, String(64)).label("worker_id"),
         ).select_from(TestCaseExecution).outerjoin(
             TestCase, TestCase.id == TestCaseExecution.test_case_id
         )
@@ -62,6 +67,7 @@ class ExecutionRecordRepository:
             WebSocketTestCaseExecution.created_at.label("started_at"),
             cast(None, WebSocketTestCaseExecution.created_at.type).label("finished_at"),
             WebSocketTestCaseExecution.created_at.label("created_at"),
+            cast(None, String(64)).label("worker_id"),
         ).select_from(WebSocketTestCaseExecution).outerjoin(
             WebSocketTestCase,
             WebSocketTestCase.id == WebSocketTestCaseExecution.websocket_test_case_id,
@@ -89,6 +95,7 @@ class ExecutionRecordRepository:
             TestScenarioRun.started_at.label("started_at"),
             TestScenarioRun.finished_at.label("finished_at"),
             TestScenarioRun.created_at.label("created_at"),
+            cast(None, String(64)).label("worker_id"),
         ).select_from(TestScenarioRun).outerjoin(
             TestScenario, TestScenario.id == TestScenarioRun.scenario_id
         )
@@ -115,8 +122,38 @@ class ExecutionRecordRepository:
             VisualFlowExecution.started_at.label("started_at"),
             VisualFlowExecution.finished_at.label("finished_at"),
             VisualFlowExecution.created_at.label("created_at"),
+            cast(None, String(64)).label("worker_id"),
         ).select_from(VisualFlowExecution).outerjoin(
             VisualFlow, VisualFlow.id == VisualFlowExecution.flow_id
+        )
+
+    @staticmethod
+    def _ui_select():
+        return select(
+            literal("ui").label("execution_type"),
+            UiExecution.id.label("execution_id"),
+            UiExecution.project_id.label("project_id"),
+            UiExecution.ui_test_case_id.label("resource_id"),
+            UiTestCase.name.label("resource_name"),
+            UiExecution.environment_id.label("environment_id"),
+            cast(None, UiExecution.id.type).label("scenario_run_id"),
+            UiExecution.status.label("status"),
+            UiExecution.trigger_type.label("scenario_trigger"),
+            UiExecution.trigger_user_id.label("trigger_user_id"),
+            UiExecution.duration_ms.label("duration_ms"),
+            UiExecution.error_message.label("error_message"),
+            cast(None, String(128)).label("dataset_id"),
+            cast(None, String(128)).label("dataset_name"),
+            cast(None, String(128)).label("record_id"),
+            cast(None, String(128)).label("record_name"),
+            UiExecution.created_at.label("started_at"),
+            UiExecution.finished_at.label("finished_at"),
+            UiExecution.created_at.label("created_at"),
+            DesktopDevice.public_id.label("worker_id"),
+        ).select_from(UiExecution).outerjoin(
+            UiTestCase, UiTestCase.id == UiExecution.ui_test_case_id
+        ).outerjoin(
+            DesktopDevice, DesktopDevice.id == UiExecution.assigned_device_id
         )
 
     def list_records(
@@ -138,13 +175,24 @@ class ExecutionRecordRepository:
             self._websocket_select(),
             self._scenario_select(),
             self._flow_select(),
+            self._ui_select(),
         ).subquery("execution_records")
 
         filters = [records.c.project_id == project_id]
         if execution_type is not None:
             filters.append(records.c.execution_type == execution_type)
         if status is not None:
-            filters.append(records.c.status == status)
+            public_statuses = {
+                "running": ("running", "queued", "pending", "claimed", "launching"),
+                "paused": ("paused", "waiting_user"),
+                "passed": ("passed", "success", "completed", "assisted"),
+                "failed": ("failed", "error", "timeout", "lost"),
+            }
+            filters.append(
+                records.c.status.in_(public_statuses[status])
+                if status in public_statuses
+                else records.c.status == status
+            )
         if environment_id is not None:
             filters.append(records.c.environment_id == environment_id)
         if trigger_user_id is not None:
@@ -217,6 +265,39 @@ class ExecutionRecordRepository:
                 VisualFlowExecution.id == execution_id,
             )
         ).one_or_none()
+
+    def get_ui(self, *, project_id: int, execution_id: int):
+        return self.db.execute(
+            select(UiExecution, UiTestCase.name)
+            .options(
+                selectinload(UiExecution.step_executions),
+                selectinload(UiExecution.runtime_patches),
+                selectinload(UiExecution.commands),
+            )
+            .outerjoin(UiTestCase, UiTestCase.id == UiExecution.ui_test_case_id)
+            .where(
+                UiExecution.project_id == project_id,
+                UiExecution.id == execution_id,
+            )
+        ).one_or_none()
+
+    def list_ui_artifacts(
+        self,
+        *,
+        project_id: int,
+        execution_id: int,
+    ) -> list[ExecutionPayloadArtifact]:
+        return list(
+            self.db.scalars(
+                select(ExecutionPayloadArtifact)
+                .where(
+                    ExecutionPayloadArtifact.project_id == project_id,
+                    ExecutionPayloadArtifact.execution_type == "ui",
+                    ExecutionPayloadArtifact.execution_id == execution_id,
+                )
+                .order_by(ExecutionPayloadArtifact.created_at, ExecutionPayloadArtifact.id)
+            ).all()
+        )
 
     def list_flow_nodes(self, execution_id: int) -> list[VisualFlowNodeExecution]:
         return list(self.db.scalars(

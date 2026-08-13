@@ -21,4 +21,5 @@ class TokenRead(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+    platform_web_url: str
     user: UserRead

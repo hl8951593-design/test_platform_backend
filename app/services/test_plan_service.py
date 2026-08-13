@@ -428,12 +428,8 @@ class TestPlanService:
         ))
         if run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="计划运行记录不存在")
-        self.db.execute(
-            update(TestScenarioRun)
-            .where(TestScenarioRun.plan_run_id == run.id)
-            .values(plan_run_id=None)
-        )
-        self.db.delete(run)
+        run.is_deleted = True
+        run.deleted_at = datetime.utcnow()
         self.db.commit()
 
     def clear_runs(self, *, project_id: int, current_user: User) -> int:
@@ -446,11 +442,10 @@ class TestPlanService:
         )).all())
         if run_ids:
             self.db.execute(
-                update(TestScenarioRun)
-                .where(TestScenarioRun.plan_run_id.in_(run_ids))
-                .values(plan_run_id=None)
+                update(TestPlanRun)
+                .where(TestPlanRun.id.in_(run_ids))
+                .values(is_deleted=True, deleted_at=datetime.utcnow())
             )
-            self.db.execute(delete(TestPlanRun).where(TestPlanRun.id.in_(run_ids)))
         self.db.commit()
         return len(run_ids)
 
@@ -535,6 +530,51 @@ class TestPlanService:
                 TestPlanRun.id.in_(existing_event.run_ids)
             )).all()) if existing_event.run_ids else []
         return runs
+
+    def webhook_run_capacity(
+        self,
+        *,
+        project_id: int,
+        event: str,
+        idempotency_key: str,
+        body_hash: str,
+    ) -> int:
+        existing_event = self.db.scalar(select(TestPlanWebhookEvent).where(
+            TestPlanWebhookEvent.project_id == project_id,
+            TestPlanWebhookEvent.event == event,
+            TestPlanWebhookEvent.idempotency_key == idempotency_key,
+        ))
+        if existing_event is not None:
+            if existing_event.body_hash != body_hash:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Webhook 幂等键已用于不同请求体",
+                )
+            if not existing_event.run_ids:
+                return 0
+            return int(self.db.scalar(
+                select(func.count()).select_from(TestPlanRun).where(
+                    TestPlanRun.id.in_(existing_event.run_ids),
+                    TestPlanRun.status == "pending",
+                )
+            ) or 0)
+
+        plans = list(self.db.scalars(select(TestPlan).where(
+            TestPlan.project_id == project_id,
+            TestPlan.is_deleted.is_(False),
+            TestPlan.enabled.is_(True),
+            TestPlan.trigger_type == "webhook",
+            TestPlan.webhook_event == event,
+        )).all())
+        active_user_ids = set(self.db.scalars(select(User.id).where(
+            User.id.in_({plan.created_by_id for plan in plans}),
+            User.is_active.is_(True),
+        )).all()) if plans else set()
+        return sum(
+            len(plan.environment_ids)
+            for plan in plans
+            if plan.created_by_id in active_user_ids
+        )
 
     def _apply_payload(self, plan: TestPlan, payload: TestPlanPayload, project_id: int,
                        preserve_bound_versions: bool) -> None:

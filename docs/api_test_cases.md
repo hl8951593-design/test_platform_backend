@@ -390,8 +390,10 @@ raw 文本请求示例：
 | 方法 | `POST` |
 | 认证 | `Authorization: Bearer <access_token>` |
 | 权限 | 管理员、项目创建者，或拥有 `test:execute` 权限的普通测试人员 |
-| 成功响应 | HTTP `200`，返回最终状态为 `passed`、`failed` 或 `error` 的执行记录 |
-| 说明 | 后端内部先创建执行记录并提交共享执行工作池，接口等待执行完成后按原结构返回结果；队列状态不暴露给前端 |
+| 成功响应 | HTTP `202`，返回 `execution_id`、`status=running`、`polling_url` 和 `poll_after_ms` |
+| 说明 | 后端先预留工作池容量，再创建执行记录并提交任务；接口不等待真实 HTTP 请求结束 |
+
+队列无容量时返回 `503`，且不会创建 `queued` 执行记录，也不会把用例最近状态误写为运行中。执行响应体保留原执行记录字段，并增加 `request_status=started`、`terminal=false` 等轮询元数据。
 
 执行记录包含来源字段：人工通过该接口执行时 `trigger_source=manual`，`agent_run_id`、`agent_tool_call_id`、`trigger_tool_name` 为空；Agent 通过 `testcase.execute_saved` 或 `testcase.batch_execute` 工具触发执行时，业务执行记录会写入 `trigger_source=agent` 和对应 Agent 追踪字段，便于执行中心区分人工与 AI 来源。
 
@@ -421,10 +423,12 @@ raw 文本请求示例：
 | 方法 | `POST` |
 | 认证 | `Authorization: Bearer <access_token>` |
 | 权限 | 管理员、项目创建者，或拥有 `test:execute` 权限的普通测试人员 |
-| 成功响应 | HTTP `200`，返回多条最终状态为 `passed`、`failed` 或 `error` 的执行记录 |
-| 说明 | 根据用户选择的测试用例 ID 创建多条执行记录并提交共享执行工作池，接口等待本批次完成后按原结构返回结果 |
+| 成功响应 | HTTP `202`，返回多条带轮询元数据的已受理执行记录 |
+| 说明 | 整批最多 100 个且 ID 不可重复；后端先预留整批容量并校验所有用例/环境，再写入执行记录，不等待执行完成 |
 
 批量执行返回的每条执行记录同样携带 `trigger_source`；人工批量执行为 `manual`，Agent 批量执行为 `agent` 并携带 `agent_run_id`、`agent_tool_call_id`、`trigger_tool_name=testcase.batch_execute`。
+
+HTTP 出口默认只允许公网 `http/https` 目标，不跟随重定向；私网/回环目标必须通过 `EXECUTION_OUTBOUND_ALLOWED_HOSTS` 显式放行，或在受控环境启用 `EXECUTION_OUTBOUND_ALLOW_PRIVATE_NETWORKS`。响应体最多读取 `EXECUTION_RESPONSE_MAX_BYTES`（默认 1 MiB），超出时 `response_snapshot.body_truncated=true`。持久化前会再次脱敏 URL 查询参数、请求/响应头、JSON body 和断言实际值中的敏感字段。
 
 请求示例：
 

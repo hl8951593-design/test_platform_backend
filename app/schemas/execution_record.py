@@ -4,7 +4,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-ExecutionType = Literal["http", "websocket", "scenario", "flow"]
+ExecutionType = Literal["http", "websocket", "scenario", "flow", "ui"]
 
 
 class ExecutionRecordSummary(BaseModel):

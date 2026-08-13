@@ -12,10 +12,12 @@ import app.models  # noqa: F401
 from app.db.base import Base
 from app.models.browser_capture import BrowserCapture, BrowserCaptureEntry
 from app.models.project import Project, ProjectEnvironment
-from app.models.scenario import TestScenarioRun
+from app.models.scenario import TestScenario, TestScenarioRun, TestScenarioVersion
 from app.models.test_plan import TestPlan, TestPlanRun
+from app.models.test_case import TestCase
 from app.models.user import User
 from app.schemas.browser_capture import BrowserCaptureEntryBatchRequest
+from app.schemas.scenario import ScenarioCreateRequest
 from app.services.browser_capture_service import BrowserCaptureService
 from app.services.scenario_service import ScenarioService
 from app.services.test_plan_service import TestPlanService
@@ -23,7 +25,7 @@ from app.services.test_report_service import TestReportService
 
 
 class ScenarioRunQueryPerformanceTests(unittest.TestCase):
-    def test_list_query_defers_snapshot_but_detail_query_keeps_full_entity(self):
+    def test_list_query_omits_large_artifacts_but_detail_query_keeps_full_entity(self):
         db = MagicMock()
         db.scalar.return_value = 0
         db.scalars.return_value.all.return_value = []
@@ -43,6 +45,8 @@ class ScenarioRunQueryPerformanceTests(unittest.TestCase):
             list_statement.compile(compile_kwargs={"literal_binds": True})
         ).lower()
         self.assertNotIn("scenario_snapshot", list_sql)
+        self.assertNotIn("variables_snapshot", list_sql)
+        self.assertNotIn("step_results", list_sql)
 
         db.reset_mock()
         db.scalar.return_value = SimpleNamespace(status="passed")
@@ -57,6 +61,150 @@ class ScenarioRunQueryPerformanceTests(unittest.TestCase):
             detail_statement.compile(compile_kwargs={"literal_binds": True})
         ).lower()
         self.assertIn("scenario_snapshot", detail_sql)
+
+
+class ScenarioListQueryPerformanceTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        self.db = sessionmaker(bind=self.engine, expire_on_commit=False)()
+        self.user = User(
+            username="scenario-list-owner",
+            account="scenario-list-owner",
+            password_hash="hash",
+            phone="13000000011",
+            email="scenario-list-owner@example.com",
+        )
+        self.db.add(self.user)
+        self.db.flush()
+        self.project = Project(
+            name="Scenario list performance",
+            created_by_id=self.user.id,
+        )
+        self.db.add(self.project)
+        self.db.flush()
+        self.environment = ProjectEnvironment(
+            project_id=self.project.id,
+            name="test",
+            base_url="https://example.test",
+            is_default=True,
+            created_by_id=self.user.id,
+        )
+        self.db.add(self.environment)
+        self.db.flush()
+        self.test_case = TestCase(
+            project_id=self.project.id,
+            environment_id=self.environment.id,
+            name="Shared scenario case",
+            method="GET",
+            path="/health",
+            headers={},
+            query_params={},
+            assertions=[],
+            extractors=[],
+            created_by_id=self.user.id,
+        )
+        self.db.add(self.test_case)
+        self.db.flush()
+        for index in range(20):
+            scenario = TestScenario(
+                project_id=self.project.id,
+                environment_id=self.environment.id,
+                current_version=1,
+                name=f"Scenario {index:02d}",
+                tags=[],
+                created_by_id=self.user.id,
+                updated_by_id=self.user.id,
+            )
+            self.db.add(scenario)
+            self.db.flush()
+            self.db.add(
+                TestScenarioVersion(
+                    scenario_id=scenario.id,
+                    version=1,
+                    definition={"nodes": [], "datasets": []},
+                    created_by_id=self.user.id,
+                )
+            )
+        self.db.commit()
+        self.service = ScenarioService(self.db)
+        self.service.permission_service.require_project_permission = MagicMock()
+
+    def tearDown(self):
+        self.db.close()
+        self.engine.dispose()
+
+    def test_twenty_scenarios_keep_response_shape_with_two_business_queries(self):
+        statements = []
+
+        def record_statement(_conn, _cursor, statement, _params, _context, _many):
+            statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", record_statement)
+        try:
+            result = self.service.list_scenarios(
+                project_id=self.project.id,
+                current_user=self.user,
+                keyword=None,
+                page=1,
+                page_size=20,
+            )
+        finally:
+            event.remove(self.engine, "before_cursor_execute", record_statement)
+
+        self.assertEqual(result["total"], 20)
+        self.assertEqual(len(result["items"]), 20)
+        self.assertTrue(
+            all(
+                item["environment_name"] == self.environment.name
+                and item["nodes"] == []
+                and item["datasets"] == []
+                for item in result["items"]
+            )
+        )
+        self.assertEqual(len(statements), 2)
+
+    def test_scenario_validation_batches_case_lookups(self):
+        payload = ScenarioCreateRequest.model_validate(
+            {
+                "name": "Batch validation",
+                "environmentId": self.environment.id,
+                "nodes": [
+                    {
+                        "id": f"NODE-{index}",
+                        "name": f"Node {index}",
+                        "beforeActions": [],
+                        "testCase": {
+                            "id": f"CASE-{index}",
+                            "kind": "api_case",
+                            "referenceId": self.test_case.id,
+                            "name": self.test_case.name,
+                            "method": "GET",
+                            "path": "/health",
+                            "config": {},
+                            "continueOnFailure": False,
+                        },
+                        "afterActions": [],
+                    }
+                    for index in range(20)
+                ],
+                "datasets": [],
+            }
+        )
+        project_id = self.project.id
+        statements = []
+
+        def record_statement(_conn, _cursor, statement, _params, _context, _many):
+            statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", record_statement)
+        try:
+            definition = self.service._validated_definition(project_id, payload)
+        finally:
+            event.remove(self.engine, "before_cursor_execute", record_statement)
+
+        self.assertEqual(len(definition["nodes"]), 20)
+        self.assertEqual(len(statements), 2)
 
 
 class NonAgentQueryIndexTests(unittest.TestCase):

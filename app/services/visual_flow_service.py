@@ -10,6 +10,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.permissions import ProjectPermission
+from app.core.sensitive_data import redact_sensitive_data
 from app.core.variable_renderer import render_variables
 from app.db.session import SessionLocal
 from app.models.user import User
@@ -215,6 +216,8 @@ class VisualFlowService:
             flow_version_id=version.id,
             idempotency_key=idempotency_key,
             current_user=current_user,
+            source_name=flow.name,
+            source_version=version.version,
         )
         return execution, version.version, self.repository.list_node_executions(execution.id)
 
@@ -248,10 +251,12 @@ class VisualFlowService:
             environment_id=selected_environment_id,
             user_id=current_user.id,
             idempotency_key=idempotency_key,
-            context_snapshot={
-                "definition": self._mask(self._stored_definition(definition)),
-                "referencedCases": self._mask(case_snapshots),
-            },
+            context_snapshot=self._execution_context_snapshot(
+                definition=definition,
+                case_snapshots=case_snapshots,
+                source_name=flow.name,
+                source_version=version.version,
+            ),
             status="queued",
             commit=False,
         )
@@ -344,6 +349,8 @@ class VisualFlowService:
             flow_version_id=None,
             idempotency_key=idempotency_key,
             current_user=current_user,
+            source_name=prepared.name or "未保存 Flow",
+            source_version=None,
         )
         return execution, None, self.repository.list_node_executions(execution.id)
 
@@ -357,6 +364,8 @@ class VisualFlowService:
         flow_version_id: int | None,
         idempotency_key: str | None,
         current_user: User,
+        source_name: str | None = None,
+        source_version: int | None = None,
         existing_execution: VisualFlowExecution | None = None,
     ) -> VisualFlowExecution:
         selected_environment_id = environment_id or definition.environment_id
@@ -378,10 +387,12 @@ class VisualFlowService:
                 environment_id=selected_environment_id,
                 user_id=current_user.id,
                 idempotency_key=idempotency_key,
-                context_snapshot={
-                    "definition": self._mask(self._stored_definition(definition)),
-                    "referencedCases": self._mask(case_snapshots),
-                },
+                context_snapshot=self._execution_context_snapshot(
+                    definition=definition,
+                    case_snapshots=case_snapshots,
+                    source_name=source_name,
+                    source_version=source_version,
+                ),
                 commit=False,
             )
             self._stage_execution_diagnostic(execution, [])
@@ -757,6 +768,37 @@ class VisualFlowService:
         if not issues and len(self._topological_order(definition)) != len(nodes):
             issues.append({"code": "cycle", "message": "Flow must be a directed acyclic graph"})
 
+        http_case_ids: set[int] = set()
+        websocket_case_ids: set[int] = set()
+        for node in definition.nodes:
+            if node.kind not in {"api_case", "websocket_case"}:
+                continue
+            try:
+                reference_id = int(node.reference_id)
+            except (TypeError, ValueError):
+                continue
+            if node.kind == "api_case":
+                http_case_ids.add(reference_id)
+            else:
+                websocket_case_ids.add(reference_id)
+        http_cases = {
+            case.id: case
+            for case in self.repository.list_http_cases(
+                project_id=project_id,
+                case_ids=http_case_ids,
+            )
+        }
+        websocket_cases = {
+            case.id: case
+            for case in self.repository.list_websocket_cases(
+                project_id=project_id,
+                case_ids=websocket_case_ids,
+            )
+        }
+        environments = {
+            environment.id: environment
+            for environment in self.repository.list_environments(project_id=project_id)
+        }
         for node in definition.nodes:
             if node.kind in {"api_case", "websocket_case"}:
                 try:
@@ -765,9 +807,9 @@ class VisualFlowService:
                     issues.append({"code": "missing_reference", "message": "Case node requires a numeric referenceId", "nodeId": node.id})
                     continue
                 case = (
-                    self.repository.get_http_case(project_id=project_id, case_id=reference_id)
+                    http_cases.get(reference_id)
                     if node.kind == "api_case"
-                    else self.repository.get_websocket_case(project_id=project_id, case_id=reference_id)
+                    else websocket_cases.get(reference_id)
                 )
                 if case is None:
                     issues.append({"code": "invalid_reference", "message": "Referenced case is missing or cross-project", "nodeId": node.id})
@@ -804,9 +846,10 @@ class VisualFlowService:
                                 override_case_data, node, allowed_fields=_WEBSOCKET_CASE_OVERRIDE_FIELDS
                             )
                             validated_override = WebSocketTestCaseConfig.model_validate(override_case_data)
-                        if validated_override.environment_id is not None and self.repository.get_environment(
-                            project_id=project_id, environment_id=validated_override.environment_id
-                        ) is None:
+                        if (
+                            validated_override.environment_id is not None
+                            and validated_override.environment_id not in environments
+                        ):
                             issues.append(
                                 {
                                     "code": "invalid_case_override_environment",
@@ -1045,6 +1088,21 @@ class VisualFlowService:
     def _stored_definition(self, definition: FlowDefinition) -> dict:
         return definition.model_dump(by_alias=True, mode="json", exclude={"id", "updated_at"})
 
+    def _execution_context_snapshot(
+        self,
+        *,
+        definition: FlowDefinition,
+        case_snapshots: dict[str, Any],
+        source_name: str | None,
+        source_version: int | None,
+    ) -> dict[str, Any]:
+        return {
+            "sourceName": source_name or definition.name or "未命名 Flow",
+            "sourceVersion": source_version,
+            "definition": self._mask(self._stored_definition(definition)),
+            "referencedCases": self._mask(case_snapshots),
+        }
+
     def _detail(self, flow: VisualFlow, stored_definition: dict) -> dict[str, Any]:
         definition = copy.deepcopy(stored_definition)
         definition.update(
@@ -1060,10 +1118,34 @@ class VisualFlowService:
         return definition
 
     def _case_snapshots(self, definition: FlowDefinition, project_id: int) -> dict[str, Any]:
+        http_case_ids = {
+            int(node.reference_id)
+            for node in definition.nodes
+            if node.kind == "api_case"
+        }
+        websocket_case_ids = {
+            int(node.reference_id)
+            for node in definition.nodes
+            if node.kind == "websocket_case"
+        }
+        http_cases = {
+            case.id: case
+            for case in self.repository.list_http_cases(
+                project_id=project_id,
+                case_ids=http_case_ids,
+            )
+        }
+        websocket_cases = {
+            case.id: case
+            for case in self.repository.list_websocket_cases(
+                project_id=project_id,
+                case_ids=websocket_case_ids,
+            )
+        }
         result = {}
         for node in definition.nodes:
             if node.kind == "api_case":
-                case = self.repository.get_http_case(project_id=project_id, case_id=int(node.reference_id))
+                case = http_cases[int(node.reference_id)]
                 result[node.id] = {
                     "kind": node.kind, "referenceId": case.id, "method": case.method, "path": case.path,
                     "headers": case.headers, "queryParams": case.query_params, "bodyType": case.body_type,
@@ -1071,7 +1153,7 @@ class VisualFlowService:
                     "retryPolicy": getattr(case, "retry_policy", None),
                 }
             elif node.kind == "websocket_case":
-                case = self.repository.get_websocket_case(project_id=project_id, case_id=int(node.reference_id))
+                case = websocket_cases[int(node.reference_id)]
                 result[node.id] = {
                     "kind": node.kind, "referenceId": case.id, "path": case.path, "headers": case.headers,
                     "subprotocols": case.subprotocols, "messages": case.messages, "receiveCount": case.receive_count,
@@ -1115,15 +1197,7 @@ class VisualFlowService:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _mask(self, value: Any) -> Any:
-        sensitive = ("authorization", "token", "password", "secret", "cookie", "api_key", "apikey")
-        if isinstance(value, dict):
-            return {
-                key: "***" if any(item in key.lower() for item in sensitive) else self._mask(item_value)
-                for key, item_value in value.items()
-            }
-        if isinstance(value, list):
-            return [self._mask(item) for item in value]
-        return value
+        return redact_sensitive_data(value)
 
     def _get_flow(self, project_id: int, flow_id: int) -> VisualFlow:
         flow = self.repository.get_flow(project_id=project_id, flow_id=flow_id)

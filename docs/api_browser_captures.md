@@ -381,9 +381,8 @@ Content-Type: application/json
 {
   "entry_ids": [11, 12, 13],
   "environment_id": 4,
-  "create_environment_variables": true,
-  "create_scenario": true,
-  "scenario_draft_id": 8
+  "create_environment_variables": false,
+  "create_scenario": true
 }
 ```
 
@@ -396,8 +395,8 @@ Content-Type: application/json
   "data": {
     "capture_id": 1,
     "environment_id": 4,
-    "scenario_draft_id": 8,
-    "create_environment_variables": true,
+    "scenario_draft_id": null,
+    "create_environment_variables": false,
     "environment_variables_created": 0,
     "success_count": 2,
     "failure_count": 1,
@@ -427,3 +426,6 @@ Content-Type: application/json
 - WebSocket 草稿会创建正式 WebSocket 用例。
 - 已导入成功的草稿再次导入会返回 `status=duplicate`。
 - `create_scenario=true` 时，后端会基于本次成功导入的正式资产创建一个基础场景；场景创建失败不会回滚已导入的正式用例。
+- `create_environment_variables=true` 和非空 `scenario_draft_id` 尚未实现，当前明确返回 HTTP `422`，不会再返回“成功但实际未处理”的假结果。
+
+批量 upsert 和单条更新在入库前执行二次脱敏：鉴权/Token/Cookie/密码类键替换为 `***`，URL 中的敏感查询参数会遮罩，JSON 字符串 body 会解析后递归脱敏。列表和详情只读取脱敏后的持久化值。
